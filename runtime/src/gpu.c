@@ -821,6 +821,21 @@ void psx_ws_sprite_tag(CPUState* cpu) {
     ws_last_tag_stamp = now;
 }
 
+/* Generic 3D-gameplay detector (2026-07-03, Tomba2 widescreen). The sprite-tag
+ * detector above needs per-title [widescreen] sprite_tag_funcs evidence; a
+ * title without it (Tomba2) had EVERY frame classified "full-2D menu" and
+ * pillarboxed 4:3 with native-wide silently inactive. The title-agnostic truth
+ * is the GTE: a frame that runs perspective transforms (RTPS/RTPT) is a 3D
+ * gameplay frame. gte.cpp calls this from gte_execute for those two ops — a
+ * chokepoint every backend (compiled, overlay DLL, dirty interp) already
+ * routes through, so no per-title config and no regen. Menus that project 3D
+ * (rare) classify as gameplay and render native-wide, which is benign there;
+ * FMV keeps its own separate pillarbox veto. Cheap: one store per RTPS/RTPT. */
+void gpu_ws_gte_activity(void) {
+    if (!ws_engaged()) return;
+    ws_last_tag_stamp = (uint32_t)s_frame_count;
+}
+
 /* Look up the executing GP0 command's prim in the tag table. The command's
  * first word lives at prim+4 (the PsyQ P_TAG header precedes it), but accept
  * a direct hit too in case a tag site passes the colour-word address. */

@@ -853,6 +853,14 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
 
     uint8_t func = cmd & 0x3F;
+    /* Generic 3D-gameplay stamp for the widescreen frame classifier: a frame
+     * that runs perspective transforms is a 3D gameplay frame. Chokepoint for
+     * every backend (compiled, overlay DLL, dirty interp) — replaces the
+     * per-title sprite_tag_funcs requirement for 3D titles (Tomba2). */
+    if (func == 0x01 || func == 0x30) {
+        extern void gpu_ws_gte_activity(void);
+        gpu_ws_gte_activity();
+    }
     switch (func) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
