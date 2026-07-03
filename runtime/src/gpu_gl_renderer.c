@@ -915,6 +915,175 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
     p_glUniform1f(uXoff, (float)dx);
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
 }
+
+/* ---- deferred wide-mirror replay (default path) --------------------------
+ * The inline mirror above re-targets the wide FBO PER BATCH. A 3D title that
+ * interleaves flat and textured prims (Tomba2) shatters batches, and the
+ * canonical<->wide FBO ping-pong dominates the frame: measured 60.5 -> 12 fps,
+ * scene GPU 0.9ms -> 60ms (frame_perf, Tomba2 attract, 2026-07-03). Instead,
+ * RECORD each mirrored draw's vertices + state during the frame and REPLAY
+ * them into the wide FBO in submission order with ONE target switch, at
+ * present (or when the mirror target/config changes).
+ *
+ * Enhancement-tier approximations (wide mode only; 4:3 is untouched and the
+ * canonical pass is always drawn live): (1) replayed textured draws sample
+ * end-of-frame VRAM, so a mid-frame texture re-upload between two prims that
+ * use it renders both with the final texels; (2) a mid-frame framebuffer
+ * CLEAR (glb_wide_clear is immediate) wipes the wide surface BEFORE the
+ * replayed draws land, so draws submitted before such a clear survive it in
+ * the margins — games clear once per frame, where order is preserved.
+ * PSX_WS_DEFER=0 reverts to the inline per-batch mirror for A/B. */
+/* Forward decls: the tex-batch machinery is defined below this block. */
+static void tex_batch_draw_passes(int nverts, int semi);
+static int  s_tb_mask;                         /* tentative; defined with the batch */
+
+#define WREPLAY_MAX_SEG 4096
+#define WREPLAY_MAX_FLOATS (2u << 20)          /* 8 MB of vertex floats */
+typedef struct {
+    unsigned char kind;                        /* 0 = geo, 1 = tex batch */
+    unsigned char bd_gate;                     /* backdrop-stretch gate at record */
+    unsigned char mask;                        /* mask-bit state at record */
+    unsigned char lines;                       /* geo: GL_LINES instead of tris */
+    int   first, nverts;                       /* range in s_wr_data (floats/vert per kind) */
+    short semi;                                /* blend mode; <0 = off */
+    short filter;                              /* tex: filter uniform */
+    int   twin[4];                             /* tex: texture-window uniform */
+    int   dx;                                  /* wide_dx() at record time */
+    int   base;                                /* g_wide_cur_base at record time */
+} WideSeg;
+static WideSeg s_wr_seg[WREPLAY_MAX_SEG];
+static int     s_wr_nseg = 0;
+static float  *s_wr_data = NULL;
+static unsigned s_wr_nfloat = 0;
+static GLuint  s_wr_fbo = 0;                   /* wide FBO the pending segments target */
+uint64_t g_wide_replay_flushes = 0, g_wide_replay_segs = 0, g_wide_replay_drops = 0;
+
+static int ws_defer_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PSX_WS_DEFER");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+/* Compute the per-segment backdrop-stretch uniforms (mirrors wide_set_bd_scale,
+ * from recorded state instead of live globals). */
+static void wr_bd_uniforms(const WideSeg *sg, GLint uScale, GLint uCenter) {
+    float scale = 1.0f, center = 0.0f;
+    if (sg->bd_gate && g_ws_bd_stretch_on && g_wide_w > 0) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        if (native_w > 0) {
+            scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
+                                             : (float)g_wide_w / (float)native_w;
+            center = (float)sg->base + (float)native_w / 2.0f;
+        }
+    }
+    p_glUniform1f(uScale, scale);
+    p_glUniform1f(uCenter, center);
+}
+
+/* Replay every pending segment into its wide FBO: one bind, ordered draws. */
+static void wide_replay_flush(void) {
+    int nseg = s_wr_nseg;
+    GLuint fbo = s_wr_fbo;
+    s_wr_nseg = 0; s_wr_nfloat = 0; s_wr_fbo = 0;   /* clear first: re-entrancy */
+    if (!nseg || !fbo || g_wide_w <= 0 || !s_raster_ok) return;
+    g_wide_replay_flushes++;
+    g_wide_replay_segs += (uint64_t)nseg;
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+
+    int save_tb_mask = s_tb_mask;   /* tex_batch_draw_passes reads this global */
+    for (int i = 0; i < nseg; i++) {
+        const WideSeg *sg = &s_wr_seg[i];
+        if (sg->kind == 0) {
+            p_glUseProgram(s_geo_prog);
+            p_glBindVertexArray(s_geo_vao);
+            p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+            p_glBufferData(PSXGL_ARRAY_BUFFER,
+                           (ptrdiff_t)(sg->nverts * 6 * sizeof(float)),
+                           s_wr_data + sg->first, PSXGL_STREAM_DRAW);
+            p_glUniform1f(s_geo_uXoff, (float)sg->dx);
+            p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
+            wr_bd_uniforms(sg, s_geo_uXscale, s_geo_uXcenter);
+            if (sg->semi >= 0) apply_psx_blend(sg->semi); else glDisable(GL_BLEND);
+            mask_stencil(sg->mask);
+            if (sg->lines) glLineWidth((float)s_scale);
+            glDrawArrays(sg->lines ? GL_LINES : GL_TRIANGLES, 0, sg->nverts);
+        } else {
+            p_glUseProgram(s_tex_prog);
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+            p_glUniform1i(s_uVram, 0);
+            p_glUniform4i(s_uTwin, sg->twin[0], sg->twin[1], sg->twin[2], sg->twin[3]);
+            p_glUniform1i(s_uMaskset, sg->mask);
+            p_glUniform1i(s_uFilter, sg->filter);
+            p_glBindVertexArray(s_tex_vao);
+            p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+            p_glBufferData(PSXGL_ARRAY_BUFFER,
+                           (ptrdiff_t)(sg->nverts * TEXV * sizeof(float)),
+                           s_wr_data + sg->first, PSXGL_STREAM_DRAW);
+            p_glUniform1f(s_tex_uXoff, (float)sg->dx);
+            p_glUniform1f(s_tex_uXhalf, (float)g_wide_w / 2.0f);
+            wr_bd_uniforms(sg, s_tex_uXscale, s_tex_uXcenter);
+            s_tb_mask = sg->mask;
+            tex_batch_draw_passes(sg->nverts, sg->semi);
+        }
+    }
+    s_tb_mask = save_tb_mask;
+    /* Neutralize the wide projection on both programs for the next canonical
+     * pass (mirrors wide_target_end). */
+    p_glUseProgram(s_geo_prog);
+    p_glUniform1f(s_geo_uXoff, 0.0f); p_glUniform1f(s_geo_uXhalf, 512.0f);
+    p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
+    p_glUseProgram(s_tex_prog);
+    p_glUniform1f(s_tex_uXoff, 0.0f); p_glUniform1f(s_tex_uXhalf, 512.0f);
+    p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+    hr_end();
+}
+
+/* Append one mirrored draw to the replay queue. floats_per_vert = 6 (geo) or
+ * TEXV (tex). On queue overflow, replay immediately (one extra FBO round-trip,
+ * order preserved) and retry; a single draw larger than the buffer is dropped
+ * (counted — cannot happen with current batch caps). */
+static void wide_replay_record(int kind, const float *verts, int nverts,
+                               int floats_per_vert, int lines, int semi,
+                               int mask, int filter, const int twin[4],
+                               int bd_gate) {
+    if (!g_wide_cur) return;
+    if (!s_wr_data) {
+        s_wr_data = (float *)malloc(WREPLAY_MAX_FLOATS * sizeof(float));
+        if (!s_wr_data) { g_wide_replay_drops++; return; }
+    }
+    unsigned need = (unsigned)(nverts * floats_per_vert);
+    if (need > WREPLAY_MAX_FLOATS) { g_wide_replay_drops++; return; }
+    if (s_wr_fbo && s_wr_fbo != g_wide_cur) wide_replay_flush();
+    if (s_wr_nseg >= WREPLAY_MAX_SEG || s_wr_nfloat + need > WREPLAY_MAX_FLOATS) {
+        GLuint cur = g_wide_cur;
+        wide_replay_flush();
+        g_wide_cur = cur;   /* flush neutralized state, target unchanged */
+    }
+    s_wr_fbo = g_wide_cur;
+    WideSeg *sg = &s_wr_seg[s_wr_nseg++];
+    sg->kind = (unsigned char)kind;
+    sg->bd_gate = (unsigned char)(bd_gate ? 1 : 0);
+    sg->mask = (unsigned char)(mask ? 1 : 0);
+    sg->lines = (unsigned char)(lines ? 1 : 0);
+    sg->first = (int)s_wr_nfloat;
+    sg->nverts = nverts;
+    sg->semi = (short)semi;
+    sg->filter = (short)filter;
+    if (twin) { for (int i = 0; i < 4; i++) sg->twin[i] = twin[i]; }
+    else      { sg->twin[0] = sg->twin[1] = sg->twin[2] = sg->twin[3] = 0; }
+    sg->dx = wide_dx();
+    sg->base = g_wide_cur_base;
+    memcpy(s_wr_data + s_wr_nfloat, verts, (size_t)need * sizeof(float));
+    s_wr_nfloat += need;
+}
 static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glUniform1f(uXoff, 0.0f);
     p_glUniform1f(uXhalf, 512.0f);
@@ -1041,13 +1210,20 @@ static void flush_tex_batch(void) {
     tex_batch_draw_passes(nverts, semi);
 
     if (g_wide_cur) {                       /* native-wide mirror */
-        int dx = wide_dx();
-        s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
-        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
-        wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        tex_batch_draw_passes(nverts, semi);
-        wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+        if (ws_defer_enabled()) {
+            /* Deferred: queue this batch for the once-per-frame wide replay
+             * (s_tb still holds the verts; only the count was cleared). */
+            wide_replay_record(1, s_tb, nverts, TEXV, 0, semi,
+                               s_tb_mask, s_tb_filter, s_tb_twin, s_tb_gate);
+        } else {
+            int dx = wide_dx();
+            s_bd_gate = s_tb_gate;          /* this batch is uniform-gate (flushed on change) */
+            wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+            wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+            tex_batch_draw_passes(nverts, semi);
+            wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+            wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+        }
     }
     hr_end();
 }
@@ -1085,13 +1261,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      * is applied in the vertex shader via u_xoff, and the wider clip via
      * u_xhalf. Canonical pass above is untouched (u_xoff=0/u_xhalf=512). */
     if (g_wide_cur && !s_wide_suppress) {
-        int dx = wide_dx();
-        s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
-        wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
-        wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        glDrawArrays(mode, 0, n);
-        wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+        if (ws_defer_enabled()) {
+            wide_replay_record(0, verts, n, 6, mode == GL_LINES, semi,
+                               s_mask_set, 0, NULL, bd_prim_gate(xs, n));
+        } else {
+            int dx = wide_dx();
+            s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
+            wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
+            wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+            glDrawArrays(mode, 0, n);
+            wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+            wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+        }
     }
     hr_end();
 }
@@ -1910,6 +2091,8 @@ void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]) {
  * ------------------------------------------------------------------------- */
 
 static void wide_free_all(void) {
+    /* Discard pending replay segments: their target FBO ids die here. */
+    s_wr_nseg = 0; s_wr_nfloat = 0; s_wr_fbo = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
         if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
@@ -2024,6 +2207,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
      * make sure all wide-FBO draws have completed before the readback. */
     flush_tex_batch();
     flush_cpu_upload();
+    wide_replay_flush();
     glFinish();
 
     int W = g_wide_w * s_scale;
@@ -2253,6 +2437,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     g_wide_last_disp_y = disp_y;
     flush_tex_batch();
     flush_cpu_upload();
+    wide_replay_flush();          /* land the deferred mirror before the blit */
     gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;

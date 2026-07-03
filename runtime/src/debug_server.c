@@ -6314,10 +6314,12 @@ static void handle_ws_nw(int id, const char *json)
     /* Wide-path attribution counters (gpu_gl_renderer.c; zero on SW backend). */
     extern uint64_t g_wide_mirror_draws, g_wide_present_ok, g_wide_present_nosurf,
                     g_wide_present_canon, g_prim_size_rejects;
+    extern uint64_t g_wide_replay_flushes, g_wide_replay_segs, g_wide_replay_drops;
     extern int g_wide_last_disp_y, g_wide_last_target;
     send_fmt("{\"id\":%d,\"ok\":true,\"native_wide\":%d,\"mode\":%d,\"nw_extra\":%d,"
              "\"mirror_draws\":%llu,\"present_ok\":%llu,\"present_nosurf\":%llu,"
              "\"present_canon\":%llu,\"size_rejects\":%llu,"
+             "\"replay_flushes\":%llu,\"replay_segs\":%llu,\"replay_drops\":%llu,"
              "\"last_disp_y\":%d,\"last_target\":%d}",
              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra,
              (unsigned long long)g_wide_mirror_draws,
@@ -6325,6 +6327,9 @@ static void handle_ws_nw(int id, const char *json)
              (unsigned long long)g_wide_present_nosurf,
              (unsigned long long)g_wide_present_canon,
              (unsigned long long)g_prim_size_rejects,
+             (unsigned long long)g_wide_replay_flushes,
+             (unsigned long long)g_wide_replay_segs,
+             (unsigned long long)g_wide_replay_drops,
              g_wide_last_disp_y, g_wide_last_target);
 }
 
