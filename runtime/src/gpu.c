@@ -1599,6 +1599,30 @@ static void raster_triangle(int32_t x0, int32_t y0,
     #undef UNFP
 }
 
+/* Hardware polygon size rejection (psx-spx, "GPU Render Polygon Commands"):
+ * the real GPU does not render a triangle whose x-extent exceeds 1023 or
+ * y-extent exceeds 511 (each triangle of a quad is tested independently).
+ * The SW rasterizer applied this privately (raster_triangle); the GL backend
+ * never did — invisible at 4:3 because games cull such prims themselves, but
+ * widescreen cull-widening admits polys with one in-window vertex and
+ * GTE-saturated (±1024-clamped) partners, which hardware would reject and GL
+ * happily drew as screen-wide garbage spikes (Tomba2 16:9 flicker/"bleed").
+ * One shared gate here fixes every backend and every title, faithfully.
+ * Counted (g_prim_size_rejects) for the rings. */
+uint64_t g_prim_size_rejects = 0;
+static int tri_size_ok(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                       int32_t x2, int32_t y2) {
+    int32_t xmin = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2);
+    int32_t xmax = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
+    int32_t ymin = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    int32_t ymax = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    if ((xmax - xmin) > 1023 || (ymax - ymin) > 511) {
+        g_prim_size_rejects++;
+        return 0;
+    }
+    return 1;
+}
+
 /* Execute mono triangle (GP0 0x20-0x23) */
 static void gp0_exec_mono_tri(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
@@ -1610,7 +1634,8 @@ static void gp0_exec_mono_tri(void) {
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
 }
 
 /* Execute mono quad (GP0 0x28-0x2B) — two triangles: (0,1,2) and (2,1,3) */
@@ -1624,8 +1649,10 @@ static void gp0_exec_mono_quad(void) {
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    if (tri_size_ok(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3]))
+        gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
 }
 
 /* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
@@ -1641,9 +1668,10 @@ static void gp0_exec_shaded_tri(void) {
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
-                             vx[1], vy[1], c[1],
-                             vx[2], vy[2], c[2]);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
+                                 vx[1], vy[1], c[1],
+                                 vx[2], vy[2], c[2]);
 }
 
 void gpu_arm_shaded_quad_capture(void) { sq_cap_armed = 1; sq_cap_count = 0; }
@@ -1674,12 +1702,14 @@ static void gp0_exec_shaded_quad(void) {
         }
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
-                             vx[1], vy[1], c[1],
-                             vx[2], vy[2], c[2]);
-    gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
-                             vx[1], vy[1], c[1],
-                             vx[3], vy[3], c[3]);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
+                                 vx[1], vy[1], c[1],
+                                 vx[2], vy[2], c[2]);
+    if (tri_size_ok(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3]))
+        gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
+                                 vx[1], vy[1], c[1],
+                                 vx[3], vy[3], c[3]);
 }
 
 /* Helper: build texpage word from GPU state for SW renderer.
@@ -1727,10 +1757,11 @@ static void gp0_exec_textured_tri(void) {
     }
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[2], vy[2], u[2], v[2],
-                              clut_x, clut_y, tpage);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                                  vx[1], vy[1], u[1], v[1],
+                                  vx[2], vy[2], u[2], v[2],
+                                  clut_x, clut_y, tpage);
 }
 
 /* Execute textured quad (GP0 0x2C-0x2F) */
@@ -1794,14 +1825,16 @@ static void gp0_exec_textured_quad(void) {
         }
     }
 
-    gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[2], vy[2], u[2], v[2],
-                              clut_x, clut_y, tpage);
-    gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[3], vy[3], u[3], v[3],
-                              clut_x, clut_y, tpage);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                                  vx[1], vy[1], u[1], v[1],
+                                  vx[2], vy[2], u[2], v[2],
+                                  clut_x, clut_y, tpage);
+    if (tri_size_ok(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3]))
+        gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
+                                  vx[1], vy[1], u[1], v[1],
+                                  vx[3], vy[3], u[3], v[3],
+                                  clut_x, clut_y, tpage);
 }
 
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
@@ -1832,10 +1865,11 @@ static void gp0_exec_shaded_textured_tri(void) {
     }
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
-                                     vx[1], vy[1], u[1], v[1], c[1],
-                                     vx[2], vy[2], u[2], v[2], c[2],
-                                     clut_x, clut_y, tpage, raw_texture);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+                                         vx[1], vy[1], u[1], v[1], c[1],
+                                         vx[2], vy[2], u[2], v[2], c[2],
+                                         clut_x, clut_y, tpage, raw_texture);
 }
 
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
@@ -1869,14 +1903,16 @@ static void gp0_exec_shaded_textured_quad(void) {
     }
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
-                                     vx[1], vy[1], u[1], v[1], c[1],
-                                     vx[2], vy[2], u[2], v[2], c[2],
-                                     clut_x, clut_y, tpage, raw_texture);
-    gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
-                                     vx[1], vy[1], u[1], v[1], c[1],
-                                     vx[3], vy[3], u[3], v[3], c[3],
-                                     clut_x, clut_y, tpage, raw_texture);
+    if (tri_size_ok(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2]))
+        gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+                                         vx[1], vy[1], u[1], v[1], c[1],
+                                         vx[2], vy[2], u[2], v[2], c[2],
+                                         clut_x, clut_y, tpage, raw_texture);
+    if (tri_size_ok(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3]))
+        gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
+                                         vx[1], vy[1], u[1], v[1], c[1],
+                                         vx[3], vy[3], u[3], v[3], c[3],
+                                         clut_x, clut_y, tpage, raw_texture);
 }
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */

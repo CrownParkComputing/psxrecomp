@@ -897,7 +897,17 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
  * letting the shifted geometry fill the revealed 16:9 margins that lie OUTSIDE
  * the game's 4:3 draw-area x-range. Scissoring to the (translated) draw area
  * would crop exactly the margin content native-wide exists to reveal. */
+/* Always-on wide-path counters (queried via debug ws_nw). Named the Tomba2
+ * vertical-double-buffer flicker hunt: per-frame mirror-draw volume + present
+ * outcome attribution, cheap increments only. */
+uint64_t g_wide_mirror_draws   = 0;  /* wide-pass draw calls (all time) */
+uint64_t g_wide_present_ok     = 0;  /* wide present readbacks served */
+uint64_t g_wide_present_nosurf = 0;  /* present fallbacks: no surface for base */
+int      g_wide_last_disp_y    = -1; /* disp_y of the last wide present */
+int      g_wide_last_target    = -1; /* base_x of the current mirror target */
+
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
+    g_wide_mirror_draws++;
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -1953,6 +1963,7 @@ static void glb_wide_set_target(int base_x) {
     flush_tex_batch();   /* drain into the OLD target before switching */
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
+    g_wide_last_target = g_wide_cur ? base_x : -1;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
@@ -2004,7 +2015,9 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     GLuint fbo = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == base_x) { fbo = s_wide_fbo[i]; break; }
-    if (!fbo) return 0;
+    if (!fbo) { g_wide_present_nosurf++; return 0; }
+    g_wide_present_ok++;
+    g_wide_last_disp_y = disp_y;
 
     /* Fold any pending CPU->VRAM uploads into the canonical FBO first (uploads
      * are never mirrored to wide, but draws after them are; keep op order) and
@@ -2190,9 +2203,11 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
     return n;
 }
 
+uint64_t g_wide_present_canon = 0;   /* canonical (non-wide) presents */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
+    g_wide_present_canon++;
     flush_tex_batch();
     flush_cpu_upload();
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
@@ -2233,7 +2248,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     GLuint fbo = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) { fbo = s_wide_fbo[i]; break; }
-    if (!fbo) return 0;
+    if (!fbo) { g_wide_present_nosurf++; return 0; }
+    g_wide_present_ok++;          /* GPU-direct wide blit (the common path) */
+    g_wide_last_disp_y = disp_y;
     flush_tex_batch();
     flush_cpu_upload();
     gl_perf_present_enter();

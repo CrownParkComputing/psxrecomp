@@ -6311,8 +6311,21 @@ static void handle_ws_nw(int id, const char *json)
     if (on >= 0) psx_ws_set_native_wide(on);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
-    send_fmt("{\"id\":%d,\"ok\":true,\"native_wide\":%d,\"mode\":%d,\"nw_extra\":%d}",
-             id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
+    /* Wide-path attribution counters (gpu_gl_renderer.c; zero on SW backend). */
+    extern uint64_t g_wide_mirror_draws, g_wide_present_ok, g_wide_present_nosurf,
+                    g_wide_present_canon, g_prim_size_rejects;
+    extern int g_wide_last_disp_y, g_wide_last_target;
+    send_fmt("{\"id\":%d,\"ok\":true,\"native_wide\":%d,\"mode\":%d,\"nw_extra\":%d,"
+             "\"mirror_draws\":%llu,\"present_ok\":%llu,\"present_nosurf\":%llu,"
+             "\"present_canon\":%llu,\"size_rejects\":%llu,"
+             "\"last_disp_y\":%d,\"last_target\":%d}",
+             id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra,
+             (unsigned long long)g_wide_mirror_draws,
+             (unsigned long long)g_wide_present_ok,
+             (unsigned long long)g_wide_present_nosurf,
+             (unsigned long long)g_wide_present_canon,
+             (unsigned long long)g_prim_size_rejects,
+             g_wide_last_disp_y, g_wide_last_target);
 }
 
 /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
