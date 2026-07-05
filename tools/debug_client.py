@@ -34,8 +34,13 @@ Commands (shared — identical on both servers):
     ts <start> <end>            Frame timeseries — compact (max 200)
     set_snapshot <slot> <addr>  Configure RAM snapshot region (slot 0-3)
     get_snapshots               Show snapshot region config
-    input <buttons_hex>         Override controller input
+    press <btn...> [frames=N]   Tap button(s), auto-release after N frames (default 6)
+    hold  <btn...>              Hold button(s) until release/hold none
+    release                     Release all (alias: hold none)
+    input <buttons_hex>         Raw override (ACTIVE-LOW word; prefer press/hold)
     clear_input                 Remove input override
+      buttons: up down left right x/cross o/circle triangle/tri square/sq
+               start select l1 r1 l2 r2   e.g.  press start   |   hold right   |   press x o
     quit                        Quit game
 
 Tier 1 write trace commands:
@@ -67,6 +72,31 @@ import argparse
 DEFAULT_HOST = "127.0.0.1"
 NATIVE_PORT = 4370
 DS_PORT = 4371
+
+# PSX pad buttons -> "pressed" bit. Mirrors the runtime's PSXKB_BIT_* in
+# psx_keybinds.c. The pad word reported to the game is ACTIVE-LOW: 0xFFFF = all
+# released; a CLEARED bit = pressed. Operators name buttons; psx_pad_word()
+# does the inversion so nobody hand-computes masks (that trap ate a debug pass).
+PSX_BTN = {
+    "select": 1 << 0, "start": 1 << 3,
+    "up": 1 << 4, "right": 1 << 5, "down": 1 << 6, "left": 1 << 7,
+    "l2": 1 << 8, "r2": 1 << 9, "l1": 1 << 10, "r1": 1 << 11,
+    "triangle": 1 << 12, "tri": 1 << 12,
+    "circle": 1 << 13, "o": 1 << 13,
+    "cross": 1 << 14, "x": 1 << 14,
+    "square": 1 << 15, "sq": 1 << 15,
+}
+
+def psx_pad_word(names):
+    """Active-low pad word (0xFFFF=released) for a list of button names."""
+    pressed = 0
+    for n in names:
+        key = n.lower()
+        if key not in PSX_BTN:
+            raise ValueError("unknown button '%s' (valid: %s)"
+                             % (n, ", ".join(sorted(set(PSX_BTN)))))
+        pressed |= PSX_BTN[key]
+    return 0xFFFF & ~pressed
 
 REG_NAMES = [
     "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
@@ -261,8 +291,33 @@ def build_cmd(args):
         return {"cmd": "get_snapshots"}, pretty_json
     elif cmd == "input":
         if len(args) < 2:
-            return None, lambda _: "Usage: input <buttons_hex>"
+            return None, lambda _: "Usage: input <buttons_hex>  (raw ACTIVE-LOW word; prefer press/hold/release)"
         return {"cmd": "set_input", "buttons": args[1]}, pretty_json
+    elif cmd in ("press", "tap", "hold", "release"):
+        # press/tap <btn...> [frames=N]  momentary press, auto-releases after N frames (default 6)
+        # hold <btn...>                  hold indefinitely (until release / hold none)
+        # release  |  hold none          clear the override
+        if cmd == "release" or (cmd == "hold" and len(args) >= 2
+                                and args[1].lower() in ("none", "off", "clear")):
+            return {"cmd": "clear_input"}, pretty_json
+        if len(args) < 2:
+            usage = "Usage: %s <button...> %s" % (cmd, "[frames=N]" if cmd in ("press", "tap") else "")
+            return None, (lambda _, _m=usage: _m)
+        names = list(args[1:])
+        frames = 6
+        if names and names[-1].lower().startswith("frames="):
+            try:
+                frames = int(names[-1].split("=", 1)[1])
+            except ValueError:
+                pass
+            names = names[:-1]
+        try:
+            word = psx_pad_word(names)
+        except ValueError as e:
+            return None, (lambda _, _m=str(e): _m)
+        if cmd in ("press", "tap"):
+            return {"cmd": "press", "buttons": word, "frames": frames}, pretty_json
+        return {"cmd": "set_input", "buttons": "%04X" % word}, pretty_json
     elif cmd == "clear_input":
         return {"cmd": "clear_input"}, pretty_json
     elif cmd == "ws_margin":
