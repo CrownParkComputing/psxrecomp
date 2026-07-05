@@ -529,6 +529,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     const std::string id   = game.contains("id")
                                 ? toml::find<std::string>(game, "id")
                                 : std::string{};
+    // Optional variant tag (ROM-hack / regional variant). Namespaces the
+    // overlay cache + saves so a variant never loads the stock game's (or
+    // another variant's) shards. Empty => stock (byte-identical behaviour).
+    const std::string variant = game.contains("variant")
+                                ? toml::find<std::string>(game, "variant")
+                                : std::string{};
 
     std::string exe_field;
     if (game.contains("exe")) {
@@ -714,6 +720,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*project_root*/     root,
         /*name*/             name,
         /*id*/               id,
+        /*variant*/          variant,
         /*exe_path*/         exe_path,
         /*load_address*/     load_address,
         /*entry_pc*/         entry_pc,

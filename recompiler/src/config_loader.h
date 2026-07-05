@@ -332,6 +332,16 @@ struct GameConfig {
     // [game] block
     std::string           name;          // e.g. "Tomba!"
     std::string           id;            // e.g. "SCUS-94236"
+    // Optional variant tag (a ROM-hack / regional variant of the same title,
+    // e.g. "tweaks-a1b2c3d4"). Read verbatim from [game] variant. When set,
+    // load_game_config (shared by the recompiler AND the runtime) exposes it so
+    // both the runtime overlay loader and the overlay compiler namespace this
+    // variant's cache + saves under "<id>~<variant>", making cross-variant
+    // overlay-shard reuse impossible by construction. The variant string is the
+    // full id — the tweaks resolver bakes a content hash (crc of the patched
+    // EXE) into it for dedup; no runtime EXE hashing needed (the EXE isn't
+    // shipped). Empty for the stock game (path/behaviour byte-identical).
+    std::string           variant;       // full variant id from [game] variant
     std::filesystem::path exe_path;      // absolute path to PS-X EXE
     uint32_t              load_address;
     uint32_t              entry_pc;

@@ -2015,6 +2015,7 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    std::string game_variant;   /* [game] variant tag; namespaces cache + saves */
     bool        game_has_disc_crc = false;
     uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
@@ -2029,6 +2030,7 @@ int main(int argc, char** argv) {
             const auto gc = PSXRecompV4::load_game_config(game_config_path);
             game_name = gc.name;
             game_id   = gc.id;
+            game_variant = gc.variant;
             game_has_disc_crc = gc.has_disc_crc;
             game_disc_crc     = gc.disc_crc;
             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
@@ -2118,7 +2120,13 @@ int main(int argc, char** argv) {
                 std::string cache_dir = (exe_dir / "cache").string();
                 overlay_capture_set_out_dir(exe_dir.string().c_str());
                 overlay_capture_set_enabled(1);
-                overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+                /* Namespace the overlay cache by variant so a ROM-hack variant
+                 * (e.g. MMX6 Tweaks) never loads the stock game's — or another
+                 * variant's — shards. Stock (empty variant) keeps the bare id,
+                 * so its cache path is byte-identical to before. */
+                std::string overlay_game_id =
+                    game_variant.empty() ? game_id : (game_id + "~" + game_variant);
+                overlay_loader_init(cache_dir.c_str(), overlay_game_id.c_str());
                 for (uint32_t addr : gc.runtime.overlay_native_block) {
                     overlay_loader_native_block_add(addr);
                 }
@@ -2283,6 +2291,10 @@ int main(int argc, char** argv) {
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+    /* Isolate a variant's saves from the stock game (and other variants): a
+     * ROM-hack variant can change parts/ranks/progression, so its saves must
+     * not mix. Stock (empty variant) is unchanged. */
+    if (!game_variant.empty()) memcard_dir /= ("variant-" + game_variant);
 
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml

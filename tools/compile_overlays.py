@@ -1607,6 +1607,12 @@ def main():
         raw = f.read().lstrip(b'\xef\xbb\xbf')  # UTF-8 BOM
     toml = tomllib.loads(raw.decode('utf-8'))
     game_id = toml.get('game', {}).get('id', 'UNKNOWN')
+    # Namespace by [game] variant so a ROM-hack variant's shards are written to
+    # (and only found under) <id>~<variant>/, matching the runtime's
+    # overlay_loader_init. A variant can never read the stock game's shards.
+    variant = toml.get('game', {}).get('variant', '')
+    if variant:
+        game_id = f'{game_id}~{variant}'
     print(f'Game ID: {game_id}')
 
     # Stale-recompiler-binary guard — BOTH modes (static overlays are just as
