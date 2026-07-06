@@ -26,10 +26,13 @@ extern "C" {
 
 #include <SDL.h>
 
+#include <atomic>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -40,6 +43,145 @@ extern "C" {
 namespace fs = std::filesystem;
 
 namespace {
+
+// ---- Tweaks tab: apply a ROM-hack variant by driving tools/tweaks_resolver.py ----
+//
+// The heavy work (drive acediez's patcher engine -> patched BIN -> extract SLUS
+// -> variant id -> stage variants/<id>/ -> emit game.<id>.toml) runs in a
+// background thread so the UI stays responsive; the main loop polls this shared
+// state and pushes it into the data model. Producing the variant + toml is the
+// tab's job; the (multi-minute) regen + rebuild of that variant is a separate,
+// explicit step surfaced in the status line.
+struct TweaksApplyState {
+    std::mutex        mtx;
+    std::atomic<bool> dirty{false};
+    std::atomic<bool> busy{false};
+    std::string       status;   // guarded by mtx
+    std::string       variant;  // guarded by mtx
+};
+TweaksApplyState g_tweaks;
+
+// Walk up from a path looking for tools/tweaks_resolver.py; return the
+// containing project root (empty if not found from this anchor).
+fs::path walk_up_for_resolver(fs::path start) {
+    std::error_code ec;
+    if (start.empty()) return {};
+    if (fs::is_regular_file(start, ec)) start = start.parent_path();
+    for (fs::path d = start; !d.empty(); d = d.parent_path()) {
+        if (fs::is_regular_file(d / "tools" / "tweaks_resolver.py", ec))
+            return d;
+        if (d == d.root_path()) break;
+    }
+    return {};
+}
+
+// Locate the project root holding the resolver. Try walking up from the disc
+// (may resolve into a junctioned input tree without tools/), then from the
+// current working directory (the launcher is typically run from its build dir,
+// a child of the worktree root that has tools/).
+fs::path find_resolver_root(const std::string& disc) {
+    if (fs::path r = walk_up_for_resolver(fs::path(disc)); !r.empty()) return r;
+    std::error_code ec;
+    if (fs::path r = walk_up_for_resolver(fs::current_path(ec)); !r.empty()) return r;
+    return {};
+}
+
+// Find a Python interpreter the launcher can invoke via cmd.exe. Prefer a
+// NATIVE Windows python (mingw) — a cygwin/msys python cannot exec the Windows
+// AutoHotkey path the resolver drives when cygpath isn't on cmd's PATH. Returns
+// a command token (quoted abspath, or a bare name found on PATH).
+std::string find_python() {
+    const char* abs[] = {
+        "C:\\msys64\\mingw64\\bin\\python.exe",   // native mingw python (preferred)
+        "C:\\Python312\\python.exe",
+        "C:\\Python311\\python.exe",
+        "C:\\Python310\\python.exe",
+    };
+    std::error_code ec;
+    for (const char* c : abs)
+        if (fs::is_regular_file(fs::path(c), ec))
+            return std::string("\"") + c + "\"";
+#if defined(_WIN32)
+    // py launcher, then bare names on PATH.
+    if (std::system("where py >nul 2>nul") == 0)      return "py -3";
+    if (std::system("where python >nul 2>nul") == 0)  return "python";
+    if (std::system("where python3 >nul 2>nul") == 0) return "python3";
+#endif
+    return "python";  // last resort; may fail loudly in status
+}
+
+// preset key for the tab's 3-way choice (0=None,1=Some,2=All).
+const char* tweaks_preset_for(int choice) {
+    switch (choice) {
+        case 0:  return "default";     // base fixes only
+        case 1:  return "tweaks";      // acediez's curated sample
+        default: return "tweaks_l_c";  // everything (mechanics + loc + custom art)
+    }
+}
+
+void tweaks_set_status(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_tweaks.mtx);
+    g_tweaks.status = s;
+    g_tweaks.dirty.store(true);
+}
+
+// Background worker: run the resolver's apply for the chosen preset.
+void tweaks_apply_worker(std::string root, int choice) {
+    const char* preset = tweaks_preset_for(choice);
+    tweaks_set_status(std::string("Applying \"") + preset + "\" — driving the patcher engine (~15s)…");
+
+#if defined(_WIN32)
+    // cmd.exe: cd into the project root, run the resolver, merge stderr.
+    const std::string py = find_python();
+    std::string cmd = "cmd /c \"cd /d \"" + root + "\" && " + py +
+                      " tools\\tweaks_resolver.py apply --profile " + preset + " 2>&1\"";
+    FILE* p = _popen(cmd.c_str(), "r");
+#else
+    std::string cmd = "cd '" + root + "' && python3 tools/tweaks_resolver.py apply --profile "
+                      + std::string(preset) + " 2>&1";
+    FILE* p = popen(cmd.c_str(), "r");
+#endif
+    std::string variant, last_meaningful;
+    bool ok = false;
+    if (p) {
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), p)) {
+            std::string line(buf);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            if (line.empty()) continue;
+            last_meaningful = line;
+            // "[apply] ..." progress lines make good live status.
+            if (line.rfind("[apply]", 0) == 0)
+                tweaks_set_status(line.substr(0, 90));
+            auto vpos = line.find("variant=");
+            if (vpos != std::string::npos) {
+                variant = line.substr(vpos + 8);
+                // trim trailing spaces
+                while (!variant.empty() && (variant.back() == ' ')) variant.pop_back();
+            }
+        }
+#if defined(_WIN32)
+        int rc = _pclose(p);
+#else
+        int rc = pclose(p);
+#endif
+        ok = (rc == 0) && !variant.empty();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_tweaks.mtx);
+        if (ok) {
+            g_tweaks.variant = variant;
+            g_tweaks.status  = "Variant " + variant + " staged. Build it: regen with game." +
+                               variant + ".toml, then rebuild the runtime.";
+        } else {
+            g_tweaks.status = std::string("Apply failed. ") +
+                (last_meaningful.empty() ? "Is Python + AutoHotkey installed?" : last_meaningful);
+        }
+        g_tweaks.dirty.store(true);
+    }
+    g_tweaks.busy.store(false);
+}
 
 // RenderInterface_GL3 only decodes uncompressed TGA. Override LoadTexture to
 // decode PNG via stb_image (falling back to the base TGA path), so the launcher
@@ -135,8 +277,15 @@ struct LauncherModel {
     Rml::String verdict_detail; // sub line
     Rml::String verdict_state;  // "ok" | "warn" | "bad" | "none" — drives colour
 
-    // View toggle: "dashboard" (default) | "settings".
+    // View toggle: "dashboard" (default) | "settings" | "tweaks".
     Rml::String view = "dashboard";
+
+    // Tweaks tab (MMX6 Tweaks ROM-hack variant builder). 3-way level choice
+    // maps to acediez preset profiles; Apply drives tools/tweaks_resolver.py.
+    int         tweaks_choice  = 2;   // 0=None, 1=Some, 2=All
+    bool        tweaks_busy    = false;
+    Rml::String tweaks_status  = "Pick a tweak level, then Apply to build the variant.";
+    Rml::String tweaks_variant;
 
     // Player cards — real device routing. Each port picks a device (None /
     // Keyboard / a plugged-in SDL controller) and a pad type (DualShock=analog).
@@ -744,6 +893,10 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("verdict_detail", &m.verdict_detail);
     c.Bind("verdict_state",  &m.verdict_state);
     c.Bind("view",           &m.view);
+    c.Bind("tweaks_choice",  &m.tweaks_choice);
+    c.Bind("tweaks_busy",    &m.tweaks_busy);
+    c.Bind("tweaks_status",  &m.tweaks_status);
+    c.Bind("tweaks_variant", &m.tweaks_variant);
     c.Bind("p1_mode",        &m.p1_mode);
     c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("allow_hybrid",   &m.allow_hybrid);
@@ -899,6 +1052,30 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.view = "dashboard"; handle.DirtyVariable("view");
         });
+    // ---- Tweaks tab ----
+    c.BindEventCallback("show_tweaks",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.view = "tweaks"; handle.DirtyVariable("view");
+        });
+    c.BindEventCallback("set_tweaks_choice",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            if (args.empty()) return;
+            m.tweaks_choice = (int)args[0].Get<int>();
+            handle.DirtyVariable("tweaks_choice");
+        });
+    c.BindEventCallback("apply_tweaks",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (g_tweaks.busy.load()) return;               // one apply at a time
+            fs::path root = find_resolver_root(std::string(m.disc_path));
+            if (root.empty()) {
+                m.tweaks_status = "Could not locate tools/tweaks_resolver.py near the disc.";
+                handle.DirtyVariable("tweaks_status");
+                return;
+            }
+            g_tweaks.busy.store(true);
+            m.tweaks_busy = true; handle.DirtyVariable("tweaks_busy");
+            std::thread(tweaks_apply_worker, root.generic_string(), m.tweaks_choice).detach();
+        });
     // ---- controller: device dropdown + pad-mode segmented selector ----
     auto dirty_player = [handle](int player) mutable {
         const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_mode"};
@@ -1033,6 +1210,20 @@ Result run(SDL_Window* window, void* gl_context,
 
         if (m.launch_requested) { result = Result::Launch; running = false; }
         if (m.quit_requested)   { result = Result::Quit;   running = false; }
+
+        // Pull any background tweaks-apply progress into the model (main thread).
+        if (g_tweaks.dirty.exchange(false)) {
+            {
+                std::lock_guard<std::mutex> lk(g_tweaks.mtx);
+                m.tweaks_status = Rml::String(g_tweaks.status);
+                if (!g_tweaks.variant.empty())
+                    m.tweaks_variant = Rml::String(g_tweaks.variant);
+            }
+            m.tweaks_busy = g_tweaks.busy.load();
+            handle.DirtyVariable("tweaks_status");
+            handle.DirtyVariable("tweaks_variant");
+            handle.DirtyVariable("tweaks_busy");
+        }
 
         context->Update();
 

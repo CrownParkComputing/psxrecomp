@@ -197,6 +197,40 @@ button:hover { background-color: #232d3c; }
 .modal-btns button { margin-left: 10dp; }
 .modal-confirm { background-color: #2563eb; border-color: #3b82f6; color: #ffffff; font-weight: bold; }
 .modal-confirm:hover { background-color: #3b82f6; }
+
+/* ---- Tweaks tab ---- */
+.tw-panel { padding: 28dp 30dp; }
+.tw-hero { display: block; border-bottom: 1dp #21262d; padding-bottom: 20dp; margin-bottom: 22dp; }
+.tw-title { display: block; color: #f0f6fc; font-size: 26dp; font-weight: bold; margin-top: 6dp; margin-bottom: 10dp; }
+.tweaks-lead { display: block; color: #8b949e; font-size: 13dp; line-height: 1.6; max-width: 820dp; }
+.tweaks-lead b { color: #cdd5df; }
+.tw-section-lbl { display: block; color: #6e7681; font-size: 11dp; font-weight: bold; letter-spacing: 1dp; margin-bottom: 12dp; }
+
+.tw-cards { display: flex; flex-direction: row; }
+.tw-card { display: block; flex: 1 1 0; margin-right: 14dp; padding: 18dp 18dp 20dp 18dp; border: 2dp #262c36;
+	border-radius: 12dp; background-color: #0f141b; position: relative; }
+.tw-card:hover { border-color: #384150; background-color: #121821; }
+.tw-card.on { border-color: #2563eb; background-color: #12203b; }
+.tw-card-check { display: block; position: absolute; top: 16dp; right: 16dp; width: 18dp; height: 18dp; border-radius: 9dp;
+	border: 2dp #384150; }
+.tw-card.on .tw-card-check { border-color: #2563eb; background-color: #2563eb; }
+.tw-card-hd { display: block; color: #f0f6fc; font-size: 18dp; font-weight: bold; margin-bottom: 3dp; }
+.tw-card-tag { display: block; color: #58a6ff; font-size: 11dp; font-weight: bold; margin-bottom: 12dp; }
+.tw-card.on .tw-card-tag { color: #79c0ff; }
+.tw-card-desc { display: block; color: #8b949e; font-size: 12dp; line-height: 1.5; }
+
+.tw-footer { display: block; margin-top: 26dp; padding-top: 22dp; border-top: 1dp #21262d; }
+.tweaks-actions { display: flex; flex-direction: row; align-items: center; }
+.tweaks-apply { background-color: #2563eb; color: #ffffff; padding: 12dp 26dp; border-radius: 8dp;
+	font-size: 14dp; font-weight: bold; }
+.tweaks-apply:hover { background-color: #3b82f6; }
+.tweaks-apply.busy { background-color: #21262d; color: #6e7681; }
+.tweaks-spin { color: #8b949e; font-size: 13dp; margin-left: 14dp; }
+.tw-dot { display: inline-block; width: 8dp; height: 8dp; border-radius: 4dp; background-color: #d29922; margin-right: 8dp; }
+.tweaks-status { display: block; margin-top: 18dp; padding: 13dp 15dp; border-radius: 8dp; background-color: #0d1117;
+	border: 1dp #21262d; border-left: 3dp #384150; color: #cdd5df; font-size: 13dp; line-height: 1.6; }
+.tweaks-status.busy { border-left-color: #d29922; }
+.tweaks-status.ok { border-left-color: #2ea043; }
 </style>
 </head>
 
@@ -210,8 +244,10 @@ button:hover { background-color: #232d3c; }
 			<div class="subtitle">{{game_name}} launcher</div>
 		</div>
 		<div class="topbar-actions">
+			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_tweaks">Tweaks</button>
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
 			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+			<button class="top-btn primary" data-if="view == 'tweaks'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 		</div>
 	</div>
 
@@ -383,6 +419,49 @@ button:hover { background-color: #232d3c; }
 				<button data-event-click="browse_disc">Browse</button>
 				<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
 				<span class="path empty" data-if="disc_path == ''">(not set)</span></span></div>
+		</div>
+	</div>
+
+	<!-- ================= TWEAKS VIEW ================= -->
+	<div data-if="view == 'tweaks'">
+		<div class="panel tw-panel">
+			<div class="tw-hero">
+				<div class="eyebrow">MEGA MAN X6 TWEAKS</div>
+				<div class="tw-title">Build a Tweaks variant</div>
+				<div class="tweaks-lead">A ROM-hack by <b>acediez</b> (romhacking.net #4035). Options, patch data and
+					artwork are acediez's work — this builds a recompiled variant from a disc image you patch with the
+					tool acediez distributes. Nothing of the hack is redistributed here.</div>
+			</div>
+
+			<div class="tw-section-lbl">CHOOSE A TWEAK LEVEL</div>
+			<div class="tw-cards">
+				<div class="tw-card" data-class-on="tweaks_choice == 0" data-event-click="set_tweaks_choice(0)">
+					<div class="tw-card-check"></div>
+					<div class="tw-card-hd">No Tweaks</div>
+					<div class="tw-card-tag">Vanilla + fixes</div>
+					<div class="tw-card-desc">Base bug-fixes only. No optional gameplay changes.</div>
+				</div>
+				<div class="tw-card" data-class-on="tweaks_choice == 1" data-event-click="set_tweaks_choice(1)">
+					<div class="tw-card-check"></div>
+					<div class="tw-card-hd">Some</div>
+					<div class="tw-card-tag">Curated sample</div>
+					<div class="tw-card-desc">acediez's standalone "Tweaks" selection — the recommended set.</div>
+				</div>
+				<div class="tw-card" data-class-on="tweaks_choice == 2" data-event-click="set_tweaks_choice(2)">
+					<div class="tw-card-check"></div>
+					<div class="tw-card-hd">All</div>
+					<div class="tw-card-tag">Everything</div>
+					<div class="tw-card-desc">Gameplay mechanics + retranslated script + custom art.</div>
+				</div>
+			</div>
+
+			<div class="tw-footer">
+				<div class="tweaks-actions">
+					<button class="tweaks-apply" data-event-click="apply_tweaks" data-class-busy="tweaks_busy">Apply &amp; Build Variant</button>
+					<span class="tweaks-spin" data-if="tweaks_busy"><span class="tw-dot"></span>Working…</span>
+				</div>
+				<div class="tweaks-status" data-class-ok="tweaks_variant != ''" data-class-busy="tweaks_busy">{{tweaks_status}}</div>
+			</div>
 		</div>
 	</div>
 
