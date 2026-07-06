@@ -2626,9 +2626,24 @@ std::string CodeGenerator::generate_file(
 
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
+            // Targets whose harvesting CFG belongs to a CODE function. Such a
+            // target is a real control-flow edge, so the split piece it mints
+            // is executable code even when it lands inside a data-classified
+            // region (ROM hacks inject hook bodies into vanilla data blobs:
+            // MMX6 Tweaks `j 0x80079F00` fail-fasted on the inherited data
+            // stub). Targets harvested from DATA-section CFGs stay data —
+            // that inheritance is the containment for garbage edges decoded
+            // out of data blobs (Tomba data-walk emission bloat).
+            std::set<uint32_t> code_reached;
+            std::map<uint32_t, bool> func_is_data;
+            for (const auto& f : functions_mut) {
+                if (f.alias_walk_lo == 0) func_is_data[f.start_addr] = f.is_data_section;
+            }
 
             // Scan either all CFGs (pass 0) or only rebuilt CFGs (pass 1+)
-            auto scan_cfg = [&](const ControlFlowGraph& cfg) {
+            auto scan_cfg = [&](uint32_t owner_addr, const ControlFlowGraph& cfg) {
+                auto own_it = func_is_data.find(owner_addr);
+                bool owner_is_code = (own_it != func_is_data.end()) && !own_it->second;
                 for (const auto& [baddr, block] : cfg.blocks) {
                     auto check_target = [&](uint32_t target) {
                         if (target == 0) return;
@@ -2637,6 +2652,7 @@ std::string CodeGenerator::generate_file(
                         if (target < exe_start || target >= exe_end) return;
                         if (target & 3) return;
                         mid_targets.insert(target);
+                        if (owner_is_code) code_reached.insert(target);
                     };
 
                     if (block.exit_instr.type == ControlFlowType::Branch) {
@@ -2649,11 +2665,11 @@ std::string CodeGenerator::generate_file(
             };
 
             if (cfgs_to_scan.empty()) {
-                for (const auto& [cfg_addr, cfg] : cfgs_mut) scan_cfg(cfg);
+                for (const auto& [cfg_addr, cfg] : cfgs_mut) scan_cfg(cfg_addr, cfg);
             } else {
                 for (uint32_t addr : cfgs_to_scan) {
                     auto it = cfgs_mut.find(addr);
-                    if (it != cfgs_mut.end()) scan_cfg(it->second);
+                    if (it != cfgs_mut.end()) scan_cfg(addr, it->second);
                 }
             }
 
@@ -2741,7 +2757,13 @@ std::string CodeGenerator::generate_file(
                         nf.has_prologue = false;
                         nf.has_epilogue = false;
                         nf.stack_frame_size = 0;
-                        nf.is_data_section = orig_data;
+                        /* A piece minted at a target reached from a CODE
+                         * function's CFG is executable by construction —
+                         * never inherit the parent's data classification
+                         * (hook-into-data ROM-hack pattern). Data-CFG
+                         * targets keep the parent's flag as garbage-edge
+                         * containment. */
+                        nf.is_data_section = orig_data && !code_reached.count(nf.start_addr);
                         new_funcs.push_back(nf);
                         known_addrs.insert(nf.start_addr);
                         affected.insert(nf.start_addr);
