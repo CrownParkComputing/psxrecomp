@@ -205,19 +205,26 @@ button:hover { background-color: #232d3c; }
 .tweaks-lead { display: block; color: #8b949e; font-size: 13dp; line-height: 1.6; max-width: 820dp; }
 .tweaks-lead b { color: #cdd5df; }
 .tw-section-lbl { display: block; color: #6e7681; font-size: 11dp; font-weight: bold; letter-spacing: 1dp; margin-bottom: 12dp; }
+.tw-section-note { color: #6e7681; font-size: 11dp; font-weight: normal; letter-spacing: 0dp; }
 
-.tw-cards { display: flex; flex-direction: row; }
-.tw-card { display: block; flex: 1 1 0; margin-right: 14dp; padding: 18dp 18dp 20dp 18dp; border: 2dp #262c36;
-	border-radius: 12dp; background-color: #0f141b; position: relative; }
-.tw-card:hover { border-color: #384150; background-color: #121821; }
-.tw-card.on { border-color: #2563eb; background-color: #12203b; }
-.tw-card-check { display: block; position: absolute; top: 16dp; right: 16dp; width: 18dp; height: 18dp; border-radius: 9dp;
-	border: 2dp #384150; }
-.tw-card.on .tw-card-check { border-color: #2563eb; background-color: #2563eb; }
-.tw-card-hd { display: block; color: #f0f6fc; font-size: 18dp; font-weight: bold; margin-bottom: 3dp; }
-.tw-card-tag { display: block; color: #58a6ff; font-size: 11dp; font-weight: bold; margin-bottom: 12dp; }
-.tw-card.on .tw-card-tag { color: #79c0ff; }
-.tw-card-desc { display: block; color: #8b949e; font-size: 12dp; line-height: 1.5; }
+/* The scrollable option tree (markup injected via data-rml from the resolver). */
+.tw-tree { display: block; height: 470dp; overflow-y: auto;
+	border: 1dp #21262d; border-radius: 10dp; background-color: #0c1015; }
+.tw-tree-inner { display: block; width: 1130dp; padding: 6dp 14dp 14dp 14dp; }
+.tw-tab-block { display: block; margin-top: 8dp; }
+.tw-tab-hd { display: block; color: #f0f6fc; font-size: 16dp; font-weight: bold;
+	margin-top: 16dp; margin-bottom: 4dp; padding-bottom: 5dp; border-bottom: 1dp #21262d; }
+.tw-sec-hd { display: block; color: #58a6ff; font-size: 11dp; font-weight: bold; letter-spacing: 1dp;
+	margin-top: 14dp; margin-bottom: 6dp; }
+.tw-opt { display: block; padding: 4dp 6dp; border-radius: 6dp; }
+.tw-opt:hover { background-color: #12181f; }
+.tw-box { display: inline-block; width: 15dp; height: 15dp; border-radius: 4dp; border: 2dp #3a4351;
+	background-color: #0c1015; margin-right: 9dp; vertical-align: -3dp; }
+.tw-opt.on .tw-box { border-color: #2563eb; background-color: #2563eb; }
+.tw-box.adv { border-color: #21262d; border-radius: 8dp; background-color: transparent; }
+.tw-lbl { display: inline; color: #cdd5df; font-size: 13dp; }
+.tw-opt.ro .tw-lbl { color: #6e7681; }
+.tw-adv { color: #4d5560; font-size: 11dp; margin-left: 8dp; }
 
 .tw-footer { display: block; margin-top: 26dp; padding-top: 22dp; border-top: 1dp #21262d; }
 .tweaks-actions { display: flex; flex-direction: row; align-items: center; }
@@ -433,27 +440,8 @@ button:hover { background-color: #232d3c; }
 					tool acediez distributes. Nothing of the hack is redistributed here.</div>
 			</div>
 
-			<div class="tw-section-lbl">CHOOSE A TWEAK LEVEL</div>
-			<div class="tw-cards">
-				<div class="tw-card" data-class-on="tweaks_choice == 0" data-event-click="set_tweaks_choice(0)">
-					<div class="tw-card-check"></div>
-					<div class="tw-card-hd">No Tweaks</div>
-					<div class="tw-card-tag">Vanilla + fixes</div>
-					<div class="tw-card-desc">Base bug-fixes only. No optional gameplay changes.</div>
-				</div>
-				<div class="tw-card" data-class-on="tweaks_choice == 1" data-event-click="set_tweaks_choice(1)">
-					<div class="tw-card-check"></div>
-					<div class="tw-card-hd">Some</div>
-					<div class="tw-card-tag">Curated sample</div>
-					<div class="tw-card-desc">acediez's standalone "Tweaks" selection — the recommended set.</div>
-				</div>
-				<div class="tw-card" data-class-on="tweaks_choice == 2" data-event-click="set_tweaks_choice(2)">
-					<div class="tw-card-check"></div>
-					<div class="tw-card-hd">All</div>
-					<div class="tw-card-tag">Everything</div>
-					<div class="tw-card-desc">Gameplay mechanics + retranslated script + custom art.</div>
-				</div>
-			</div>
+			<div class="tw-section-lbl">OPTIONS <span class="tw-section-note">— acediez's full option set. Tick what you want, then Apply.</span></div>
+			<div id="tw_tree" class="tw-tree"><div class="tw-tree-inner" data-rml="tweaks_tree"></div></div>
 
 			<div class="tw-footer">
 				<div class="tweaks-actions">

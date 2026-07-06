@@ -30,7 +30,10 @@ extern "C" {
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,8 +59,10 @@ struct TweaksApplyState {
     std::mutex        mtx;
     std::atomic<bool> dirty{false};
     std::atomic<bool> busy{false};
+    std::atomic<bool> tree_ready{false};
     std::string       status;   // guarded by mtx
     std::string       variant;  // guarded by mtx
+    std::string       tree;     // guarded by mtx: catalog markup (data-rml)
 };
 TweaksApplyState g_tweaks;
 
@@ -110,73 +115,81 @@ std::string find_python() {
     return "python";  // last resort; may fail loudly in status
 }
 
-// preset key for the tab's 3-way choice (0=None,1=Some,2=All).
-const char* tweaks_preset_for(int choice) {
-    switch (choice) {
-        case 0:  return "default";     // base fixes only
-        case 1:  return "tweaks";      // acediez's curated sample
-        default: return "tweaks_l_c";  // everything (mechanics + loc + custom art)
-    }
-}
-
 void tweaks_set_status(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_tweaks.mtx);
     g_tweaks.status = s;
     g_tweaks.dirty.store(true);
 }
 
-// Background worker: run the resolver's apply for the chosen preset.
-void tweaks_apply_worker(std::string root, int choice) {
-    const char* preset = tweaks_preset_for(choice);
-    tweaks_set_status(std::string("Applying \"") + preset + "\" — driving the patcher engine (~15s)…");
-
+// Run `python tools/tweaks_resolver.py <args>` in `root`; capture combined output.
+std::string run_resolver(const std::string& root, const std::string& args) {
 #if defined(_WIN32)
-    // cmd.exe: cd into the project root, run the resolver, merge stderr.
     const std::string py = find_python();
     std::string cmd = "cmd /c \"cd /d \"" + root + "\" && " + py +
-                      " tools\\tweaks_resolver.py apply --profile " + preset + " 2>&1\"";
+                      " tools\\tweaks_resolver.py " + args + " 2>&1\"";
     FILE* p = _popen(cmd.c_str(), "r");
 #else
-    std::string cmd = "cd '" + root + "' && python3 tools/tweaks_resolver.py apply --profile "
-                      + std::string(preset) + " 2>&1";
+    std::string cmd = "cd '" + root + "' && python3 tools/tweaks_resolver.py " + args + " 2>&1";
     FILE* p = popen(cmd.c_str(), "r");
 #endif
-    std::string variant, last_meaningful;
-    bool ok = false;
+    std::string out;
     if (p) {
-        char buf[1024];
-        while (fgets(buf, sizeof(buf), p)) {
-            std::string line(buf);
-            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-            if (line.empty()) continue;
-            last_meaningful = line;
-            // "[apply] ..." progress lines make good live status.
-            if (line.rfind("[apply]", 0) == 0)
-                tweaks_set_status(line.substr(0, 90));
-            auto vpos = line.find("variant=");
-            if (vpos != std::string::npos) {
-                variant = line.substr(vpos + 8);
-                // trim trailing spaces
-                while (!variant.empty() && (variant.back() == ' ')) variant.pop_back();
-            }
-        }
+        char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
 #if defined(_WIN32)
-        int rc = _pclose(p);
+        _pclose(p);
 #else
-        int rc = pclose(p);
+        pclose(p);
 #endif
-        ok = (rc == 0) && !variant.empty();
     }
+    return out;
+}
 
+// Background worker: fetch the option catalog as an RML fragment.
+void tweaks_load_tree_worker(std::string root) {
+    std::string rml = run_resolver(root, "catalog --rml");
+    std::lock_guard<std::mutex> lk(g_tweaks.mtx);
+    g_tweaks.tree = (rml.find("tw_toggle") != std::string::npos)
+        ? rml
+        : "<div class=\"tw-sec-hd\">Could not load options — need Python and the "
+          "acediez patcher archive under mmx6-tweaks/_patcher/.</div>";
+    g_tweaks.tree_ready.store(true);
+    g_tweaks.dirty.store(true);
+}
+
+// Background worker: apply a UI selection (JSON) -> patched variant + toml.
+void tweaks_apply_worker(std::string root, std::string selection_json) {
+    tweaks_set_status("Applying selection — driving the patcher engine (~15s)…");
+    // Stage the selection JSON where the resolver's work dir lives.
+    fs::path wd = fs::path(root) / "mmx6-tweaks" / "_patcher" / "_worktmp";
+    std::error_code ec; fs::create_directories(wd, ec);
+    fs::path selpath = wd / "_ui_selection.json";
+    { std::ofstream f(selpath.string()); f << selection_json; }
+
+    std::string out = run_resolver(root, "apply --selection \"" + selpath.generic_string() + "\"");
+    std::string variant, last;
+    std::istringstream ss(out);
+    for (std::string line; std::getline(ss, line); ) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        last = line;
+        if (line.rfind("[apply]", 0) == 0) tweaks_set_status(line.substr(0, 90));
+        auto v = line.find("variant=");
+        if (v != std::string::npos) {
+            variant = line.substr(v + 8);
+            while (!variant.empty() && variant.back() == ' ') variant.pop_back();
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(g_tweaks.mtx);
-        if (ok) {
+        if (!variant.empty()) {
             g_tweaks.variant = variant;
             g_tweaks.status  = "Variant " + variant + " staged. Build it: regen with game." +
                                variant + ".toml, then rebuild the runtime.";
         } else {
             g_tweaks.status = std::string("Apply failed. ") +
-                (last_meaningful.empty() ? "Is Python + AutoHotkey installed?" : last_meaningful);
+                (last.empty() ? "Is Python + AutoHotkey installed?" : last);
         }
         g_tweaks.dirty.store(true);
     }
@@ -280,12 +293,14 @@ struct LauncherModel {
     // View toggle: "dashboard" (default) | "settings" | "tweaks".
     Rml::String view = "dashboard";
 
-    // Tweaks tab (MMX6 Tweaks ROM-hack variant builder). 3-way level choice
-    // maps to acediez preset profiles; Apply drives tools/tweaks_resolver.py.
-    int         tweaks_choice  = 2;   // 0=None, 1=Some, 2=All
-    bool        tweaks_busy    = false;
-    Rml::String tweaks_status  = "Pick a tweak level, then Apply to build the variant.";
+    // Tweaks tab (MMX6 Tweaks ROM-hack variant builder). The full option tree is
+    // fetched from tools/tweaks_resolver.py (catalog --rml) and injected via
+    // data-rml; ticking options and Apply drives the resolver's selection apply.
+    bool        tweaks_busy         = false;
+    bool        tweaks_tree_loaded  = false;
+    Rml::String tweaks_status  = "Tick the options you want, then Apply to build the variant.";
     Rml::String tweaks_variant;
+    Rml::String tweaks_tree    = "<div class=\"tw-sec-hd\">Loading options…</div>";
 
     // Player cards — real device routing. Each port picks a device (None /
     // Keyboard / a plugged-in SDL controller) and a pad type (DualShock=analog).
@@ -893,10 +908,10 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("verdict_detail", &m.verdict_detail);
     c.Bind("verdict_state",  &m.verdict_state);
     c.Bind("view",           &m.view);
-    c.Bind("tweaks_choice",  &m.tweaks_choice);
     c.Bind("tweaks_busy",    &m.tweaks_busy);
     c.Bind("tweaks_status",  &m.tweaks_status);
     c.Bind("tweaks_variant", &m.tweaks_variant);
+    c.Bind("tweaks_tree",    &m.tweaks_tree);
     c.Bind("p1_mode",        &m.p1_mode);
     c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("allow_hybrid",   &m.allow_hybrid);
@@ -1056,25 +1071,75 @@ Result run(SDL_Window* window, void* gl_context,
     c.BindEventCallback("show_tweaks",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.view = "tweaks"; handle.DirtyVariable("view");
+            if (m.tweaks_tree_loaded) return;              // fetch the option tree once
+            m.tweaks_tree_loaded = true;
+            fs::path root = find_resolver_root(std::string(m.disc_path));
+            if (root.empty()) {
+                m.tweaks_tree = "<div class=\"tw-sec-hd\">Could not locate "
+                                "tools/tweaks_resolver.py near the disc.</div>";
+                handle.DirtyVariable("tweaks_tree");
+                return;
+            }
+            std::thread(tweaks_load_tree_worker, root.generic_string()).detach();
         });
-    c.BindEventCallback("set_tweaks_choice",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
-            if (args.empty()) return;
-            m.tweaks_choice = (int)args[0].Get<int>();
-            handle.DirtyVariable("tweaks_choice");
+    // Toggle an option in the injected tree. Checkbox flips its own state; a
+    // radio (data-group set) becomes the sole selection in its group.
+    c.BindEventCallback("tw_toggle",
+        [](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) {
+            Rml::Element* el = ev.GetCurrentElement();
+            if (!el) return;
+            Rml::String group = el->GetAttribute<Rml::String>("data-group", "");
+            if (group.empty()) {
+                el->SetClass("on", !el->IsClassSet("on"));
+            } else if (Rml::Element* parent = el->GetParentNode()) {
+                for (int i = 0; i < parent->GetNumChildren(); ++i) {
+                    Rml::Element* c = parent->GetChild(i);
+                    if (c->GetAttribute<Rml::String>("data-group", "") == group)
+                        c->SetClass("on", c == el);
+                }
+            }
         });
     c.BindEventCallback("apply_tweaks",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+        [&m, handle](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) mutable {
             if (g_tweaks.busy.load()) return;               // one apply at a time
+            Rml::Element* btn = ev.GetCurrentElement();
+            Rml::ElementDocument* doc = btn ? btn->GetOwnerDocument() : nullptr;
+            Rml::Element* tree = doc ? doc->GetElementById("tw_tree") : nullptr;
+            if (!tree) {
+                m.tweaks_status = "Options aren't loaded yet.";
+                handle.DirtyVariable("tweaks_status"); return;
+            }
+            // Collect the tree's current state into a selection JSON: every
+            // checkbox (true/false) + each group's selected radio (true).
+            std::string json = "{";
+            bool first = true;
+            std::function<void(Rml::Element*)> walk = [&](Rml::Element* e) {
+                if (e->IsClassSet("tw-opt")) {
+                    Rml::String var  = e->GetAttribute<Rml::String>("data-var", "");
+                    Rml::String type = e->GetAttribute<Rml::String>("data-type", "");
+                    if (!var.empty()) {
+                        bool on = e->IsClassSet("on");
+                        bool include = (type == "checkbox") || (type == "radio" && on);
+                        if (include) {
+                            if (!first) json += ",";
+                            json += "\"" + std::string(var.c_str()) + "\":" +
+                                    ((type == "checkbox") ? (on ? "true" : "false") : "true");
+                            first = false;
+                        }
+                    }
+                }
+                for (int i = 0; i < e->GetNumChildren(); ++i) walk(e->GetChild(i));
+            };
+            walk(tree);
+            json += "}";
             fs::path root = find_resolver_root(std::string(m.disc_path));
             if (root.empty()) {
                 m.tweaks_status = "Could not locate tools/tweaks_resolver.py near the disc.";
-                handle.DirtyVariable("tweaks_status");
-                return;
+                handle.DirtyVariable("tweaks_status"); return;
             }
             g_tweaks.busy.store(true);
             m.tweaks_busy = true; handle.DirtyVariable("tweaks_busy");
-            std::thread(tweaks_apply_worker, root.generic_string(), m.tweaks_choice).detach();
+            std::thread(tweaks_apply_worker, root.generic_string(), json).detach();
         });
     // ---- controller: device dropdown + pad-mode segmented selector ----
     auto dirty_player = [handle](int player) mutable {
@@ -1211,18 +1276,22 @@ Result run(SDL_Window* window, void* gl_context,
         if (m.launch_requested) { result = Result::Launch; running = false; }
         if (m.quit_requested)   { result = Result::Quit;   running = false; }
 
-        // Pull any background tweaks-apply progress into the model (main thread).
+        // Pull any background tweaks progress into the model (main thread only).
         if (g_tweaks.dirty.exchange(false)) {
+            bool tree_ready = g_tweaks.tree_ready.exchange(false);
             {
                 std::lock_guard<std::mutex> lk(g_tweaks.mtx);
                 m.tweaks_status = Rml::String(g_tweaks.status);
                 if (!g_tweaks.variant.empty())
                     m.tweaks_variant = Rml::String(g_tweaks.variant);
+                if (tree_ready)
+                    m.tweaks_tree = Rml::String(g_tweaks.tree);
             }
             m.tweaks_busy = g_tweaks.busy.load();
             handle.DirtyVariable("tweaks_status");
             handle.DirtyVariable("tweaks_variant");
             handle.DirtyVariable("tweaks_busy");
+            if (tree_ready) handle.DirtyVariable("tweaks_tree");
         }
 
         context->Update();
