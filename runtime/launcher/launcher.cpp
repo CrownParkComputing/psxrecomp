@@ -150,7 +150,7 @@ std::string run_resolver(const std::string& root, const std::string& args) {
 void tweaks_load_tree_worker(std::string root) {
     std::string rml = run_resolver(root, "catalog --rml");
     std::lock_guard<std::mutex> lk(g_tweaks.mtx);
-    g_tweaks.tree = (rml.find("tw_toggle") != std::string::npos)
+    g_tweaks.tree = (rml.find("data-type=") != std::string::npos)
         ? rml
         : "<div class=\"tw-sec-hd\">Could not load options — need Python and the "
           "acediez patcher archive under mmx6-tweaks/_patcher/.</div>";
@@ -1082,22 +1082,101 @@ Result run(SDL_Window* window, void* gl_context,
             }
             std::thread(tweaks_load_tree_worker, root.generic_string()).detach();
         });
-    // Toggle an option in the injected tree. Checkbox flips its own state; a
-    // radio (data-group set) becomes the sole selection in its group.
-    c.BindEventCallback("tw_toggle",
+    // Click handler for the option tree. Each injected row binds this directly
+    // via data-event-click="tw_click" (see tweaks_resolver.catalog_to_rml): a
+    // single delegated handler on the static #tw_tree container does NOT fire
+    // for data-rml/SetInnerRML-injected descendants in this RmlUi build (bubbled
+    // clicks from injected content never reach the parent's data-event listener),
+    // so per-row binding is required. The handler still walks up from the actual
+    // event target to the nearest actionable element (dropdown choice/field, or a
+    // checkbox/radio row), so it is correct whether the click lands on the row or
+    // one of its (focus:none) leaf spans.
+    c.BindEventCallback("tw_click",
         [](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) {
-            Rml::Element* el = ev.GetCurrentElement();
-            if (!el) return;
-            Rml::String group = el->GetAttribute<Rml::String>("data-group", "");
-            if (group.empty()) {
-                el->SetClass("on", !el->IsClassSet("on"));
-            } else if (Rml::Element* parent = el->GetParentNode()) {
-                for (int i = 0; i < parent->GetNumChildren(); ++i) {
-                    Rml::Element* c = parent->GetChild(i);
-                    if (c->GetAttribute<Rml::String>("data-group", "") == group)
-                        c->SetClass("on", c == el);
+            Rml::Element* e = ev.GetTargetElement();
+            for (; e && !e->IsClassSet("tw-tree"); e = e->GetParentNode()) {
+                // --- dropdown choice picked ---
+                if (e->IsClassSet("tw-dd-choice")) {
+                    Rml::String idx = e->GetAttribute<Rml::String>("data-idx", "");
+                    Rml::Element* dd = e;
+                    while (dd && !dd->IsClassSet("tw-dd")) dd = dd->GetParentNode();
+                    if (!dd) return;
+                    dd->SetAttribute("data-value", Rml::String("@") + idx);
+                    std::function<Rml::Element*(Rml::Element*, const char*)> find =
+                        [&](Rml::Element* n, const char* cls) -> Rml::Element* {
+                            if (n->IsClassSet(cls)) return n;
+                            for (int i = 0; i < n->GetNumChildren(); ++i)
+                                if (Rml::Element* r = find(n->GetChild(i), cls)) return r;
+                            return nullptr;
+                        };
+                    if (Rml::Element* cur = find(dd, "tw-dd-cur"))
+                        cur->SetInnerRML(e->GetInnerRML());
+                    Rml::Element* picked = e;
+                    std::function<void(Rml::Element*)> mark = [&](Rml::Element* n) {
+                        if (n->IsClassSet("tw-dd-choice")) n->SetClass("on", n == picked);
+                        for (int i = 0; i < n->GetNumChildren(); ++i) mark(n->GetChild(i));
+                    };
+                    mark(dd);
+                    dd->SetClass("open", false);
+                    return;
+                }
+                // --- dropdown value field: toggle the accordion open ---
+                if (e->IsClassSet("tw-dd-field")) {
+                    Rml::Element* dd = e;
+                    while (dd && !dd->IsClassSet("tw-dd")) dd = dd->GetParentNode();
+                    if (!dd) return;
+                    bool want_open = !dd->IsClassSet("open");
+                    Rml::ElementDocument* doc = dd->GetOwnerDocument();
+                    if (Rml::Element* tree = doc ? doc->GetElementById("tw_tree") : nullptr) {
+                        std::function<void(Rml::Element*)> w = [&](Rml::Element* n) {
+                            if (n->IsClassSet("tw-dd")) n->SetClass("open", false);
+                            for (int i = 0; i < n->GetNumChildren(); ++i) w(n->GetChild(i));
+                        };
+                        w(tree);
+                    }
+                    dd->SetClass("open", want_open);
+                    return;
+                }
+                // --- checkbox / radio row ---
+                Rml::String type = e->GetAttribute<Rml::String>("data-type", "");
+                if (type == "checkbox") {
+                    e->SetClass("on", !e->IsClassSet("on"));
+                    return;
+                }
+                if (type == "radio") {
+                    Rml::String group = e->GetAttribute<Rml::String>("data-group", "");
+                    if (Rml::Element* parent = e->GetParentNode()) {
+                        for (int i = 0; i < parent->GetNumChildren(); ++i) {
+                            Rml::Element* c = parent->GetChild(i);
+                            if (c->GetAttribute<Rml::String>("data-group", "") == group)
+                                c->SetClass("on", c == e);
+                        }
+                    }
+                    return;
                 }
             }
+        });
+    // Bulk select/clear every checkbox in the tree (radios/dropdowns are
+    // either/or, so "select all" only touches the tickable checkboxes).
+    auto tw_bulk_check = [](Rml::Event& ev, bool on) {
+        Rml::Element* btn = ev.GetCurrentElement();
+        Rml::ElementDocument* doc = btn ? btn->GetOwnerDocument() : nullptr;
+        Rml::Element* tree = doc ? doc->GetElementById("tw_tree") : nullptr;
+        if (!tree) return;
+        std::function<void(Rml::Element*)> w = [&](Rml::Element* e) {
+            if (e->GetAttribute<Rml::String>("data-type", "") == "checkbox")
+                e->SetClass("on", on);
+            for (int i = 0; i < e->GetNumChildren(); ++i) w(e->GetChild(i));
+        };
+        w(tree);
+    };
+    c.BindEventCallback("tw_select_all",
+        [tw_bulk_check](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) {
+            tw_bulk_check(ev, true);
+        });
+    c.BindEventCallback("tw_select_none",
+        [tw_bulk_check](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) {
+            tw_bulk_check(ev, false);
         });
     c.BindEventCallback("apply_tweaks",
         [&m, handle](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) mutable {
@@ -1110,22 +1189,29 @@ Result run(SDL_Window* window, void* gl_context,
                 handle.DirtyVariable("tweaks_status"); return;
             }
             // Collect the tree's current state into a selection JSON: every
-            // checkbox (true/false) + each group's selected radio (true).
+            // checkbox (true/false), each group's selected radio pill (true),
+            // and each dropdown's chosen index (the `@N` sentinel in data-value).
             std::string json = "{";
             bool first = true;
             std::function<void(Rml::Element*)> walk = [&](Rml::Element* e) {
-                if (e->IsClassSet("tw-opt")) {
-                    Rml::String var  = e->GetAttribute<Rml::String>("data-var", "");
-                    Rml::String type = e->GetAttribute<Rml::String>("data-type", "");
-                    if (!var.empty()) {
-                        bool on = e->IsClassSet("on");
-                        bool include = (type == "checkbox") || (type == "radio" && on);
-                        if (include) {
-                            if (!first) json += ",";
-                            json += "\"" + std::string(var.c_str()) + "\":" +
-                                    ((type == "checkbox") ? (on ? "true" : "false") : "true");
-                            first = false;
-                        }
+                Rml::String var  = e->GetAttribute<Rml::String>("data-var", "");
+                Rml::String type = e->GetAttribute<Rml::String>("data-type", "");
+                if (!var.empty() && !type.empty()) {
+                    bool on = e->IsClassSet("on");
+                    std::string entry;
+                    if (type == "checkbox")
+                        entry = "\"" + std::string(var.c_str()) + "\":" + (on ? "true" : "false");
+                    else if (type == "radio" && on)
+                        entry = "\"" + std::string(var.c_str()) + "\":true";
+                    else if (type == "dropdownlist") {
+                        Rml::String val = e->GetAttribute<Rml::String>("data-value", "");
+                        entry = "\"" + std::string(var.c_str()) + "\":\"" +
+                                std::string(val.c_str()) + "\"";
+                    }
+                    if (!entry.empty()) {
+                        if (!first) json += ",";
+                        json += entry;
+                        first = false;
                     }
                 }
                 for (int i = 0; i < e->GetNumChildren(); ++i) walk(e->GetChild(i));

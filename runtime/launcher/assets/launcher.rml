@@ -207,16 +207,37 @@ button:hover { background-color: #232d3c; }
 .tw-section-lbl { display: block; color: #6e7681; font-size: 11dp; font-weight: bold; letter-spacing: 1dp; margin-bottom: 12dp; }
 .tw-section-note { color: #6e7681; font-size: 11dp; font-weight: normal; letter-spacing: 0dp; }
 
-/* The scrollable option tree (markup injected via data-rml from the resolver). */
-.tw-tree { display: block; height: 470dp; overflow-y: auto;
+/* Scrollbars: RmlUi ships NO default scrollbar geometry, so an unstyled
+ * scrollbarvertical resolves width:auto to the FULL element width and paints
+ * over the content, swallowing every click as a track-scroll (ElementScroll.cpp
+ * sizes the bar from its computed width). Style them GLOBALLY as thin edge bars
+ * so every scroll container in the launcher stays clickable. */
+scrollbarvertical { width: 12dp; }
+scrollbarhorizontal { height: 12dp; }
+scrollbarvertical slidertrack, scrollbarhorizontal slidertrack {
+	background-color: #0c1015; border-radius: 6dp; }
+scrollbarvertical sliderbar { width: 8dp; min-height: 40dp; margin-left: 2dp; margin-right: 2dp;
+	background-color: #2b3543; border-radius: 5dp; }
+scrollbarhorizontal sliderbar { height: 8dp; min-width: 40dp; margin-top: 2dp; margin-bottom: 2dp;
+	background-color: #2b3543; border-radius: 5dp; }
+sliderbar:hover { background-color: #3b4553; }
+sliderbar:active { background-color: #4b5563; }
+sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
+
+/* The scrollable option tree (markup injected via data-rml from the resolver).
+ * Options flow in a 3-column grid (flex-wrap): headers span the full width and
+ * force a new row, so each section's options pack 3-across beneath it. This
+ * uses the horizontal space and cuts scrolling ~3x vs the old single column. */
+.tw-tree { display: block; height: 500dp; overflow-y: auto; overflow-x: hidden;
 	border: 1dp #21262d; border-radius: 10dp; background-color: #0c1015; }
-.tw-tree-inner { display: block; width: 1130dp; padding: 6dp 14dp 14dp 14dp; }
-.tw-tab-block { display: block; margin-top: 8dp; }
-.tw-tab-hd { display: block; color: #f0f6fc; font-size: 16dp; font-weight: bold;
+.tw-tree-inner { display: block; padding: 6dp 12dp 14dp 12dp; }
+.tw-tab-block { display: flex; flex-direction: row; flex-wrap: wrap; align-items: flex-start;
+	margin-top: 8dp; }
+.tw-tab-hd { flex: 0 0 100%; box-sizing: border-box; color: #f0f6fc; font-size: 16dp; font-weight: bold;
 	margin-top: 16dp; margin-bottom: 4dp; padding-bottom: 5dp; border-bottom: 1dp #21262d; }
-.tw-sec-hd { display: block; color: #58a6ff; font-size: 11dp; font-weight: bold; letter-spacing: 1dp;
-	margin-top: 14dp; margin-bottom: 6dp; }
-.tw-opt { display: block; padding: 4dp 6dp; border-radius: 6dp; }
+.tw-sec-hd { flex: 0 0 100%; box-sizing: border-box; color: #58a6ff; font-size: 11dp; font-weight: bold;
+	letter-spacing: 1dp; margin-top: 14dp; margin-bottom: 6dp; }
+.tw-opt { flex: 0 0 33%; box-sizing: border-box; display: block; padding: 4dp 6dp; border-radius: 6dp; }
 .tw-opt:hover { background-color: #12181f; }
 .tw-box { display: inline-block; width: 15dp; height: 15dp; border-radius: 4dp; border: 2dp #3a4351;
 	background-color: #0c1015; margin-right: 9dp; vertical-align: -3dp; }
@@ -225,6 +246,40 @@ button:hover { background-color: #232d3c; }
 .tw-lbl { display: inline; color: #cdd5df; font-size: 13dp; }
 .tw-opt.ro .tw-lbl { color: #6e7681; }
 .tw-adv { color: #4d5560; font-size: 11dp; margin-left: 8dp; }
+
+/* Leaf spans must not steal focus/hit-testing from their clickable row: RmlUi
+ * sets the click target ('active') to the deepest hovered element, so if the
+ * box/label were focusable a tiny cursor move mid-click would change the target
+ * and drop the click. focus:none makes the row (.tw-opt/.tw-dd-field/pill) the
+ * stable click target. */
+.tw-box, .tw-lbl, .tw-adv, .tw-dd-cur, .tw-dd-caret { focus: none; }
+
+/* select-all / select-none toolbar */
+.tw-toolbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 10dp; }
+.tw-tool-btn { background-color: #161d28; border: 1dp #2b3543; border-radius: 6dp; color: #adbac7;
+	font-size: 12dp; font-weight: bold; padding: 7dp 15dp; margin-right: 8dp; }
+.tw-tool-btn:hover { border-color: #3b82f6; color: #ffffff; }
+.tw-toolbar-note { color: #6e7681; font-size: 11dp; margin-left: 6dp; }
+
+/* radio group -> segmented either/or pills (full-width row within the grid) */
+.tw-radio-row { flex: 0 0 100%; box-sizing: border-box; display: block; padding: 4dp 6dp 6dp 6dp; }
+.tw-pill { display: inline-block; padding: 6dp 15dp; margin-right: 8dp; margin-bottom: 4dp;
+	border-radius: 20dp; border: 1dp #2b3543; background-color: #0f151d; color: #9aa4b2; font-size: 12dp; }
+.tw-pill:hover { border-color: #3b82f6; color: #e6e9ef; }
+.tw-pill.on { background-color: #2563eb; border-color: #2563eb; color: #ffffff; font-weight: bold; }
+
+/* dropdown -> inline accordion (flows in the tree; never clipped by scroll) */
+.tw-dd { display: block; padding: 1dp 0dp; }
+.tw-dd-field { display: flex; flex-direction: row; align-items: center; padding: 5dp 8dp; border-radius: 6dp; }
+.tw-dd-field:hover { background-color: #12181f; }
+.tw-dd .tw-lbl { flex: 1 1 auto; }
+.tw-dd-cur { color: #58a6ff; font-size: 13dp; font-weight: bold; margin-right: 9dp; }
+.tw-dd-caret { width: 11dp; height: 11dp; flex: 0 0 11dp; decorator: image(img/caret.png contain); }
+.tw-dd-panel { display: none; padding: 3dp 0dp 8dp 24dp; }
+.tw-dd.open .tw-dd-panel { display: block; }
+.tw-dd-choice { display: block; padding: 5dp 11dp; border-radius: 5dp; color: #c2c9d2; font-size: 12dp; }
+.tw-dd-choice:hover { background-color: #1b2330; color: #ffffff; }
+.tw-dd-choice.on { color: #58a6ff; font-weight: bold; background-color: #131b26; }
 
 .tw-footer { display: block; margin-top: 26dp; padding-top: 22dp; border-top: 1dp #21262d; }
 .tweaks-actions { display: flex; flex-direction: row; align-items: center; }
@@ -441,6 +496,15 @@ button:hover { background-color: #232d3c; }
 			</div>
 
 			<div class="tw-section-lbl">OPTIONS <span class="tw-section-note">— acediez's full option set. Tick what you want, then Apply.</span></div>
+			<div class="tw-toolbar">
+				<button class="tw-tool-btn" data-event-click="tw_select_all">Select all</button>
+				<button class="tw-tool-btn" data-event-click="tw_select_none">Select none</button>
+				<span class="tw-toolbar-note">Ticks / unticks every checkbox. Radios &amp; dropdowns are either-or.</span>
+			</div>
+			<!-- Each injected row carries its own data-event-click="tw_click" (see
+			     tweaks_resolver.catalog_to_rml): a delegated handler on this static
+			     container does NOT fire for data-rml/SetInnerRML-injected descendants
+			     in this RmlUi build, so per-row binding is required. -->
 			<div id="tw_tree" class="tw-tree"><div class="tw-tree-inner" data-rml="tweaks_tree"></div></div>
 
 			<div class="tw-footer">
