@@ -10864,6 +10864,15 @@ static void handle_game_options(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"go\":%s}", id, buf);
 }
 
+static void handle_tweaks(int id, const char *json)
+{
+    (void)json;
+    extern int tweak_runtime_debug_json(char *out, int cap);
+    char buf[8192];
+    tweak_runtime_debug_json(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"tweaks\":%s}", id, buf);
+}
+
 /* Live host-stack-usage profile (RECURSION_BUG.md §17): read the always-on ring
  * while the game is still responsive to distinguish a gradual cross-frame leak
  * (used_kb climbs linearly with frame) from a within-one-frame runaway. */
@@ -10991,6 +11000,7 @@ static const CmdEntry s_commands[] = {
     { "latency",           handle_latency },
     { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },
+    { "tweaks",            handle_tweaks },
     { "stack_profile",     handle_stack_profile },
     { "xprobe",            handle_xprobe },
     { "xprobe_arm",        handle_xprobe_arm },

@@ -37,6 +37,7 @@
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include "game_options.h"
+#include "tweak_runtime.h"
 #include "crc32.h"
 #include "disc_identity.h"
 #if defined(PSX_LAUNCHER)
@@ -1690,6 +1691,19 @@ static void sdl_vblank_present(void) {
         }
     }
 
+    /* Apply Tweaks data-section RAM pokes once the game EXE has loaded + started
+     * (same game-entry gate as widescreen); idempotent. */
+    {
+        static bool s_tweaks_applied = false;
+        if (!s_tweaks_applied) {
+            extern int fntrace_is_game_started(void);
+            if (fntrace_is_game_started()) {
+                s_tweaks_applied = true;
+                tweak_runtime_apply();
+            }
+        }
+    }
+
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
@@ -2332,6 +2346,20 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& ex) {
             std::fprintf(stderr, "psxrecomp: game_options.toml ignored: %s\n", ex.what());
+        }
+    }
+
+    /* Compile-free Tweaks runtime state (TWEAKS_PREBAKE.md Phase 2): a launcher-
+     * written `tweaks.state` next to game.toml carries flag bits (baked guarded
+     * code variants), parameterized immediate values, and data-section RAM pokes.
+     * Best-effort: a missing/malformed file just leaves the feature off. */
+    if (game_config_path) {
+        try {
+            std::string tw_state =
+                (std::filesystem::path(game_config_path).parent_path() / "tweaks.state").string();
+            tweak_runtime_configure(tw_state.c_str());
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "psxrecomp: tweaks.state ignored: %s\n", ex.what());
         }
     }
 
