@@ -160,15 +160,25 @@ void tweaks_load_tree_worker(std::string root) {
 }
 
 // Background worker: apply a UI selection (JSON) -> patched variant + toml.
-void tweaks_apply_worker(std::string root, std::string selection_json) {
-    tweaks_set_status("Applying selection — driving the patcher engine (~15s)…");
+void tweaks_apply_worker(std::string root, std::string selection_json, std::string parts_seed) {
+    tweaks_set_status("Applying selection — building the patched variant…");
     // Stage the selection JSON where the resolver's work dir lives.
     fs::path wd = fs::path(root) / "mmx6-tweaks" / "_patcher" / "_worktmp";
     std::error_code ec; fs::create_directories(wd, ec);
     fs::path selpath = wd / "_ui_selection.json";
     { std::ofstream f(selpath.string()); f << selection_json; }
 
-    std::string out = run_resolver(root, "apply --selection \"" + selpath.generic_string() + "\"");
+    // --engine auto: build with the pure-Python engine (no AutoHotkey) for every
+    // option it covers; fall back to the reference AHK engine only for options
+    // still parked in the port (Mugshot custom-art). --parts-seed makes the
+    // PartsRandom randomizer reproducible when the user supplies a seed.
+    std::string args = "apply --engine auto --selection \"" + selpath.generic_string() + "\"";
+    if (!parts_seed.empty()) {
+        std::string esc;                            // shell-quote the seed
+        for (char ch : parts_seed) { if (ch == '"' || ch == '\\') esc += '\\'; esc += ch; }
+        args += " --parts-seed \"" + esc + "\"";
+    }
+    std::string out = run_resolver(root, args);
     std::string variant, last;
     std::istringstream ss(out);
     for (std::string line; std::getline(ss, line); ) {
@@ -1237,6 +1247,12 @@ Result run(SDL_Window* window, void* gl_context,
             };
             walk(tree);
             json += "}";
+            // PartsRandom seed field (optional): the same seed reproduces the same
+            // randomized layout, so a build is stable (one recompile) and shareable.
+            std::string seed;
+            if (Rml::Element* se = doc->GetElementById("tw_parts_seed"))
+                if (auto* fc = rmlui_dynamic_cast<Rml::ElementFormControl*>(se))
+                    seed = fc->GetValue().c_str();
             fs::path root = find_resolver_root(std::string(m.disc_path));
             if (root.empty()) {
                 m.tweaks_status = "Could not locate tools/tweaks_resolver.py near the disc.";
@@ -1244,7 +1260,7 @@ Result run(SDL_Window* window, void* gl_context,
             }
             g_tweaks.busy.store(true);
             m.tweaks_busy = true; handle.DirtyVariable("tweaks_busy");
-            std::thread(tweaks_apply_worker, root.generic_string(), json).detach();
+            std::thread(tweaks_apply_worker, root.generic_string(), json, seed).detach();
         });
     // ---- controller: device dropdown + pad-mode segmented selector ----
     auto dirty_player = [handle](int player) mutable {

@@ -296,6 +296,11 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 .tweaks-apply:hover { background-color: #3b82f6; }
 .tweaks-apply.busy { background-color: #21262d; color: #6e7681; }
 .tweaks-spin { color: #8b949e; font-size: 13dp; margin-left: 14dp; }
+.tw-seed-field { display: flex; flex-direction: row; align-items: center; margin-left: 16dp; }
+.tw-seed-lbl { color: #8b949e; font-size: 12dp; margin-right: 8dp; }
+.tw-seed-input { width: 130dp; padding: 7dp 9dp; border-radius: 6dp; background-color: #0d1117;
+	color: #c9d1d9; border: 1dp #30363d; font-size: 12dp; }
+.tw-seed-input:focus { border-color: #2563eb; }
 .tw-dot { display: inline-block; width: 8dp; height: 8dp; border-radius: 4dp; background-color: #d29922; margin-right: 8dp; }
 .tweaks-status { display: block; margin-top: 12dp; padding: 11dp 15dp; border-radius: 8dp; background-color: #0d1117;
 	border: 1dp #21262d; border-left: 3dp #384150; color: #cdd5df; font-size: 13dp; line-height: 1.6; }
@@ -518,6 +523,7 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 			<div class="tw-footer">
 				<div class="tweaks-actions">
 					<button class="tweaks-apply" data-event-click="apply_tweaks" data-class-busy="tweaks_busy">Build</button>
+					<span class="tw-seed-field"><span class="tw-seed-lbl">Randomizer seed</span><input type="text" id="tw_parts_seed" class="tw-seed-input" placeholder="(default)"/></span>
 					<span class="tweaks-spin" data-if="tweaks_busy"><span class="tw-dot"></span>Working…</span>
 				</div>
 				<div class="tweaks-status" data-if="tweaks_status != ''" data-class-ok="tweaks_variant != ''" data-class-busy="tweaks_busy">{{tweaks_status}}</div>
