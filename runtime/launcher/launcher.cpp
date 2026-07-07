@@ -168,11 +168,12 @@ void tweaks_apply_worker(std::string root, std::string selection_json, std::stri
     fs::path selpath = wd / "_ui_selection.json";
     { std::ofstream f(selpath.string()); f << selection_json; }
 
-    // --engine auto: build with the pure-Python engine (no AutoHotkey) for every
-    // option it covers; fall back to the reference AHK engine only for options
-    // still parked in the port (Mugshot custom-art). --parts-seed makes the
-    // PartsRandom randomizer reproducible when the user supplies a seed.
-    std::string args = "apply --engine auto --selection \"" + selpath.generic_string() + "\"";
+    // --engine python: the pure-Python engine now covers the ENTIRE tool (no
+    // AutoHotkey), so production builds are AHK-free. The only residual refusal is
+    // a custom-mugshot art file the user hasn't supplied. (`--engine ahk`/`auto`
+    // remain available on the CLI for debugging against the reference engine.)
+    // --parts-seed makes the PartsRandom randomizer reproducible.
+    std::string args = "apply --engine python --selection \"" + selpath.generic_string() + "\"";
     if (!parts_seed.empty()) {
         std::string esc;                            // shell-quote the seed
         for (char ch : parts_seed) { if (ch == '"' || ch == '\\') esc += '\\'; esc += ch; }
