@@ -228,7 +228,7 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
  * Options flow in a 3-column grid (flex-wrap): headers span the full width and
  * force a new row, so each section's options pack 3-across beneath it. This
  * uses the horizontal space and cuts scrolling ~3x vs the old single column. */
-.tw-tree { display: block; height: 500dp; overflow-y: auto; overflow-x: hidden;
+.tw-tree { display: block; height: 410dp; overflow-y: auto; overflow-x: hidden;
 	border: 1dp #21262d; border-radius: 10dp; background-color: #0c1015; }
 .tw-tree-inner { display: block; padding: 6dp 12dp 14dp 12dp; }
 .tw-tab-block { display: flex; flex-direction: row; flex-wrap: wrap; align-items: flex-start;
@@ -289,7 +289,7 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 .tw-dd-choice:hover { background-color: #1b2330; color: #ffffff; }
 .tw-dd-choice.on { color: #58a6ff; font-weight: bold; background-color: #131b26; }
 
-.tw-footer { display: block; margin-top: 26dp; padding-top: 22dp; border-top: 1dp #21262d; }
+.tw-footer { display: block; margin-top: 16dp; padding-top: 16dp; border-top: 1dp #21262d; }
 .tweaks-actions { display: flex; flex-direction: row; align-items: center; }
 .tweaks-apply { background-color: #2563eb; color: #ffffff; padding: 12dp 26dp; border-radius: 8dp;
 	font-size: 14dp; font-weight: bold; }
@@ -297,7 +297,7 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 .tweaks-apply.busy { background-color: #21262d; color: #6e7681; }
 .tweaks-spin { color: #8b949e; font-size: 13dp; margin-left: 14dp; }
 .tw-dot { display: inline-block; width: 8dp; height: 8dp; border-radius: 4dp; background-color: #d29922; margin-right: 8dp; }
-.tweaks-status { display: block; margin-top: 18dp; padding: 13dp 15dp; border-radius: 8dp; background-color: #0d1117;
+.tweaks-status { display: block; margin-top: 12dp; padding: 11dp 15dp; border-radius: 8dp; background-color: #0d1117;
 	border: 1dp #21262d; border-left: 3dp #384150; color: #cdd5df; font-size: 13dp; line-height: 1.6; }
 .tweaks-status.busy { border-left-color: #d29922; }
 .tweaks-status.ok { border-left-color: #2ea043; }
@@ -517,7 +517,7 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 
 			<div class="tw-footer">
 				<div class="tweaks-actions">
-					<button class="tweaks-apply" data-event-click="apply_tweaks" data-class-busy="tweaks_busy">Apply &amp; Build Variant</button>
+					<button class="tweaks-apply" data-event-click="apply_tweaks" data-class-busy="tweaks_busy">Build</button>
 					<span class="tweaks-spin" data-if="tweaks_busy"><span class="tw-dot"></span>Working…</span>
 				</div>
 				<div class="tweaks-status" data-class-ok="tweaks_variant != ''" data-class-busy="tweaks_busy">{{tweaks_status}}</div>
