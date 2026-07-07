@@ -239,6 +239,14 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 	letter-spacing: 1dp; margin-top: 14dp; margin-bottom: 6dp; }
 .tw-opt { flex: 0 0 33%; box-sizing: border-box; display: block; padding: 4dp 6dp; border-radius: 6dp; }
 .tw-opt:hover { background-color: #12181f; }
+
+/* numeric entry (edit / slider) — label + text input + optional range hint */
+.tw-num { display: flex; flex-direction: row; align-items: center; }
+.tw-num .tw-lbl { flex: 1 1 auto; white-space: nowrap; overflow: hidden; }
+.tw-num-input { flex: 0 0 82dp; width: 82dp; font-size: 12dp; color: #e6e9ef;
+	background-color: #0f151d; border: 1dp #2b3543; border-radius: 5dp; padding: 4dp 7dp; }
+.tw-num-input:focus { border-color: #3b82f6; background-color: #0c1116; }
+.tw-num-range { flex: 0 0 auto; color: #6e7681; font-size: 10dp; margin-left: 7dp; }
 .tw-box { display: inline-block; width: 15dp; height: 15dp; border-radius: 4dp; border: 2dp #3a4351;
 	background-color: #0c1015; margin-right: 9dp; vertical-align: -3dp; }
 .tw-opt.on .tw-box { border-color: #2563eb; background-color: #2563eb; }

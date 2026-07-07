@@ -18,6 +18,7 @@ extern "C" {
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/DataModelHandle.h>
 #include <RmlUi/Core/ElementDocument.h>
+#include <RmlUi/Core/Elements/ElementFormControl.h>
 
 #include "RmlUi_Platform_SDL.h"
 #include "RmlUi_Renderer_GL3.h"
@@ -1207,6 +1208,24 @@ Result run(SDL_Window* window, void* gl_context,
                         Rml::String val = e->GetAttribute<Rml::String>("data-value", "");
                         entry = "\"" + std::string(var.c_str()) + "\":\"" +
                                 std::string(val.c_str()) + "\"";
+                    }
+                    else if (type == "edit" || type == "slider") {
+                        // Numeric entry: read the live text of the descendant
+                        // <input> (its edited value, not the initial attribute).
+                        std::function<Rml::ElementFormControl*(Rml::Element*)> findfc =
+                            [&](Rml::Element* n) -> Rml::ElementFormControl* {
+                                if (auto* fc = rmlui_dynamic_cast<Rml::ElementFormControl*>(n))
+                                    return fc;
+                                for (int i = 0; i < n->GetNumChildren(); ++i)
+                                    if (auto* r = findfc(n->GetChild(i))) return r;
+                                return nullptr;
+                            };
+                        if (Rml::ElementFormControl* fc = findfc(e)) {
+                            std::string v = fc->GetValue().c_str();
+                            std::string esc;
+                            for (char ch : v) { if (ch == '"' || ch == '\\') esc += '\\'; esc += ch; }
+                            entry = "\"" + std::string(var.c_str()) + "\":\"" + esc + "\"";
+                        }
                     }
                     if (!entry.empty()) {
                         if (!first) json += ",";
