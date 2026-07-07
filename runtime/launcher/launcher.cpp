@@ -12,6 +12,7 @@
 
 extern "C" {
 #include "memcard.h"
+#include "psx_keybinds.h"
 }
 
 #include <RmlUi/Core.h>
@@ -33,6 +34,7 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -302,8 +304,12 @@ struct LauncherModel {
     Rml::String verdict_detail; // sub line
     Rml::String verdict_state;  // "ok" | "warn" | "bad" | "none" — drives colour
 
-    // View toggle: "dashboard" (default) | "settings" | "tweaks".
+    // View toggle: "dashboard" (default) | "settings" | "controls" | "tweaks".
     Rml::String view = "dashboard";
+
+    // Controls page: which player's keyboard binds are being edited (0=P1,1=P2).
+    int         cfg_player = 0;
+    Rml::String cfg_player_label = "1";
 
     // Tweaks tab (MMX6 Tweaks ROM-hack variant builder). The full option tree is
     // fetched from tools/tweaks_resolver.py (catalog --rml) and injected via
@@ -330,7 +336,13 @@ struct LauncherModel {
     Rml::String p1_status, p2_status;        // resolved status line
     Rml::String p1_dot, p2_dot;              // "" (on) | "off"
     Rml::String p1_options, p2_options;      // data-rml option-list markup
-    Rml::String dd_open;                     // "" | "p1" | "p2" (which list is open)
+    Rml::String dd_open;                     // "" | "p1" | "p2" (which device list is open)
+
+    // Localization (only shown when the game declares languages). Settings-view
+    // cycle button, like Renderer / Screen model.
+    bool        lang_menu    = false;        // game.languages non-empty => show it
+    int         lang_index   = 0;            // index into the game's language list
+    Rml::String lang_label;                  // current option label ("English")
 
     // Memory cards — real introspection of the on-disk .mcd images. Each slot
     // has a resolved file path, an enable toggle, and parsed directory stats.
@@ -518,6 +530,22 @@ void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption
     if (o.kind == 0)      { status = "No device — port empty"; dot = "off"; }
     else if (o.kind == 1) { status = Rml::String("Keyboard \xE2\x80\x94 ") + type; dot = ""; }
     else                  { status = o.label + Rml::String(" \xE2\x80\x94 ") + type; dot = ""; }
+}
+
+// Recompute the language button's label from lang_index (Settings cycle toggle).
+void refresh_language(LauncherModel& m,
+                      const std::vector<psx_launcher::GameInfo::Language>& langs) {
+    if (langs.empty()) return;
+    if (m.lang_index < 0 || m.lang_index >= (int)langs.size()) m.lang_index = 0;
+    m.lang_label = langs[m.lang_index].label;
+}
+
+// Resolve a saved language code to an index in the game's language list.
+int lang_index_for(const std::vector<psx_launcher::GameInfo::Language>& langs,
+                   const std::string& code) {
+    for (size_t i = 0; i < langs.size(); i++)
+        if (langs[i].code == code) return (int)i;
+    return 0;   // unknown/first — the game's declared default sits at [0] by convention
 }
 
 const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
@@ -783,6 +811,11 @@ Result run(SDL_Window* window, void* gl_context,
 {
     (void)gl_context;  // already created + current; we only need the window.
 
+    // Keyboard keybinds live in keybinds.ini next to the exe (assets_dir == the
+    // exe dir). Load them so the Controls page edits the real, persisted map;
+    // the runtime re-reads the same file at startup (psx_keybinds_init).
+    psx_keybinds_init(assets_dir);
+
     const std::string expected_serial = game.expected_serial ? game.expected_serial : "";
     const uint32_t    expected_crc    = game.expected_crc;
     const bool        has_expected_crc = game.has_expected_crc;
@@ -884,6 +917,13 @@ Result run(SDL_Window* window, void* gl_context,
     refresh_player(m, 0, dev_opts);
     refresh_player(m, 1, dev_opts);
 
+    // ---- Seed the localization dropdown (only when the game declares one) ----
+    m.lang_menu = !game.languages.empty();
+    if (m.lang_menu) {
+        m.lang_index = lang_index_for(game.languages, io.language);
+        refresh_language(m, game.languages);
+    }
+
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
@@ -924,6 +964,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("tweaks_status",  &m.tweaks_status);
     c.Bind("tweaks_variant", &m.tweaks_variant);
     c.Bind("tweaks_tree",    &m.tweaks_tree);
+    c.Bind("cfg_player",     &m.cfg_player);
+    c.Bind("cfg_player_label", &m.cfg_player_label);
     c.Bind("p1_mode",        &m.p1_mode);
     c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("allow_hybrid",   &m.allow_hybrid);
@@ -938,6 +980,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p1_options",     &m.p1_options);
     c.Bind("p2_options",     &m.p2_options);
     c.Bind("dd_open",        &m.dd_open);
+    c.Bind("lang_menu",      &m.lang_menu);
+    c.Bind("lang_label",     &m.lang_label);
     c.Bind("mc1_enabled",    &m.mc1_enabled);
     c.Bind("mc2_enabled",    &m.mc2_enabled);
     c.Bind("mc1_name",       &m.mc1_name);
@@ -952,6 +996,84 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("mc2_grid",       &m.mc2_grid);
 
     Rml::DataModelHandle handle = c.GetModelHandle();
+
+    // ---- keyboard keybind rebinding (Controls page) --------------------------
+    // The chip list is built programmatically after the document loads (data-for
+    // can't generate the per-button chips), and re-wired on each rebuild. A scan
+    // is armed when a chip is clicked; the SDL loop then swallows the next keydown
+    // and resolves it (Esc cancels). Bindings save to keybinds.ini immediately on
+    // capture. Mirrors snesrecomp's launcher Configure view.
+    Rml::ElementDocument*  kbdoc = nullptr;           // set after LoadDocument
+    std::function<void()>  build_rebind_list;         // set after LoadDocument
+    bool  rebuild_pending = false;
+    int   scan_kind  = 0;                              // 0=idle, 1=capturing
+    int   scan_index = 0;                              // button being rebound
+    std::string scan_chip_id;
+
+    auto kb_chip_label = [&m](int button) -> std::string {
+        SDL_Scancode sc = psx_keybinds_get_button(m.cfg_player + 1, button);
+        const char* n = (sc != SDL_SCANCODE_UNKNOWN) ? SDL_GetScancodeName(sc) : "";
+        return (n && n[0]) ? std::string(n) : std::string("None");
+    };
+    auto end_scan = [&]() {
+        if (!scan_kind) return;
+        if (kbdoc) if (Rml::Element* e = kbdoc->GetElementById(scan_chip_id)) {
+            e->SetInnerRML(kb_chip_label(scan_index));
+            e->SetClass("rb-chip--scan", false);
+        }
+        scan_kind = 0; scan_chip_id.clear();
+    };
+    auto begin_scan = [&](int index, const std::string& chip_id) {
+        end_scan();
+        scan_kind = 1; scan_index = index; scan_chip_id = chip_id;
+        if (kbdoc) if (Rml::Element* e = kbdoc->GetElementById(chip_id)) {
+            e->SetInnerRML("Press a key...");
+            e->SetClass("rb-chip--scan", true);
+        }
+    };
+    auto handle_scan_key = [&](const SDL_KeyboardEvent& ke) {
+        if (ke.keysym.sym == SDLK_ESCAPE) { end_scan(); return; }
+        const SDL_Scancode sc = ke.keysym.scancode;
+        // Steal: a key already bound elsewhere (either player) moves here instead
+        // of silently double-firing.
+        for (int pl = 1; pl <= 2; pl++)
+            for (int b = 0; b < psx_keybinds_button_count(); b++)
+                if (psx_keybinds_get_button(pl, b) == sc &&
+                    !(pl == m.cfg_player + 1 && b == scan_index))
+                    psx_keybinds_set_button(pl, b, SDL_SCANCODE_UNKNOWN);
+        psx_keybinds_set_button(m.cfg_player + 1, scan_index, sc);
+        psx_keybinds_save();
+        end_scan();
+        rebuild_pending = true;   // stolen chips refresh too
+    };
+
+    c.BindEventCallback("show_controls",
+        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
+            m.view = "controls"; handle.DirtyVariable("view");
+            rebuild_pending = true;
+        });
+    c.BindEventCallback("cfg_player_1",
+        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
+            m.cfg_player = 0; m.cfg_player_label = "1";
+            handle.DirtyVariable("cfg_player"); handle.DirtyVariable("cfg_player_label");
+            rebuild_pending = true;
+        });
+    c.BindEventCallback("cfg_player_2",
+        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
+            m.cfg_player = 1; m.cfg_player_label = "2";
+            handle.DirtyVariable("cfg_player"); handle.DirtyVariable("cfg_player_label");
+            rebuild_pending = true;
+        });
+    c.BindEventCallback("rebind_reset",
+        [&m, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
+            psx_keybinds_reset_player(m.cfg_player + 1);
+            psx_keybinds_save();
+            rebuild_pending = true;
+        });
 
     c.BindEventCallback("cycle_renderer",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1072,11 +1194,13 @@ Result run(SDL_Window* window, void* gl_context,
     c.BindEventCallback("change_iso",  do_browse_disc);
 
     c.BindEventCallback("show_settings",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+        [&m, handle, &end_scan](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
             m.view = "settings"; handle.DirtyVariable("view");
         });
     c.BindEventCallback("show_dashboard",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+        [&m, handle, &end_scan](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            end_scan();
             m.view = "dashboard"; handle.DirtyVariable("view");
         });
     // ---- Tweaks tab ----
@@ -1293,6 +1417,16 @@ Result run(SDL_Window* window, void* gl_context,
             dirty_player(player);
             handle.DirtyVariable("dd_open");
         });
+    // ---- localization: Language cycle button (Settings > LOCALIZATION) ----
+    // Matches the Settings-view idiom (Renderer / Screen model cycle toggles):
+    // each click advances to the next declared language, wrapping around.
+    c.BindEventCallback("cycle_language",
+        [&m, handle, langs = game.languages](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (langs.empty()) return;
+            m.lang_index = (m.lang_index + 1) % (int)langs.size();
+            refresh_language(m, langs);
+            handle.DirtyVariable("lang_label");
+        });
     // Pad-mode segmented selector: each segment passes its mode (0=hybrid,
     // 1=analog, 2=digital) so any mode is one click away.
     c.BindEventCallback("set_mode_p1",
@@ -1371,12 +1505,60 @@ Result run(SDL_Window* window, void* gl_context,
     }
     doc->Show();
 
+    // ---- build the keybind chip list (Controls page) ----
+    // data-if only hides the controls view, so #rebind-list exists from load and
+    // GetElementById finds it even while the dashboard is showing. Each chip is a
+    // <button> whose click arms a scan; listeners are re-wired on every rebuild.
+    kbdoc = doc;
+    struct KbClickListener : Rml::EventListener {
+        std::function<void()> on_click;
+        void ProcessEvent(Rml::Event&) override { if (on_click) on_click(); }
+    };
+    std::vector<std::unique_ptr<KbClickListener>> kb_listeners;
+    build_rebind_list = [&]() {
+        Rml::Element* list = doc->GetElementById("rebind-list");
+        if (!list) return;
+        const int n = psx_keybinds_button_count();
+        std::string html;
+        for (int b = 0; b < n; b += 2) {          // two (label, chip) pairs per row
+            html += "<div class=\"rb-row\">";
+            for (int k = b; k < b + 2 && k < n; k++) {
+                html += "<span class=\"rb-label\">";
+                html += rml_escape(psx_keybinds_button_label(k));
+                html += "</span><button class=\"rb-chip\" id=\"kb-";
+                html += psx_keybinds_button_name(k);
+                html += "\">" + rml_escape(kb_chip_label(k)) + "</button>";
+            }
+            html += "</div>";
+        }
+        list->SetInnerRML(html);              // destroys prior chips...
+        kb_listeners.clear();                 // ...so dropping their listeners is safe
+        for (int k = 0; k < n; k++) {
+            const std::string id = std::string("kb-") + psx_keybinds_button_name(k);
+            if (Rml::Element* e = doc->GetElementById(id)) {
+                auto lis = std::make_unique<KbClickListener>();
+                lis->on_click = [&, k, id]() { begin_scan(k, id); };
+                e->AddEventListener(Rml::EventId::Click, lis.get());
+                kb_listeners.push_back(std::move(lis));
+            }
+        }
+    };
+    build_rebind_list();
+
     // ---- Main loop ----
     Result result = Result::Quit;
     bool running = true;
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // While a rebind scan is armed, swallow keyboard input (the next
+            // keydown resolves it; Esc cancels) so it can't leak into RmlUi
+            // controls.
+            if (scan_kind &&
+                (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP || ev.type == SDL_TEXTINPUT)) {
+                if (ev.type == SDL_KEYDOWN) handle_scan_key(ev.key);
+                continue;
+            }
             switch (ev.type) {
             case SDL_QUIT:
                 m.quit_requested = true;
@@ -1415,6 +1597,10 @@ Result run(SDL_Window* window, void* gl_context,
             handle.DirtyVariable("tweaks_busy");
             if (tree_ready) handle.DirtyVariable("tweaks_tree");
         }
+        // Deferred chip-list rebuild (set from chip handlers / scan capture /
+        // player switch / reset — never rebuild a list from inside its own
+        // listener's dispatch).
+        if (rebuild_pending) { rebuild_pending = false; build_rebind_list(); }
 
         context->Update();
 
@@ -1456,6 +1642,14 @@ Result run(SDL_Window* window, void* gl_context,
         io.p1_mode = m.p1_mode; io.has_p1_mode = true;
         io.p2_mode = m.p2_mode; io.has_p2_mode = true;
         io.deadzone = m.deadzone_pct * 32767 / 100; io.has_deadzone = true;
+
+        // Localization: persist the chosen language code (only meaningful when the
+        // game declared a menu; otherwise leave io.language untouched).
+        if (m.lang_menu && m.lang_index >= 0 &&
+            m.lang_index < (int)game.languages.size()) {
+            io.language = game.languages[m.lang_index].code;
+            io.has_language = true;
+        }
     }
 
     Rml::Shutdown();

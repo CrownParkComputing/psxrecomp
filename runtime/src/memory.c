@@ -32,6 +32,19 @@ static uint8_t ram[RAM_SIZE];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
+/* Physical address translation for guest accesses. The 2 MB main RAM is
+ * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
+ * register, default 0x0B88) and games rely on it — Kula World's crt0
+ * parks $sp in the 4th mirror (0x807FFFF8). Fold the mirrors here so the
+ * RAM bounds checks below see canonical offsets; without this, mirror
+ * writes fell into the open-bus no-op and mirror reads returned 0 (the
+ * guest's stack silently vanished and $ra came back as 0). */
+static inline uint32_t psx_phys_addr(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys < 0x00800000u) phys &= (uint32_t)(RAM_SIZE - 1);
+    return phys;
+}
+
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
@@ -87,6 +100,8 @@ static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
     dirty_ram_mark_page(phys);
 }
 
+int dirty_ram_is_dirty(uint32_t phys);
+
 /* Establish the clean compiled-image baseline for the game-EXE text region.
  * Called ONCE when the game entry is first reached (fntrace game-start): by then
  * the BIOS has fully loaded the boot EXE into [0x10000, FLOOR) — which IS the
@@ -108,6 +123,120 @@ void dirty_ram_clear_image_baseline(void) {
     for (uint32_t page = first_page; page <= last_page; page++)
         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
 }
+
+/* Text-image divergence guard.
+ *
+ * dirty_ram_is_dirty() is intentionally coarse: it says a page was touched by
+ * runtime code loading. For deciding whether the original static game dispatch
+ * is still safe, a dirty page is not enough information: data in a code page can
+ * be written without changing the instructions at a target, while packed games
+ * can also rewrite their own text with completely different instructions.
+ *
+ * main.cpp registers the boot EXE bytes as the reference image. Writes inside
+ * that range mark pages whose bytes differ from the reference. At dispatch time,
+ * a modified page is still allowed to use the static native entry if the code
+ * bytes at the target match the original image; otherwise it is sticky-diverged
+ * and must execute from live RAM through the dirty interpreter. */
+/* Mutable: the runtime owns this heap buffer (main.cpp mallocs the EXE image and
+ * never frees it). Intentional data patches by the translation layer are blessed
+ * into it via dirty_ram_text_bless so they are not mistaken for self-modifying
+ * code — see dirty_ram_text_native_ok / dirty_ram_text_bless. */
+static uint8_t *text_ref_image = NULL;
+static uint32_t text_ref_lo = 0, text_ref_hi = 0;
+static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint64_t g_text_native_blocked = 0;
+static uint32_t g_text_diverged_pages = 0;
+
+void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
+                                   uint32_t len) {
+    if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
+    if (len > RAM_SIZE - phys_lo) len = RAM_SIZE - phys_lo;
+    text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
+    text_ref_lo = phys_lo;
+    text_ref_hi = phys_lo + len;
+    memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
+    g_text_native_blocked = 0;
+    g_text_diverged_pages = 0;
+}
+
+static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
+    if (!text_ref_image) return;
+    if (phys < text_ref_lo || phys + (uint32_t)size > text_ref_hi) return;
+    const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
+    uint8_t buf[4] = { (uint8_t)val, (uint8_t)(val >> 8),
+                       (uint8_t)(val >> 16), (uint8_t)(val >> 24) };
+    if (memcmp(ref, buf, (size_t)size) != 0) {
+        uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
+        text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+    }
+}
+
+int dirty_ram_text_native_ok(uint32_t phys) {
+    if (!text_ref_image || phys < text_ref_lo || phys >= text_ref_hi)
+        return !dirty_ram_is_dirty(phys);
+
+    uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t bit = 1u << (page & 31u);
+    if (text_diverged_bitmap[page >> 5] & bit) {
+        g_text_native_blocked++;
+        return 0;
+    }
+    /* Fast path: a page never touched by a guarded write AND not runtime-dirty
+     * still holds the pristine compiled image — native is safe with no compare. */
+    if (!(text_modified_bitmap[page >> 5] & bit) && !dirty_ram_is_dirty(phys))
+        return 1;
+
+    /* Flagged (a guarded write that differed, an overlay-dirty page, or an
+     * intentional runtime data patch): the compiled native code is valid IFF the
+     * bytes at the entry still match the reference image. Decide by the ACTUAL
+     * bytes, not the page-dirty heuristic — so a data-only change in a page that
+     * also holds code (e.g. a translation string table blessed into the ref via
+     * dirty_ram_text_bless) does not needlessly block a still-valid function and
+     * route it to psx_unknown_dispatch. A genuine code overwrite still diverges. */
+    uint32_t n = 256;
+    if (n > text_ref_hi - phys) n = text_ref_hi - phys;
+    if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), n) == 0)
+        return 1;
+
+    text_diverged_bitmap[page >> 5] |= bit;
+    g_text_diverged_pages++;
+    g_text_native_blocked++;
+    return 0;
+}
+
+/* Bless an INTENTIONAL data patch into the reference image so the text-divergence
+ * guard does not mistake it for self-modifying code. The runtime's own
+ * translation layer (text_xlate) patches string/glyph tables that share 4 KB
+ * pages — and the guard's 256-byte compare window — with real compiled functions.
+ * Without this, patching a data table diverges the page and blocks native
+ * dispatch of every function in it (a real function fatally routes to
+ * psx_unknown_dispatch). By updating text_ref_image to match the patched bytes,
+ * the compare passes for the intentional change while a genuine game write of
+ * DIFFERENT bytes still diverges and is still caught. Clears the sticky diverged
+ * bit for affected pages so the guard re-evaluates against the updated reference.
+ * Byte-for-byte identical writes are a no-op. */
+void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
+    if (!text_ref_image || !bytes || len == 0) return;
+    if (phys >= text_ref_hi || phys + len <= text_ref_lo) return;   /* out of range */
+    uint32_t lo = phys < text_ref_lo ? text_ref_lo : phys;
+    uint32_t hi = phys + len > text_ref_hi ? text_ref_hi : phys + len;
+    if (hi <= lo) return;
+    uint8_t *ref = text_ref_image + (lo - text_ref_lo);
+    const uint8_t *src = bytes + (lo - phys);
+    if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
+    memcpy(ref, src, hi - lo);
+    /* Re-open the affected pages: clear the sticky diverged bit so the next
+     * dispatch re-runs the compare against the now-updated reference. */
+    uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page  = (hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; page++)
+        text_diverged_bitmap[page >> 5] &= ~(1u << (page & 31u));
+}
+
+uint64_t dirty_ram_text_native_blocked(void) { return g_text_native_blocked; }
+uint32_t dirty_ram_text_diverged_pages(void) { return g_text_diverged_pages; }
 
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
@@ -837,6 +966,16 @@ uint32_t psx_read_word(uint32_t addr) {
     if (!psx_get_in_exception()) ls_read_hook(addr, 4, v);
     return v;
 }
+/* Physical address of a CPU/DMA main-RAM access. Fold KUSEG/KSEG0/KSEG1 first
+ * (0x1FFFFFFF), then fold the 2nd-4th main-RAM mirrors: real hardware mirrors the
+ * 2 MB DRAM across the WHOLE 0..0x7FFFFF physical window (Beetle libretro.cpp:874
+ * `A < 0x00800000` routes to main RAM; psx-spx "2048K RAM ... mirrored 4x"). A game
+ * may legitimately place its stack at the top of that window — Tsumu Light computes
+ * sp = (ramtop-8)|0x80000000 with its ramtop constant 0x00800000, giving sp=0x807FFFF8
+ * (top of the 4th mirror). Without this fold those accesses miss DRAM (`< RAM_SIZE`
+ * fails) and hit open bus: stores drop, loads return 0, so the first saved return
+ * address reads back 0 and `jr ra` derails to PC=0. Identity for phys < RAM_SIZE, so
+ * normal-range RAM is byte-identical; MMIO/scratchpad/BIOS (>= 0x800000) untouched. */
 static uint32_t psx_read_word_raw(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
@@ -850,7 +989,7 @@ static uint32_t psx_read_word_raw(uint32_t addr) {
      * fatal (frame 9705). Ignore writes, read as 0, count for telemetry. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         uint32_t v = (uint32_t)ram[phys]
@@ -940,7 +1079,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
      * We have no cache model, so silently discard RAM/scratchpad writes. */
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
@@ -948,6 +1087,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         parity_trace_note_write(phys, 4, effective_store_pc());
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
+        text_guard_note_write(phys, val, 4);
         overlay_watch_note_write(phys, 4);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
@@ -998,7 +1138,7 @@ uint16_t psx_read_half(uint32_t addr) {
 static uint16_t psx_read_half_raw(uint32_t addr) {
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
@@ -1033,13 +1173,14 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
         parity_trace_note_write(phys, 2, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
+        text_guard_note_write(phys, (uint32_t)val, 2);
         overlay_watch_note_write(phys, 2);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
@@ -1081,7 +1222,7 @@ uint8_t psx_read_byte(uint32_t addr) {
 static uint8_t psx_read_byte_raw(uint32_t addr) {
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         return ram[phys];
@@ -1260,13 +1401,14 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
+        text_guard_note_write(phys, (uint32_t)val, 1);
         overlay_watch_note_write(phys, 1);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }

@@ -1,6 +1,7 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
 #include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include <string.h>
 #include <stdlib.h>
@@ -43,6 +44,13 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
 int fntrace_is_game_started(void) { return s_game_started; }
 
 static inline int armed_match(uint32_t target) {
+    /* PSX_FNTRACE_ALL=1 records every dispatch from power-on — the ring
+     * then holds the earliest boot execution (before any TCP client can
+     * arm it) for offline first-divergence diffs. Checked once. */
+    static int boot_all = -1;
+    if (boot_all == -1) { const char *e = getenv("PSX_FNTRACE_ALL");
+                          boot_all = (e && *e && *e != '0') ? 1 : 0; }
+    if (boot_all) return 1;
     if (s_arm_record_all) return 1;
     /* Hot path: when nothing is armed, record nothing. Recording every
      * dispatch by default makes the ring fill in seconds and burns ~10%
@@ -56,6 +64,15 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* On-the-fly string translation (framework feature — text_xlate.cpp). The
+     * generated psx_dispatch_impl calls us at the top of each dispatch iteration
+     * with cpu->gpr[4..7] holding THIS call's args, BEFORE the target function
+     * runs — the exact chokepoint to (a) capture every source string drawn and
+     * (b) repoint a string-arg at a translated replacement so the game's own
+     * renderer draws it. Cheap no-op when uninitialised/disarmed. No BIOS regen
+     * (runtime-side), works in Release. See docs/STRING_TRANSLATION.md. */
+    text_xlate_on_dispatch(cpu, target);
+
     /* General parity ring: one DISPATCH row per leader while current_tcb matches
      * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
      * a single branch on this hot path. pc==target (the leader being entered). */
@@ -101,11 +118,18 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             boot_state_trigger_capture(cpu);
         }
     }
-    if (!armed_match(target)) return;
     /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
      * preserves the pre-divergence window instead of evicting it. */
     extern int g_insn_log_frozen;
-    if (g_insn_log_frozen) return;
+    int was_frozen = g_insn_log_frozen;
+    /* Null-page dispatch guard: a dispatch whose phys target sits below the
+     * exception vectors (0x80/0xA0) is a jump through a null/garbage pointer —
+     * the wedge itself, never legitimate code. Latch the capture freeze so the
+     * ring preserves the window that led here (this culprit entry, with its
+     * ra, still records; the wedge storm after it does not). */
+    if ((target & 0x1FFFFFFFu) < 0x40u) g_insn_log_frozen = 1;
+    if (!armed_match(target)) return;
+    if (was_frozen) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];
     e->frame  = (uint32_t)s_frame_count;

@@ -8,7 +8,7 @@ body {
 	background-color: #0b0e14;
 	font-size: 15dp;
 }
-#root { width: 100%; height: 100%; display: block; }
+#root { width: 100%; height: 100%; display: block; overflow-y: auto; }
 #frame { display: block; padding: 22dp 26dp; }
 
 /* ---- top bar ---- */
@@ -34,6 +34,12 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 	padding: 18dp 22dp;
 	margin-bottom: 13dp;
 }
+/* Settings view: two side-by-side columns so the panels use the horizontal
+   space and the view fits without scrolling. SYSTEM stays full-width below
+   (its BIOS/disc paths need the room). */
+.settings-cols { display: flex; flex-direction: row; align-items: flex-start; }
+.settings-col { display: block; flex: 1 1 0; min-width: 0; }
+.settings-col:first-child { margin-right: 13dp; }
 .cards-row { display: flex; flex-direction: row; align-items: stretch; margin-bottom: 13dp; }
 .card {
 	display: block;
@@ -170,6 +176,23 @@ button:hover { background-color: #232d3c; }
 .path { flex: 1 1 auto; min-width: 0dp; margin-left: 12dp; color: #7d8590;
 	white-space: nowrap; overflow: hidden; }
 .path.empty { color: #f85149; }
+
+/* ---- controls / keybind rebind view ---- */
+.kb-head { display: flex; flex-direction: row; align-items: center; margin-bottom: 16dp; }
+.kb-player-lbl { color: #adbac7; margin-right: 10dp; }
+.kb-hint { color: #7d8590; font-size: 12dp; margin-left: 18dp; flex: 1 1 auto;
+	white-space: nowrap; overflow: hidden; }
+.kb-reset { background-color: #1b2330; border: 1dp #2b3543; border-radius: 7dp;
+	color: #e6e9ef; padding: 7dp 14dp; margin-left: 12dp; }
+.kb-reset:hover { border-color: #3b82f6; }
+.rebind-list { display: block; }
+.rb-row { display: flex; flex-direction: row; align-items: center; margin-bottom: 8dp; }
+.rb-label { width: 130dp; flex: 0 0 130dp; color: #adbac7; font-size: 13dp; }
+.rb-chip { width: 150dp; flex: 0 0 150dp; text-align: center; margin-right: 34dp;
+	background-color: #161d28; border: 1dp #2b3543; border-radius: 7dp;
+	color: #e6e9ef; padding: 7dp 10dp; }
+.rb-chip:hover { border-color: #3b82f6; }
+.rb-chip--scan { border-color: #f0b429; color: #f0b429; }
 
 /* ---- footer ---- */
 .footer { display: flex; flex-direction: row; align-items: center; margin-top: 6dp;
@@ -320,9 +343,11 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 		</div>
 		<div class="topbar-actions">
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_tweaks">Tweaks</button>
+			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_controls">Controls</button>
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
 			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 			<button class="top-btn primary" data-if="view == 'tweaks'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+			<button class="top-btn primary" data-if="view == 'controls'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 		</div>
 	</div>
 
@@ -449,6 +474,8 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 
 	<!-- ================= SETTINGS VIEW ================= -->
 	<div data-if="view == 'settings'">
+		<div class="settings-cols">
+		<div class="settings-col">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
 			<div class="set-row"><span class="set-lbl">Window size</span><span class="set-ctl">
@@ -474,6 +501,13 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
 		</div>
+		</div>
+		<div class="settings-col">
+		<div class="panel" data-if="lang_menu">
+			<div class="eyebrow">LOCALIZATION</div>
+			<div class="set-row"><span class="set-lbl">Language</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_language"><span class="value">{{lang_label}}</span></button></span></div>
+		</div>
 		<div class="panel">
 			<div class="eyebrow">AUDIO</div>
 			<div class="set-row"><span class="set-lbl">SPU high-quality (float shadow)</span><span class="set-ctl">
@@ -483,6 +517,8 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 			<div class="eyebrow">CONTROLLER</div>
 			<div class="set-row"><span class="set-lbl">Analog stick deadzone</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_deadzone"><span class="value">{{deadzone_pct}}%</span></button></span></div>
+		</div>
+		</div>
 		</div>
 		<div class="panel">
 			<div class="eyebrow">SYSTEM</div>
@@ -528,6 +564,23 @@ sliderarrowdec, sliderarrowinc { width: 0dp; height: 0dp; }
 				</div>
 				<div class="tweaks-status" data-if="tweaks_status != ''" data-class-ok="tweaks_variant != ''" data-class-busy="tweaks_busy">{{tweaks_status}}</div>
 			</div>
+		</div>
+	</div>
+
+	<!-- ================= CONTROLS (KEYBOARD KEYBINDS) VIEW ================= -->
+	<div data-if="view == 'controls'">
+		<div class="panel">
+			<div class="eyebrow">KEYBOARD CONTROLS</div>
+			<div class="kb-head">
+				<span class="kb-player-lbl">Player</span>
+				<div class="seg">
+					<span class="seg-opt" data-class-on="cfg_player == 0" data-event-click="cfg_player_1">1</span>
+					<span class="seg-opt" data-class-on="cfg_player == 1" data-event-click="cfg_player_2">2</span>
+				</div>
+				<span class="kb-hint">Click a key, then press the new key to bind it. Esc cancels. Changes save instantly.</span>
+				<button class="kb-reset" data-event-click="rebind_reset">Reset to defaults</button>
+			</div>
+			<div id="rebind-list" class="rebind-list"></div>
 		</div>
 	</div>
 

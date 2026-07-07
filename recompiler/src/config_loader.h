@@ -48,6 +48,19 @@ struct RuntimeConfig {
     bool                  has_debug_port = false;
     uint16_t              debug_port     = 0;
 
+    // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
+    // language selects the translations/*.toml column; "jp"/"off"/"" disables
+    // APPLY (capture still runs). From [localization].language or [runtime].
+    // language; env PSX_LANG overrides at runtime. Also the launcher default.
+    std::string           language = "en";
+
+    // Optional launcher-facing language menu. When a game declares
+    // [localization].languages, the launcher shows a "Localization" dropdown of
+    // these {code,label} options (code feeds `language`; "off"/"jp"/"" = the
+    // untranslated native game). Empty => no dropdown (the general default).
+    struct LanguageOption { std::string code; std::string label; };
+    std::vector<LanguageOption> languages;
+
     bool                  has_window_title = false;
     std::string           window_title;
 
@@ -79,15 +92,18 @@ struct RuntimeConfig {
     // at host speed. Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
 
-    // bios_hle: opt-in High-Level Emulation tier for BIOS kernel services
-    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). Default off =
-    // LLE (the recompiled BIOS), which remains the reference implementation
-    // and the oracle. When on, implemented kernel services are computed
-    // in-runtime against the real guest kernel structures and every other
-    // call falls through to LLE. Implies the HLE boot shell-skip unless
-    // bios_hle_keep_intro. PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env
-    // override at launch. Runtime: runtime/src/bios_hle.c.
-    bool                  bios_hle = false;
+    // bios_hle: High-Level Emulation tier for BIOS kernel services
+    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). DEFAULT ON as of
+    // 2026-07-06 (user-directed player default: instant boot-skip for every
+    // game). Opt OUT with [runtime] bios_hle = false or env PSX_BIOS_HLE=0 to run
+    // pure LLE (the recompiled BIOS), which REMAINS the reference implementation
+    // and the oracle — this only flips the default, LLE is still fully linked and
+    // selectable. When on, implemented kernel services are computed in-runtime
+    // against the real guest kernel structures and every other call falls through
+    // to LLE. Implies the HLE boot shell-skip unless bios_hle_keep_intro.
+    // PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env override at launch.
+    // Runtime: runtime/src/bios_hle.c.
+    bool                  bios_hle = true;
     bool                  bios_hle_keep_intro = false;
 
     // hle_scheduler: the HLE tier's standing SUBSYSTEM REPLACEMENT for guest
@@ -560,6 +576,10 @@ struct UserSettings {
     // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
     // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
     bool has_deadzone  = false; int  deadzone  = 12000;
+    // Localization: the launcher's chosen language code (feeds RuntimeConfig
+    // .language / g_lang). "off"/"jp"/"" = untranslated native game. Persisted to
+    // settings.toml [localization].language.
+    bool has_language = false; std::string language = "en";
 };
 
 // GameOptions — the game's OWN native OPTION-screen settings, declared in a
