@@ -49,10 +49,48 @@ struct TweakParamSite {
 };
 using TweakParamMap = std::map<uint32_t, TweakParamSite>;
 
-// Full parse of a tweaks_bake.toml: guarded-variant sites + parameterized sites.
+// -------------------------------------------------------------------------
+// Function-variant bake (TWEAKS_PREBAKE.md §13 — dual-source).
+// An instruction-level guarded site (above) cannot represent a CONTROL-FLOW
+// tweak: the block structure is baked from the vanilla CFG, so a patched
+// j/jal/branch can't restructure it mid-block. A function-variant instead
+// emits the WHOLE function twice — once from vanilla bytes, once from a
+// patched-image VIEW (the word overrides below applied) whose CFG is
+// re-analyzed — and a `func_XXXX` dispatcher picks the body at ENTRY via
+// psx_tweak_on(flag_bit). The flag is immutable at runtime (set at boot,
+// relaunch-to-apply), so re-entered CPS continuations resolve to the same
+// variant every time. flags-off => the vanilla body runs (byte-behaviour
+// identical to a non-tweak build).
+// -------------------------------------------------------------------------
+
+// One instruction word this variant patches (drives BOTH the re-analyzed CFG
+// and the translation via PS1Executable::set_word_override).
+struct TweakWordOverride {
+    uint32_t addr;
+    uint32_t vanilla_word;   // gen-time drift check vs the image
+    uint32_t patched_word;
+};
+
+// One patched variant of a function: its flag bit + the words it overrides.
+struct TweakFuncVariant {
+    int                            flag_bit;
+    std::vector<TweakWordOverride> overrides;
+};
+
+// All variants for one function entry address.
+struct TweakFuncSite {
+    std::vector<TweakFuncVariant> variants;
+};
+
+// func_start_addr -> its variants.
+using TweakFuncMap = std::map<uint32_t, TweakFuncSite>;
+
+// Full parse of a tweaks_bake.toml: guarded-variant sites + parameterized
+// sites + control-flow function-variants.
 struct TweakBake {
     TweakGuardMap guarded;
     TweakParamMap param;
+    TweakFuncMap  func_variants;
 };
 
 } // namespace PSXRecomp

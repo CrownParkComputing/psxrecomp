@@ -133,6 +133,10 @@ struct CodeGenConfig {
     // Parameterized value-immediate sites (strategy B): the immediate is emitted
     // as g_tweak_param[index] instead of a literal. Empty => no param reads.
     TweakParamMap tweak_param_sites;
+    // Control-flow function-variants (TWEAKS_PREBAKE.md §13, dual-source): a
+    // function whose entry dispatches vanilla-vs-patched whole-body variants by
+    // g_tweak_flags bit. Empty (the default, no --tweaks-bake) => byte-identical.
+    TweakFuncMap tweak_func_sites;
 
     CodeGenConfig()
         : emit_comments(true)
@@ -161,10 +165,15 @@ public:
     // flow (ControlFlowType::None), emit a tail call to that function before '}'.
     // This handles MIPS functions that fall through into the next function without
     // an explicit jr/j instruction.
+    // name_override: emit the body under this C name/signature instead of
+    // func.name (used for tweak function-variants: func_XXXX__tw_van /
+    // func_XXXX__tw_b<bit>). The CPS continuation owner stays func.start_addr
+    // so a dispatched continuation still routes through the func_XXXX dispatcher.
     GeneratedFunction generate_function(
         const Function& func,
         const ControlFlowGraph& cfg,
-        const std::string& fallthrough_name = "");
+        const std::string& fallthrough_name = "",
+        const std::string& name_override = "");
 
     // Generate C code for all functions
     std::vector<GeneratedFunction> generate_all_functions(

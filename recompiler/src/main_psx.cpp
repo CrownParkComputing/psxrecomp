@@ -806,11 +806,14 @@ int main(int argc, char** argv) {
         PSXRecomp::TweakBake bake = PSXRecompV4::load_tweak_bake(tweaks_bake_path);
         codegen_config.tweak_guard_sites = std::move(bake.guarded);
         codegen_config.tweak_param_sites = std::move(bake.param);
-        if (!codegen_config.tweak_guard_sites.empty() || !codegen_config.tweak_param_sites.empty())
-            fmt::print("  tweaks bake = {} ({} guarded, {} param site(s))\n",
+        codegen_config.tweak_func_sites  = std::move(bake.func_variants);
+        if (!codegen_config.tweak_guard_sites.empty() || !codegen_config.tweak_param_sites.empty()
+            || !codegen_config.tweak_func_sites.empty())
+            fmt::print("  tweaks bake = {} ({} guarded, {} param, {} func-variant site(s))\n",
                        tweaks_bake_path.string(),
                        codegen_config.tweak_guard_sites.size(),
-                       codegen_config.tweak_param_sites.size());
+                       codegen_config.tweak_param_sites.size(),
+                       codegen_config.tweak_func_sites.size());
     } catch (const std::exception& e) {
         fmt::print(stderr, "FATAL: --tweaks-bake load failed: {}\n", e.what());
         return 1;

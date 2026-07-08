@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <map>
 #include <filesystem>
 
 namespace PSXRecomp {
@@ -61,6 +62,17 @@ public:
     PS1ExeHeader header;
     std::vector<uint8_t> code_data;  // Raw binary (file_size bytes)
 
+    // Compile-free Tweaks dual-source (TWEAKS_PREBAKE.md §13): a patched-image
+    // VIEW. When generating a tweak function-variant, the affected instruction
+    // words are overridden here so BOTH the CFG re-analysis (analyze_function)
+    // and the block translation (translate_basic_block) see the patched bytes,
+    // then cleared to restore the vanilla view. mutable + const setters so the
+    // code generator's `const PS1Executable& exe_` can drive it. Empty in every
+    // normal (non-variant) code path => read_word is byte-identical to before.
+    mutable std::map<uint32_t, uint32_t> word_overrides_;
+    void set_word_override(uint32_t addr, uint32_t word) const { word_overrides_[addr] = word; }
+    void clear_word_overrides() const { word_overrides_.clear(); }
+
     // Computed properties
     uint32_t load_address() const { return header.load_address; }
     uint32_t entry_point() const { return header.initial_pc; }
@@ -71,6 +83,10 @@ public:
     std::optional<uint32_t> read_word(uint32_t address) const {
         if (address < load_address() || address >= end_address()) {
             return std::nullopt;  // Out of range
+        }
+        if (!word_overrides_.empty()) {
+            auto it = word_overrides_.find(address);
+            if (it != word_overrides_.end()) return it->second;  // patched-image view
         }
         uint32_t offset = address - load_address();
         if (offset + 3 >= code_data.size()) {

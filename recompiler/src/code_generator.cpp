@@ -2120,11 +2120,13 @@ int CodeGenerator::detect_backdrop_windows(const ControlFlowGraph& cfg) {
 GeneratedFunction CodeGenerator::generate_function(
     const Function& func,
     const ControlFlowGraph& cfg,
-    const std::string& fallthrough_name) {
+    const std::string& fallthrough_name,
+    const std::string& name_override) {
 
     GeneratedFunction result;
-    result.function_name = func.name;
-    result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+    const std::string emit_name = name_override.empty() ? func.name : name_override;
+    result.function_name = emit_name;
+    result.signature = fmt::format("void {}(CPUState* cpu)", emit_name);
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
     // translate_instruction widens this function's width compares. Cleared for
@@ -2608,6 +2610,62 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
         auto ft_it = func_name_by_addr.find(next_addr);
         if (ft_it != func_name_by_addr.end()) {
             fallthrough_name = ft_it->second;
+        }
+
+        // ---- Compile-free Tweaks function-variants (TWEAKS_PREBAKE.md §13) ----
+        // A control-flow tweak can't be an instruction-level guard, so emit the
+        // WHOLE function as vanilla + per-variant patched bodies (each re-analyzed
+        // from a patched-image view) as separate static-named functions, plus a
+        // func_XXXX dispatcher that selects the body at ENTRY by flag. flags-off =>
+        // the vanilla body runs. The dispatcher keeps func.name so the dispatch
+        // table + CPS continuation owner (func.start_addr) resolve through it.
+        {
+            auto tfv_it = config_.tweak_func_sites.find(func.start_addr);
+            if (tfv_it != config_.tweak_func_sites.end() && !tfv_it->second.variants.empty()) {
+                const TweakFuncSite& site = tfv_it->second;
+                GeneratedFunction vbody =
+                    generate_function(func, cfg, fallthrough_name, func.name + "__tw_van");
+                total_lines += vbody.line_count;
+                results.push_back(std::move(vbody));
+
+                ControlFlowAnalyzer tfv_cfg_analyzer(exe_);
+                for (const TweakFuncVariant& var : site.variants) {
+                    for (const TweakWordOverride& ov : var.overrides) {
+                        auto cur = exe_.read_word(ov.addr);
+                        if (!cur.has_value() || *cur != ov.vanilla_word) {
+                            fmt::print(stderr,
+                                "FATAL: tweak func-variant 0x{:08X} bit {} drift at 0x{:08X}: "
+                                "image 0x{:08X} != manifest van 0x{:08X}\n",
+                                func.start_addr, var.flag_bit, ov.addr,
+                                cur.value_or(0), ov.vanilla_word);
+                            std::exit(1);
+                        }
+                        exe_.set_word_override(ov.addr, ov.patched_word);
+                    }
+                    ControlFlowGraph vcfg = tfv_cfg_analyzer.analyze_function(func);
+                    GeneratedFunction pbody = generate_function(
+                        func, vcfg, fallthrough_name,
+                        fmt::format("{}__tw_b{}", func.name, var.flag_bit));
+                    exe_.clear_word_overrides();
+                    total_lines += pbody.line_count;
+                    results.push_back(std::move(pbody));
+                }
+
+                GeneratedFunction disp;
+                disp.function_name = func.name;
+                disp.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+                std::string db = "{\n";
+                for (const TweakFuncVariant& var : site.variants)
+                    db += fmt::format("    if (psx_tweak_on({})) {{ {}__tw_b{}(cpu); return; }}\n",
+                                      var.flag_bit, func.name, var.flag_bit);
+                db += fmt::format("    {}__tw_van(cpu);\n}}\n", func.name);
+                disp.body = db;
+                disp.full_code = disp.signature + "\n" + disp.body;
+                disp.line_count = (int)std::count(disp.full_code.begin(), disp.full_code.end(), '\n');
+                total_lines += disp.line_count;
+                results.push_back(std::move(disp));
+                continue;
+            }
         }
 
         GeneratedFunction gen_func = generate_function(func, cfg, fallthrough_name);

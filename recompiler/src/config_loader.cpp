@@ -890,6 +890,23 @@ PSXRecomp::TweakBake load_tweak_bake(const fs::path& path) {
             bake.param[addr] = PSXRecomp::TweakParamSite{idx, (uint16_t)imm, def};
         }
     }
+    // Control-flow function-variants (§13 dual-source). Flat rows grouped by
+    // (func, bit): each row is one word this variant overrides. A func may carry
+    // several variants (bits); a variant may override several words.
+    if (doc.contains("func_variant")) {
+        for (const auto& row : toml::find<toml::array>(doc, "func_variant")) {
+            uint32_t func = parse_hex(toml::find<std::string>(row, "func"), "tweaks [[func_variant]] func");
+            uint32_t addr = parse_hex(toml::find<std::string>(row, "addr"), "tweaks [[func_variant]] addr");
+            uint32_t van  = parse_hex(toml::find<std::string>(row, "van"),  "tweaks [[func_variant]] van");
+            uint32_t word = parse_hex(toml::find<std::string>(row, "word"), "tweaks [[func_variant]] word");
+            int      bit  = static_cast<int>(toml::find<int64_t>(row, "bit"));
+            auto& site = bake.func_variants[func];
+            PSXRecomp::TweakFuncVariant* var = nullptr;
+            for (auto& v : site.variants) if (v.flag_bit == bit) { var = &v; break; }
+            if (!var) { site.variants.push_back(PSXRecomp::TweakFuncVariant{bit, {}}); var = &site.variants.back(); }
+            var->overrides.push_back(PSXRecomp::TweakWordOverride{addr, van, word});
+        }
+    }
     return bake;
 }
 
