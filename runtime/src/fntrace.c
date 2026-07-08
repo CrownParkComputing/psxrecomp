@@ -128,6 +128,22 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             extern void tweak_runtime_apply(void);
             tweak_runtime_apply();
 
+            /* Tweaks patched disc: the recompiled BIOS just loaded the disc's
+             * (patched) SLUS into RAM, but the text-divergence reference was armed
+             * from the vanilla exe= file. Re-arm it from the loaded image so the
+             * guard accepts the disc's SLUS as authorized and keeps running BAKED
+             * code (the recomp executes vanilla func_XXXX; disc SLUS code patches
+             * are not applied — code tweaks come from the flag/param bake). Without
+             * this the guard routes the patched pages to the dirty-RAM interpreter,
+             * which fatals on injected-code unknown dispatch. Non-SLUS disc assets
+             * (art, localization) apply regardless. Before the pokes so their
+             * bless() lands on top of the re-armed reference. */
+            extern int g_tweaks_disc_active;
+            if (g_tweaks_disc_active) {
+                extern void dirty_ram_text_rearm_from_ram(void);
+                dirty_ram_text_rearm_from_ram();
+            }
+
             extern void dirty_ram_clear_image_baseline(void);
             dirty_ram_clear_image_baseline();
             cdrom_notify_game_started();

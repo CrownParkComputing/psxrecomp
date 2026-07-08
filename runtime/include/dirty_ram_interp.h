@@ -107,6 +107,10 @@ int      dirty_ram_text_native_ok(uint32_t phys);
 /* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
  * into the text reference image so it is not mistaken for self-modifying code. */
 void     dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len);
+/* Re-arm the whole text reference from the currently loaded guest RAM image
+ * (Tweaks patched-disc: accept the disc's loaded SLUS as authorized so the guard
+ * keeps running baked code instead of interpreting patched bytes). */
+void     dirty_ram_text_rearm_from_ram(void);
 uint64_t dirty_ram_text_native_blocked(void);
 uint32_t dirty_ram_text_diverged_pages(void);
 

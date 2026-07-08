@@ -561,6 +561,12 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
 // next to the exe, target it; a vanilla selection leaves it absent -> stock disc runs.
 // "The file decides what's active" — no separate variant build, the stock binary just
 // mounts the patched disc. Returns {} when no patched sibling is present.
+// Set when a Tweaks patched disc (<stem>.tweaks.*) is mounted: the game-start hook
+// re-arms the text-divergence reference from the loaded (patched) SLUS so the guard
+// keeps running baked code instead of interpreting patched bytes. See
+// dirty_ram_text_rearm_from_ram (memory.c).
+extern "C" { int g_tweaks_disc_active = 0; }
+
 static std::filesystem::path resolve_tweaks_disc_sibling(const std::filesystem::path& stock_disc,
                                                          const std::string& game_id,
                                                          const char* argv0) {
@@ -579,6 +585,7 @@ static std::filesystem::path resolve_tweaks_disc_sibling(const std::filesystem::
             if (std::filesystem::exists(cand) && validate_disc_for_launch(cand, game_id)) {
                 std::fprintf(stdout,
                     "psxrecomp: Tweaks patched disc active -> %s\n", cand.string().c_str());
+                g_tweaks_disc_active = 1;
                 return cand;
             }
         }

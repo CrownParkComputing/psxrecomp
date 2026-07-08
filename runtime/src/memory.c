@@ -161,6 +161,26 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     g_text_diverged_pages = 0;
 }
 
+/* Re-arm the text-divergence reference from the CURRENTLY loaded guest RAM image.
+ * Used when a compile-free Tweaks PATCHED DISC is mounted: the recompiled BIOS
+ * loads the disc's (patched) SLUS into RAM, but the reference was armed from the
+ * vanilla exe= file, so the guard flags every patched byte as self-modifying code
+ * and routes those pages to the dirty-RAM interpreter — which runs the patched
+ * (uncompiled, possibly code-injecting) bytes and can fatal on unknown dispatch.
+ * Re-arming to the loaded image tells the guard "this IS the authorized image", so
+ * the dispatch keeps running the BAKED code (the recomp always executes vanilla
+ * func_XXXX; SLUS code patches on the disc are simply not applied — code tweaks
+ * come from the flag/param bake). Non-SLUS disc assets (art, localization) still
+ * apply. Call once at game start (after the EXE is loaded), before the pokes. */
+void dirty_ram_text_rearm_from_ram(void) {
+    if (!text_ref_image || text_ref_hi <= text_ref_lo) return;
+    memcpy(text_ref_image, ram + text_ref_lo, text_ref_hi - text_ref_lo);
+    memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
+    g_text_native_blocked = 0;
+    g_text_diverged_pages = 0;
+}
+
 static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
     if (!text_ref_image) return;
     if (phys < text_ref_lo || phys + (uint32_t)size > text_ref_hi) return;
