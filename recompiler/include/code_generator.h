@@ -130,6 +130,9 @@ struct CodeGenConfig {
     // g_tweak_flags bit. Empty (the default, no --tweaks-bake) => generated code
     // is byte-identical to a build without the feature.
     TweakGuardMap tweak_guard_sites;
+    // Parameterized value-immediate sites (strategy B): the immediate is emitted
+    // as g_tweak_param[index] instead of a literal. Empty => no param reads.
+    TweakParamMap tweak_param_sites;
 
     CodeGenConfig()
         : emit_comments(true)

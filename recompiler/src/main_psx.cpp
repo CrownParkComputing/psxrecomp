@@ -803,11 +803,14 @@ int main(int argc, char** argv) {
     // Loaded directly into the codegen config — one line, no GameConfig field or
     // per-site copy dance. Empty (no --tweaks-bake) => byte-identical output.
     try {
-        codegen_config.tweak_guard_sites =
-            PSXRecompV4::load_tweak_bake(tweaks_bake_path);
-        if (!codegen_config.tweak_guard_sites.empty())
-            fmt::print("  tweaks bake = {} ({} guarded site(s))\n",
-                       tweaks_bake_path.string(), codegen_config.tweak_guard_sites.size());
+        PSXRecomp::TweakBake bake = PSXRecompV4::load_tweak_bake(tweaks_bake_path);
+        codegen_config.tweak_guard_sites = std::move(bake.guarded);
+        codegen_config.tweak_param_sites = std::move(bake.param);
+        if (!codegen_config.tweak_guard_sites.empty() || !codegen_config.tweak_param_sites.empty())
+            fmt::print("  tweaks bake = {} ({} guarded, {} param site(s))\n",
+                       tweaks_bake_path.string(),
+                       codegen_config.tweak_guard_sites.size(),
+                       codegen_config.tweak_param_sites.size());
     } catch (const std::exception& e) {
         fmt::print(stderr, "FATAL: --tweaks-bake load failed: {}\n", e.what());
         return 1;

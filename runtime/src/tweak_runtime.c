@@ -27,6 +27,12 @@ extern uint8_t psx_read_byte(uint32_t addr);                /* memory.c */
  * and forced to the interpreter (memory.c). */
 extern void    dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len);
 
+/* Seed g_tweak_param[] with the baked vanilla defaults. The recompiler emits a
+ * STRONG definition into the game's generated C (from the --tweaks-bake param
+ * sites); this weak no-op is the fallback for builds with no param sites (or no
+ * generated game code), so the call below always links. */
+__attribute__((weak)) void psx_tweak_param_seed(void) {}
+
 #define TWEAK_MAX_POKE     1024      /* large data tables chunk into many poke lines */
 #define TWEAK_POKE_BYTES     64      /* max bytes per poke line (emitter chunks to 32) */
 #define TWEAK_FORMAT_VERSION 1
@@ -66,6 +72,9 @@ static int parse_hexbytes(const char *s, uint8_t *out, int cap) {
 
 void tweak_runtime_configure(const char *state_path) {
     reset();
+    /* Seed parameterized-immediate defaults BEFORE parsing overrides, so a param
+     * the state file doesn't set reads its baked vanilla value (identity). */
+    psx_tweak_param_seed();
     g_ver_bad = 0;
     g_path[0] = '\0';
     if (!state_path) return;

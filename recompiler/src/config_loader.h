@@ -671,7 +671,7 @@ GameOptions load_game_options(const std::filesystem::path& path);
 // addr into per-site case lists. Returns an empty map if the file is missing
 // (feature off => byte-identical build); throws on a malformed row so a stale/
 // corrupt manifest is surfaced, not silently dropped. See tweak_sites.h.
-PSXRecomp::TweakGuardMap load_tweak_bake(const std::filesystem::path& path);
+PSXRecomp::TweakBake load_tweak_bake(const std::filesystem::path& path);
 
 // Load settings.toml. Returns an all-defaults (all has_*=false) struct if the
 // file is missing or unreadable. Malformed values are skipped (best-effort:

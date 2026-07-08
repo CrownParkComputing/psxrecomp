@@ -747,6 +747,51 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
 }
 
 std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
+    // Compile-free Tweaks parameterized value immediate (strategy B): emit the
+    // 16-bit immediate as a runtime read g_tweak_param[index] instead of a literal,
+    // seeded to the vanilla value so it is identity until tweaks.state overrides it.
+    // Only real value-immediate opcodes are param sites (addiu/slti/sltiu/ori-li);
+    // the bake never emits a param row for masks, offsets, control flow, or
+    // register-form words, so the opcode check below is a drift assert, not a
+    // filter. Mirrors the widescreen psx_ws_x_margin() site rewrite.
+    if (!config_.tweak_param_sites.empty()) {
+        auto pit = config_.tweak_param_sites.find(addr);
+        if (pit != config_.tweak_param_sites.end()) {
+            uint32_t op = (instr >> 26) & 0x3F;
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            const int i = pit->second.index;
+            std::string cm = config_.emit_comments
+                ? fmt::format("  /* 0x{:08X}: 0x{:08X} tweak.param[{}] */", addr, instr, i)
+                : std::string{};
+            auto drift = [&](const char* want) {
+                if (config_.overlay_mode) return false;   // addr is other code in this variant
+                fmt::print(stderr, "ERROR: [tweaks] param site 0x{:08X} not {} "
+                           "(opcode 0x{:02X} imm 0x{:04X} vs 0x{:04X})\n",
+                           addr, want, op, imm, pit->second.vanilla_imm);
+                std::exit(1);
+                return true;
+            };
+            if (imm != pit->second.vanilla_imm && !config_.overlay_mode) drift("(vanilla imm)");
+            if (rt == 0) { /* write-to-$zero: no value produced — emit vanilla */ }
+            else if (op == 0x09 || op == 0x08) {          // addiu / addi
+                return (rs == 0)
+                    ? fmt::format("{} = (uint32_t)g_tweak_param[{}];{}", reg_name(rt), i, cm)
+                    : fmt::format("{} = {} + (uint32_t)g_tweak_param[{}];{}", reg_name(rt), reg_name(rs), i, cm);
+            }
+            else if (op == 0x0A)                          // slti
+                return fmt::format("{} = ((int32_t){} < g_tweak_param[{}]) ? 1 : 0;{}",
+                                   reg_name(rt), reg_name(rs), i, cm);
+            else if (op == 0x0B)                          // sltiu
+                return fmt::format("{} = ({} < (uint32_t)g_tweak_param[{}]) ? 1 : 0;{}",
+                                   reg_name(rt), reg_name(rs), i, cm);
+            else if (op == 0x0D && rs == 0)               // ori li-form (rt = imm)
+                return fmt::format("{} = (uint32_t)g_tweak_param[{}];{}", reg_name(rt), i, cm);
+            else if (!config_.overlay_mode) drift("a parameterizable value opcode");
+            // overlay variant or write-to-$zero: fall through to vanilla.
+        }
+    }
+
     // Compile-free Tweaks guarded-variant bake (tweak_sites.h, TWEAKS_PREBAKE.md
     // Phase 3). At a baked site, emit a runtime-flag-selected if/else-if chain
     // over the option(s)' patched word(s), falling through to the vanilla
@@ -2652,6 +2697,18 @@ std::string CodeGenerator::generate_file(
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n";
     ss << "extern uint32_t g_debug_last_store_pc;  /* exact PC of the executing SW/SH/SB — wtrace/readtrace producer attribution (debug_server.c) */\n\n";
+
+    // Compile-free Tweaks parameterized-immediate defaults (strategy B). Seed each
+    // g_tweak_param[index] with the vanilla value so an unset param reads identical
+    // to vanilla; tweak_runtime_configure() calls this once before applying any
+    // tweaks.state override. Always emitted (empty body when no param sites) so the
+    // runtime's extern call always links. g_tweak_param is declared via
+    // tweak_runtime.h (pulled in by psx_runtime.h).
+    ss << "void psx_tweak_param_seed(void) {\n";
+    for (const auto& [addr, p] : config_.tweak_param_sites)
+        ss << fmt::format("    g_tweak_param[{}] = {};  /* 0x{:08X} default 0x{:04X} */\n",
+                          p.index, p.vanilla_default, addr, p.vanilla_imm);
+    ss << "}\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

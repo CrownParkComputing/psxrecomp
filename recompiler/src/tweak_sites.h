@@ -34,4 +34,25 @@ struct TweakGuardSite {
 // std::set<uint32_t> site-lookup pattern (here a map because we carry a payload).
 using TweakGuardMap = std::map<uint32_t, TweakGuardSite>;
 
+// A parameterized value immediate (strategy B): the instruction's 16-bit
+// immediate is emitted as a runtime read g_tweak_param[index] instead of a
+// literal, defaulting to vanilla_imm (identity when tweaks.state doesn't set it).
+// Only opcodes with a real value immediate are parameterized (addiu/slti/sltiu/
+// ori-li); masks, load/store offsets, control flow, and register-form (opcode 0)
+// words are never param sites. Mirrors the widescreen psx_ws_x_margin() pattern.
+struct TweakParamSite {
+    int      index;             // g_tweak_param[] slot
+    uint16_t vanilla_imm;       // raw 16-bit immediate in the vanilla word (drift check)
+    int32_t  vanilla_default;   // seed value (sign/zero-extended per opcode by the
+                                // baker) written to g_tweak_param[index] at boot, so
+                                // an unset param reads identical to vanilla
+};
+using TweakParamMap = std::map<uint32_t, TweakParamSite>;
+
+// Full parse of a tweaks_bake.toml: guarded-variant sites + parameterized sites.
+struct TweakBake {
+    TweakGuardMap guarded;
+    TweakParamMap param;
+};
+
 } // namespace PSXRecomp
