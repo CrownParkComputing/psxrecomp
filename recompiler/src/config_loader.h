@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "tweak_sites.h"   // PSXRecomp::TweakGuardMap (load_tweak_bake return type)
 
 namespace PSXRecompV4 {
 
@@ -664,6 +665,13 @@ struct GameOptions {
 // empty GameOptions if the file is missing/unreadable; throws on a malformed
 // declared entry (bad addr / size) so a typo is surfaced, not silently dropped.
 GameOptions load_game_options(const std::filesystem::path& path);
+
+// Load the compile-free Tweaks bake manifest (tweaks_bake.toml, TWEAKS_PREBAKE.md
+// Phase 3): a flat array of [[guarded]] rows {addr, van, bit, word} grouped by
+// addr into per-site case lists. Returns an empty map if the file is missing
+// (feature off => byte-identical build); throws on a malformed row so a stale/
+// corrupt manifest is surfaced, not silently dropped. See tweak_sites.h.
+PSXRecomp::TweakGuardMap load_tweak_bake(const std::filesystem::path& path);
 
 // Load settings.toml. Returns an all-defaults (all has_*=false) struct if the
 // file is missing or unreadable. Malformed values are skipped (best-effort:

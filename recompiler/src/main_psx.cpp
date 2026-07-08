@@ -112,6 +112,17 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    // --tweaks-bake <path>: bake the compile-free Tweaks guarded variants from
+    // this manifest (tweaks_bake.toml). Absent => vanilla build, byte-identical.
+    std::filesystem::path tweaks_bake_path;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--tweaks-bake" && i + 1 < argc) { tweaks_bake_path = argv[i + 1]; break; }
+        if (a.rfind("--tweaks-bake=", 0) == 0) {
+            tweaks_bake_path = a.substr(std::string("--tweaks-bake=").size());
+            break;
+        }
+    }
 
     std::filesystem::path exe_path;
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
@@ -788,6 +799,19 @@ int main(int argc, char** argv) {
     codegen_config.ws_bg2d_stream_right_site = ws_bg2d_stream_right_site;
     codegen_config.ws_bg2d_bufbase_site = ws_bg2d_bufbase_site;
     codegen_config.ws_bg2d_cap_site     = ws_bg2d_cap_site;
+    // Compile-free Tweaks guarded-variant bake (TWEAKS_PREBAKE.md Phase 3).
+    // Loaded directly into the codegen config — one line, no GameConfig field or
+    // per-site copy dance. Empty (no --tweaks-bake) => byte-identical output.
+    try {
+        codegen_config.tweak_guard_sites =
+            PSXRecompV4::load_tweak_bake(tweaks_bake_path);
+        if (!codegen_config.tweak_guard_sites.empty())
+            fmt::print("  tweaks bake = {} ({} guarded site(s))\n",
+                       tweaks_bake_path.string(), codegen_config.tweak_guard_sites.size());
+    } catch (const std::exception& e) {
+        fmt::print(stderr, "FATAL: --tweaks-bake load failed: {}\n", e.what());
+        return 1;
+    }
     if (ws_bg2d_count_site || ws_bg2d_startcol_site || ws_bg2d_startx_site)
         fmt::print("  ws_bg2d 2D-background widen = ON (count=0x{:08X} startcol=0x{:08X} startx=0x{:08X})\n",
                    ws_bg2d_count_site, ws_bg2d_startcol_site, ws_bg2d_startx_site);

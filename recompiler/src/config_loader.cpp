@@ -853,6 +853,34 @@ GameOptions load_game_options(const fs::path& path) {
     return go;
 }
 
+PSXRecomp::TweakGuardMap load_tweak_bake(const fs::path& path) {
+    PSXRecomp::TweakGuardMap sites;
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec)) return sites;
+
+    const toml::value doc = toml::parse(path.string());
+    if (!doc.contains("guarded")) return sites;
+    const auto& arr = toml::find<toml::array>(doc, "guarded");
+    for (const auto& row : arr) {
+        uint32_t addr = parse_hex(toml::find<std::string>(row, "addr"), "tweaks [[guarded]] addr");
+        uint32_t van  = parse_hex(toml::find<std::string>(row, "van"),  "tweaks [[guarded]] van");
+        uint32_t word = parse_hex(toml::find<std::string>(row, "word"), "tweaks [[guarded]] word");
+        int      bit  = static_cast<int>(toml::find<int64_t>(row, "bit"));
+        auto& site = sites[addr];
+        if (site.cases.empty()) {
+            site.vanilla_word = van;
+        } else if (site.vanilla_word != van) {
+            // Every option targeting one address must agree on the vanilla word
+            // (it is the ROM byte); disagreement means a corrupt/mismatched bake.
+            throw std::runtime_error(fmt::format(
+                "tweaks bake: guard site 0x{:08X} vanilla mismatch (0x{:08X} vs 0x{:08X})",
+                addr, site.vanilla_word, van));
+        }
+        site.cases.push_back(PSXRecomp::TweakGuardCase{bit, word});
+    }
+    return sites;
+}
+
 // ---- UserSettings (settings.toml) — launcher-written override layer ----
 
 UserSettings load_user_settings(const fs::path& path) {

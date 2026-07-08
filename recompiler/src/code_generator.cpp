@@ -747,6 +747,45 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
 }
 
 std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
+    // Compile-free Tweaks guarded-variant bake (tweak_sites.h, TWEAKS_PREBAKE.md
+    // Phase 3). At a baked site, emit a runtime-flag-selected if/else-if chain
+    // over the option(s)' patched word(s), falling through to the vanilla
+    // translation. The tool's radio/PreReq exclusivity guarantees ≤1 case is
+    // active, so an ordered chain is correct. Each body is rendered by the raw
+    // translator, so this wrapper never recurses. Empty map (no --tweaks-bake) =>
+    // this is a straight pass-through and generated code is byte-identical.
+    if (!config_.tweak_guard_sites.empty()) {
+        auto it = config_.tweak_guard_sites.find(addr);
+        if (it != config_.tweak_guard_sites.end()) {
+            const TweakGuardSite& site = it->second;
+            // Drift guard: the manifest's vanilla word must match the image at
+            // gen time, or the bake is stale against a re-dumped/re-based EXE.
+            // Loud in main-EXE mode; in overlay mode the same address holds
+            // different code per variant, so a mismatch just means "not this
+            // variant" -> emit the vanilla translation only.
+            if (instr != site.vanilla_word) {
+                if (!config_.overlay_mode) {
+                    fmt::print(stderr, "ERROR: [tweaks] guard site 0x{:08X} vanilla "
+                               "0x{:08X} != image 0x{:08X} (stale bake)\n",
+                               addr, site.vanilla_word, instr);
+                    std::exit(1);
+                }
+                return translate_instruction_raw(addr, instr);
+            }
+            std::string out;
+            for (size_t i = 0; i < site.cases.size(); ++i)
+                out += fmt::format("{}(psx_tweak_on({})) {{ {} }} ",
+                                   i == 0 ? "if " : "else if ",
+                                   site.cases[i].flag_bit,
+                                   translate_instruction_raw(addr, site.cases[i].patched_word));
+            out += fmt::format("else {{ {} }}", translate_instruction_raw(addr, instr));
+            return out;
+        }
+    }
+    return translate_instruction_raw(addr, instr);
+}
+
+std::string CodeGenerator::translate_instruction_raw(uint32_t addr, uint32_t instr) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t funct = instr & 0x3F;
 

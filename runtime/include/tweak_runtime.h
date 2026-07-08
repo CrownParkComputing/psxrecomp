@@ -22,12 +22,24 @@
 extern "C" {
 #endif
 
-#define TWEAK_MAX_PARAM 128
+#define TWEAK_MAX_PARAM  128
+#define TWEAK_FLAG_WORDS 4          /* 256 baked guarded-variant option bits */
 
-/* Read by recompiler-emitted guarded variants (g_tweak_flags bits) and
- * parameterized immediate reads (g_tweak_param[index]) — Phase 3. */
-extern uint64_t g_tweak_flags;
+/* Read by recompiler-emitted guarded variants (via psx_tweak_on) and
+ * parameterized immediate reads (g_tweak_param[index]) — Phase 3.
+ * g_tweak_flags is a bitset: one bit per baked guarded option (>64 options, so
+ * a single uint64 is insufficient). Set from the launcher-written tweaks.state. */
+extern uint64_t g_tweak_flags[TWEAK_FLAG_WORDS];
 extern int32_t  g_tweak_param[TWEAK_MAX_PARAM];
+
+/* Is guarded-variant option bit `bit` active? Emitted generated code calls this
+ * to select a baked patched instruction over the vanilla one. static inline so
+ * both the runtime and every generated TU that includes this header get it with
+ * no link dependency; bounds-checked so an out-of-range bit reads as off. */
+static inline int psx_tweak_on(int bit) {
+    if ((unsigned)bit >= (unsigned)(TWEAK_FLAG_WORDS * 64)) return 0;
+    return (int)((g_tweak_flags[bit >> 6] >> (bit & 63)) & 1u);
+}
 
 /* Parse the launcher-written state file. A NULL path, missing file, or a file
  * declaring a newer format_version disables the feature. Copies what it needs;

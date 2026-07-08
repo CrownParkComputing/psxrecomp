@@ -8,7 +8,7 @@
  *
  * State-file grammar (one directive per line; '#' comments; anything else ignored):
  *   format_version=1
- *   flags=0x0000000000000003
+ *   flag  <bitindex>                 ; activate guarded-variant option bit N (sparse)
  *   param <index> <value>            ; decimal or 0x, stored int32 at g_tweak_param[index]
  *   poke  <addr_hex> <hexbytes>      ; bytes in ADDRESS order, e.g. poke 0x800A1234 63
  *
@@ -31,7 +31,7 @@ extern void    dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_
 #define TWEAK_POKE_BYTES     64      /* max bytes per poke line (emitter chunks to 32) */
 #define TWEAK_FORMAT_VERSION 1
 
-uint64_t g_tweak_flags = 0;
+uint64_t g_tweak_flags[TWEAK_FLAG_WORDS];
 int32_t  g_tweak_param[TWEAK_MAX_PARAM];
 
 typedef struct { uint32_t addr; uint16_t nbytes; uint8_t bytes[TWEAK_POKE_BYTES]; } Poke;
@@ -44,7 +44,7 @@ static int  g_ver_bad = 0;
 static char g_path[1024];
 
 static void reset(void) {
-    g_tweak_flags = 0;
+    memset(g_tweak_flags, 0, sizeof(g_tweak_flags));
     g_npoke = g_nparam_set = g_applied = g_have = 0;
     memset(g_tweak_param, 0, sizeof(g_tweak_param));
 }
@@ -81,8 +81,10 @@ void tweak_runtime_configure(const char *state_path) {
             }
             continue;
         }
-        if (strncmp(line, "flags=", 6) == 0) {
-            g_tweak_flags = (uint64_t)strtoull(line + 6, NULL, 0);
+        if (strncmp(line, "flag ", 5) == 0) {
+            long b = strtol(line + 5, NULL, 0);
+            if (b >= 0 && b < TWEAK_FLAG_WORDS * 64)
+                g_tweak_flags[b >> 6] |= (uint64_t)1u << (b & 63);
             continue;
         }
         if (strncmp(line, "param ", 6) == 0) {
@@ -137,11 +139,17 @@ int tweak_runtime_debug_json(char *out, int cap) {
     char p[1024];
     snprintf(p, sizeof(p), "%s", g_path);
     for (char *c = p; *c; c++) if (*c == '\\') *c = '/';
+    /* flags bitset: count set bits + render the words high-index-first */
+    int nflag = 0;
+    for (int w = 0; w < TWEAK_FLAG_WORDS; w++)
+        for (uint64_t x = g_tweak_flags[w]; x; x &= x - 1) nflag++;
     int n = snprintf(out, cap,
-        "{\"have\":%d,\"version_rejected\":%d,\"flags\":\"0x%016llX\",\"n_param\":%d,"
-        "\"n_poke\":%d,\"applied\":%d,\"path\":\"%s\",\"pokes\":[",
-        g_have, g_ver_bad, (unsigned long long)g_tweak_flags, g_nparam_set,
-        g_npoke, g_applied, p);
+        "{\"have\":%d,\"version_rejected\":%d,\"n_flag\":%d,\"flags\":\"0x%016llX%016llX%016llX%016llX\","
+        "\"n_param\":%d,\"n_poke\":%d,\"applied\":%d,\"path\":\"%s\",\"pokes\":[",
+        g_have, g_ver_bad, nflag,
+        (unsigned long long)g_tweak_flags[3], (unsigned long long)g_tweak_flags[2],
+        (unsigned long long)g_tweak_flags[1], (unsigned long long)g_tweak_flags[0],
+        g_nparam_set, g_npoke, g_applied, p);
     for (int i = 0; i < g_npoke && n < cap; i++) {
         /* readback: current guest RAM at the poke address (proves it landed) */
         uint32_t cur = 0;

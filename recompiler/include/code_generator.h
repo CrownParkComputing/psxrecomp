@@ -5,9 +5,11 @@
 #include <vector>
 #include <sstream>
 #include <set>
+#include <map>
 #include "ps1_exe_parser.h"
 #include "function_analysis.h"
 #include "control_flow.h"
+#include "../src/tweak_sites.h"
 #include "../src/annotations.hpp"
 
 namespace PSXRecomp {
@@ -122,6 +124,12 @@ struct CodeGenConfig {
     // session overrides the default at initialization (issue #5). Identity when
     // nothing is persisted, so a fresh install is byte-identical. Empty=default.
     std::set<uint32_t> persist_init_store_sites;
+
+    // Compile-free Tweaks guarded-variant bake (tweak_sites.h, TWEAKS_PREBAKE.md
+    // Phase 3). word_addr -> baked patched-word cases, each gated on a runtime
+    // g_tweak_flags bit. Empty (the default, no --tweaks-bake) => generated code
+    // is byte-identical to a build without the feature.
+    TweakGuardMap tweak_guard_sites;
 
     CodeGenConfig()
         : emit_comments(true)
@@ -271,6 +279,12 @@ private:
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);
+    // The actual per-instruction translator. translate_instruction() is a thin
+    // wrapper that first consults config_.tweak_guard_sites and, on a hit, emits
+    // a flag-selected if/else-if chain whose bodies are rendered by calling this
+    // raw path (so the guard check does not recurse). All other callers get the
+    // vanilla translation unchanged.
+    std::string translate_instruction_raw(uint32_t addr, uint32_t instr);
 
     // Register name mapping
     static std::string reg_name(int reg_num);

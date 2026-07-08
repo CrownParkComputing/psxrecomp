@@ -4,6 +4,7 @@
 #include "cpu_state.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "tweak_runtime.h"   /* g_tweak_param + psx_tweak_on() for baked Tweaks variants */
 
 #ifdef __cplusplus
 extern "C" {
