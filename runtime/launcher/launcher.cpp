@@ -330,6 +330,7 @@ struct LauncherModel {
     int  p2_mode      = 0;
     bool allow_hybrid = true;  // game.allow_hybrid: when false the Hybrid segment is hidden
     bool mode_selectable = true; // game.lock_mode == false: when false the whole pad-mode selector is hidden
+    bool device_locked   = false; // game.lock_device: when true the Player 1/2 cards are hidden entirely (fixed, auto-bound pad type)
     int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
     Rml::String p1_dev_label = "Keyboard";
     Rml::String p2_dev_label = "None";
@@ -604,7 +605,9 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
-    m.ws_eligible     = true;                     // native-wide works on BOTH backends now (SW + GL compositor)
+    /* ws_eligible is set once at model init from GameInfo.ws_offered ([widescreen]
+     * offer): renderer no longer matters (native-wide works on SW + GL), so
+     * refresh must not overwrite the per-game gate. */
 }
 
 std::string region_long(const std::string& r) {
@@ -872,6 +875,11 @@ Result run(SDL_Window* window, void* gl_context,
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
+    // Games whose widescreen is unported/unvalidated declare [widescreen]
+    // offer=false: hide the toggle AND clamp a stale persisted 16:9 back to
+    // 4:3 so the hack can't engage from an old settings.toml.
+    m.ws_eligible    = game.ws_offered;
+    if (!game.ws_offered) m.aspect_index = 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
@@ -906,6 +914,9 @@ Result run(SDL_Window* window, void* gl_context,
         m.p1_mode = game.locked_mode;
         m.p2_mode = game.locked_mode;
     }
+    // lock_device: hide the Player controller cards entirely — the pad type is
+    // fixed and auto-bound (e.g. Ape Escape ships DualShock analog, no choice).
+    m.device_locked = game.lock_device;
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     if (io.has_p1_device) {
         m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
@@ -970,6 +981,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("allow_hybrid",   &m.allow_hybrid);
     c.Bind("mode_selectable",&m.mode_selectable);
+    c.Bind("device_locked",  &m.device_locked);
     c.Bind("deadzone_pct",   &m.deadzone_pct);
     c.Bind("p1_dev_label",   &m.p1_dev_label);
     c.Bind("p2_dev_label",   &m.p2_dev_label);

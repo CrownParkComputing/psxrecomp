@@ -157,6 +157,7 @@ static void depth_cue_from_ir(GTEState* gte) {
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
+extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 
 // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
 // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
@@ -186,6 +187,65 @@ extern "C" void gte_ws_get_sz_stats(int* mn, int* mx, unsigned* n, unsigned* far
     if (n)  *n  = s_ws_sz_n;
     if (far_n) *far_n = s_ws_sz_far;
     s_ws_sz_min = 0x7FFFFFFF; s_ws_sz_max = 0; s_ws_sz_n = 0; s_ws_sz_far = 0;
+}
+
+// ---- Native-wide sky-DOME expand ------------------------------------------
+// In native-wide (mode 2) the GTE is fed identity (no squash) so the world
+// fills the wider FOV via the cull widening. But a sky DOME is a FINITE mesh
+// authored to fill 4:3 — its curved edge falls short of the wider frame corners
+// (black corners). Fix: scale the FAR-depth vertices' projected X OUTWARD from
+// the projection centre (OFX) by the frame-widening ratio (3*num)/(4*den) — the
+// inverse of the squash — so the dome grows to cover the wider FOV. DEPTH-GATED
+// (SZ >= s_ws_far_threshold) so only the farthest layer (the sky) expands while
+// nearer world geometry stays put. On + ratio set from main.cpp when native-
+// wide engages; threshold tuned live via ws_far_threshold. Off => identity.
+static int      s_ws_dome_on  = 0;
+static int32_t  s_ws_dome_num = 1, s_ws_dome_den = 1;  // expand = num/den (>1)
+extern "C" void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den) {
+    s_ws_dome_on = on ? 1 : 0;
+    // widen ratio = wide_w / disp_w = (aspect/(4:3)) = (3*num)/(4*den).
+    int32_t n = 3 * aspect_num, d = 4 * aspect_den;
+    if (n <= 0 || d <= 0 || n <= d) { s_ws_dome_num = s_ws_dome_den = 1; return; }
+    s_ws_dome_num = n; s_ws_dome_den = d;
+}
+
+// ---- Dome-locate probe -----------------------------------------------------
+// Tally which guest function (g_debug_current_func_addr, set at dispatch)
+// projects FAR (SZ >= threshold) vertices, so the sky-dome draw function can be
+// identified as the top far-vertex emitter — the target for the per-function
+// dome-expand bracket (the clean alternative to the scene-dependent depth gate).
+extern "C" { extern uint32_t g_debug_current_func_addr; }
+static uint32_t s_gte_caller_ra = 0;   /* guest ra at gte_execute = return into the GAME fn that issued the projection (not the libgte leaf) */
+#define DOME_PROBE_SLOTS 48
+static struct { uint32_t func; uint32_t count; int32_t max_sz; } s_dome_probe[DOME_PROBE_SLOTS];
+static int     s_dome_probe_on  = 0;
+static int32_t s_dome_probe_thr = 4000;
+extern "C" void gte_dome_probe(int on, int thr) {
+    s_dome_probe_on = on ? 1 : 0;
+    if (thr > 0) s_dome_probe_thr = thr;
+    if (on) for (int i = 0; i < DOME_PROBE_SLOTS; i++) { s_dome_probe[i].func = 0; s_dome_probe[i].count = 0; s_dome_probe[i].max_sz = 0; }
+}
+static inline void dome_probe_note(int32_t sz) {
+    if (!s_dome_probe_on || sz < s_dome_probe_thr) return;
+    /* Tally the guest RA (the GAME fn that jal'd to libgte for this projection),
+     * NOT g_debug_current_func_addr (which is the libgte leaf 0x80000F40). */
+    uint32_t f = s_gte_caller_ra;
+    int slot = -1, empty = -1;
+    for (int i = 0; i < DOME_PROBE_SLOTS; i++) {
+        if (s_dome_probe[i].count && s_dome_probe[i].func == f) { slot = i; break; }
+        if (empty < 0 && s_dome_probe[i].count == 0) empty = i;
+    }
+    if (slot < 0) slot = empty;
+    if (slot < 0) return;
+    s_dome_probe[slot].func = f;
+    s_dome_probe[slot].count++;
+    if (sz > s_dome_probe[slot].max_sz) s_dome_probe[slot].max_sz = sz;
+}
+extern "C" int gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap) {
+    int n = 0;
+    for (int i = 0; i < DOME_PROBE_SLOTS && n < cap; i++)
+        if (s_dome_probe[i].count) { funcs[n] = s_dome_probe[i].func; counts[n] = s_dome_probe[i].count; maxsz[n] = s_dome_probe[i].max_sz; n++; }
+    return n;
 }
 
 extern "C" void gte_set_display_aspect(int num, int den) {
@@ -249,6 +309,21 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     }
     if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
+    // Native-wide sky-dome expand: no squash active (identity), dome mode on,
+    // this frame is stretched, and the vertex is far (sky). Scale X outward from
+    // the projection centre so the finite dome mesh reaches the wider frame.
+    else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+             !gpu_ws_present_native_43()) {
+        int32_t sz = gte->SZ[3];
+        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+        s_ws_sz_n++;
+        if (sz >= s_ws_far_threshold) {
+            xterm = xterm * s_ws_dome_num / s_ws_dome_den;
+            s_ws_sz_far++;
+        }
+    }
+    dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);
@@ -879,6 +954,7 @@ extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
     s_gte_exec_count++;
+    s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
 
     GTEState gte;
     // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
@@ -890,6 +966,11 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
 
     uint8_t func = cmd & 0x3F;
+    /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
+     * perspective projection so gpu.c can stamp real 3D frames as gameplay
+     * (no-op unless the game opts in — early-out on the config flag). */
+    if (func == 0x01 || func == 0x30)
+        psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
     switch (func) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;

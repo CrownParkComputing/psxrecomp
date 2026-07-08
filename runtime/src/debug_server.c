@@ -3457,6 +3457,7 @@ static const char *thread_kind_name(uint32_t kind)
         case 20: return "syscall3_enter";             /* ChangeThread/RFE syscall, in_exc==0 (switch-eligible) */
         case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
         case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
+        case 30: return "inexc_switch_escape";        /* guest moved PCB[0] inside handler -> scheduler escape */
         default: return "unknown";
     }
 }
@@ -6513,6 +6514,19 @@ static void handle_gl_ws_ablate(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
 }
 
+/* gl_wide_fast on=<0|1>: native-wide centre-blit fast path. 1 (default) = skip
+ * the redundant centre mirror and copy the canonical 4:3 frame into the wide
+ * surface centre at present (fast). 0 = re-rasterize the whole wide surface
+ * every prim (the original full-mirror path). For A/B perf + parity checks. */
+extern void gl_renderer_set_wide_fast(int on);
+extern int  gl_renderer_get_wide_fast(void);
+static void handle_gl_wide_fast(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gl_renderer_set_wide_fast(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_get_wide_fast());
+}
+
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
  * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
  * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
@@ -6638,6 +6652,48 @@ static void handle_ws_far_threshold(int id, const char *json)
     gte_ws_get_sz_stats(&mn, &mx, &n, &far_n);
     send_fmt("{\"id\":%d,\"ok\":true,\"threshold\":%d,\"sz_min\":%d,\"sz_max\":%d,\"sz_n\":%u,\"sz_far\":%u}",
              id, gte_ws_get_far_threshold(), mn, mx, n, far_n);
+}
+
+/* ws_dome on=<0|1> [num=<W> den=<H>]: native-wide sky-DOME expand. Scales far-
+ * depth (SZ >= ws_far_threshold) GTE X outward from the projection centre by
+ * (3*num)/(4*den) so a finite sky dome grows to fill the wider FOV. Tune the
+ * depth split with ws_far_threshold (its sz_far count = verts being expanded). */
+extern void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den);
+static void handle_ws_dome(int id, const char *json)
+{
+    int on  = json_get_int(json, "on", 1);
+    int num = json_get_int(json, "num", 16);
+    int den = json_get_int(json, "den", 9);
+    gte_ws_set_dome_expand(on, num, den);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"num\":%d,\"den\":%d}", id, on ? 1 : 0, num, den);
+}
+
+/* ws_dome_probe on=<0|1> [thr=<SZ>] | dump: tally which guest function projects
+ * far (SZ>=thr) vertices -> identifies the sky-dome draw fn (top far emitter,
+ * highest max_sz) for the per-function dome-expand bracket. Arm with on=1, let a
+ * dome frame render, then call with no args to dump the tally. */
+extern void gte_dome_probe(int on, int thr);
+extern int  gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap);
+static void handle_ws_dome_probe(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    int thr = json_get_int(json, "thr", -1);
+    if (on >= 0) gte_dome_probe(on, thr);
+    uint32_t funcs[48], counts[48]; int32_t maxsz[48];
+    int n = gte_dome_probe_dump(funcs, counts, maxsz, 48);
+    /* simple insertion-sort by count desc for readability */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && counts[j] > counts[j-1]; j--) {
+            uint32_t tf=funcs[j];funcs[j]=funcs[j-1];funcs[j-1]=tf;
+            uint32_t tc=counts[j];counts[j]=counts[j-1];counts[j-1]=tc;
+            int32_t tm=maxsz[j];maxsz[j]=maxsz[j-1];maxsz[j-1]=tm;
+        }
+    char buf[4096]; int p = snprintf(buf, sizeof buf, "{\"id\":%d,\"ok\":true,\"n\":%d,\"funcs\":[", id, n);
+    for (int i = 0; i < n && p < (int)sizeof(buf)-80; i++)
+        p += snprintf(buf+p, sizeof(buf)-p, "%s{\"ra\":\"0x%08X\",\"n\":%u,\"max_sz\":%d}",
+                      i?",":"", funcs[i], counts[i], maxsz[i]);
+    snprintf(buf+p, sizeof(buf)-p, "]}");
+    debug_server_send_line(buf);
 }
 
 static void handle_ws_census(int id, const char *json)
@@ -7095,98 +7151,7 @@ static void handle_get_snapshots(int id, const char *json)
  * blocks. Bigger on disk than a compressed PNG, but a real PNG that every
  * viewer (and the harness Read tool) accepts, and nothing new to link against
  * — which keeps the self-contained static runtime self-contained. */
-static uint32_t s_png_crc_tbl[256];
-static int      s_png_crc_init = 0;
-static void png_crc_build(void) {
-    for (uint32_t n = 0; n < 256; n++) {
-        uint32_t c = n;
-        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        s_png_crc_tbl[n] = c;
-    }
-    s_png_crc_init = 1;
-}
-static uint32_t png_crc_update(uint32_t crc, const uint8_t *p, size_t n) {
-    if (!s_png_crc_init) png_crc_build();
-    for (size_t i = 0; i < n; i++) crc = s_png_crc_tbl[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return crc;
-}
-static uint32_t png_adler32(const uint8_t *p, size_t n) {
-    uint32_t a = 1, b = 0;
-    /* process in blocks so the 16-bit sums never overflow before the mod */
-    while (n) {
-        size_t k = n < 5552 ? n : 5552;
-        for (size_t i = 0; i < k; i++) { a += p[i]; b += a; }
-        a %= 65521; b %= 65521; p += k; n -= k;
-    }
-    return (b << 16) | a;
-}
-static void png_put_be32(FILE *f, uint32_t v) {
-    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16),
-                     (uint8_t)(v >> 8), (uint8_t)v };
-    fwrite(b, 1, 4, f);
-}
-static void png_chunk(FILE *f, const char *type, const uint8_t *data, size_t len) {
-    png_put_be32(f, (uint32_t)len);
-    uint32_t crc = 0xFFFFFFFFu;
-    crc = png_crc_update(crc, (const uint8_t *)type, 4);
-    crc = png_crc_update(crc, data, len);
-    fwrite(type, 1, 4, f);
-    if (len) fwrite(data, 1, len, f);
-    png_put_be32(f, crc ^ 0xFFFFFFFFu);
-}
-/* Write an RGB (3 bytes/pixel, top-down) buffer as a PNG. Returns 1 on success. */
-static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
-    static const uint8_t sig[8] = { 137,80,78,71,13,10,26,10 };
-    fwrite(sig, 1, 8, f);
-
-    uint8_t ihdr[13];
-    ihdr[0]=(uint8_t)(w>>24); ihdr[1]=(uint8_t)(w>>16); ihdr[2]=(uint8_t)(w>>8); ihdr[3]=(uint8_t)w;
-    ihdr[4]=(uint8_t)(h>>24); ihdr[5]=(uint8_t)(h>>16); ihdr[6]=(uint8_t)(h>>8); ihdr[7]=(uint8_t)h;
-    ihdr[8]=8;   /* bit depth   */
-    ihdr[9]=2;   /* color type 2 = truecolor RGB */
-    ihdr[10]=0;  /* compression */
-    ihdr[11]=0;  /* filter      */
-    ihdr[12]=0;  /* interlace   */
-    png_chunk(f, "IHDR", ihdr, sizeof ihdr);
-
-    /* Filtered raw scanlines: each row prefixed with filter byte 0 (None). */
-    size_t raw_len = (size_t)h * (1 + (size_t)w * 3);
-    uint8_t *raw = (uint8_t *)malloc(raw_len);
-    if (!raw) return 0;
-    for (uint32_t y = 0; y < h; y++) {
-        uint8_t *row = raw + (size_t)y * (1 + (size_t)w * 3);
-        row[0] = 0;
-        memcpy(row + 1, rgb + (size_t)y * w * 3, (size_t)w * 3);
-    }
-
-    /* zlib stream: 2-byte header + stored DEFLATE blocks + 4-byte Adler32. */
-    size_t nblocks = (raw_len + 65534) / 65535; if (nblocks == 0) nblocks = 1;
-    size_t z_len = 2 + nblocks * 5 + raw_len + 4;
-    uint8_t *z = (uint8_t *)malloc(z_len);
-    if (!z) { free(raw); return 0; }
-    size_t zi = 0;
-    z[zi++] = 0x78;  /* CMF: 32K window, deflate */
-    z[zi++] = 0x01;  /* FLG: check bits make 0x7801 a multiple of 31 */
-    size_t off = 0;
-    while (off < raw_len) {
-        size_t n = raw_len - off; if (n > 65535) n = 65535;
-        int final = (off + n >= raw_len);
-        z[zi++] = (uint8_t)(final ? 1 : 0);          /* BFINAL | BTYPE=00 */
-        z[zi++] = (uint8_t)(n & 0xFF); z[zi++] = (uint8_t)(n >> 8);
-        uint16_t nl = (uint16_t)~n;
-        z[zi++] = (uint8_t)(nl & 0xFF); z[zi++] = (uint8_t)(nl >> 8);
-        memcpy(z + zi, raw + off, n); zi += n; off += n;
-    }
-    uint32_t ad = png_adler32(raw, raw_len);
-    z[zi++] = (uint8_t)(ad >> 24); z[zi++] = (uint8_t)(ad >> 16);
-    z[zi++] = (uint8_t)(ad >> 8);  z[zi++] = (uint8_t)ad;
-    free(raw);
-
-    png_chunk(f, "IDAT", z, zi);
-    free(z);
-    png_chunk(f, "IEND", NULL, 0);
-    return 1;
-}
+#include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
 
 /* Unified screenshot: writes an 8-bit RGB PNG of the current display to "path"
  * (default psx_screenshot.png in the runtime cwd) and answers with a single
@@ -7312,7 +7277,12 @@ static void handle_wide_shot(int id, const char *json)
  * to 0 (the common vertical-double-buffer origin). */
 static void handle_wide_full(int id, const char *json)
 {
-    extern int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    /* Backend-dispatched: gr_wide_dump_full routes to the active renderer's full
+     * wide-surface dump (SW: sw_wide_dump_full; GL: glb_wide_dump_full), so the
+     * whole compositor surface can be inspected on either backend over TCP. */
+    extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();   /* no-op on SW; ensures pending GL frame is flushed */
     int base_x = json_get_int(json, "base_x", 0);
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
@@ -7323,7 +7293,7 @@ static void handle_wide_full(int id, const char *json)
     uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
     if (!buf) { send_err(id, "alloc failed"); return; }
     int W = 0, H = 0;
-    int n = sw_wide_dump_full(buf, cap, &W, &H, base_x);
+    int n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
     if (n <= 0) { free(buf); send_err(id, "no wide surface (SW backend? native-wide engaged?)"); return; }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
@@ -8068,38 +8038,56 @@ static void handle_d44_ring(int id, const char *json)
  * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
 static void handle_irqctx_ring(int id, const char *json)
 {
-    (void)json;
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
                      cdrom_active, is_vblank; int dma_depth;
                      uint32_t take_pc, real_epc, exit_pc, exit_reason, same_thread,
-                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects; } E;
+                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects,
+                     entry_sp, pump_site; } E;
     extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
-    uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
-    uint32_t n = total < cap ? (uint32_t)total : cap;
-    static char buf[49152]; size_t pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    /* Ring cap must track IRQCTX_RING_CAP in interrupts.c. */
+    uint32_t cap = 4096u;
+    /* Optional frame-window filter + newest-N count so a deep ring can be
+     * windowed to the delivery window of interest (ring-buffer discipline). */
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+    int count    = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > (int)cap) count = (int)cap;
+    uint64_t total = g_irqctx_seq;
+    uint32_t avail = total < cap ? (uint32_t)total : cap;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 512u + (size_t)n * 410u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
                     id, (unsigned long long)total);
-    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 512; i++) {
+    int emitted = 0;
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 512; i++) {
         uint64_t idx = total - n + i;
         E *e = &g_irqctx_ring[idx & (cap - 1u)];
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
             "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
             "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
             "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
             "\"take_pc\":\"0x%08X\",\"real_epc\":\"0x%08X\",\"exit_pc\":\"0x%08X\","
             "\"exit_reason\":%u,\"same_thread\":%u,\"restored\":%u,"
             "\"v1_exit\":\"0x%08X\",\"v1_saved\":\"0x%08X\","
-            "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u}",
-            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u,"
+            "\"entry_sp\":\"0x%08X\",\"pump_site\":%u}",
+            emitted ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
             e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
             e->sr, e->istat, e->imask,
             e->take_pc, e->real_epc, e->exit_pc, e->exit_reason, e->same_thread,
             e->restored, e->v1_exit, e->v1_saved, e->ra_exit, e->ra_saved,
-            e->redirects);
+            e->redirects, e->entry_sp, e->pump_site);
+        emitted++;
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
     debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_freeze_check(int id, const char *json)
@@ -11049,6 +11037,8 @@ static const CmdEntry s_commands[] = {
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
+    { "ws_dome",           handle_ws_dome },
+    { "ws_dome_probe",     handle_ws_dome_probe },
     { "ws_census",         handle_ws_census },
     { "mmx6_freshfix",     handle_mmx6_freshfix },
     { "mmx6_reveal",       handle_mmx6_reveal },
@@ -11058,6 +11048,7 @@ static const CmdEntry s_commands[] = {
     { "gl_present_ring",   handle_gl_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
+    { "gl_wide_fast",      handle_gl_wide_fast },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
@@ -11538,7 +11529,32 @@ void debug_server_init(int port)
     s_wtrace_ranges[14].hi = 0x00066BD0u;
     s_wtrace_ranges[15].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_ranges[15].hi = 0x00097430u;
-    s_wtrace_range_count = 16;
+    /* Ape LOAD-GAME higher-layer (libcard + game card-manager) always-on
+     * capture. Oracle diff (2026-07-07 session 3) proved the low-level card
+     * protocol succeeds on both runtimes, but ours stays in top-scene 1
+     * ("Checking") while Beetle advances to scene 4 (file-select). These cells
+     * are the higher-layer state that diverges; capturing every writer from
+     * boot (never probe-time armed) attributes WHICH libcard op-state stalls
+     * and what completion it awaits. Masked-physical (KUSEG) addresses.
+     *   0x800b4e30 = libcard op struct field 0 (count/op-state; 0 ours vs 1 Beetle)
+     *   0x800b4e50 = save-name ptr + filename buffer ("bu00:BASCUS-94423SYS" on Beetle, zeros ours)
+     *   0x800b4ed0 = libcard op-handler ptr (0x80020f4c ours vs 0x80020bc8 Beetle)
+     *   0x800e3880 = SCENE (no-op flip-flop) + 0x800e3884 = TRIG (= top-scene index; 1 ours vs 4 Beetle)
+     *   0x8013af50 = game card-menu substate block (0x8013af56 = 0 ours vs 1 Beetle)
+     *   0x00007264 = kernel card-driver per-state byte M8[0x7264] (handoff: stuck at 1) */
+    s_wtrace_ranges[16].lo = 0x000B4E2Cu;
+    s_wtrace_ranges[16].hi = 0x000B4E40u;
+    s_wtrace_ranges[17].lo = 0x000B4E50u;
+    s_wtrace_ranges[17].hi = 0x000B4E68u;
+    s_wtrace_ranges[18].lo = 0x000B4ECCu;
+    s_wtrace_ranges[18].hi = 0x000B4ED4u;
+    s_wtrace_ranges[19].lo = 0x000E3880u;
+    s_wtrace_ranges[19].hi = 0x000E3888u;
+    s_wtrace_ranges[20].lo = 0x0013AF50u;
+    s_wtrace_ranges[20].hi = 0x0013AF60u;
+    s_wtrace_ranges[21].lo = 0x00007260u;
+    s_wtrace_ranges[21].hi = 0x00007270u;
+    s_wtrace_range_count = 22;
 
     s_wtrace_boot_ranges[0].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_boot_ranges[0].hi = 0x00097430u;

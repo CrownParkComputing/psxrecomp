@@ -48,6 +48,7 @@
 #include <SDL.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -1169,23 +1170,33 @@ static uint16_t controller_pad_buttons(SDL_GameController* h) {
     return buttons;
 }
 
-/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred),
- * applying the configured centre deadzone: travel within controller_deadzone
- * reads as centred (0x80) and the remaining travel is rescaled to the full range
- * so the stick still reaches the extremes. Gives clean variable analog speed
- * with no centre drift. */
-static uint8_t axis_to_pad_byte(int16_t v) {
-    const int dz = controller_deadzone;
-    int av = v < 0 ? -(int)v : (int)v;        /* |v|, 0..32768 */
-    if (av <= dz) return 0x80;                /* inside deadzone -> centred */
-    int range = 32767 - dz;
-    if (range < 1) range = 1;
-    int mag = (av - dz) * 32767 / range;      /* 0..32767 past the deadzone */
-    if (mag > 32767) mag = 32767;
-    int sv = v < 0 ? -mag : mag;
-    int b = (sv + 32768) >> 8;                /* 0..255 */
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-    return (uint8_t)b;
+/* Radial deadzone: process a stick's X and Y together so the dead region is a
+ * small CIRCLE, not a per-axis square. Travel within controller_deadzone reads
+ * centred (0x80/0x80); beyond it the vector MAGNITUDE is rescaled to the full
+ * range along the stick's true direction, so diagonals are preserved (a
+ * per-axis deadzone snaps diagonals toward the cardinals and feels notchy —
+ * bad for directional analog like Ape Escape's net swing). The magnitude is
+ * capped at 32767 before rescale so a full-diagonal push (raw mag ~46341) maps
+ * to ~0x9E/0x9E per axis — the circular gate a real DualShock stick reports,
+ * not 0xFF/0xFF. At dz==0 it reduces to a plain magnitude-preserving map. */
+static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby) {
+    const double dz = controller_deadzone;
+    double x = vx, y = vy;
+    double mag = std::sqrt(x * x + y * y);            /* 0 .. ~46341 */
+    if (mag <= dz || mag <= 0.0) { *obx = 0x80; *oby = 0x80; return; }
+    double capped = mag > 32767.0 ? 32767.0 : mag;
+    double range = 32767.0 - dz;
+    if (range < 1.0) range = 1.0;
+    double newmag = (capped - dz) * 32767.0 / range;  /* 0 .. 32767 */
+    double scale = newmag / mag;                       /* along true direction */
+    int sx = (int)std::lround(x * scale);
+    int sy = (int)std::lround(y * scale);
+    if (sx > 32767) sx = 32767; else if (sx < -32768) sx = -32768;
+    if (sy > 32767) sy = 32767; else if (sy < -32768) sy = -32768;
+    int bx = (sx + 32768) >> 8;
+    int by = (sy + 32768) >> 8;
+    *obx = (uint8_t)(bx < 0 ? 0 : (bx > 255 ? 255 : bx));
+    *oby = (uint8_t)(by < 0 ? 0 : (by > 255 ? 255 : by));
 }
 
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
@@ -1220,10 +1231,12 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], boo
         return;
     }
     if (p.kind == 2 && p.handle) {
-        out[0] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX));
-        out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
-        out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
-        out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY),
+                         &out[0], &out[1]);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY),
+                         &out[2], &out[3]);
         if (fold_dpad) {
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;
@@ -1270,17 +1283,64 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
  * (stick -> analog, D-pad -> digital) so the game runs its own analog or
  * digital input path exactly as on hardware (mirrors the inline block this
  * helper was extracted from for the low-latency re-sample). */
-/* Dev builds (PSX_DEBUG_TOOLS — the dev/debug configuration) ALWAYS feed the
- * keyboard into Player 1 alongside whatever device the launcher routed to port 1,
- * so a tester can drive the game from EITHER the keyboard OR the selected
- * controller (e.g. a DualShock) at the same time, with no reconfiguration. The
- * keyboard map and the controller are merged (active-low AND) onto the P1 pad
- * word. Release builds keep the single launcher-selected device per port. */
-#if defined(PSX_DEBUG_TOOLS)
-static const bool g_dev_kb_p1 = true;
-#else
-static const bool g_dev_kb_p1 = false;
-#endif
+/* Dev input mode: while enabled, Player 1 is driven by the keyboard AND EVERY
+ * connected game controller, all merged together (active-low AND) onto the P1 pad
+ * word — so a tester can navigate P1 from whatever is plugged in (keyboard, the
+ * launcher-assigned pad, or any other controller) with no reconfiguration. The P1
+ * pad TYPE is left unchanged: a launcher-assigned analog DualShock still presents
+ * as analog (so the game's analog input path / SIO handshake cadence is preserved
+ * exactly), and merged sources only contribute button/stick STATE, never a type
+ * downgrade. Controlled by PSX_DEV_INPUT (default ON for the dev workflow); set
+ * PSX_DEV_INPUT=0 to restore strict single-device-per-port routing. */
+static bool dev_any_input_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = std::getenv("PSX_DEV_INPUT");
+        cached = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F')) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Merge (active-low AND) the button words of every connected game controller.
+ * Handles are resolved from SDL's already-open set when possible and opened once
+ * on first sight otherwise (kept open for the process lifetime; if a slot later
+ * closes a shared device this self-heals by reopening next frame). This does NOT
+ * disturb per-slot routing — SDL returns the same handle for an already-open
+ * device, so reads are shared and harmless. */
+static uint16_t dev_all_controllers_buttons() {
+    uint16_t btn = 0xFFFF;
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
+        if (h) btn &= controller_pad_buttons(h);
+    }
+    return btn;
+}
+
+/* Fold the first live (non-neutral) left/right stick from ANY connected
+ * controller into st[] (lx,ly,rx,ry). Lets an analog-mode P1 steer from
+ * whatever pad is plugged in, not only the launcher-assigned one. Only axes
+ * that read past the deadzone override; a neutral pad leaves st[] untouched. */
+static void dev_any_controller_sticks(uint8_t st[4]) {
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);
+        if (!h) continue;
+        uint8_t lx, ly, rx, ry;
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTY), &lx, &ly);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTY), &rx, &ry);
+        if (lx != 0x80 || ly != 0x80) { st[0] = lx; st[1] = ly; }
+        if (rx != 0x80 || ry != 0x80) { st[2] = rx; st[3] = ry; }
+    }
+}
 
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
@@ -1290,18 +1350,32 @@ static void sample_pad_into_sio(int override) {
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
         const int  player  = s + 1;             /* keybinds.ini section (1|2) */
-        const bool kb_here = (g_dev_kb_p1 && s == 0);
-        if (p.kind == 0 && !kb_here) continue;  /* no device in this port */
+        /* Dev input: P1 is driven by the keyboard AND every connected controller,
+         * so a tester can navigate from whatever is plugged in (P2 keeps strict
+         * per-port routing). */
+        const bool dev_here = (dev_any_input_enabled() && s == 0);
+        if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
         /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). */
+         * active-low, so AND combines "pressed on either source"). In dev mode P1
+         * also folds in the keyboard binds and EVERY connected controller. */
         uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
-        if (kb_here) btn &= pad_from_keyboard(1);  /* dev keyboard drives P1 binds */
+        if (dev_here) {
+            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
+            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
+        }
         sio_set_pad_state_slot(s, btn);
 
-        /* Resolve the pad type this frame from the player's mode (a port driven
-         * by the keyboard alone presents as a digital pad). */
-        const int mode = (p.kind != 0) ? p.mode : (int)PSXRecompV4::PAD_MODE_DIGITAL;
+        /* Resolve the pad type this frame. An assigned device keeps its configured
+         * mode (a launcher-selected analog DualShock stays analog, so its input
+         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
+         * device but dev-any-input on presents as HYBRID — boots analog like a
+         * DualShock and auto-drops to digital on the d-pad — so any plugged
+         * controller and the keyboard both navigate. */
+        int mode;
+        if (p.kind != 0)      mode = p.mode;
+        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
         uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
         if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
@@ -1311,15 +1385,17 @@ static void sample_pad_into_sio(int override) {
             pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
             if (hybrid_stick_active(p))                       p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, player, kb_here))  p.hybrid_analog = false;
+            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
             if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
-        /* In dev builds also fold the keyboard's stick binds onto the analog
-         * stick, so an analog-mode P1 still steers from the keyboard (P1 binds). */
-        if (kb_here && eff_analog) {
+        /* Dev mode: fold the keyboard's stick binds AND any connected controller's
+         * sticks onto the analog stick, so an analog-mode P1 steers from whatever
+         * is plugged in (P1 binds). */
+        if (dev_here && eff_analog) {
             const Uint8* keys = SDL_GetKeyboardState(NULL);
             psx_keybinds_sticks(keys, 1, st);
+            dev_any_controller_sticks(st);
         }
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
@@ -2004,10 +2080,11 @@ int main(int argc, char** argv) {
     bool memcard2_enabled = true;
     /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
     /* Dev builds default Player 1 to the first connected controller ("auto"):
-     * combined with the always-on keyboard merge (g_dev_kb_p1) this means the
-     * selected controller AND the keyboard both drive P1 with no launcher setup.
-     * If no controller is present, "auto" opens nothing and the keyboard merge
-     * still drives P1. Release keeps "keyboard" (the launcher assigns devices). */
+     * combined with dev-any-input (dev_any_input_enabled(), default ON) the
+     * selected controller, EVERY other plugged-in controller, AND the keyboard
+     * all drive P1 with no launcher setup. If no controller is present, "auto"
+     * opens nothing and the keyboard/any-controller merge still drives P1.
+     * Release keeps "keyboard" (the launcher assigns devices). */
 #if defined(PSX_DEBUG_TOOLS)
     std::string p1_device = "auto";
 #else
@@ -2018,6 +2095,14 @@ int main(int argc, char** argv) {
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
+    bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
+    /* The game-DECLARED port modes, captured at game.toml load and immune to the
+     * settings.toml overrides below. Under lock_mode these are the only valid
+     * modes (the game supports exactly one pad type), so they are what the
+     * runtime clamps to and what the launcher locks its selector to. */
+    int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2087,6 +2172,21 @@ int main(int argc, char** argv) {
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
+            gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
+            gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
+            gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen.cull] per-game gates + signature immediates for the
+             * pattern-scanned interp/sljit widen hooks. A title that never
+             * opted in must never have its live code scanned and rewritten. */
+            gpu_ws_set_auto_hooks(gc.ws_auto_screen_x_cull ? 1 : 0,
+                                  gc.ws_auto_backdrop_preload ? 1 : 0);
+            if (!gc.ws_cull_w_imms.empty() || !gc.ws_cull_h_imms.empty())
+                gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
+                                     gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
+            ws_offered = gc.ws_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2102,8 +2202,11 @@ int main(int argc, char** argv) {
                 p1_mode = gc.runtime.default_p1_mode;
                 p2_mode = gc.runtime.default_p2_mode;
             }
+            ctrl_locked_p1_mode = gc.runtime.default_p1_mode;
+            ctrl_locked_p2_mode = gc.runtime.default_p2_mode;
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
+            ctrl_lock_device  = gc.runtime.controller_lock_device;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
              * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
@@ -2334,6 +2437,33 @@ int main(int argc, char** argv) {
         if (us.has_vsync)             g_video_vsync       = us.vsync;
     }
 
+    /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
+     * digital-only — X4's pre-DualShock libpad silently discards input from a
+     * pad answering id 0x73). The launcher hides its selector for such games,
+     * but that alone left two holes: (a) launcher-less builds still honoured a
+     * settings.toml p1_mode/p2_mode, and (b) a settings.toml persisted BEFORE
+     * the game declared lock_mode fed the stale mode back as the launcher's
+     * locked_mode. Clamp to the game-declared modes here, after every
+     * config/settings source has been applied, so a locked game can never boot
+     * a pad type it doesn't support. */
+    if (ctrl_lock_mode) {
+        p1_mode = ctrl_locked_p1_mode;
+        p2_mode = ctrl_locked_p2_mode;
+    }
+
+    /* [widescreen] offer=false: this title's widescreen is unported/unvalidated,
+     * so the launcher hides its toggle — and, same completeness treatment as
+     * lock_mode above, the runtime clamps the display aspect to native 4:3 here
+     * so a stale persisted 16:9 in settings.toml can't engage the hack in
+     * launcher-less builds either. */
+    if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
+        std::fprintf(stdout, "psxrecomp: widescreen not offered for this title; "
+                     "clamping display aspect %d:%d -> 4:3\n",
+                     g_video_aspect_num, g_video_aspect_den);
+        g_video_aspect_num = 4;
+        g_video_aspect_den = 3;
+    }
+
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
@@ -2480,6 +2610,8 @@ int main(int argc, char** argv) {
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     ginfo.lock_mode        = ctrl_lock_mode;
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+                    ginfo.lock_device      = ctrl_lock_device;
+                    ginfo.ws_offered       = ws_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
@@ -2632,10 +2764,10 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
-        /* Dev builds keep P1 connected even with no controller so the always-on
-         * keyboard (g_dev_kb_p1) can drive port 1 standalone. */
-        const bool kb_p1 = (g_dev_kb_p1 && s == 0);
-        sio_set_pad_connected(s, (g_players[s].kind != 0 || kb_p1) ? 1 : 0);
+        /* Dev-any-input keeps P1 connected even with no assigned controller so the
+         * keyboard / any plugged-in controller can drive port 1 standalone. */
+        const bool dev_p1 = (dev_any_input_enabled() && s == 0);
+        sio_set_pad_connected(s, (g_players[s].kind != 0 || dev_p1) ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
