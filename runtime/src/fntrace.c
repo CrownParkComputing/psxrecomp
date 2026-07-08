@@ -112,6 +112,22 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
              * positive); clearing it makes dirty_ram_is_dirty() true ONLY for pages a
              * later overlay overwrites, so the dispatch runs clean text compiled and
              * interprets only true overlays (Tomba 2 boot-text loader overlay). */
+            /* Apply compile-free Tweaks data-section RAM pokes at the game-entry
+             * handoff, and CRUCIALLY *before* the image-baseline clear below. The
+             * pokes modify the loaded EXE's data section; they must be folded INTO
+             * the clean compiled-image baseline. If applied AFTER the baseline clear,
+             * the poke marks its 4KB page dirty, and because data and code share
+             * pages in the SLUS, the CODE sharing that page is forced to the dirty-RAM
+             * interpreter — which fails on interior-block entry (observed: a poke near
+             * 0x8006D608 dirtied code block 0x8006D5A0 -> unknown-dispatch fatal). By
+             * poking first, the baseline treats the poked image as clean, so the code
+             * stays compiled/native and simply reads the new data value. This is also
+             * the pre-first-instruction timing the design doc calls for (§7a opt 1):
+             * a value read on the first boot frame (e.g. DefOptions) sees the poke.
+             * Idempotent; main.cpp's post-frame apply remains a no-op fallback. */
+            extern void tweak_runtime_apply(void);
+            tweak_runtime_apply();
+
             extern void dirty_ram_clear_image_baseline(void);
             dirty_ram_clear_image_baseline();
             cdrom_notify_game_started();

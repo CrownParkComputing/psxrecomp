@@ -22,6 +22,10 @@
 
 extern void    psx_write_byte(uint32_t addr, uint8_t val);  /* memory.c */
 extern uint8_t psx_read_byte(uint32_t addr);                /* memory.c */
+/* Bless an intentional data patch into the text-divergence reference image so
+ * code that shares the poked 4KB page is not mistaken for self-modifying code
+ * and forced to the interpreter (memory.c). */
+extern void    dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len);
 
 #define TWEAK_MAX_POKE     1024      /* large data tables chunk into many poke lines */
 #define TWEAK_POKE_BYTES     64      /* max bytes per poke line (emitter chunks to 32) */
@@ -112,9 +116,21 @@ void tweak_runtime_configure(const char *state_path) {
 void tweak_runtime_apply(void) {
     if (g_applied) return;
     g_applied = 1;
-    for (int i = 0; i < g_npoke; i++)
+    for (int i = 0; i < g_npoke; i++) {
         for (int b = 0; b < g_poke[i].nbytes; b++)
             psx_write_byte(g_poke[i].addr + (uint32_t)b, g_poke[i].bytes[b]);
+        /* Fold the poke into the text-divergence reference image. Data and code
+         * interleave within 4KB pages in the SLUS EXE; without this, poking a
+         * data value makes the guard's byte-compare window diverge for the code
+         * sharing that page, forcing it to the dirty-RAM interpreter — which
+         * fatals on interior-block entry (observed: a poke near 0x8006D608
+         * wedged code block 0x8006D5A0 with an unknown-dispatch halt). Blessing
+         * keeps the poked bytes as the authorized image so the code stays
+         * compiled/native and simply reads the new value. A genuine game write
+         * of DIFFERENT bytes still diverges and is still caught. */
+        dirty_ram_text_bless(g_poke[i].addr & 0x1FFFFFFFu,
+                             g_poke[i].bytes, g_poke[i].nbytes);
+    }
 }
 
 int tweak_runtime_debug_json(char *out, int cap) {

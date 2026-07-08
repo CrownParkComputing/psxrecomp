@@ -555,6 +555,37 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
     }
 }
 
+// Compile-free Tweaks disc swap (TWEAKS_PREBAKE.md §9): the "Build" step writes a
+// patched disc as "<stem>.tweaks.<ext>" (cue+bin, or iso) for a NON-vanilla selection
+// that includes disc/asset patches. If such a sibling exists next to the stock disc or
+// next to the exe, target it; a vanilla selection leaves it absent -> stock disc runs.
+// "The file decides what's active" — no separate variant build, the stock binary just
+// mounts the patched disc. Returns {} when no patched sibling is present.
+static std::filesystem::path resolve_tweaks_disc_sibling(const std::filesystem::path& stock_disc,
+                                                         const std::string& game_id,
+                                                         const char* argv0) {
+    std::filesystem::path stem = stock_disc.filename();
+    stem.replace_extension();                       // "Game (USA).cue" -> "Game (USA)"
+    std::vector<std::filesystem::path> dirs;
+    if (stock_disc.has_parent_path()) dirs.push_back(stock_disc.parent_path());
+    if (argv0 && argv0[0]) {
+        std::error_code ec;
+        std::filesystem::path exe = std::filesystem::absolute(argv0, ec);
+        if (!ec && exe.has_parent_path()) dirs.push_back(exe.parent_path());
+    }
+    for (const auto& dir : dirs) {
+        for (const char* ext : {".tweaks.cue", ".tweaks.iso", ".tweaks.bin"}) {
+            std::filesystem::path cand = dir / (stem.string() + ext);
+            if (std::filesystem::exists(cand) && validate_disc_for_launch(cand, game_id)) {
+                std::fprintf(stdout,
+                    "psxrecomp: Tweaks patched disc active -> %s\n", cand.string().c_str());
+                return cand;
+            }
+        }
+    }
+    return {};
+}
+
 static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::path& config_disc,
                                                       const char* disc_override,
                                                       const std::string& game_id,
@@ -574,7 +605,8 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
             if (!r.empty()) cd = r;
         }
         if (std::filesystem::exists(cd) && validate_disc_for_launch(cd, game_id)) {
-            return cd;
+            std::filesystem::path tw = resolve_tweaks_disc_sibling(cd, game_id, argv0);
+            return tw.empty() ? cd : tw;
         }
     }
 
