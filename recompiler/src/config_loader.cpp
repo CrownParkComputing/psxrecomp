@@ -1032,6 +1032,16 @@ UserSettings load_user_settings(const fs::path& path) {
             if (!v.empty()) { s.language = v; s.has_language = true; }
         });
     }
+    if (doc.contains("launcher")) {
+        const toml::value& lc = toml::find(doc, "launcher");
+        if (lc.contains("ui_scale")) try_get([&]{
+            const auto v = toml::find<std::string>(lc, "ui_scale");
+            if (!v.empty()) {
+                float val = std::stof(v);
+                if (val >= 0.5f && val <= 2.0f) { s.ui_scale = val; s.has_ui_scale = true; }
+            }
+        });
+    }
     if (doc.contains("controller")) {
         const toml::value& ct = toml::find(doc, "controller");
         if (ct.contains("p1_device")) try_get([&]{
@@ -1127,8 +1137,9 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     f << "\n[audio]\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
-    if (s.has_skip_launcher)
+    if (s.has_skip_launcher || s.has_ui_scale)
         f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
+    if (s.has_ui_scale) f << "ui_scale         = " << s.ui_scale << "\n";
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)

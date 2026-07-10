@@ -2696,6 +2696,7 @@ int main(int argc, char** argv) {
             seed.deadzone = resolved_deadzone >= 0 ? resolved_deadzone : 12000;
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
+            // ui_scale: default to 1.0 (no config source yet, launcher reads from settings.toml)
 
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);

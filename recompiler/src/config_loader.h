@@ -620,6 +620,10 @@ struct UserSettings {
     // .language / g_lang). "off"/"jp"/"" = untranslated native game. Persisted to
     // settings.toml [localization].language.
     bool has_language = false; std::string language = "en";
+
+    // UI scale: launcher UI scale cycling (0.5 0.75 1.0 1.25 1.5 1.75 2.0).
+    // Persisted to settings.toml [launcher].ui_scale.
+    bool has_ui_scale = false; float ui_scale = 1.0f;
 };
 
 // GameOptions — the game's OWN native OPTION-screen settings, declared in a

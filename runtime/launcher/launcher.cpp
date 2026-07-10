@@ -321,8 +321,10 @@ struct LauncherModel {
     std::string disc_file, disc_region, disc_serial, verdict_title, verdict_detail, verdict_state="none";
     bool v_header=false, v_crc=false, v_verified=false;
 
-    // display labels (computed from the values above)
+    // launcher UI scale (persistent, 0.5..2.0)
     float uiscale = 1.0f;
+
+    // display labels (computed from the values above)
     std::string renderer_label, crt_label, texfilter_label, aspect_label, winsize_label, uiscale_label;
 
     // keybind rebinding
@@ -746,7 +748,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.lock_device = game.lock_device;
     m.ws_offered  = game.ws_offered;
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
-    m.uiscale = 1.0f; // TODO: persist uiscale in UserSettings
+    m.uiscale = io.has_ui_scale ? io.ui_scale : 1.0f;
     m.p1_dev_index = io.has_p1_device ? find_or_add_device_index(dev_opts, io.p1_device) : (dev_opts.size()>2?2:1);
     m.p2_dev_index = io.has_p2_device ? find_or_add_device_index(dev_opts, io.p2_device) : 0;
     refresh_player(m, 0, dev_opts);
@@ -1191,7 +1193,7 @@ Result run(SDL_Window* window, void* gl_context,
             io.language = game.languages[m.lang_index].code;
             io.has_language = true;
         }
-        // io.uiscale = m.uiscale; io.has_uiscale = true;
+        io.ui_scale = m.uiscale; io.has_ui_scale = true;
     }
 
     return result;
