@@ -10,7 +10,8 @@ duckstation/dep/prebuilt/
 
 # Ghidra project files (large, regenerable)
 ghidra/
-
+references/
+SpiritDecomp
 # Backup of the working state — see CURRENT_STATE.md for what this contains.
 .happypath/
 
@@ -26,6 +27,7 @@ test_msvc/
 
 # Recompiler output (derivative of copyrighted Sony BIOS, regenerate locally)
 generated/
+
 
 # Release packaging artifacts
 release-stage/

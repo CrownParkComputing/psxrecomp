@@ -35,6 +35,12 @@ bool ControlFlowAnalyzer::is_control_flow(uint32_t instr) {
         return true; // j, jal
     }
 
+    // COP2 branches (BC2F, BC2T): opcode 0x12, rs=0x08 or 0x09
+    if (opcode == 0x12) {
+        uint32_t rs = (instr >> 21) & 0x1F;
+        if (rs == 0x08 || rs == 0x09) return true; // bc2f, bc2t
+    }
+
     return false;
 }
 
@@ -169,6 +175,23 @@ ControlFlowInstr ControlFlowAnalyzer::analyze_instruction(uint32_t addr, uint32_
             cf.target = get_jump_target(addr, instr);
             cf.has_delay_slot = true;
             cf.mnemonic = "jal";
+            break;
+
+        case 0x12: // COP2 branches (BC2F, BC2T)
+            {
+                uint32_t cop2_rs = (instr >> 21) & 0x1F;
+                if (cop2_rs == 0x08) { // BC2F
+                    cf.type = ControlFlowType::Branch;
+                    cf.target = get_branch_target(addr, instr);
+                    cf.has_delay_slot = true;
+                    cf.mnemonic = "bc2f";
+                } else if (cop2_rs == 0x09) { // BC2T
+                    cf.type = ControlFlowType::Branch;
+                    cf.target = get_branch_target(addr, instr);
+                    cf.has_delay_slot = true;
+                    cf.mnemonic = "bc2t";
+                }
+            }
             break;
     }
 

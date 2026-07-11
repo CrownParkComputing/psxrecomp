@@ -6,6 +6,10 @@
 
 extern uint64_t s_frame_count;
 
+/* Forward declarations for DMA completion callbacks */
+extern void mdec_finish_async_in_transfer(uint32_t final_addr, uint32_t total_words);
+extern void mdec_finish_async_out_transfer(uint32_t final_addr, uint32_t total_words);
+
 /* FMV-activity detector: frame stamp of the newest colour (15/24-bit) MDEC
  * decode. Streamed video decodes every frame; texture decompression uses the
  * 4/8-bit luma path and does not stamp. */
@@ -563,12 +567,12 @@ uint32_t mdec_dma_read_word(void) {
     return value;
 }
 
-int mdec_dma_write_ready(void) {
-    if (mdec.output_pos < mdec.output_size) return 0;
+bool mdec_dma_write_ready(void) {
+    if (mdec.output_pos < mdec.output_size) return false;
     return !mdec.busy || mdec.input_count < mdec.expected_halfwords;
 }
 
-int mdec_dma_read_ready(void) {
+bool mdec_dma_read_ready(void) {
     return mdec.output_pos < mdec.output_size;
 }
 
@@ -597,11 +601,11 @@ void mdec_debug_get_state(MDECDebugState *out) {
     out->dma_read_underflows = mdec.dma_read_underflows;
 }
 
-uint64_t mdec_debug_get_event_total(void) {
-    return mdec_trace_seq;
+uint32_t mdec_debug_get_event_total(void) {
+    return (uint32_t)mdec_trace_seq;
 }
 
-uint32_t mdec_debug_copy_events(uint64_t seq_lo, uint64_t seq_hi,
+uint32_t mdec_debug_copy_events(uint32_t seq_lo, uint32_t seq_hi,
                                 MDECDebugEvent *out, uint32_t max_count) {
     if (!out || max_count == 0) return 0;
     uint64_t oldest = (mdec_trace_seq > MDEC_TRACE_CAP) ? mdec_trace_seq - MDEC_TRACE_CAP : 0;

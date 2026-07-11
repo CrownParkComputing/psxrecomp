@@ -56,5 +56,10 @@ hardware provides.
 
 ## Resolved
 
+- ~~S1 — GPU shaded line uses flat color~~ — Fixed: sw_draw_shaded_line interpolates C0→C1 per pixel
+- ~~S2 — GPU polyline crashes~~ — Fixed: state machine with 0x50005000 terminator
+- ~~S3 — MDEC decoder is a no-op~~ — Fixed: full Beetle-faithful decoder (RLE decode, dequant, IDCT, YCbCr→RGB 15/24bpp, macroblock pipeline)
+- ~~S4 — SPU has no audio synthesis~~ — Fixed: 24-voice ADPCM decoder, reverb, noise LFSR, volume sweep, pitch modulation (PMON), IRQ delivery
+- ~~S5 — DMA channels 0,1,3,5 unimplemented~~ — Fixed: ch0/1 MDEC, ch3 CDROM, ch4 SPU, ch5 PIO all implemented
 - ~~DMA ch2 GPU→RAM writes zeros~~ — Fixed 2026-04-24 (4054dc1)
 - ~~GPU raw texture mode uses color==0x808080 check~~ — Fixed 2026-04-24

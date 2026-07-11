@@ -24,15 +24,15 @@ bool FunctionAnalyzer::is_jr_ra(uint32_t instr) {
 }
 
 bool FunctionAnalyzer::is_prologue(uint32_t instr, int32_t& stack_size) {
-    // addiu $sp, $sp, -N
-    // Format: 001001 11101 11101 <16-bit signed immediate>
-    // Opcode: 0x27 (addiu), rs=$sp (29), rt=$sp (29)
+    // addiu/addi $sp, $sp, -N
+    // Format: 001001/001000 11101 11101 <16-bit signed immediate>
+    // Opcode: 0x09 (addiu) or 0x08 (addi), rs=$sp (29), rt=$sp (29)
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
     uint32_t rt = (instr >> 16) & 0x1F;
     int16_t imm = (int16_t)(instr & 0xFFFF);
 
-    if (opcode == 0x09 && rs == 29 && rt == 29 && imm < 0) {
+    if ((opcode == 0x09 || opcode == 0x08) && rs == 29 && rt == 29 && imm < 0) {
         stack_size = -imm; // Store positive stack frame size
         return true;
     }
@@ -40,13 +40,13 @@ bool FunctionAnalyzer::is_prologue(uint32_t instr, int32_t& stack_size) {
 }
 
 bool FunctionAnalyzer::is_epilogue(uint32_t instr, int32_t& stack_size) {
-    // addiu $sp, $sp, +N
+    // addiu/addi $sp, $sp, +N
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
     uint32_t rt = (instr >> 16) & 0x1F;
     int16_t imm = (int16_t)(instr & 0xFFFF);
 
-    if (opcode == 0x09 && rs == 29 && rt == 29 && imm > 0) {
+    if ((opcode == 0x09 || opcode == 0x08) && rs == 29 && rt == 29 && imm > 0) {
         stack_size = imm;
         return true;
     }
@@ -64,6 +64,7 @@ bool FunctionAnalyzer::is_valid_mips_word(uint32_t instr) {
         switch (funct) {
         case 0x00u: case 0x02u: case 0x03u: case 0x04u:
         case 0x06u: case 0x07u: case 0x08u: case 0x09u:
+        case 0x0Au: case 0x0Bu:  // MOVN, MOVZ
         case 0x0Cu: case 0x0Du:
         case 0x10u: case 0x11u: case 0x12u: case 0x13u:
         case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
@@ -76,7 +77,8 @@ bool FunctionAnalyzer::is_valid_mips_word(uint32_t instr) {
         }
     }
     if (opcode == 0x01u) {
-        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
+        return rt == 0x00u || rt == 0x01u || rt == 0x02u || rt == 0x03u ||
+               rt == 0x10u || rt == 0x11u || rt == 0x12u || rt == 0x13u;
     }
 
     switch (opcode) {
@@ -85,6 +87,7 @@ bool FunctionAnalyzer::is_valid_mips_word(uint32_t instr) {
     case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
     case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
     case 0x10u: case 0x12u:
+    case 0x14u: case 0x15u: case 0x16u: case 0x17u:  // branch-likely
     case 0x20u: case 0x21u: case 0x22u: case 0x23u:
     case 0x24u: case 0x25u: case 0x26u:
     case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
@@ -102,6 +105,8 @@ bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
     if (opcode == 0x02 || opcode == 0x03) return true;
     // BEQ, BNE, BLEZ, BGTZ
     if (opcode >= 0x04 && opcode <= 0x07) return true;
+    // BEQL, BNEL, BLEZL, BGTZL (branch-likely)
+    if (opcode >= 0x14 && opcode <= 0x17) return true;
     // REGIMM: BLTZ, BGEZ, BLTZAL, BGEZAL
     if (opcode == 0x01) return true;
     // SPECIAL: JR, JALR
@@ -117,7 +122,7 @@ bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
 static bool is_load_imm_zero_u16(uint32_t instr, uint32_t& rt_out, uint32_t& imm_out) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
-    if ((opcode != 0x09 && opcode != 0x0D) || rs != 0) {
+    if ((opcode != 0x09 && opcode != 0x08 && opcode != 0x0D) || rs != 0) {
         return false;
     }
     rt_out = (instr >> 16) & 0x1F;
@@ -224,7 +229,7 @@ static bool is_load_from_reg_base(uint32_t instr, uint32_t base_reg, uint32_t& r
 static bool is_load_imm_zero(uint32_t instr, uint32_t& rt_out) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
-    if ((opcode != 0x09 && opcode != 0x0D) || rs != 0) return false;
+    if ((opcode != 0x09 && opcode != 0x08 && opcode != 0x0D) || rs != 0) return false;
     rt_out = (instr >> 16) & 0x1F;
     return rt_out != 0;
 }
@@ -410,7 +415,7 @@ bool FunctionAnalyzer::is_likely_data_section(uint32_t start_addr, uint32_t end_
     static const bool valid_opcode[64] = {
         true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
         true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
-        true,  false, true,  false, false, false, false, false,   // 0x10-0x17 (COP0=0x10, COP2=0x12)
+        true,  false, true,  false, true,  true,  true,  true,   // 0x10-0x17 (COP0=0x10, COP2=0x12, branch-likely=0x14-0x17)
         false, false, false, false, false, false, false, false,   // 0x18-0x1F
         true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
         true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F
@@ -490,7 +495,7 @@ static bool exact_is_addiu_sp_neg(uint32_t instr) {
     uint32_t rs = (instr >> 21) & 0x1Fu;
     uint32_t rt = (instr >> 16) & 0x1Fu;
     int16_t imm = static_cast<int16_t>(instr & 0xFFFFu);
-    return opcode == 0x09u && rs == 29u && rt == 29u && imm < 0;
+    return (opcode == 0x09u || opcode == 0x08u) && rs == 29u && rt == 29u && imm < 0;
 }
 
 static bool exact_is_valid_mips_word(uint32_t instr) {
@@ -532,6 +537,12 @@ static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
     }
     if (opcode == 0x01u || (opcode >= 0x04u && opcode <= 0x07u) ||
         (opcode >= 0x14u && opcode <= 0x17u)) {
+        cf.kind = ExactCfKind::Branch;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    // COP2 branches (BC2F, BC2T): opcode 0x12, rs=0x08/0x09
+    if (opcode == 0x12u && (rs == 0x08u || rs == 0x09u)) {
         cf.kind = ExactCfKind::Branch;
         cf.target = exact_branch_target(pc, instr);
         return cf;
@@ -1166,7 +1177,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         static const bool valid[64] = {
             true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
             true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
-            true,  false, true,  false, false, false, false, false,  // 0x10-0x17
+            true,  false, true,  false, true,  true,  true,  true,   // 0x10-0x17
             false, false, false, false, false, false, false, false,  // 0x18-0x1F
             true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
             true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F

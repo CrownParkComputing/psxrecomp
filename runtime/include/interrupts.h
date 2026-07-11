@@ -21,6 +21,8 @@ struct CPUState;
 #define IRQ_SIO1    8
 #define IRQ_SPU     9
 #define IRQ_PIO     10
+#define IRQ_MDEC_IN  11
+#define IRQ_MDEC_OUT 12
 
 void interrupts_init(void);
 

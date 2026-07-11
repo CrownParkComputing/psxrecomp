@@ -107,6 +107,7 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
  * the storm and matches hardware (the SPU RAM payload still moves immediately;
  * only the busy-bit clear + completion IRQ are deferred). */
 #define DMA_SPU_CYCLES_PER_WORD      48u
+#define DMA_PIO_CYCLES_PER_WORD       4u
 
 /* DMA-execution provenance flags (read by memory.c's psx_write_word d44_note probe
  * for the MMX6 VSync-callback-pointer corruption hunt). g_dma_exec_depth>0 means a
@@ -453,6 +454,14 @@ static void finish_async_mdec_transfer(int ch, uint32_t final_addr, uint32_t tot
     complete_transfer(ch);
 }
 
+void mdec_finish_async_in_transfer(uint32_t final_addr, uint32_t total_words) {
+    finish_async_mdec_transfer(0, final_addr, total_words);
+}
+
+void mdec_finish_async_out_transfer(uint32_t final_addr, uint32_t total_words) {
+    finish_async_mdec_transfer(1, final_addr, total_words);
+}
+
 static void start_async_cdrom_transfer(void) {
     DMAAsyncChannel *a = &cdrom_async;
     if (a->active) return;
@@ -789,6 +798,36 @@ static void execute_ch6_otc(void) {
     complete_transfer(6);
 }
 
+static void execute_ch5_pio(void) {
+    /* PIO (Parallel I/O) — used for expansion port / parallel port transfers.
+     * Very simple: just move words directly to/from RAM with no device interaction.
+     * Direction: 0 = to RAM (read from device), 1 = from RAM (write to device).
+     * For now, we just complete the transfer immediately as PIO devices are
+     * typically slow and the game handles timing via busy-wait on the port. */
+    uint32_t chcr = channels[5].chcr;
+    uint32_t direction = chcr & 1u;
+    uint32_t step = (chcr >> 1) & 1u;
+    uint32_t total_words = transfer_word_count(5);
+    uint32_t addr = channels[5].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+
+    if (direction == 1) {
+        /* from RAM to device: just read and discard */
+        for (uint32_t i = 0; i < total_words; i++) {
+            (void)psx_read_word(addr);
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    } else {
+        /* to RAM from device: write zeros (device not emulated) */
+        for (uint32_t i = 0; i < total_words; i++) {
+            psx_write_word(addr, 0);
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    }
+    channels[5].madr = addr;
+    complete_transfer(5);
+}
+
 static void try_execute(int ch) {
     uint32_t chcr = channels[ch].chcr;
 
@@ -827,6 +866,9 @@ static void try_execute(int ch) {
         case 4:
             schedule_delayed_complete(4, execute_ch4_spu(),
                                       DMA_SPU_CYCLES_PER_WORD);
+            break;
+        case 5:
+            execute_ch5_pio();
             break;
         case 6:
             execute_ch6_otc();

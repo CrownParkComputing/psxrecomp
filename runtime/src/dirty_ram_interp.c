@@ -2149,6 +2149,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (_gc) return 1;
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    } else if (psx_game_address_in_text(addr)) {
+        /* Page diverged from reference image — compiled dispatch blocked.
+         * Still mark as a game-text miss so the interpreter gate at the
+         * bottom does not close (the page may be dirty from a self-mod
+         * that dirty_ram_mark_kernel_write didn't track). */
+        clean_game_text_miss = 1;
     }
 #endif
 

@@ -175,6 +175,14 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        /* Also mark the page dirty in dirty_ram_bitmap so the interpreter can
+         * handle the modified code. Without this, a self-modifying game text
+         * page diverges from the reference image (text_diverged_bitmap set) but
+         * stays non-dirty (dirty_ram_mark_kernel_write is a no-op for
+         * phys >= 0x10000, and dirty_ram_clear_image_baseline cleared it).
+         * Result: compiled dispatch is blocked (diverged) AND interpreter
+         * dispatch is blocked (not dirty) → unknown dispatch → crash. */
+        dirty_ram_mark_page(phys);
     }
 }
 

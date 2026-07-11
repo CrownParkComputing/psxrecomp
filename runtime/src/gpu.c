@@ -3122,8 +3122,19 @@ static void gpu_write_gp0_body(uint32_t val) {
         return;
     }
 
-    /* State: shaded polyline — alternating color, vertex words */
+/* State: shaded polyline — alternating color, vertex words */
     if (gp0_state == GP0_POLYLINE_SHADED) {
+        /* Terminator: hardware ends a polyline ONLY when the masked word
+         * matches 0x50005000 (the 0x55555555 terminator) — Beetle
+         * gpu.cpp:1030, psx-spx. The terminator check MUST be at the top,
+         * like in the mono polyline case, otherwise a terminator at a
+         * vertex position (polyline_has_prev == 2) won't be detected and
+         * will be treated as a vertex, de-phasing the command stream. */
+        if ((val & 0xF000F000u) == 0x50005000u) {
+            gp0_state = GP0_IDLE;
+            return;
+        }
+
         /* Even words (after cmd) are colors, odd words are vertices.
          * Sequence: [cmd+C0] [V0] [C1] [V1] [C2] [V2] ...
          * polyline_has_prev tracks: 0=need V0, 1=need C_next, 2=need V_next */

@@ -7,16 +7,10 @@
 namespace PS1 {
 
 // PS1 CD-ROM sector size (Mode 2, Form 1 user data)
-constexpr size_t SECTOR_SIZE = 2048;
-
-// Full sector size including headers/subchannel (2352 bytes for raw BIN files)
-constexpr size_t RAW_SECTOR_SIZE = 2352;
-
-// Offset to user data in raw sector (Mode 2, Form 1)
-constexpr size_t RAW_DATA_OFFSET = 24;
-
-// Primary Volume Descriptor location
-constexpr uint32_t PVD_SECTOR = 16;
+// constexpr size_t PS1::SECTOR_SIZE = 2048;
+// constexpr size_t PS1::RAW_SECTOR_SIZE = 2352;
+// constexpr size_t PS1::RAW_DATA_OFFSET = 24;
+// constexpr uint32_t PS1::PVD_SECTOR = 16;
 
 ISOReader::ISOReader()
     : is_open_(false) {
@@ -56,6 +50,7 @@ bool ISOReader::Open(const std::string& filename) {
         std::string line;
         int  cur_track_num   = -1;
         bool cur_track_audio = false;
+        std::string current_bin_path;
         while (std::getline(cue_file, line)) {
             // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
@@ -155,11 +150,11 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
     file_.clear();
 
     // Check if file uses raw sectors (2352 bytes) or cooked sectors (2048 bytes)
-    bool is_raw_format = (file_size % RAW_SECTOR_SIZE == 0);
+    bool is_raw_format = (file_size % PS1::RAW_SECTOR_SIZE == 0);
 
     if (is_raw_format) {
         // Raw BIN format - read full sector, extract user data
-        std::streampos offset = static_cast<std::streampos>(lba) * RAW_SECTOR_SIZE + RAW_DATA_OFFSET;
+        std::streampos offset = static_cast<std::streampos>(lba) * PS1::RAW_SECTOR_SIZE + PS1::RAW_DATA_OFFSET;
         file_.seekg(offset, std::ios::beg);
 
         if (!file_.good()) {
@@ -167,14 +162,14 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
             return false;
         }
 
-        file_.read(reinterpret_cast<char*>(buffer), SECTOR_SIZE);
+        file_.read(reinterpret_cast<char*>(buffer), PS1::SECTOR_SIZE);
         std::streamsize bytes_read = file_.gcount();
-        bool success = (bytes_read == SECTOR_SIZE);
+        bool success = (bytes_read == PS1::SECTOR_SIZE);
         file_.clear();
         return success;
     } else {
         // ISO format - sectors are already 2048 bytes
-        std::streampos offset = static_cast<std::streampos>(lba) * SECTOR_SIZE;
+        std::streampos offset = static_cast<std::streampos>(lba) * PS1::SECTOR_SIZE;
         file_.seekg(offset, std::ios::beg);
 
         if (!file_.good()) {
@@ -182,9 +177,9 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
             return false;
         }
 
-        file_.read(reinterpret_cast<char*>(buffer), SECTOR_SIZE);
+        file_.read(reinterpret_cast<char*>(buffer), PS1::SECTOR_SIZE);
         std::streamsize bytes_read = file_.gcount();
-        bool success = (bytes_read == SECTOR_SIZE);
+        bool success = (bytes_read == PS1::SECTOR_SIZE);
         file_.clear();
         return success;
     }
@@ -200,20 +195,20 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
     std::streampos file_size = file_.tellg();
     file_.clear();
 
-    if (file_size <= 0 || (file_size % RAW_SECTOR_SIZE) != 0) {
+    if (file_size <= 0 || (file_size % PS1::RAW_SECTOR_SIZE) != 0) {
         return false;
     }
 
-    std::streampos offset = static_cast<std::streampos>(lba) * RAW_SECTOR_SIZE;
+    std::streampos offset = static_cast<std::streampos>(lba) * PS1::RAW_SECTOR_SIZE;
     file_.seekg(offset, std::ios::beg);
     if (!file_.good()) {
         file_.clear();
         return false;
     }
 
-    file_.read(reinterpret_cast<char*>(buffer), RAW_SECTOR_SIZE);
+    file_.read(reinterpret_cast<char*>(buffer), PS1::RAW_SECTOR_SIZE);
     std::streamsize bytes_read = file_.gcount();
-    bool success = (bytes_read == RAW_SECTOR_SIZE);
+    bool success = (bytes_read == PS1::RAW_SECTOR_SIZE);
     file_.clear();
     return success;
 }
@@ -244,10 +239,10 @@ uint32_t ISOReader::GetSectorCount() {
     }
 
     const uint64_t size = static_cast<uint64_t>(file_size);
-    if ((size % RAW_SECTOR_SIZE) == 0) {
-        return static_cast<uint32_t>(size / RAW_SECTOR_SIZE);
+    if ((size % PS1::RAW_SECTOR_SIZE) == 0) {
+        return static_cast<uint32_t>(size / PS1::RAW_SECTOR_SIZE);
     }
-    return static_cast<uint32_t>(size / SECTOR_SIZE);
+    return static_cast<uint32_t>(size / PS1::SECTOR_SIZE);
 }
 
 int ISOReader::TrackCount() const {
@@ -279,8 +274,8 @@ uint32_t ISOReader::Read733(const uint8_t* data) const {
 
 bool ISOReader::ParseVolumeDescriptor() {
     // Read Primary Volume Descriptor from sector 16
-    uint8_t pvd[SECTOR_SIZE];
-    if (!ReadSector(PVD_SECTOR, pvd)) {
+    uint8_t pvd[PS1::SECTOR_SIZE];
+    if (!ReadSector(PS1::PVD_SECTOR, pvd)) {
         return false;
     }
 
@@ -521,17 +516,17 @@ size_t ISOReader::ReadFile(const std::string& path, uint8_t* buffer, size_t max_
     size_t bytes_to_read = std::min(static_cast<size_t>(entry.size), max_size);
 
     // Calculate number of sectors to read
-    uint32_t sectors_to_read = (bytes_to_read + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    uint32_t sectors_to_read = (bytes_to_read + PS1::SECTOR_SIZE - 1) / PS1::SECTOR_SIZE;
 
     // Read sectors sequentially
     size_t bytes_read = 0;
     for (uint32_t i = 0; i < sectors_to_read; i++) {
         // Calculate how many bytes to read from this sector
         size_t bytes_remaining = bytes_to_read - bytes_read;
-        size_t sector_bytes = std::min(bytes_remaining, SECTOR_SIZE);
+        size_t sector_bytes = std::min(bytes_remaining, PS1::SECTOR_SIZE);
 
         // Read sector into temporary buffer
-        uint8_t sector_buffer[SECTOR_SIZE];
+        uint8_t sector_buffer[PS1::SECTOR_SIZE];
         if (!ReadSector(entry.lba + i, sector_buffer)) {
             return bytes_read;  // Error - return what we've read so far
         }

@@ -705,21 +705,21 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
 
-    // REGIMM branches (bltz, bgez, bltzal, bgezal)
+    // REGIMM branches (bltz, bgez, bltzal, bgezal + likely variants)
     if (opcode == 0x01) {
         uint32_t regimm_op = (instr >> 16) & 0x1F;
-        if (regimm_op == 0x00) { // bltz
+        if (regimm_op == 0x00 || regimm_op == 0x02) { // bltz / bltzl
             // Classified LEFT-edge funnel bltz (auto_screen_x, signed idioms):
             // reject only past the revealed margin. Identity at 4:3 (margin 0).
             if (ws_cull_bltz_pcs_.count(addr))
                 return fmt::format("psx_ws_cull_bltz({}) /* ws auto screen-x cull (left edge) */",
                                    reg_name(rs));
             return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x01) { // bgez
+        } else if (regimm_op == 0x01 || regimm_op == 0x03) { // bgez / bgezl
             return fmt::format("(int32_t){} >= 0", reg_name(rs));
-        } else if (regimm_op == 0x10) { // bltzal
+        } else if (regimm_op == 0x10 || regimm_op == 0x12) { // bltzal / bltzall
             return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x11) { // bgezal
+        } else if (regimm_op == 0x11 || regimm_op == 0x13) { // bgezal / bgezall
             return fmt::format("(int32_t){} >= 0", reg_name(rs));
         }
     }
@@ -741,6 +741,26 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
         case 0x07: // bgtz
         case 0x17: // bgtzl
             return fmt::format("(int32_t){} > 0", reg_name(rs));
+
+        case 0x12: // COP2 branch (BC2F, BC2T)
+            {
+                uint32_t cop2_rs = (instr >> 21) & 0x1F;
+                uint32_t cond_code = (instr >> 16) & 0x3;
+                // BC2F (cop2_rs==0x08): branch if COP2 condition is FALSE
+                // BC2T (cop2_rs==0x09): branch if COP2 condition is TRUE
+                // The condition tests bit (30+cond_code) of GTE ctrl register 31
+                // (flags register). GTE flags bits: bit31=LE0, bit30=GE0, etc.
+                // For PS1 games, the standard pattern is:
+                //   BC2F: branch if (gte_ctrl[31] & (1 << (30+cc))) == 0
+                //   BC2T: branch if (gte_ctrl[31] & (1 << (30+cc))) != 0
+                if (cop2_rs == 0x09) { // BC2T
+                    return fmt::format("(cpu->gte_ctrl[31] & 0x{:08X}u) != 0",
+                                      1u << (30 + cond_code));
+                } else { // BC2F
+                    return fmt::format("(cpu->gte_ctrl[31] & 0x{:08X}u) == 0",
+                                      1u << (30 + cond_code));
+                }
+            }
     }
 
     return "0 /* unknown branch condition: defaults to not-taken */";
@@ -1086,6 +1106,24 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             case 0x27: code = translate_nor(instr); break;     // nor
             case 0x2A: code = translate_slt(instr); break;     // slt
             case 0x2B: code = translate_sltu(instr); break;    // sltu
+            case 0x0A:                                          // movn
+                {
+                    uint32_t rs = get_rs(instr);
+                    uint32_t rt = get_rt(instr);
+                    uint32_t rd = get_rd(instr);
+                    code = fmt::format("if ({}) {} = {};  /* movn */",
+                                      reg_name(rt), reg_name(rd), reg_name(rs));
+                }
+                break;
+            case 0x0B:                                          // movz
+                {
+                    uint32_t rs = get_rs(instr);
+                    uint32_t rt = get_rt(instr);
+                    uint32_t rd = get_rd(instr);
+                    code = fmt::format("if ({}) {} = {};  /* movz */",
+                                      reg_name(rt), reg_name(rd), reg_name(rs));
+                }
+                break;
             default:
                 code = fmt::format("/* TODO: SPECIAL funct=0x{:02X} */", funct);
         }
@@ -1173,6 +1211,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                         uint32_t gte_cmd = instr & 0x1FFFFFF;
                         // Route ALL GTE commands through gte_execute() for correct behavior
                         code = fmt::format("gte_execute(cpu, 0x{:07X});  /* gte cmd 0x{:02X} */", gte_cmd, gte_cmd & 0x3F);
+                    } else if (cop_op == 0x08) { // BC2F - branch if GTE flag clear
+                        code = fmt::format("/* BC2F — handled as block exit branch */  (void)0;  /* bc2f */");
+                    } else if (cop_op == 0x09) { // BC2T - branch if GTE flag set
+                        code = fmt::format("/* BC2T — handled as block exit branch */  (void)0;  /* bc2t */");
                     } else {
                         code = fmt::format("/* cop2: 0x{:08X} */", instr);
                     }
@@ -1476,7 +1518,8 @@ std::string CodeGenerator::translate_basic_block(
                     uint32_t branch_instr = block.exit_instr.instruction;
                     uint32_t b_opcode = (branch_instr >> 26) & 0x3F;
                     uint32_t regimm_op = (branch_instr >> 16) & 0x1F;
-                    if (b_opcode == 0x01 && (regimm_op == 0x10 || regimm_op == 0x11)) {
+                    if (b_opcode == 0x01 && (regimm_op == 0x10 || regimm_op == 0x11 ||
+                                             regimm_op == 0x12 || regimm_op == 0x13)) {
                         ss << config_.indent
                            << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* branch-and-link before delay slot */\n",
                                           addr + 8);
@@ -1531,8 +1574,9 @@ std::string CodeGenerator::translate_basic_block(
                         uint32_t b_opcode = (branch_instr >> 26) & 0x3F;
                         if (b_opcode == 0x01) {
                             uint32_t regimm_op = (branch_instr >> 16) & 0x1F;
-                            if (regimm_op == 0x10 || regimm_op == 0x11) {
-                                // bltzal or bgezal: link register always set
+                            if (regimm_op == 0x10 || regimm_op == 0x11 ||
+                                regimm_op == 0x12 || regimm_op == 0x13) {
+                                // bltzal/bgezal/bltzall/bgezall: link register always set
                                 ss << config_.indent
                                    << fmt::format("cpu->gpr[31] = 0x{:08X};  /* branch-and-link return addr */\n", addr + 8);
                             }

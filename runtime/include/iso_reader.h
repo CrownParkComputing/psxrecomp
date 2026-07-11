@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <map>
 
 /**
  * ISO/BIN/CUE Reader for PS1 CD-ROM images
@@ -18,6 +19,18 @@
  */
 
 namespace PS1 {
+
+// PS1 CD-ROM sector size (Mode 2, Form 1 user data)
+constexpr size_t SECTOR_SIZE = 2048;
+
+// Full sector size including headers/subchannel (2352 bytes for raw BIN files)
+constexpr size_t RAW_SECTOR_SIZE = 2352;
+
+// Offset to user data in raw sector (Mode 2, Form 1)
+constexpr size_t RAW_DATA_OFFSET = 24;
+
+// Primary Volume Descriptor location
+constexpr uint32_t PVD_SECTOR = 16;
 
 /**
  * Information about a file entry in the ISO filesystem
@@ -44,9 +57,10 @@ struct RootDirectoryInfo {
  * commands (GetTN/GetTD) must report them.
  */
 struct CDTrack {
-    int      number;     // 1-based track number
+    int      number;      // 1-based track number
     bool     is_audio;   // true = CD-DA audio (Red Book); false = data
-    uint32_t start_lba;  // .bin-relative start LBA (cue INDEX 01; track 1 = 0)
+    uint32_t start_lba;  // absolute disc LBA (absolute from start of disc)
+    std::string bin_path; // path to the .bin file for this track
 };
 
 class ISOReader {
@@ -187,12 +201,27 @@ private:
      */
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
 
-    std::ifstream file_;
+    /**
+     * Find the track index for a given LBA
+     * @param lba Logical Block Address
+     * @return Index in tracks_ vector, or -1 if not found
+     */
+    int FindTrackForLBA(uint32_t lba) const;
+
+    /**
+     * Open a BIN file for a specific track
+     * @param track_idx Index in tracks_ vector
+     * @return true if opened successfully
+     */
+    bool OpenTrackBIN(int track_idx);
+
+std::ifstream file_;
     bool is_open_;
     std::string volume_id_;
     std::string bin_path_;
     RootDirectoryInfo root_dir_;
     std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
+    std::map<std::string, std::ifstream> bin_files_;  // per-track BIN files
 };
 
 } // namespace PS1

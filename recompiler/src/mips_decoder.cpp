@@ -65,6 +65,8 @@ void MipsDecoder::decode_special(DecodedInstruction& out) {
         case 0x25: out.mnemonic = "OR";      break;
         case 0x26: out.mnemonic = "XOR";     break;
         case 0x27: out.mnemonic = "NOR";     break;
+        case 0x0A: out.mnemonic = "MOVN";    break;
+        case 0x0B: out.mnemonic = "MOVZ";    break;
         case 0x2A: out.mnemonic = "SLT";     break;
         case 0x2B: out.mnemonic = "SLTU";    break;
         default:
@@ -82,8 +84,12 @@ void MipsDecoder::decode_regimm(DecodedInstruction& out) {
     switch (out.rt) {
         case 0x00: out.mnemonic = "BLTZ";    break;
         case 0x01: out.mnemonic = "BGEZ";    break;
+        case 0x02: out.mnemonic = "BLTZL";   break;
+        case 0x03: out.mnemonic = "BGEZL";   break;
         case 0x10: out.mnemonic = "BLTZAL";  break;
         case 0x11: out.mnemonic = "BGEZAL";  break;
+        case 0x12: out.mnemonic = "BLTZALL"; break;
+        case 0x13: out.mnemonic = "BGEZALL"; break;
         default:
             out.mnemonic = "REGIMM?";
             out.format   = InstrFormat::UNKNOWN;
@@ -119,6 +125,8 @@ void MipsDecoder::decode_cop2(DecodedInstruction& out) {
         case 0x02: out.mnemonic = "CFC2"; break;
         case 0x04: out.mnemonic = "MTC2"; break;
         case 0x06: out.mnemonic = "CTC2"; break;
+        case 0x08: out.mnemonic = "BC2F"; break;
+        case 0x09: out.mnemonic = "BC2T"; break;
         default:
             // CO bit (bit 25) set => GTE command word
             if (out.rs & 0x10) out.mnemonic = "GTE";
@@ -157,6 +165,10 @@ void MipsDecoder::set_classification_flags(DecodedInstruction& out) {
                 out.is_jump           = true;
                 out.is_delay_slot_user = true;
                 break;
+            case 0x0A: // MOVN
+            case 0x0B: // MOVZ
+                out.is_alu = true;
+                break;
             case 0x0C: out.is_syscall = true; break;
             case 0x0D: out.is_break   = true; break;
             default:   out.is_alu     = true; break;
@@ -184,6 +196,10 @@ void MipsDecoder::set_classification_flags(DecodedInstruction& out) {
         case 0x05: // BNE
         case 0x06: // BLEZ
         case 0x07: // BGTZ
+        case 0x14: // BEQL
+        case 0x15: // BNEL
+        case 0x16: // BLEZL
+        case 0x17: // BGTZL
             out.is_branch         = true;
             out.is_delay_slot_user = true;
             break;
@@ -223,7 +239,15 @@ void MipsDecoder::set_classification_flags(DecodedInstruction& out) {
             break;
 
         // COP0, COP2: neither load/store/alu/branch/jump
+        // except BC2F/BC2T which are COP2 conditional branches
         default:
+            if (out.opcode == 0x12) {
+                uint32_t cop2_rs = (out.raw >> 21) & 0x1F;
+                if (cop2_rs == 0x08 || cop2_rs == 0x09) { // BC2F, BC2T
+                    out.is_branch         = true;
+                    out.is_delay_slot_user = true;
+                }
+            }
             break;
     }
 }
@@ -270,6 +294,10 @@ DecodedInstruction MipsDecoder::decode(uint32_t instr, uint32_t address) {
         case 0x0F: out.mnemonic = "LUI";   out.format = InstrFormat::I; break;
         case 0x10: decode_cop0(out); break;
         case 0x12: decode_cop2(out); break;
+        case 0x14: out.mnemonic = "BEQL";   out.format = InstrFormat::I; break;
+        case 0x15: out.mnemonic = "BNEL";   out.format = InstrFormat::I; break;
+        case 0x16: out.mnemonic = "BLEZL";  out.format = InstrFormat::I; break;
+        case 0x17: out.mnemonic = "BGTZL";  out.format = InstrFormat::I; break;
         case 0x20: out.mnemonic = "LB";    out.format = InstrFormat::I; break;
         case 0x21: out.mnemonic = "LH";    out.format = InstrFormat::I; break;
         case 0x22: out.mnemonic = "LWL";   out.format = InstrFormat::I; break;
@@ -297,8 +325,10 @@ DecodedInstruction MipsDecoder::decode(uint32_t instr, uint32_t address) {
     }
     if (out.opcode == 0x04 || out.opcode == 0x05 ||
         out.opcode == 0x06 || out.opcode == 0x07 ||
-        out.opcode == 0x01) {
-        // BEQ/BNE/BLEZ/BGTZ + REGIMM (BLTZ/BGEZ/etc.)
+        out.opcode == 0x01 ||
+        out.opcode == 0x14 || out.opcode == 0x15 ||
+        out.opcode == 0x16 || out.opcode == 0x17) {
+        // BEQ/BNE/BLEZ/BGTZ + REGIMM (BLTZ/BGEZ/etc.) + branch-likely variants
         out.branch_target = compute_branch_target(address, out.imm16);
     }
 
