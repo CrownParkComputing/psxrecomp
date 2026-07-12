@@ -1682,6 +1682,40 @@ static void sdl_vblank_present(void) {
     int override = -1;
 #endif
 
+    /* FPS counter (window title + stderr, every 1s). Placed at the TOP of the
+     * function BEFORE any early returns (turbo, fmv_skip, headless) so it
+     * always fires regardless of presentation state. */
+    {
+        static uint64_t fps_last_frame = 0;
+        static Uint64   fps_last_time  = 0;
+        static std::string base_title;
+        extern uint64_t s_frame_count;
+        Uint64 now = SDL_GetPerformanceCounter();
+        Uint64 freq = SDL_GetPerformanceFrequency();
+        if (fps_last_time == 0) {
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+            const char *t = SDL_GetWindowTitle(sdl_window);
+            if (t) base_title = t;
+        }
+        Uint64 elapsed = now - fps_last_time;
+        if (elapsed >= freq) {
+            uint64_t df = s_frame_count - fps_last_frame;
+            double dt = (double)elapsed / (double)freq;
+            double game_fps = (double)df / dt;
+            double speed = game_fps / 59.94;
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s  [%.0f fps %.2fx]",
+                     base_title.c_str(), game_fps, speed);
+            if (sdl_window) SDL_SetWindowTitle(sdl_window, buf);
+            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx)  |  frames: %llu\n",
+                         game_fps, speed, (unsigned long long)s_frame_count);
+            std::fflush(stderr);
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+        }
+    }
+
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
      * returns so the curve is captured even when presents are skipped. */

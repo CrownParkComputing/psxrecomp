@@ -974,12 +974,12 @@ static void scan_cache_dir(void) {
 
     /* Startup inventory: print every indexed shared library so the user can
      * confirm the cache is being read (and not silently falling to interp). */
-    loader_log("overlay cache scan: %d " OV_LIB_EXT " file(s) indexed [arch=%s]",
-               s_cache_idx_count, PSX_OVERLAY_ARCH_ABI);
+    fprintf(stderr, "overlay cache scan: %d " OV_LIB_EXT " file(s) indexed [arch=%s]\n",
+            s_cache_idx_count, PSX_OVERLAY_ARCH_ABI);
     for (int i = 0; i < s_cache_idx_count; i++) {
         const char *base = strrchr(s_cache_idx[i].path, '/');
         base = base ? base + 1 : s_cache_idx[i].path;
-        loader_log("  [%d] %s (region=0x%08X)", i, base, s_cache_idx[i].region_start);
+        fprintf(stderr, "  [%d] %s (region=0x%08X)\n", i, base, s_cache_idx[i].region_start);
     }
 }
 
