@@ -1313,6 +1313,28 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
                 return;
             }
         }
+        /* Targeted write watchpoint for Crash Bash overlay pointer table.
+         * The bad pointer 0x6766BD35 was found at phys 0x000B3AC4. The disc
+         * overlay had zeros there — the game wrote these at runtime. Log
+         * every write to the table region so we can see which PC computed
+         * the bad value. Enabled by PSX_WRITE_WATCH=1. */
+        {
+            static int s_watch_enabled = -1;
+            if (s_watch_enabled < 0) {
+                const char *e = getenv("PSX_WRITE_WATCH");
+                s_watch_enabled = (e && *e == '1') ? 1 : 0;
+            }
+            if (s_watch_enabled && phys >= 0x000B3A80u && phys < 0x000B3B00u) {
+                uint32_t old = read_ram_word(phys);
+                fprintf(stderr,
+                    "WRITE_WATCH: phys=0x%08X val=0x%08X old=0x%08X "
+                    "store_pc=0x%08X frame=%llu\n",
+                    phys, val, old,
+                    g_debug_last_store_pc,
+                    (unsigned long long)s_frame_count);
+                fflush(stderr);
+            }
+        }
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         parity_trace_note_write(phys, 4, effective_store_pc());
