@@ -311,6 +311,8 @@ struct LauncherModel {
     int  texture_filter=0, crt=0, aspect_index=0, window_width=1280;
     int  p1_dev_index=1, p2_dev_index=0, p1_mode=0, p2_mode=0, deadzone_pct=37;
     bool allow_hybrid=true, mode_selectable=true, lock_device=false, ws_offered=true, lang_menu=false;
+    bool frame_interpolation=false;
+    int  frame_interpolation_fps=0;
     int  lang_index=0, cfg_player=0;
     bool mc1_enabled=true, mc2_enabled=true, launch_requested=false, quit_requested=false;
     std::string bios_path, disc_path, view="dashboard";
@@ -347,6 +349,9 @@ static int aspect_index_for(int num,int den){for(int i=0;i<kNumAspects;i++)if(kA
 static const int kWinWidths[]={960,1280,1600,1920};
 static const int kNumWinWidths=4;
 static int winsize_index(int w){int b=1,bd=1<<30;for(int i=0;i<kNumWinWidths;i++){int d=w>kWinWidths[i]?w-kWinWidths[i]:kWinWidths[i]-w;if(d<bd){bd=d;b=i;}}return b;}
+static const int kInterpFps[]={0,90,120,144,165,240};
+static const int kNumInterpFps=(int)(sizeof(kInterpFps)/sizeof(kInterpFps[0]));
+static int interp_fps_index(int fps){for(int i=0;i<kNumInterpFps;i++)if(kInterpFps[i]==fps)return i;return 0;}
 static std::string winsize_label_for(int w,int ai){return std::to_string(w)+" \xC3\x97 "+std::to_string(w*kAspects[ai][1]/kAspects[ai][0]);}
 static void refresh_labels(LauncherModel& m){
     m.renderer_label=renderer_name(m.renderer); m.crt_label=crt_name(m.crt);

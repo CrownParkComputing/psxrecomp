@@ -1722,19 +1722,6 @@ static void present_pending_dataready(void) {
     s_dataready_fires++;
 }
 
-/* Present a pended data-ready INT1 the moment the guest fully acks the
- * previous INT (Beetle CheckAIP: async results present as soon as the IRQ
- * register clears). Called from the irq_flag ack write. */
-static void present_pending_dataready(void) {
-    if (!pending_dataready || irq_flag != 0) return;
-    pending_dataready = 0;
-    response_clear();
-    response_push(pending_dataready_stat);
-    set_irq(CDIRQ_DATA_READY);
-    fire_cdrom_irq();
-    s_dataready_fires++;
-}
-
 void cdrom_init(const char* cue_path) {
     memset(param_fifo, 0, sizeof(param_fifo));
     memset(response_fifo, 0, sizeof(response_fifo));
