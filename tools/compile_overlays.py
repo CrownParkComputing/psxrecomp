@@ -151,6 +151,11 @@ def is_windows() -> bool:
             or platform.system().startswith(('MSYS', 'CYGWIN', 'MINGW')))
 
 
+def overlay_ext() -> str:
+    """Platform-correct shared library extension: .dll on Windows, .so elsewhere."""
+    return '.dll' if is_windows() else '.so'
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
@@ -1448,7 +1453,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         key = binascii.crc32(b''.join(
             struct.pack('<II', ev, crc)
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
-        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}.dll')
+        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
         if os.path.exists(dll_path) and not args.force:
             return frag_ids   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
@@ -1814,7 +1819,7 @@ def main():
                                            _interiors | _disp_roots, _executed))
 
         if not args.static:
-            dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}.dll')
+            dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}{overlay_ext()}')
 
         print(f'Overlay  load=0x{load_addr:08X}  size={size}  crc32=0x{crc32:08X}')
         if args.static:

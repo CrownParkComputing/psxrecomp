@@ -19,6 +19,20 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
+#  include <dirent.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#  include <elf.h>
+#endif
+
+/* Platform-correct shared library extension for glob patterns / ranges-path
+ * suffix replacement.  Must match compile_overlays.py overlay_ext(). */
+#ifdef _WIN32
+#  define OV_LIB_EXT ".dll"
+#  define OV_LIB_EXT_LEN 4
+#else
+#  define OV_LIB_EXT ".so"
+#  define OV_LIB_EXT_LEN 3
 #endif
 
 /* ============================================================================
@@ -653,18 +667,18 @@ static int cache_idx_has_basename(const char *fname) {
 
 const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
 
-/* Scan one directory for <addr8>_<crc8>.dll cache entries into the index.
+/* Scan one directory for <addr8>_<crc8>.{dll,so} cache entries into the index.
  * `dir` is a full directory path. Idempotent (skips already-indexed paths). */
 static void scan_one_cache_dir(const char *dir) {
 #ifdef _WIN32
     char pattern[768];
-    snprintf(pattern, sizeof(pattern), "%s/*_*.dll", dir);
+    snprintf(pattern, sizeof(pattern), "%s/*_*" OV_LIB_EXT, dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (strlen(fd.cFileName) != 21) continue; /* 8+1+8+4 = 21 */
-        /* Validate the <addr8>_<crc8>.dll shape explicitly: region_start 0 is
+        if (strlen(fd.cFileName) != 8 + 1 + 8 + OV_LIB_EXT_LEN) continue;
+        /* Validate the <addr8>_<crc8>.{dll,so} shape explicitly: region_start 0 is
          * LEGAL (the kernel-RAM window starts at phys 0), so a zero parse
          * result can't be used as the invalid sentinel. */
         int valid = (fd.cFileName[8] == '_');
@@ -694,7 +708,37 @@ static void scan_one_cache_dir(const char *dir) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    (void)dir;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        size_t nlen = strlen(name);
+        /* Expected: <addr8>_<crc8>.so — total length = 8+1+8+3 = 20 */
+        if (nlen != 8 + 1 + 8 + OV_LIB_EXT_LEN) continue;
+        if (strcmp(name + nlen - OV_LIB_EXT_LEN, OV_LIB_EXT) != 0) continue;
+        int valid = (name[8] == '_');
+        for (int ci = 0; valid && ci < 8; ci++) {
+            char c = name[ci];
+            valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+                    (c >= 'a' && c <= 'f');
+        }
+        if (!valid) continue;
+        uint32_t addr = (uint32_t)strtoul(name, NULL, 16);
+        if (s_cache_idx_count >= CACHE_IDX_CAP) {
+            loader_log("*** CACHE INDEX FULL (%d): further shared libs in %s are "
+                       "IGNORED — their regions will run interpreted. Raise "
+                       "CACHE_IDX_CAP.", CACHE_IDX_CAP, dir);
+            break;
+        }
+        if (cache_idx_has_basename(name)) continue;
+        char full[768];
+        snprintf(full, sizeof(full), "%s/%s", dir, name);
+        CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
+        e->region_start = addr;
+        snprintf(e->path, sizeof(e->path), "%s", full);
+    }
+    closedir(d);
 #endif
 }
 
@@ -728,7 +772,7 @@ static void warn_on_cgtag_mismatch(const char *tier) {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (strcmp(fd.cFileName, expect) == 0) continue;     /* our own tag */
         char dllpat[900]; WIN32_FIND_DATAA fd2;
-        snprintf(dllpat, sizeof dllpat, "%s/%s/*_*.dll", base, fd.cFileName);
+        snprintf(dllpat, sizeof dllpat, "%s/%s/*_*" OV_LIB_EXT, base, fd.cFileName);
         HANDLE h2 = FindFirstFileA(dllpat, &fd2);
         if (h2 != INVALID_HANDLE_VALUE) {          /* sibling tag HAS shards */
             FindClose(h2);
@@ -742,7 +786,44 @@ static void warn_on_cgtag_mismatch(const char *tier) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    (void)tier;
+    char base[768];
+    snprintf(base, sizeof base, "%s/%s/%s/%s",
+             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    char expect[64];
+    snprintf(expect, sizeof expect, "cg%d_%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    DIR *d = opendir(base);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_type != DT_DIR) continue;
+        if (strcmp(ent->d_name, expect) == 0) continue;
+        char sub[900];
+        snprintf(sub, sizeof sub, "%s/%s", base, ent->d_name);
+        DIR *d2 = opendir(sub);
+        if (!d2) continue;
+        struct dirent *e2;
+        int has_shards = 0;
+        while ((e2 = readdir(d2)) != NULL) {
+            size_t nl = strlen(e2->d_name);
+            if (nl > OV_LIB_EXT_LEN &&
+                strcmp(e2->d_name + nl - OV_LIB_EXT_LEN, OV_LIB_EXT) == 0 &&
+                strchr(e2->d_name, '_') != NULL) {
+                has_shards = 1;
+                break;
+            }
+        }
+        closedir(d2);
+        if (has_shards) {
+            loader_log("*** OVERLAY CACHE HASH MISMATCH: this build reads %s/%s but "
+                       "shards exist under %s/%s. The autocompile is writing to a "
+                       "DIFFERENT codegen hash than this runtime reads -> ALL overlays "
+                       "run INTERPRETED (slow). Fix overlay_autocompile_cmd's "
+                       "--recompiler/--runtime-include to match THIS build's framework.",
+                       tier, expect, tier, ent->d_name);
+        }
+    }
+    closedir(d);
 #endif
 }
 
@@ -773,7 +854,7 @@ static void abi_preflight_sweep(const char *dir) {
      * the planted v6 DLL survived behind the old 256-entry index cap). */
     int purged = 0, kept = 0;
     char pattern[900];
-    snprintf(pattern, sizeof pattern, "%s/*_*.dll", dir);
+    snprintf(pattern, sizeof pattern, "%s/*_*" OV_LIB_EXT, dir);
     WIN32_FIND_DATAA fd;
     HANDLE hf = FindFirstFileA(pattern, &fd);
     if (hf != INVALID_HANDLE_VALUE) {
@@ -792,9 +873,9 @@ static void abi_preflight_sweep(const char *dir) {
             DeleteFileA(full);
             char ranges[912];
             size_t n = strlen(full);
-            if (n > 4 && n + 4 < sizeof ranges) {
-                memcpy(ranges, full, n - 4);
-                memcpy(ranges + n - 4, ".ranges", 8);
+            if (n > OV_LIB_EXT_LEN && n + 7 < sizeof ranges) {
+                memcpy(ranges, full, n - OV_LIB_EXT_LEN);
+                memcpy(ranges + n - OV_LIB_EXT_LEN, ".ranges", 8);
                 DeleteFileA(ranges);
             }
             purged++;
@@ -815,7 +896,56 @@ static void abi_preflight_sweep(const char *dir) {
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
 #else
-    (void)dir;
+    char marker[900];
+    snprintf(marker, sizeof marker, "%s/.abi_%08x.ok", dir, (unsigned)PSX_OVERLAY_ABI_TAG);
+    struct stat st;
+    if (stat(marker, &st) == 0) return;  /* swept */
+
+    int purged = 0, kept = 0;
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            const char *name = ent->d_name;
+            size_t nlen = strlen(name);
+            if (nlen <= OV_LIB_EXT_LEN) continue;
+            if (strcmp(name + nlen - OV_LIB_EXT_LEN, OV_LIB_EXT) != 0) continue;
+            if (strchr(name, '_') == NULL) continue;
+            char full[900];
+            snprintf(full, sizeof full, "%s/%s", dir, name);
+            void *h = dlopen(full, RTLD_NOW | RTLD_LOCAL);
+            if (h) {
+                typedef int (*AbiFn)(void);
+                AbiFn abi_fn = (AbiFn)dlsym(h, "overlay_abi");
+                int abi = abi_fn ? abi_fn() : 0;
+                dlclose(h);
+                if (abi == PSX_OVERLAY_ABI_TAG) { kept++; continue; }
+            }
+            /* Unloadable or wrong ABI: purge shared lib + its .ranges + index entry. */
+            remove(full);
+            char ranges[912];
+            size_t n = strlen(full);
+            if (n > OV_LIB_EXT_LEN && n + 7 < sizeof ranges) {
+                memcpy(ranges, full, n - OV_LIB_EXT_LEN);
+                memcpy(ranges + n - OV_LIB_EXT_LEN, ".ranges", 8);
+                remove(ranges);
+            }
+            purged++;
+            for (int i = 0; i < s_cache_idx_count; i++) {
+                if (strcmp(s_cache_idx[i].path, full) == 0) {
+                    s_cache_idx[i] = s_cache_idx[--s_cache_idx_count];
+                    break;
+                }
+            }
+        }
+        closedir(d);
+    }
+    if (purged)
+        loader_log("abi preflight: purged %d stale shared lib(s), kept %d in %s",
+                   purged, kept, dir);
+    /* Mark the sweep complete. */
+    FILE *mf = fopen(marker, "w");
+    if (mf) fclose(mf);
 #endif
 }
 
@@ -840,6 +970,16 @@ static void scan_cache_dir(void) {
     if (s_cache_idx_count == 0) {
         warn_on_cgtag_mismatch("gcc");
         warn_on_cgtag_mismatch("tcc");
+    }
+
+    /* Startup inventory: print every indexed shared library so the user can
+     * confirm the cache is being read (and not silently falling to interp). */
+    loader_log("overlay cache scan: %d " OV_LIB_EXT " file(s) indexed [arch=%s]",
+               s_cache_idx_count, PSX_OVERLAY_ARCH_ABI);
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        const char *base = strrchr(s_cache_idx[i].path, '/');
+        base = base ? base + 1 : s_cache_idx[i].path;
+        loader_log("  [%d] %s (region=0x%08X)", i, base, s_cache_idx[i].region_start);
     }
 }
 
@@ -901,20 +1041,25 @@ static void sljit_mkdir_p(const char *path) {
     }
     CreateDirectoryA(tmp, NULL);
 }
+#else
+static void sljit_mkdir_p(const char *path) {
+    char tmp[768];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
+}
 #endif
 
 static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
                                 const void *blob, unsigned long blob_size) {
-#ifdef _WIN32
     s_sljit_persist_calls++;
     if (!s_sljit_persist)            { s_persist_dbg = 1; return; }
     if (!blob || blob_size == 0)     { s_persist_dbg = 2; return; }
     if (len == 0)                    { s_persist_dbg = 3; return; }
     const uint8_t *ram = memory_get_ram_ptr();
     if (!ram)                        { s_persist_dbg = 4; return; }
-    /* crc over the live bytes the shard was JIT'd from — identical to cand_crc()
-     * for this single range, so the reloaded candidate's crc matches what
-     * dispatch re-hashes. */
     uint32_t crc = crc32_update(0xFFFFFFFFu, ram + (lo & 0x1FFFFFFFu), len) ^ 0xFFFFFFFFu;
     char dir[768]; sljit_cache_dir(dir, sizeof(dir));
     sljit_mkdir_p(dir);
@@ -934,9 +1079,6 @@ static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
     s_persist_dbg = 6;
     loader_log("sljit shard persisted %08X_%08X [%lu bytes]",
                entry_phys & 0x1FFFFFFFu, crc, blob_size);
-#else
-    (void)entry_phys; (void)lo; (void)len; (void)blob; (void)blob_size;
-#endif
 }
 
 /* Worker-thread publish (overlay_compile_worker.c): write a freshly-JIT'd shard
@@ -948,13 +1090,16 @@ static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
 void overlay_loader_async_publish(uint32_t entry_phys, uint32_t lo, uint32_t len,
                                   uint32_t crc, const void *blob,
                                   unsigned long blob_size) {
-#ifdef _WIN32
     if (!s_sljit_persist || !blob || blob_size == 0 || len == 0) return;
     char dir[768]; sljit_cache_dir(dir, sizeof(dir));
     sljit_mkdir_p(dir);
     char path[860], tmp[920];
     snprintf(path, sizeof(path), "%s/%08X_%08X.sljit", dir, entry_phys & 0x1FFFFFFFu, crc);
+#ifdef _WIN32
     snprintf(tmp,  sizeof(tmp),  "%s.tmp%lu", path, (unsigned long)GetCurrentThreadId());
+#else
+    snprintf(tmp,  sizeof(tmp),  "%s.tmp%lu", path, (unsigned long)getpid());
+#endif
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
     SljitBlobHeader hh;
@@ -966,12 +1111,13 @@ void overlay_loader_async_publish(uint32_t entry_phys, uint32_t lo, uint32_t len
               (fwrite(blob, 1, blob_size, f) == blob_size);
     fclose(f);
     if (!wok) { remove(tmp); return; }
+#ifdef _WIN32
     if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { remove(tmp); return; }
+#else
+    if (rename(tmp, path) != 0) { remove(tmp); return; }
+#endif
     s_sljit_persist_writes++;   /* telemetry-only; benign cross-thread incr */
     async_cache_dirty_exchange(1);
-#else
-    (void)entry_phys; (void)lo; (void)len; (void)crc; (void)blob; (void)blob_size;
-#endif
 }
 
 /* Idempotency for the on-miss rescan: a dispatch-thread-only set of .sljit
@@ -1031,17 +1177,55 @@ static void scan_sljit_cache_dir(void) {
     } while (FindNextFileA(fh, &fd));
     FindClose(fh);
     if (s_sljit_reloaded) loader_log("sljit cache: reloaded %u shard(s)", s_sljit_reloaded);
+#else
+    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        size_t nlen = strlen(name);
+        if (nlen < 7 || strcmp(name + nlen - 6, ".sljit") != 0) continue;
+        s_reload_seen++;
+        if (blob_already_loaded(name)) continue;
+        char full[900];
+        snprintf(full, sizeof(full), "%s/%s", dir, name);
+        FILE *f = fopen(full, "rb");
+        if (!f) continue;
+        SljitBlobHeader hd;
+        if (fread(&hd, sizeof(hd), 1, f) != 1) { fclose(f); s_reload_hdrbad++; continue; }
+        if (hd.magic != SLJIT_BLOB_MAGIC || hd.format_ver != SLJIT_BLOB_FORMAT_VER ||
+            hd.helper_order_ver != SLJIT_HELPER_ORDER_VER ||
+            hd.blob_size == 0 || hd.blob_size > (4u * 1024u * 1024u)) { fclose(f); s_reload_hdrbad++; continue; }
+        void *blob = malloc(hd.blob_size);
+        if (!blob) { fclose(f); continue; }
+        size_t got = fread(blob, 1, hd.blob_size, f);
+        fclose(f);
+        if (got != hd.blob_size) { free(blob); s_reload_hdrbad++; continue; }
+        OverlaySljitFn fn = overlay_sljit_deserialize(blob, hd.blob_size);
+        free(blob);
+        if (!fn) { s_reload_deserfail++; continue; }
+        register_sljit_candidate(hd.entry_phys, (OverlayFn)fn,
+                                 hd.code_lo, hd.code_len, hd.crc_code);
+        s_sljit_reloaded++;
+        blob_mark_loaded(name);
+    }
+    closedir(d);
+    if (s_sljit_reloaded) loader_log("sljit cache: reloaded %u shard(s)", s_sljit_reloaded);
 #endif
 }
 
-/* True if the cache holds a DLL for this region compiled from an image with
- * this CRC (filename <addr8>_<crc8>.dll). Autocapture's "unseen" test. */
+/* True if the cache holds a shared lib for this region compiled from an image
+ * with this CRC (filename <addr8>_<crc8>.{dll,so}). Autocapture's "unseen" test. */
 int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
     for (int i = 0; i < s_cache_idx_count; i++) {
         if (s_cache_idx[i].region_start != region_start) continue;
         const char *fn = strrchr(s_cache_idx[i].path, '/');
         fn = fn ? fn + 1 : s_cache_idx[i].path;
-        if (strlen(fn) == 21 && (uint32_t)strtoul(fn + 9, NULL, 16) == crc)
+        /* <addr8>_<crc8>.{dll,so}: 8+1+8+ext_len */
+        size_t fn_len = strlen(fn);
+        if (fn_len == (size_t)(8 + 1 + 8 + OV_LIB_EXT_LEN) &&
+            (uint32_t)strtoul(fn + 9, NULL, 16) == crc)
             return 1;
     }
     return 0;
@@ -1378,8 +1562,8 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     return registered;
 }
 #else
+
 static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
-    (void)man; (void)man_n; (void)dll;
     void *h = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, dlerror()); return 0; }
     /* ABI gate (see the _WIN32 branch). */
@@ -1398,8 +1582,109 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     InitFn init_fn = (InitFn)dlsym(h, "overlay_init");
     if (!init_fn) { loader_log("no overlay_init in %s", dll_path); dlclose(h); return 0; }
     init_fn(&s_callbacks);
-    loader_log("%s loaded (posix export scan TODO)", dll_path);
-    return 0;
+
+    /* Parse ELF .dynsym to enumerate func_XXXXXXXX exports.  The in-memory
+     * image from dlopen is a complete ELF with section headers stripped but
+     * the PT_DYNAMIC segment (and thus .dynsym/.dynstr) intact — that's all
+     * we need.  We walk the ELF file on disk (stable, no relocation fuzz)
+     * and resolve function pointers via dlsym for each matching name. */
+    FILE *f = fopen(dll_path, "rb");
+    if (!f) { loader_log("cannot open %s for ELF scan", dll_path); return 0; }
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1 ||
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        loader_log("bad ELF header in %s", dll_path);
+        fclose(f); return 0;
+    }
+
+    /* Read program headers to find PT_DYNAMIC. */
+    Elf64_Phdr *phdrs = malloc(ehdr.e_phnum * ehdr.e_phentsize);
+    if (!phdrs) { fclose(f); return 0; }
+    fseek(f, ehdr.e_phoff, SEEK_SET);
+    if (fread(phdrs, ehdr.e_phentsize, ehdr.e_phnum, f) != ehdr.e_phnum) {
+        free(phdrs); fclose(f); return 0;
+    }
+
+    Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            dyn = malloc(phdrs[i].p_filesz);
+            if (!dyn) { free(phdrs); fclose(f); return 0; }
+            fseek(f, phdrs[i].p_offset, SEEK_SET);
+            if (fread(dyn, 1, phdrs[i].p_filesz, f) != phdrs[i].p_filesz) {
+                free(dyn); free(phdrs); fclose(f); return 0;
+            }
+            break;
+        }
+    }
+    free(phdrs);
+    if (!dyn) { loader_log("no PT_DYNAMIC in %s", dll_path); fclose(f); return 0; }
+
+    /* Extract .dynsym and .dynstr offsets from PT_DYNAMIC. */
+    Elf64_Addr symtab_paddr = 0, strtab_paddr = 0;
+    Elf64_Xword symtab_size = 0, strtab_size = 0;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_SYMTAB:  symtab_paddr = d->d_un.d_ptr; break;
+        case DT_STRTAB:  strtab_paddr = d->d_un.d_ptr; break;
+        case DT_SYMENT:  break; /* we know sizeof(Elf64_Sym) */
+        case DT_STRSZ:   strtab_size = d->d_un.d_val; break;
+        }
+    }
+    free(dyn);
+
+    if (!symtab_paddr || !strtab_paddr) {
+        loader_log("no DT_SYMTAB/DT_STRTAB in %s", dll_path);
+        fclose(f); return 0;
+    }
+
+    /* Read .dynsym and .strtab from disk.  These are file offsets (p_offset ==
+     * p_vaddr for loadable segments in a PIE .so), so direct seek works. */
+    /* First, find the file offset for symtab_paddr by re-reading program headers
+     * we already have — or just compute: for PIE shared libs the virtual address
+     * equals the file offset for PT_LOAD segments.  Use a simpler heuristic:
+     * the symtab pointer is a vaddr; since PIE .so loads at 0, vaddr == file offset. */
+    fseek(f, symtab_paddr, SEEK_SET);
+    /* We don't know the exact number of symbols, but DT_SYMTAB doesn't carry a
+     * size.  Estimate: read up to 64KB of symtab (enough for thousands of funcs). */
+    #define MAX_SYMTAB_READ (64u * 1024u)
+    Elf64_Sym *syms = malloc(MAX_SYMTAB_READ);
+    if (!syms) { fclose(f); return 0; }
+    size_t sym_bytes = fread(syms, 1, MAX_SYMTAB_READ, f);
+    int nsym = (int)(sym_bytes / sizeof(Elf64_Sym));
+
+    char *strtab = malloc(strtab_size ? strtab_size : 65536);
+    if (!strtab) { free(syms); fclose(f); return 0; }
+    fseek(f, strtab_paddr, SEEK_SET);
+    size_t str_got = fread(strtab, 1, strtab_size ? strtab_size : 65536, f);
+
+    fclose(f);
+
+    int registered = 0;
+    for (int i = 0; i < nsym; i++) {
+        if (syms[i].st_name == 0) continue;
+        if (syms[i].st_name >= str_got) continue;
+        const char *name = strtab + syms[i].st_name;
+        if (strncmp(name, "func_", 5) != 0) continue;
+        if (strlen(name) != 13) continue;
+        uint32_t addr = (uint32_t)strtoul(name + 5, NULL, 16);
+        if (addr == 0) continue;
+
+        OverlayFn fn = (OverlayFn)dlsym(h, name);
+        if (!fn) continue;
+
+        ManFn *m = man_find(man, man_n, addr);
+        if (!m || m->n == 0) { s_no_manifest++; continue; }
+        cand_register(addr & 0x1FFFFFFFu, fn, m, dll);
+        registered++;
+    }
+    free(syms);
+    free(strtab);
+
+    loader_log("loaded %s -> %d candidates (%u no-manifest)",
+               dll_path, registered, s_no_manifest);
+    return registered;
 }
 #endif
 
@@ -1601,12 +1886,13 @@ static int dll_already_loaded(const char *path) {
 }
 
 static int load_one_dll(const char *dll_path) {
-    /* Sibling code-range manifest: {base}_{crc}.ranges next to the DLL. */
+    /* Sibling code-range manifest: {base}_{crc}.ranges next to the shared lib. */
     char ranges_path[800];
     snprintf(ranges_path, sizeof(ranges_path), "%s", dll_path);
     size_t plen = strlen(ranges_path);
-    if (plen >= 4 && strcmp(ranges_path + plen - 4, ".dll") == 0)
-        snprintf(ranges_path + plen - 4, sizeof(ranges_path) - (plen - 4), ".ranges");
+    if (plen >= OV_LIB_EXT_LEN && strcmp(ranges_path + plen - OV_LIB_EXT_LEN, OV_LIB_EXT) == 0)
+        snprintf(ranges_path + plen - OV_LIB_EXT_LEN,
+                 sizeof(ranges_path) - (plen - OV_LIB_EXT_LEN), ".ranges");
 
     int man_n = 0;
     ManFn *man = parse_manifest(ranges_path, &man_n);
