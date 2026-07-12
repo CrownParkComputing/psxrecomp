@@ -1,0 +1,271 @@
+cmd,params,description,backend
+ping,,"Returns frame number + dispatch miss counters. Health check.",both
+frame,,"Returns current guest frame number.",both
+quit,,"Shuts down the runtime.",psx-runtime
+set_input,"buttons (str)","Sets persistent controller input. buttons=hex button word (e.g. '0x8000' = DPadUp).",both
+press,"buttons (int), frames (int)","Press buttons for N frames. buttons=hex word, frames default 1.",both
+clear_input,,"Clears all input overrides.",both
+pad_status,,"Returns current pad state (buttons + analog if active).",both
+savestate,"slot (int), op (str)","Save/load state. slot=0|1, op='save'|'load'.",psx-runtime
+turbo,"enabled (int), on (int)","Toggle turbo mode. enabled or on=1 to enable, 0 to disable.",psx-runtime
+turbo_state,,"Returns current turbo state.",psx-runtime
+turbo_loads,"n (int)","Run N frames at max speed, then report.",psx-runtime
+pause,,"Pauses emulation at next safe point.",psx-runtime
+continue,,"Resumes emulation from pause.",psx-runtime
+step,,"Single-step one guest instruction (must be paused).",psx-runtime
+run_to_frame,,"Continue until next vblank/frame boundary.",psx-runtime
+dirty_break_range,"lo (str), hi (str)","Set phys address range for dirty-RAM one-shot break. When a write hits [lo,hi), pause and capture CPU state.",psx-runtime
+dirty_break_clear,,"Disarms dirty break.",psx-runtime
+dirty_break_state,,"Returns current dirty-break state (armed/target/hits).",psx-runtime
+read_ram,"addr (str), len (int)","Read len bytes from phys addr. Returns hex string.",both
+dump_ram,"addr (str), len (int)","Alias for read_ram.",both
+write_ram,"addr (str), val (str)","Write hex val to phys addr.",psx-runtime
+mem_words,"addr (str), count (int)","Read count words (4 bytes each) from phys addr. Returns JSON array.",psx-runtime
+get_registers,,"Returns all CPU registers (GPR + COP0 + PC + hi/lo).",both
+screenshot,"","Takes a screenshot (returns base64 PNG or writes to default path).",both
+screenshot_file,"path (str)","Takes a screenshot and writes to the given file path.",both
+read_frame_ram,"frame (int), addr (str), len (int)","Read RAM snapshot from a specific historical frame.",both
+set_snapshot,"slot (int), addr (str)","Configure a persistent RAM snapshot slot. Writes snapshot_addrs[slot]=addr.",both
+get_snapshots,,"Returns configured snapshot slots and their current values.",both
+frame_fingerprint,"count (int), frame_lo (int), frame_hi (int)","Dump per-frame write fingerprint ring. Diff wr/pc hashes between two runs to find first-divergence frame.",psx-runtime
+record_frame,"frame (int)","Arm the frame-gated ordered access recorder for guest frame N. -1 disarms.",psx-runtime
+record_frame_dump,"offset (int), count (int), kind (int)","Dump recorded frame's ordered access log. kind: 0=ramw,1=spw,2=mmiow,3=mmior,4=ramr, -1=all.",psx-runtime
+record_reads_dump,"offset (int), count (int)","Dump recorded frame's MMIO-read entries only.",psx-runtime
+history,,"Returns per-frame history ring buffer.",both
+get_frame,"frame (int)","Returns a single frame record by number.",both
+frame_range,"start (int), end (int)","Returns frame records in [start, end].",both
+frame_timeseries,"start (int), end (int)","Returns frame time series for [start, end].",both
+first_failure,,"Returns the first frame where native and interp fingerprints diverge.",psx-runtime
+frame_perf,,"Returns per-frame GPU/render performance counters.",psx-runtime
+watch,"addr (str)","Set a watchpoint on a physical address. Triggers on read/write.",psx-runtime
+unwatch,"addr (str)","Remove a watchpoint.",psx-runtime
+gpu_state,,"Returns current GPU state (display mode, VRAM transfer, GP0/GP1 pending).",psx-runtime
+gpu_opcodes,,"Returns GPU GP0/GP1 opcode statistics.",psx-runtime
+gpu_ring_stats,,"Returns GPU command ring buffer stats.",psx-runtime
+gpu_frame_dump,"frame (int), count (int)","Dump GPU command ring for a specific frame.",psx-runtime
+gp1_dump,"frame_lo (int), frame_hi (int), count (int), newest (int)","Dump GP1 (display control) command history. newest=1 for reverse order.",psx-runtime
+irq_state,,"Returns I_STAT and I_MASK registers.",both
+cycles_to_next_event,,"Returns cycles until next scheduled device event.",psx-runtime
+timers_state,,"Returns state of all 4 hardware timers.",psx-runtime
+dma_state,,"Returns state of all DMA channels (control, status, block info).",psx-runtime
+dma_trace_dump,"count (int)","Dump last N DMA trace entries.",psx-runtime
+dma_trace_clear,,"Clear DMA trace ring.",psx-runtime
+dma_cdrom_history,"count (int), frame_lo (int), frame_hi (int), newest (int)","Dump CDROM DMA transfer history.",psx-runtime
+cdrom_state,,"Returns full CDROM controller state (status, mode, pending commands).",psx-runtime
+cdrom_sector_dump,"offset (int), len (int)","Dump raw sector data from CDROM buffer.",psx-runtime
+cdrom_sector_history,"count (int), lba (str)","Dump CDROM sector read history. Optional LBA filter.",psx-runtime
+cdrom_sector_history_clear,,"Clear CDROM sector history.",psx-runtime
+cdrom_command_history,"count (int), frame_lo (int), frame_hi (int)","Dump CDROM command history ring.",psx-runtime
+cdrom_command_history_clear,,"Clear CDROM command history.",psx-runtime
+cdrom_trace_dump,"count (int), frame_lo (int), frame_hi (int)","Dump detailed CDROM timing trace.",psx-runtime
+cdrom_trace_clear,,"Clear CDROM trace.",psx-runtime
+cdrom_instant_rate,"n (int)","Report instantaneous CD read rate (sectors/sec) over last N vblanks.",psx-runtime
+cdrom_bursts,"count (int)","Dump recent CD read burst patterns (default 32, max 128).",psx-runtime
+cd_read_log,"tail (int)","Dump CD read log entries (default 256 recent).",psx-runtime
+cd_overwrite,,"Report CD controller overwrite race state.",psx-runtime
+sio_state,,"Returns SIO (serial I/O) controller/card state.",psx-runtime
+sio_trace,"count (int)","Dump last N SIO byte-level trace entries.",both
+sio_trace_window,"seq (int), before (int), after (int)","Dump SIO trace around a specific sequence number.",psx-runtime
+sio_pc_trace,"count (int), addr_lo (str), addr_hi (str)","Dump SIO write PC trace. Optional addr filter for specific SIO registers.",psx-runtime
+sio_pc_window,"byte_seq (int), before (int), after (int), addr_lo (str), addr_hi (str)","Dump SIO PC trace around a specific byte sequence.",psx-runtime
+sio_ctrl_reg_trace,"count (int)","Dump SIO_CTRL (0x1F80104A) write trace with full CPU state.",psx-runtime
+sio_ctrl_reg_window,"byte_seq (int), before (int), after (int)","Dump SIO_CTRL trace around a specific byte sequence.",psx-runtime
+sio_ctrl_reg_clear,,"Clear SIO_CTRL register trace.",psx-runtime
+sio_irq_dump,"count (int), src (int)","Dump SIO IRQ events. src=filter to specific IRQ source.",psx-runtime
+sio_irq_window,"byte_seq (int), before (int), after (int), src (int)","Dump SIO IRQ events around a byte sequence.",psx-runtime
+sio_irq_dump (alias),,"Clear SIO IRQ trace.",psx-runtime
+sio_burst_stats,,"Returns SIO burst timing statistics.",psx-runtime
+sio_arm_audit,,"Returns SIO arm/audit state.",psx-runtime
+sio_write_window,"","Returns the SIO write window (for parity with psx-beetle).",psx-beetle
+sio_trace_reset,,"Reset SIO trace (psx-beetle parity).",psx-beetle
+sio_write_window,"","Dump recent SIO byte writes in a time window.",psx-beetle
+pad_cfg,"set (int)","Configure pad mode. set=0 for modern DualShock, set=1 for digital-only.",psx-runtime
+mc_status,,"Returns memory card status.",psx-runtime
+card_buffer_dump,"slot (int), offset (int), len (int)","Dump raw card buffer bytes. slot=0|1.",psx-runtime
+card_trace_dump,"count (int), addr_lo (str), addr_hi (str)","Dump memory card command trace.",psx-runtime
+card_txn_dump,"count (int), slot (int)","Dump memory card transaction history.",psx-runtime
+card_read_summary,,"Returns card read performance summary.",psx-runtime
+card_read_summary_reset,,"Reset card read summary counters.",psx-runtime
+card_data_writes,"count (int)","Dump card data write log.",psx-runtime
+card_data_writes_reset,,"Reset card data write log.",psx-runtime
+card_mgr_trace,,"Dump card manager state machine trace.",psx-runtime
+card_mgr_clear,,"Clear card manager trace.",psx-runtime
+spu_status,,"Returns SPU (Sound Processing Unit) global state.",psx-runtime
+spu_voices,,"Returns per-voice SPU state (ADSR, pitch, volume, data pointers).",both
+spu_events,"count (int)","Dump SPU event ring (KEYON/KEYOFF/END_STOP/END_LOOP with frame timestamps).",both
+spu_events_reset,,"Clear SPU event ring.",psx-runtime
+audio_stats,,"Returns host audio output statistics.",both
+audio_wav,"path (str), tap (int), start (str), count (str)","Dump audio to WAV file. tap=which tap point, start/count for range.",both
+audio_events,"count (int)","Dump audio event ring.",both
+mdec_state,,"Returns MDEC (Motion Decoder) state for FMV playback.",psx-runtime
+mdec_trace,"seq_lo (str), seq_hi (str), count (int)","Dump MDEC decoder trace entries.",psx-runtime
+mdec_trace_clear,,"Clear MDEC trace.",psx-runtime
+fmv_state,,"Returns FMV playback state (MDEC + DMA ch0 status).",psx-runtime
+gte_state,,"Returns GTE (Geometry Transform Engine) register state.",psx-runtime
+dma_trace_dump,"count (int)","Dump DMA trace entries.",psx-runtime
+dma_trace_clear,,"Clear DMA trace ring.",psx-runtime
+spu_events_reset,,"Clear SPU event ring.",psx-runtime
+a0_history,,"Dump BIOS A0 function call history ring.",psx-runtime
+c0_history,,"Dump BIOS C0 function call history ring.",psx-runtime
+bioscall_dump,"tail (int), index (int), table (str)","Dump BIOS service call history. tail=N for last N, table=A0|B0|C0, index=specific fn.",psx-runtime
+hle_dump,"tail (int), fn (int), route (int), since (int)","Dump HLE BIOS dispatch log. fn=t1 index, route=0|1|2 (LLE/HLE/fallback).",psx-runtime
+unknown_dispatch_log,"tail (int)","Dump unknown dispatch log (addresses the recompiler couldn't resolve).",psx-runtime
+dispatch_stats,,"Returns static dispatch hit vs miss coverage summary.",psx-runtime
+dispatch_check,,"Check if a specific address was ever dispatched.",psx-runtime
+dispatch_tail,"","Dump the last N dispatched function addresses.",psx-runtime
+evcb_snapshot,,"Snapshots the full kernel EvCB table (entry/exit states).",psx-runtime
+evcb_walk_dump,"count (int)","Dump EvCB walk ring (paired entry/exit snapshots around DeliverEvent).",psx-runtime
+evcb_walk_stats,,"Returns EvCB walk ring statistics.",psx-runtime
+imask_trace,"count (int), only_b7c (int)","Dump I_MASK change trace. only_b7c=1 for only addr 0xB7C changes.",psx-runtime
+thread_trace,"count (int), newest (int), seq_lo (str), frame_lo (str), frame_hi (str), kind (str), current_tcb (str), target_tcb (str), tcb (str)","Dump kernel thread scheduling trace with full TCB state.",psx-runtime
+thread_trace_clear,,"Clear thread trace ring.",psx-runtime
+thread_ctx_ring,"count (int)","Dump thread context ring (snapshot of kernel thread table).",psx-runtime
+fntrace_arm,"target (str)","Arm function trace filtering to target address range.",psx-runtime
+fntrace_arm_clear,,"Clear function trace arm filter.",psx-runtime
+fntrace_armed,,"Returns current function trace arm filter state.",psx-runtime
+fntrace_clear,,"Clear function entry/exit trace rings.",psx-runtime
+fntrace_dump,"target_lo (str), target_hi (str), seq_lo (str), seq_hi (str), count (int)","Dump function entry/exit trace. Filter by address range or sequence range.",psx-runtime
+fn_filter,,"Set function trace filter.",psx-runtime
+fn_disable,,"Disable function trace.",psx-runtime
+fn_clear,,"Clear function trace filters.",psx-runtime
+fn_stats,,"Returns function trace ring statistics.",psx-runtime
+fn_entry_dump,,"Dump function entry trace ring.",psx-runtime
+fn_entry_tail,,"Dump last N function entries.",psx-runtime
+fn_exit_dump,,"Dump function exit trace ring.",psx-runtime
+chain_trace,"count (int)","Dump chain-dispatch return-v0 trace (card chain state machine).",psx-runtime
+sreg_trace_dump,"count (int), newest (int), seq_lo (str), tcb (str), func_lo (str), func_hi (str), frame_lo (str), frame_hi (str)","Dump saved-register trace (s0-s7 across function calls).",psx-runtime
+sreg_trace_find,"tcb (str), frame_lo (str), frame_hi (str), zero (int), yield_only (int), newest (int), window (int)","Find specific sreg trace entries by TCB or frame range.",psx-runtime
+sreg_trace_stats,,"Returns sreg trace ring statistics.",psx-runtime
+sreg_trace_clear,,"Clear sreg trace ring.",psx-runtime
+probe_trace,"count (int)","Dump probe trace ring (high-frequency call-level instrumentation).",psx-runtime
+probe_clear,,"Clear probe trace ring.",psx-runtime
+restore_trace,"count (int)","Dump restore-state/exception longjmp trace.",psx-runtime
+restore_trace_window,"byte_seq (int), before (int), after (int)","Dump restore trace around a byte sequence.",psx-runtime
+restore_trace_clear,,"Clear restore trace ring.",psx-runtime
+dirty_ram_stats,,"Returns dirty-RAM interpreter statistics (compiled/dirty/mixed counts).",psx-runtime
+dirty_ram_unsupported,,"Returns list of unsupported dirty-RAM addresses.",psx-runtime
+dirty_block_log,"target_lo (str), target_hi (str), count (int)","Dump dirty-RAM block dispatch log (most recent N entries, default 256).",psx-runtime
+dirty_flow_log,"target_lo (str), target_hi (str), count (int)","Dump dirty-RAM flow (control flow) log.",psx-runtime
+dirty_insn_log,"pc_lo (str), pc_hi (str), changed_only (int), count (int)","Dump dirty-RAM instruction log. changed_only=1 for only modified instructions.",psx-runtime
+dirty_insn_dump_file,"path (str)","Dump dirty-RAM instruction log to file (large, use file dump).",psx-runtime
+dirty_block_dump_file,"path (str)","Dump dirty-RAM block log to file.",psx-runtime
+dirty_insn_gate,"lo (str), hi (str)","Set extra address ranges for dirty-RAM instruction recording. hi=0 disables.",psx-runtime
+watch,,"Set watchpoint on physical address.",psx-runtime
+unwatch,,"Remove watchpoint.",psx-runtime
+wtrace_arm,"lo (str), hi (str)","Arm a write trace range [lo,hi). Up to 64 ranges.",both
+wtrace_disarm,"slot (int)","Disarm a specific write trace range by slot index.",both
+wtrace_disarm_all,,"Disarm all write trace ranges.",both
+wtrace_reset,,"Clear the write trace ring.",both
+wtrace_ranges,,"Returns all currently armed write trace ranges.",both
+wtrace_dump,"addr_lo (str), addr_hi (str), frame_lo (int), frame_hi (int), count (int), newest (int)","Dump write trace entries. Filter by addr range and/or frame range.",both
+wtrace_stats,,"Returns write trace ring statistics.",both
+wtrace_boot_dump,"addr_lo (str), addr_hi (str), count (int), newest (int)","Dump boot-pinned write trace (captured at startup, persists across ring rotation).",psx-runtime
+wtrace_boot_summary,"addr_lo (str), addr_hi (str), max_addrs (int)","Summarize boot writes by address frequency.",psx-runtime
+wtrace_boot_stats,,"Returns boot trace ring statistics.",psx-runtime
+wtrace_boot_reset,,"Clear boot trace ring.",psx-runtime
+wtrace_all_dump,"addr_lo (str), addr_hi (str), count (int), newest (int)","Dump always-on catch-all write ring (every RAM write, no filter).",both
+wtrace_all_stats,,"Returns catch-all write ring statistics.",both
+wtrace_all_reset,,"Reset catch-all write ring.",both
+wtrace_trans_dump,"addr_lo (str), addr_hi (str), count (int), newest (int), seq_lo (str)","Dump value-change-only write trace (only writes where new!=old).",psx-runtime
+wtrace_trans_stats,,"Returns transition write ring statistics.",psx-runtime
+wtrace_trans_reset,,"Reset transition write ring.",psx-runtime
+call_focus_dump,"seq_lo (str), seq_hi (str), func (str), func_lo (str), func_hi (str), frame_lo (str), frame_hi (str), count (int), newest (int)","Dump focused menu/render manager call trace.",psx-runtime
+call_focus_stats,,"Returns call focus ring statistics.",psx-runtime
+call_focus_reset,,"Reset call focus ring.",psx-runtime
+wtrace_range,"lo (str), hi (str)","Legacy: arm write trace range. Use wtrace_arm instead.",psx-runtime
+wtrace_add,"lo (str), hi (str)","Legacy alias for wtrace_arm.",psx-runtime
+wtrace_del,"slot (int)","Legacy alias for wtrace_disarm.",psx-runtime
+wtrace_clear,,"Legacy alias for wtrace_reset.",psx-runtime
+rtrace_arm,"lo (str), hi (str)","Arm an MMIO-read trace range.",both
+rtrace_dump,"addr (str), frame_lo (int), frame_hi (int), count (int), newest (int)","Dump MMIO-read trace entries.",both
+rtrace_clear,,"Clear MMIO-read trace.",both
+rtrace_ranges,,"Returns all armed MMIO-read trace ranges.",both
+rtrace_stats,,"Returns MMIO-read trace statistics.",both
+parity_dump,"count (int), transitions (int)","Dump control-flow parity trace (compiled vs interp dispatch parity).",both
+parity_ctl,"reset (int), arm (int)","Control parity trace. reset=1 to clear, arm=1 to start recording.",both
+devtrace_dump,"count (int), cyc_lo (str), cyc_hi (str), src (int)","Dump device event trace. src=I_STAT source bit (0..10), cyc_lo/hi=cycle filter.",both
+devtrace_ctl,"reset (int), arm (int)","Control device trace. reset=1 to clear, arm=1 to start recording.",both
+cyc_watch,"pc (str), n (int), end (str)","Arm cycle watch: monitor N cycles starting at PC. end=stop PC.",both
+cyc_watch_dump,,"Dump cycle watch ring.",both
+cyc_watch_clear,,"Clear cycle watch ring.",both
+d44_ring,,"Dump D44 (DMA control register 0x1F8010A4) change ring.",psx-runtime
+irqctx_ring,"frame_lo (int), frame_hi (int), count (int)","Dump IRQ context ring (CPU state at each IRQ delivery).",psx-runtime
+freeze_check,"window (int)","Check freeze detection state. window=vblank window size.",psx-runtime
+mmio_dump,"addr (str), frame_lo (int), frame_hi (int), count (int), newest (int)","Dump MMIO access trace for a specific device address.",psx-runtime
+mmio_clear,,"Clear MMIO trace ring.",psx-runtime
+capture_freeze,"frame (int)","Freeze capture at a specific frame (stops recording but keeps rings).",psx-runtime
+overlay_dump,"lo (str), dir (str)","Dump overlay region table (address, size, CRC32, file path).",psx-runtime
+overlay_loader_status,,"Returns overlay loader state (loaded regions, DLL count, errors).",psx-runtime
+overlay_candidates,,"Returns overlay candidate functions with code hash and generation info.",psx-runtime
+overlay_native_ring,,"Dump native-overlay dispatch ring (overlay function calls).",psx-runtime
+overlay_irq_suppress_on,,"Suppress IRQ delivery during overlay native execution (for timing isolation).",psx-runtime
+overlay_irq_suppress_off,,"Re-enable IRQ delivery during overlay native execution.",psx-runtime
+overlay_irq_ratelimit,"n (int)","Set IRQ rate-limit during overlay native execution (finer than full suppress).",psx-runtime
+overlay_native_event_granularity,"mode (str)","Set native event granularity mode.",psx-runtime
+overlay_diff_on,,"Enable overlay shadow diff (track native vs interpreter divergence).",psx-runtime
+overlay_diff_off,,"Disable overlay shadow diff.",psx-runtime
+overlay_shadow_dump,,"Dump overlay shadow divergence records.",psx-runtime
+overlay_shadow_detail,,"Dump detailed overlay shadow diff info.",psx-runtime
+overlay_fp_dump,"path (str)","Dump overlay fingerprint (function CRCs, native flags) to file.",psx-runtime
+overlay_capture_dump,,"Dump captured overlay binary files next to runtime exe.",psx-runtime
+overlay_native_on,,"Force overlay native compilation ON.",psx-runtime
+overlay_native_off,,"Force overlay native compilation OFF.",psx-runtime
+overlay_native_block,"clear (int), addr (str)","Block specific overlay addresses from native compilation. clear=1 to reset. addr=hex to block.",psx-runtime
+overlay_cps_probe,"addr (str)","Probe overlay CPS (continuation-passing style) compilation for an address. Returns outcome code.",psx-runtime
+overlay_rescan,,"Rescan overlay directory for newly compiled DLLs.",psx-runtime
+event_ring_dump,"path (str)","Dump event ring to file (default: event_ring.json).",psx-runtime
+event_ring_tail,"n (int)","Dump last N event ring entries (default 64).",psx-runtime
+event_ring_clear,,"Clear event ring.",psx-runtime
+ws_margin,"value (int)","Set/get widescreen margin (pixels). No value = report current.",psx-runtime
+ws_aspect,"num (int), den (int)","Set widescreen aspect ratio (num/den). E.g. 16/9.",psx-runtime
+ws_nw,"on (int)","Toggle native-wide mode. 2=native-wide, 1=squash.",psx-runtime
+ws_backdrop_ring,,"Dump widescreen backdrop ring.",psx-runtime
+ws_backdrop_margin,"m (int)","Set/get widescreen backdrop margin. No m = report.",psx-runtime
+ws_backdrop_stretch,"on (int), pct (int), thresh (int), mode (int)","Configure backdrop stretch. No args = report.",psx-runtime
+ws_dbg_stretch,"mode (int), pct (int), lo (str), hi (str), clut (str)","Debug stretch mode with address/CLUT filters.",psx-runtime
+ws_far_threshold,"t (int)","Set widescreen far-depth threshold.",psx-runtime
+ws_dome,"on (int), num (int), den (int)","Configure widescreen dome (depth-split vertex expansion).",psx-runtime
+ws_dome_probe,"on (int), thr (int)","Probe widescreen dome expansion stats.",psx-runtime
+ws_census,"action (str), start (int), end (int), out (str)","Run widescreen census (polygon statistics).",psx-runtime
+gl_coh_ring,"n (int), frame_min (int)","Dump GL coherence ring.",psx-runtime
+gl_present_ring,"n (int)","Dump GL present ring.",psx-runtime
+gl_ws_ablate,"mode (int)","Ablation study: toggle specific widescreen features for perf comparison.",psx-runtime
+gl_wide_fast,"on (int)","Toggle fast widescreen path (skip per-prim mirror).",psx-runtime
+gl_fbo_peek,"x (int), y (int), w (int), h (int)","Peek at GL framebuffer contents.",psx-runtime
+gl_vram_diff,,"Dump VRAM diff between frames.",psx-runtime
+synth_recurse,,"Synthesize infinite recursion to test stack overflow handling. HALTS emulation.",psx-runtime
+mmx6_freshfix,"on (int), validate (int)","Toggle MMX6 fresh-fix mode (for old MMX6 bugs).",psx-runtime
+mmx6_reveal,"on (int), reloc (int)","Toggle MMX6 reveal mode.",psx-runtime
+phase_profile,"window (int)","Dump phase profile (boot stages timing).",psx-runtime
+phase_hot,"top (int)","Dump hottest functions since boot (top N).",psx-runtime
+idle_skip,"enable (int)","Toggle idle-loop skip. enable=0|1 to force, omit to toggle.",psx-runtime
+lockstep,,"Dump lockstep cosimulation state.",psx-runtime
+lockstep_func,,"Dump lockstep function-level comparison.",psx-runtime
+xlate,"sub (str)","Translation table: dump/todo/reload.",psx-runtime
+latency,"window (int), raw (int), count (int)","Dump latency stats. raw=1 for per-frame records, count for window.",psx-runtime
+vk_perf,"count (int)","Dump Vulkan performance counters (last N frames).",psx-runtime
+game_options,,"Returns game configuration options from game.toml.",psx-runtime
+stack_profile,,"Returns host stack usage profile (detects runaway recursion).",psx-runtime
+xprobe,,"Run cross-probe analysis.",psx-runtime
+xprobe_arm,"frame_trip (int), stk_kb (int), warmup (int)","Arm cross-probe. Any 0 disables that arm.",psx-runtime
+ce_profile,,"Dump code-emitter profile (which patterns fire most).",psx-runtime
+capture_quads,,"Capture current GPU quad list.",psx-runtime
+get_quads,,"Get captured GPU quads.",psx-runtime
+dirty_insn_gate,"lo (str), hi (str)","Set extra address ranges for dirty-RAM instruction recording.",psx-runtime
+insn_freeze,"addr (str), nth (int)","Freeze instruction execution at addr (break on Nth hit). addr=0 disarms.",psx-runtime
+insn_freeze_status,,"Returns instruction freeze state.",psx-runtime
+insn_freeze_target,,"Dump instruction freeze target snapshot.",psx-runtime
+insn_freeze_snapshot,,"Take manual snapshot at current instruction freeze point.",psx-runtime
+ra_load_watch,"value (str)","Watch for loads of a specific value via $ra-derived addresses. value=0 disarms.",psx-runtime
+cdrom_cmd_dump,,"Dump CDROM command history (psx-beetle parity).",psx-beetle
+cdrom_cmd_reset,,"Reset CDROM command history (psx-beetle parity).",psx-beetle
+cdc_volume,,"Report CD controller volume state.",psx-beetle
+sio_write_window,,"Dump SIO write window (psx-beetle parity).",psx-beetle
+exc_ring,,"Dump exception ring (psx-beetle parity).",psx-beetle
+fntrace_disarm,,"Disarm function trace filter (psx-beetle parity).",psx-beetle
+fntrace_arms,,"List all armed function trace ranges (psx-beetle parity).",psx-beetle
+fntrace_unfiltered,,"Enable unfiltered function trace (psx-beetle parity).",psx-beetle
+fntrace_reset,,"Reset function trace ring (psx-beetle parity).",psx-beetle
+rtrace_disarm,,"Disarm MMIO-read trace range (psx-beetle parity).",psx-beetle
+rtrace_disarm_all,,"Disarm all MMIO-read trace ranges (psx-beetle parity).",psx-beetle
+rtrace_reset,,"Reset MMIO-read trace (psx-beetle parity).",psx-beetle

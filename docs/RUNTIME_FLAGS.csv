@@ -1,0 +1,159 @@
+type,flag_or_field,default,description
+CLI,--bios <path>,(compile-time default),Override the BIOS ROM path (SCPH1001.BIN). CLI wins over game.toml and settings.toml.
+CLI,--game <toml>,(auto-detect),Load a game config TOML (single source of truth for disc / memcard / title / debug port). Relative paths resolve against exe dir.
+CLI,--disc <path>,(from game.toml),Override the game config disc path (CUE/BIN).
+CLI,--debug-port <n>,4370,Override the TCP debug-server port (multi-instance soak fleet). Wins over game.toml.
+CLI,--renderer <name>,software,Override renderer: software | opengl | vulkan.
+CLI,--window-title <str>,(from game.toml),Override SDL window title (fleet labeling).
+CLI,--launcher,off,Force the GUI launcher on (overrides skip_launcher in settings.toml).
+CLI,--no-launcher,off,Skip the GUI launcher (boot straight in). Same as PSX_NO_LAUNCHER=1.
+CLI,--headless,off,Skip SDL window + audio; TCP screenshots/state only. Same as PSX_HEADLESS=1.
+CLI,<positional>,(none),Deprecated alias for --bios.
+ENV,PSX_BIOS_HLE,from game.toml,Enable HLE BIOS tier (1=on, 0=off). When on: instant boot-skip, kernel services computed in-runtime. 0 for pure LLE.
+ENV,PSX_BIOS_HLE_KEEP_INTRO,0,When HLE BIOS is on, keep the intro boot animation (don't skip to game).
+ENV,PSX_HLE_SCHEDULER,1,Enable deterministic HLE TCB scheduler (1=on, 0=off). Works under both BIOS backends.
+ENV,PSX_HEADLESS,0,Boot without SDL window/audio (1=on). Use TCP for all I/O.
+ENV,PSX_NO_LAUNCHER,0,Skip the GUI launcher window (1=on). Boots straight into game.
+ENV,PSX_DEV_INPUT,0,Merge all controllers to P1 for debugging (1=on).
+ENV,PSX_EXIT_HALT,0,Halt-and-serve on PC=0 exit (1=on). Keeps TCP server alive after game ends.
+ENV,PSX_FAIL_FAST_UNKNOWN_DISPATCH,1,Abort on unknown dispatch target (1=on). 0 = log and continue.
+ENV,PSX_FAIL_FAST_UNIMPLEMENTED,1,Abort on unimplemented opcode (1=on). 0 = log and continue.
+ENV,PSX_FAIL_FAST_UNSUPPORTED,1,Abort on unsupported instruction (1=on). 0 = log and continue.
+ENV,PSX_FORCE_INTERP,0,Route ALL RAM through dirty-RAM interpreter (1=on). Debug: disables compiled native code entirely.
+ENV,PSX_SHELLWIN_INTERP,0,Route BIOS shell window [0x30000,0x5AFFF] through dirty-RAM interpreter (1=on).
+ENV,PSX_MMIO_WAIT,1,Enable device-region read-cycle waits (1=on). 0 = no waits (fast but breaks timing).
+ENV,PSX_POLL_PROOF,0,Extra cycle cost for low-RAM reads (0=off, >0=cycles added). Timing correction factor.
+ENV,PSX_LOAD_DELAY,1,Enable R3000A load-delay interlock timing (1=on, 0=off). 0 = no load-delay modeling.
+ENV,PSX_ICACHE,1,Enable I-cache simulation (1=on, 0=off).
+ENV,PSX_IDLE_SKIP,0,Skip pacing in idle loops (1=on). Runs at host speed during BIOS idle polling.
+ENV,PSX_RECURSION_LIMIT,256,Max dispatch recursion depth before abort.
+ENV,PSX_MIXED_OWNER,1,Enable mixed-mode stack watermark (1=on, 0=off). Controls compiled↔interp transitions.
+ENV,PSX_MIXED_STACK_KB,700,Mixed-mode stack overflow threshold in KB.
+ENV,PSX_STARVATION_TIMEOUT_US,4000000,Watchdog timeout in microseconds (default 4s). Aborts if emulation stalls.
+ENV,PSX_RECORD_FRAME,(none),Arm the frame-gated ordered access recorder from boot for guest frame N.
+ENV,PSX_READ_WATCH,"lo,hi",Arm a targeted main-RAM read watch range for the recorded frame.
+ENV,PSX_STACK_GUARD_KB,(default),Stack guard size in KB for overflow detection.
+ENV,PSX_PRECISE_SLICE,0,Precise-cycle slicing mode (0=off, 1=on). Breaks large blocks at device deadlines.
+ENV,PSX_PRECISE_ALWAYS,0,Always use precise-cycle mode (0=off, 1=on).
+ENV,PSX_PRECISE_MARGIN,500,Margin in cycles for precise-slice deadline detection.
+ENV,PSX_DIRTY_ENTRY_POLL,0,Dirty-RAM entry poll interval.
+ENV,PSX_DEFER_SWITCH,1,Defer mode switch on exception (1=on, 0=off).
+ENV,PSX_EXC_CLEAR_RESUME_LATCH,0,Clear resume latch on exception.
+ENV,PSX_SAME_THREAD_RESTORE,0,Restore on same thread (0=default).
+ENV,PSX_COSIM_PORT,4600,TCP port for cycle-lockstep cosimulation oracle.
+ENV,PSX_COSIM_STRIDE,(default),Cosimulation stride (cycles between checks).
+ENV,PSX_COSIM_START_CYCLE,0,Cycle number to start cosimulation.
+ENV,PSX_PARITY_TRACE,0,Enable control-flow parity trace (compiled vs interp dispatch parity, 1=on).
+ENV,PSX_PARITY_WATCH,"lo,hi",Address range for parity watch (hex).
+ENV,PSX_DEVTRACE,0,Enable device event ring (1=on). Records I_STAT source events with cycle timestamps.
+ENV,PSX_FNTRACE_ALL,0,Enable function trace for ALL dispatches (1=on). Heavy overhead.
+ENV,PSX_OVERLAY_BACKEND,"auto",Overlay tier selection: auto | gcc | tcc | auto-no-gcc | sljit(deprecated).
+ENV,PSX_OVERLAY_NATIVE_BLOCK,"addr,...",Per-game overlay addresses to block from native compilation (hex, comma-separated).
+ENV,PSX_OVERLAY_NATIVE_OFF,0,Force overlay native compilation OFF (1=on). Routes everything through interpreter.
+ENV,PSX_OVERLAY_DIFF,0,Enable overlay shadow diff (track native vs interpreter divergence, 1=on).
+ENV,PSX_OVERLAY_IRQ_SUPPRESS,0,Suppress IRQ delivery during overlay native execution (1=on). For timing isolation.
+ENV,PSX_OVERLAY_IRQ_RATELIMIT,0,IRQ rate-limit during overlay native execution (finer than full suppress).
+ENV,PSX_OVERLAY_IRQ_BUDGET,(default),IRQ budget during overlay native execution.
+ENV,PSX_OVERLAY_IRQ_NO_CDROM,0,Exclude CDROM IRQs from overlay IRQ suppression.
+ENV,PSX_OVERLAY_IRQ_DEFER_CDROM,0,Defer CDROM IRQs during overlay native execution.
+ENV,PSX_OVERLAY_IRQ_POST_PUMP,(default),Post-IRQ pump cycles during overlay native execution.
+ENV,PSX_OVERLAY_UNIT_DEFER,0,Defer overlay unit loading.
+ENV,PSX_SLJIT_ENABLE,0,Enable SLJIT JIT tier for overlays.
+ENV,PSX_SLJIT_SYNC,0,Force synchronous SLJIT compilation (disable async).
+ENV,PSX_SLJIT_LIVE,0,Enable SLJIT live compilation mode.
+ENV,PSX_NO_SLJIT,0,Disable SLJIT entirely.
+ENV,PSX_WS_FORCE_2D,0,Force widescreen 2D mode (1=on). For testing pure-2D games.
+ENV,PSX_SCREEN,(default),Override CRT filter / screen kind (raw|crt|composite|trinitron).
+ENV,PSX_AUDIO_SHADOW,0,Enable SPU float-shadow re-render (1=on). Catmull-Rom resample, verified-enhancement.
+ENV,PSX_CD_TRAP_CMD,(none),Trap specific CDROM command (hex byte). Pauses when matching command is issued.
+ENV,PSX_CD_TRAP_NTH,1,Stop on the Nth matching CDTRAP command (default 1st).
+ENV,PSX_CD_DMA_TRACE,0,Enable CD DMA trace logging (1=on).
+ENV,PSX_LANG,"en",Language code for on-the-fly string translation. "off"/"jp"/"" = untranslated.
+ENV,PSX_XLATE_LE,0,Little-endian text translation mode.
+ENV,PSX_XLATE_ALLOW_NUL,0,Allow NUL bytes in text translation capture.
+ENV,PSX_XLATE_CAPTURE,0,Enable text translation capture mode.
+ENV,PSX_LOW_LATENCY_INPUT,1,Re-sample pad after wall-clock pacer (1=on). Reduces input→photon latency.
+ENV,PSX_VSYNC,1,Present/swap mode: 1=on (tear-free), 0=immediate (may tear), -1=adaptive.
+ENV,PSX_XPROBE_FRAME_TRIP,(default),Cross-probe frame trip threshold.
+ENV,PSX_XPROBE_STK_KB,(default),Cross-probe stack KB threshold.
+ENV,PSX_XPROBE_WARMUP,(default),Cross-probe warmup frames.
+ENV,PSX_RECORD_FRAME,(default),Arm frame-gated ordered-access recorder from boot for frame N.
+ENV,PSX_READ_WATCH,"lo,hi",Arm targeted main-RAM read watch for recorded frame.
+game.toml,[game].name,(required),Game display name (e.g. "Tomba!").
+game.toml,[game].id,(required),Game serial ID (e.g. "SCUS-94236").
+game.toml,[game].exe_path,(required),Path to PS-X EXE file.
+game.toml,[game].load_address,0x80010000,EXE load address in guest RAM.
+game.toml,[game].entry_pc,(required),EXE entry PC address.
+game.toml,[game].text_size,(required),EXE text segment size in bytes.
+game.toml,[game].stack_base,(none),Initial $sp value.
+game.toml,[game].disc,"...",Disc path (CUE). Single disc or first of [[game.discs]].
+game.toml,[[game.discs]],(none),Array of disc paths for multi-disc games.
+game.toml,[game].disc_crc,(none),Expected CRC32 of data track (for launcher badge).
+game.toml,[game].disc_sha1,(none),Expected SHA-1 of data track (hex).
+game.toml,[runtime].debug_port,(none),TCP debug-server port for this game.
+game.toml,[runtime].language,"en",Default localization language code.
+game.toml,[[runtime].languages],(none),Launcher language menu options [{code,label}].
+game.toml,[runtime].window_title,(none),Default SDL window title.
+game.toml,[runtime].controller,"digital",Controller type hint: "digital" | "dualshock".
+game.toml,[runtime].memcard_dir,(none),Memory card directory path.
+game.toml,[runtime].disc_speed,"1x",CD-ROM timing multiplier: "1x" | "2x" | "4x" | "instant".
+game.toml,[runtime].instant_max_per_frame,(default),Per-frame sector-IRQ budget when disc_speed="instant".
+game.toml,[runtime].fast_boot,0,DEPRECATED → alias for HLE boot shell-skip.
+game.toml,[runtime].bios_hle,1,Enable HLE BIOS tier (1=on, 0=off for pure LLE).
+game.toml,[runtime].bios_hle_keep_intro,0,Keep intro animation when HLE BIOS is on.
+game.toml,[runtime].hle_scheduler,1,Enable deterministic HLE TCB scheduler (1=on).
+game.toml,[runtime].overlay_cache,0,Enable overlay DLL cache + capture (1=on).
+game.toml,[runtime].turbo_loads,0,OPT-IN: run unpaced during CD load screens (1=on).
+game.toml,[runtime].overlay_autocompile_cmd,(none),Shell command for auto-overlay compilation.
+game.toml,[runtime].overlay_autocompile_cmd_tcc,(none),Same as above but using bundled TinyCC.
+game.toml,[runtime].overlay_backend,"auto",Overlay compiler backend: auto | gcc | tcc | auto-no-gcc.
+game.toml,[[runtime].overlay_native_block],[],Overlay function addresses to force through interpreter.
+game.toml,[video].supersampling,1,Internal-resolution SSAA factor (1= native, 2..4 = scaled).
+game.toml,[video].antialiasing,1,Linear-filter upscale (1=smooth, 0=sharp pixels).
+game.toml,[video].texture_filtering,"nearest","nearest" (native look) | "bilinear" (smooth).
+game.toml,[video].renderer,"software","software" | "opengl" | "vulkan".
+game.toml,[video].low_latency_input,1,Re-sample pad before present (1=on).
+game.toml,[video].vsync,1,Present mode: 1=on, 0=immediate, -1=adaptive.
+game.toml,[video].screen_kind,"raw","raw" | "crt" | "composite" | "trinitron".
+game.toml,[video].auto_skip_fmv,0,Skip FMVs instantly when detected (1=on).
+game.toml,[video].fmv_skip_total_table,0,Address of per-movie total-frame table (for game-native FMV skip).
+game.toml,[video].fmv_skip_movie_id,0,Address of current movie-id byte.
+game.toml,[video].fmv_skip_end_total,3,Offset subtracted from total to trigger skip.
+game.toml,[video].fmv_skip_no_xa,0,Broaden FMV detection to MDEC-only (no XA required).
+game.toml,[video].aspect_ratio,"4:3","W:H" display aspect. "16:9" enables widescreen hack.
+game.toml,[audio].spu_hq,0,Enable SPU float-shadow re-render (Catmull-Rom, 1=on).
+game.toml,[controller].default_mode,"hybrid","hybrid" | "analog" | "digital" — default pad mode.
+game.toml,[controller].allow_hybrid,1,Show Hybrid option in launcher pad-mode selector.
+game.toml,[controller].lock_mode,0,Hide pad-mode selector (force default_mode for all ports).
+game.toml,[controller].lock_device,0,Hide controller device picker entirely.
+game.toml,[controller].deadzone,12000,Default analog-stick deadzone (raw SDL axis units, 0..32767).
+game.toml,[controller].legacy_pad_config,0,Legacy pad protocol (pre-DualShock config SM). Only Tomba opts in.
+settings.toml,[video].renderer,(from game.toml),Override renderer: 0=software, 1=opengl.
+settings.toml,[video].supersampling,(from game.toml),Override SSAA factor (1..4).
+settings.toml,[video].window_width,1280,Window width in pixels (height = width*3/4).
+settings.toml,[video].antialiasing,(from game.toml),Override AA toggle.
+settings.toml,[video].texture_filter,(from game.toml),Override texture filtering: 0=nearest, 1=bilinear.
+settings.toml,[video].screen_kind,(from game.toml),Override CRT filter.
+settings.toml,[video].auto_skip_fmv,(from game.toml),Override FMV skip toggle.
+settings.toml,[video].turbo_loads,1,Override turbo-through-loads toggle.
+settings.toml,[video].fast_boot,0,Override fast boot toggle.
+settings.toml,[video].bios_hle,(from game.toml),Override HLE BIOS toggle.
+settings.toml,[video].fullscreen,0,Launch in desktop fullscreen (1=on). In-game F11/Alt+Enter toggles live.
+settings.toml,[video].low_latency_input,(from game.toml),Override low-latency input toggle.
+settings.toml,[video].vsync,(from game.toml),Override vsync mode.
+settings.toml,[launcher].skip_launcher,0,Boot straight in, skip GUI launcher (1=on).
+settings.toml,[launcher].ui_scale,1.0,Launcher UI scale (0.5 .. 2.0).
+settings.toml,[audio].spu_hq,(from game.toml),Override SPU HQ toggle.
+settings.toml,[bios].path,(from game.toml),Override BIOS ROM path.
+settings.toml,[disc].path,(from game.toml),Override disc path.
+settings.toml,[memcard].dir,(from game.toml),Override memory card directory.
+settings.toml,[memcard].card1_path,(auto),Override slot-1 card file path.
+settings.toml,[memcard].card2_path,(auto),Override slot-2 card file path.
+settings.toml,[memcard].card1_enabled,1,Enable memory card slot 1.
+settings.toml,[memcard].card2_enabled,1,Enable memory card slot 2.
+settings.toml,[controller].p1_device,"keyboard",Player 1 input device: "keyboard" | "none" | SDL GUID.
+settings.toml,[controller].p2_device,"none",Player 2 input device.
+settings.toml,[controller].p1_mode,hybrid,Player 1 pad mode: hybrid | analog | digital.
+settings.toml,[controller].p2_mode,hybrid,Player 2 pad mode.
+settings.toml,[controller].deadzone,(from game.toml),Override analog-stick deadzone.
+settings.toml,[localization].language,"en",Override localization language.
