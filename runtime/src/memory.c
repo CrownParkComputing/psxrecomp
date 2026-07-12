@@ -100,9 +100,155 @@ static inline void dirty_ram_mark_page(uint32_t phys) {
     dirty_ram_bitmap[page >> 5] |= bit;
 }
 
+/* ---- Kernel-image bless -------------------------------------------------
+ * Kernel Part 2 (RAM [0x500,0x8500)) is the BIOS's boot-time copy of ROM
+ * [0x1FC10000,0x1FC18000); the statically-recompiled kernel functions in the
+ * generated dispatch table were compiled FROM those ROM bytes. Those pages
+ * are permanently dirty (TCB saves, event tables, install stubs share the
+ * window), which diverted EVERY kernel dispatch to the interpreter — the
+ * dominant cost of event-heavy scenes (a Tomba village frame samples ~97%
+ * in kernel PCs) and CD-load drains.
+ *
+ * A dispatch key may run its static native function IFF the live RAM bytes
+ * of everything that function can execute (its body extent, emitter-supplied
+ * via psx_bios_kernel_bodies[]) still byte-match the ROM source. Per-entry,
+ * lazily verified, cached; a guest write landing INSIDE an entry's body
+ * drops that entry back to unverified (next dispatch re-compares). Entries
+ * whose bodies were runtime-patched (the BIOS installs pad/SIO handlers into
+ * ROM-zero gaps of the pad driver) simply never verify and stay on the
+ * faithful interpreter path — their behavior is unchanged by design. This is
+ * the runtime half of the relocation-manifest contract
+ * (docs/RELOCATION_MANIFEST_FORMAT.md: "runtime verifies against live RAM
+ * before dispatching the AOT function"). */
+#define KBLESS_RAM_LO  0x500u
+#define KBLESS_RAM_HI  0x8500u
+#define KBLESS_ROM_OFF 0x10000u   /* bios_rom[] offset of RAM 0x500 */
+
+typedef struct {
+    uint32_t key;
+    uint32_t body_lo;
+    uint32_t body_hi;
+} PsxKernelBody;
+extern const PsxKernelBody psx_bios_kernel_bodies[];
+extern const uint32_t      psx_bios_kernel_body_count;
+
+#define KBLESS_UNKNOWN  0u
+#define KBLESS_CLEAN    1u
+#define KBLESS_MISMATCH 2u
+#define KBLESS_MAX_ENTRIES 4096u
+static uint8_t  kbless_state[KBLESS_MAX_ENTRIES];   /* parallel to bodies[] */
+static int      kbless_enabled = -1;   /* env PSX_KERNEL_BLESS=0 disables */
+/* Always-on counters (TCP kernel_bless). */
+static uint64_t kbless_native_hits   = 0;
+static uint64_t kbless_verifies      = 0;
+static uint64_t kbless_mismatches    = 0;
+static uint64_t kbless_invalidations = 0;
+
+static int kbless_on(void) {
+    if (kbless_enabled < 0) {
+        const char* e = getenv("PSX_KERNEL_BLESS");
+        kbless_enabled = (e && e[0] == '0') ? 0 : 1;
+        if (psx_bios_kernel_body_count > KBLESS_MAX_ENTRIES) kbless_enabled = 0;
+    }
+    return kbless_enabled;
+}
+
+/* Binary search the (key-sorted) body table. -1 if absent. */
+static int kbless_find(uint32_t phys) {
+    uint32_t lo = 0, hi = psx_bios_kernel_body_count;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) >> 1;
+        uint32_t k = psx_bios_kernel_bodies[mid].key;
+        if (k == phys) return (int)mid;
+        if (k < phys) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
+
+/* Dispatch-time query: may `phys` run its static native function?
+ * Verifies lazily; every failure mode falls back to the interpreter. */
+int psx_kernel_bless_dispatchable(uint32_t phys) {
+    if (phys - KBLESS_RAM_LO >= (KBLESS_RAM_HI - KBLESS_RAM_LO)) return 0;
+    if (!kbless_on()) return 0;
+    int i = kbless_find(phys);
+    if (i < 0) return 0;
+    uint8_t st = kbless_state[i];
+    if (st == KBLESS_CLEAN)    { kbless_native_hits++; return 1; }
+    if (st == KBLESS_MISMATCH) return 0;
+    const PsxKernelBody* b = &psx_bios_kernel_bodies[i];
+    kbless_verifies++;
+    if (memcmp(ram + b->body_lo,
+               bios_rom + KBLESS_ROM_OFF + (b->body_lo - KBLESS_RAM_LO),
+               b->body_hi - b->body_lo) == 0) {
+        kbless_state[i] = KBLESS_CLEAN;
+        kbless_native_hits++;
+        return 1;
+    }
+    kbless_state[i] = KBLESS_MISMATCH;
+    kbless_mismatches++;
+    return 0;
+}
+
+/* A write landed in the kernel window: any entry whose body contains the
+ * written byte must re-verify before its next native dispatch. Kernel DATA
+ * writes (TCB saves, event tables — the frequent case) lie outside every
+ * body and fall through the loop without invalidating anything; genuine
+ * code-window writes (install-time, patches) are rare. */
+static void kbless_note_write(uint32_t phys) {
+    if (phys - KBLESS_RAM_LO >= (KBLESS_RAM_HI - KBLESS_RAM_LO)) return;
+    if (kbless_enabled == 0) return;
+    uint32_t n = psx_bios_kernel_body_count;
+    if (n > KBLESS_MAX_ENTRIES) return;
+    for (uint32_t i = 0; i < n; i++) {
+        /* No early exit: a continuation key can sort ABOVE the written
+         * address while its parent body contains it (bodies overlap). n is
+         * a few hundred; this path fires only on kernel-window writes. */
+        const PsxKernelBody* b = &psx_bios_kernel_bodies[i];
+        if (phys >= b->body_lo && phys < b->body_hi &&
+            kbless_state[i] != KBLESS_UNKNOWN) {
+            kbless_state[i] = KBLESS_UNKNOWN;
+            kbless_invalidations++;
+        }
+    }
+}
+
+/* Range write (DMA / EXE load / savestate restore) overlapping the window:
+ * bulk, rare events — reset every entry rather than per-byte scanning. */
+void psx_kernel_bless_note_range(uint32_t phys, uint32_t len) {
+    if (len == 0) return;
+    uint32_t end = phys + len;
+    if (end < phys) end = 0xFFFFFFFFu;
+    if (end <= KBLESS_RAM_LO || phys >= KBLESS_RAM_HI) return;
+    uint32_t n = psx_bios_kernel_body_count;
+    if (n > KBLESS_MAX_ENTRIES) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (kbless_state[i] != KBLESS_UNKNOWN) {
+            kbless_state[i] = KBLESS_UNKNOWN;
+            kbless_invalidations++;
+        }
+    }
+}
+
+void psx_kernel_bless_stats(uint64_t out[6]) {
+    uint32_t n = psx_bios_kernel_body_count;
+    uint32_t clean = 0, mism = 0;
+    if (n > KBLESS_MAX_ENTRIES) n = KBLESS_MAX_ENTRIES;
+    for (uint32_t i = 0; i < n; i++) {
+        if (kbless_state[i] == KBLESS_CLEAN)    clean++;
+        if (kbless_state[i] == KBLESS_MISMATCH) mism++;
+    }
+    out[0] = psx_bios_kernel_body_count;
+    out[1] = clean;
+    out[2] = mism;
+    out[3] = kbless_native_hits;
+    out[4] = kbless_verifies;
+    out[5] = kbless_invalidations;
+}
+
 static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
     if (phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
     dirty_ram_mark_page(phys);
+    kbless_note_write(phys);
 }
 
 int dirty_ram_is_dirty(uint32_t phys);
@@ -165,6 +311,8 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     g_text_native_blocked = 0;
     g_text_diverged_pages = 0;
 }
+
+int dirty_ram_text_image_registered(void) { return text_ref_image != NULL; }
 
 static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
     if (!text_ref_image) return;
@@ -253,6 +401,7 @@ uint32_t dirty_ram_text_diverged_pages(void) { return g_text_diverged_pages; }
 
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
+    psx_kernel_bless_note_range(phys, len);
     uint32_t end = phys + len - 1u;
     if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
 
@@ -1089,6 +1238,8 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
@@ -1241,6 +1392,8 @@ static uint16_t psx_read_half_raw(uint32_t addr) {
 
 static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
@@ -1470,6 +1623,8 @@ uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 
 static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_byte_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 1, val);

@@ -23,6 +23,7 @@
 #include "overlay_sljit.h"
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "present_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
@@ -49,6 +50,7 @@
 #include "game_options.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
@@ -98,6 +100,111 @@ extern "C" uint32_t memory_get_bios_checksum(void);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
                                                   uint32_t len);
+
+/* Arm the dirty-RAM text-image guard with the boot EXE bytes. The guard is
+ * load-bearing: dispatch native-safety (dirty_ram_text_native_ok) and the
+ * fntrace alternate game-start latch both key off the registered image, so
+ * every install must arm it — not just repo checkouts that happen to carry a
+ * loose EXE copy next to game.toml. Source order:
+ *   1. The local EXE file from game.toml (dev checkouts; recompiler input).
+ *   2. The boot EXE extracted from the mounted disc image (end-user installs
+ *      — the disc is the same bytes the BIOS loads, i.e. the true reference).
+ * Registration passes ownership of the malloc'd buffer to memory.c. */
+static void arm_text_image_guard(const std::string &exe_path,
+                                 uint32_t load_address,
+                                 const std::string &disc_path) {
+    const uint32_t phys_lo = load_address & 0x1FFFFFFFu;
+    /* 1. Local EXE file (skip the 2048-byte PS-X EXE header). */
+    if (!exe_path.empty()) {
+        std::ifstream ef(exe_path, std::ios::binary | std::ios::ate);
+        if (ef) {
+            std::streamsize sz = ef.tellg();
+            if (sz > 2048) {
+                uint32_t img_len = (uint32_t)(sz - 2048);
+                uint8_t *img = (uint8_t *)std::malloc(img_len);
+                if (img) {
+                    ef.seekg(2048, std::ios::beg);
+                    if (ef.read((char *)img, img_len)) {
+                        dirty_ram_register_text_image(phys_lo, img, img_len);
+                        std::fprintf(stdout,
+                            "psxrecomp: text image guard armed (0x%08X..0x%08X, local EXE)\n",
+                            load_address, load_address + img_len);
+                        return;
+                    }
+                    std::free(img);
+                }
+            }
+        }
+    }
+    /* 2. Extract the boot EXE from the disc image. */
+    if (!disc_path.empty()) {
+        PS1::ISOReader iso;
+        if (iso.Open(disc_path)) {
+            /* The boot filename: basename of the game.toml exe field (it names
+             * the same file the recompiler consumed, which came off this disc);
+             * fall back to the SYSTEM.CNF BOOT token for configs whose local
+             * name differs from the disc name. */
+            std::string boot_name;
+            if (!exe_path.empty()) {
+                const size_t slash = exe_path.find_last_of("/\\");
+                boot_name = (slash == std::string::npos)
+                                ? exe_path : exe_path.substr(slash + 1);
+            }
+            PS1::ISOFileEntry ent;
+            if (boot_name.empty() || !iso.FindFile(boot_name, ent)) {
+                /* SYSTEM.CNF: `BOOT = cdrom:\SCUS_944.23;1` */
+                uint8_t cnf[2048] = {0};
+                size_t n = iso.ReadFile("SYSTEM.CNF", cnf, sizeof(cnf) - 1);
+                if (n > 0) {
+                    std::string text((const char *)cnf, n);
+                    std::string lower = text;
+                    for (char &c : lower) c = (char)std::tolower((unsigned char)c);
+                    const size_t key = lower.find("cdrom:");
+                    if (key != std::string::npos) {
+                        size_t j = key + 6;
+                        while (j < text.size() && (text[j] == '\\' || text[j] == '/')) j++;
+                        std::string tok;
+                        while (j < text.size()) {
+                            char c = text[j];
+                            if (c == ';' || c == '\r' || c == '\n' || c == ' ' ||
+                                c == '\t' || c == '\0') break;
+                            tok += c; j++;
+                            if (tok.size() > 64) break;
+                        }
+                        const size_t s2 = tok.find_last_of("\\/");
+                        if (s2 != std::string::npos) tok = tok.substr(s2 + 1);
+                        if (!tok.empty() && iso.FindFile(tok, ent)) boot_name = tok;
+                    }
+                }
+            }
+            if (!boot_name.empty() && iso.FindFile(boot_name, ent) &&
+                ent.size > 2048) {
+                uint8_t *file = (uint8_t *)std::malloc(ent.size);
+                if (file) {
+                    size_t got = iso.ReadFile(boot_name, file, ent.size);
+                    if (got > 2048) {
+                        uint32_t img_len = (uint32_t)(got - 2048);
+                        uint8_t *img = (uint8_t *)std::malloc(img_len);
+                        if (img) {
+                            memcpy(img, file + 2048, img_len);
+                            std::free(file);
+                            dirty_ram_register_text_image(phys_lo, img, img_len);
+                            std::fprintf(stdout,
+                                "psxrecomp: text image guard armed (0x%08X..0x%08X, disc %s)\n",
+                                load_address, load_address + img_len,
+                                boot_name.c_str());
+                            return;
+                        }
+                    }
+                    std::free(file);
+                }
+            }
+        }
+    }
+    std::fprintf(stdout,
+        "psxrecomp: WARNING: text image guard NOT armed (no local EXE, no disc "
+        "boot EXE) — native text dispatch will be conservative\n");
+}
 
 /* dma.c */
 extern "C" void dma_init(void);
@@ -177,6 +284,7 @@ static int           g_fmv_skip_end_total   = 3;
  * movies never stream XA, so the default MDEC+XA detector misses them —
  * Tomba2's Whoopee Camp logo). Presentation-side fast-forward only. */
 static int           g_fmv_skip_no_xa       = 0;
+static int           g_fmv_skip_no_xa_hold  = 4;
 /* Low-latency present options (see [video] in config_loader). Measured on a
  * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
  * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
@@ -187,6 +295,9 @@ static int           g_fmv_skip_no_xa       = 0;
  * it trims the display-side scanout latency the CPU-side ring can't see. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
+static int           g_frame_interpolation = 0;
+static int           g_frame_interpolation_fps = 0;
+static double        g_host_refresh_hz = 0.0;
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -199,10 +310,12 @@ extern "C" uint32_t mdec_get_decode_count(void);
  * resolved. */
 const char *g_active_config_path = nullptr;
 extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
-                                     uint32_t *movie_id, const char **cfg_path) {
+                                      uint32_t *movie_id, int *no_xa_hold,
+                                      const char **cfg_path) {
     if (auto_skip)   *auto_skip   = g_auto_skip_fmv;
     if (total_table) *total_table = g_fmv_skip_total_table;
     if (movie_id)    *movie_id    = g_fmv_skip_movie_id;
+    if (no_xa_hold)  *no_xa_hold  = g_fmv_skip_no_xa_hold;
     if (cfg_path)    *cfg_path    = g_active_config_path ? g_active_config_path : "(null)";
 }
 
@@ -215,6 +328,9 @@ static int           g_video_aspect_den = 3;
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
 static bool          g_ws_hud_sprt = false;
+/* Runtime-only transition cleanup; kept out of gpu.h because generated game
+ * units include that ABI header and do not need this frontend-only setter. */
+extern "C" void gpu_ws_set_clear_reveal(int on);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -851,6 +967,78 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
     return 1;
 }
 
+/* Lightweight production-safe cadence probe. Unlike the TCP debug build this
+ * adds no per-block recording; it is intended for long, representative attract
+ * runs where instrumentation overhead would itself cause audio starvation. */
+static void runtime_perf_diag_tick() {
+    static int enabled = -1;
+    static uint64_t last_counter = 0, last_frame = 0, last_spu = 0;
+    static uint64_t last_underruns = 0, last_overflows = 0;
+    static uint64_t last_up[6] = {0};
+    static uint32_t last_overlay_loads = 0;
+    static uint64_t last_overlay_load_us = 0;
+    if (enabled < 0) {
+        const char *e = std::getenv("PSX_RUNTIME_PERF_DIAG");
+        enabled = e && e[0] && e[0] != '0';
+    }
+    if (!enabled) return;
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    extern uint64_t s_frame_count;
+    AudioTraceStats audio;
+    audio_trace_get_stats(&audio);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t underruns = 0, overflows = 0;
+    int legacy = 0, host_rate = 0;
+    psx_audio_out_stats(&fill_ms, &underruns, &overflows, &correction,
+                        &legacy, &host_rate);
+    uint64_t up[6] = {0};
+    gl_renderer_runtime_diag(up);
+    uint32_t overlay_loads = 0;
+    uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
+    overlay_loader_get_counters(&overlay_loads, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    overlay_loader_get_load_timing(&overlay_load_us, &overlay_load_max_us,
+                                   &overlay_load_last_us);
+    if (!last_counter) {
+        last_counter = now; last_frame = s_frame_count;
+        last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+        last_underruns = underruns; last_overflows = overflows;
+        last_overlay_loads = overlay_loads;
+        last_overlay_load_us = overlay_load_us;
+        for (int i = 0; i < 6; i++) last_up[i] = up[i];
+        return;
+    }
+    if (now - last_counter < freq * 5u) return;
+    double dt = (double)(now - last_counter) / (double)freq;
+    fprintf(stdout, "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+            "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
+            "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
+            "cpu=%.1f tex=%.1f draw=%.1f ms/s; overlay loads=+%u "
+            "wall=%.1f ms max=%.1f last=%.1f ms\n",
+            (double)(s_frame_count - last_frame) / dt,
+            (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+            fill_ms, (unsigned long long)(underruns - last_underruns),
+            (unsigned long long)(overflows - last_overflows), correction,
+            (double)(up[0] - last_up[0]) / dt,
+            (double)(up[1] - last_up[1]) / dt,
+            (double)(up[2] - last_up[2]) / dt / 1.0e6,
+            (double)(up[3] - last_up[3]) * 1000.0 / (double)freq / dt,
+            (double)(up[4] - last_up[4]) * 1000.0 / (double)freq / dt,
+            (double)(up[5] - last_up[5]) * 1000.0 / (double)freq / dt,
+            overlay_loads - last_overlay_loads,
+            (double)(overlay_load_us - last_overlay_load_us) / 1000.0,
+            (double)overlay_load_max_us / 1000.0,
+            (double)overlay_load_last_us / 1000.0);
+    fflush(stdout);
+    last_counter = now; last_frame = s_frame_count;
+    last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+    last_underruns = underruns; last_overflows = overflows;
+    last_overlay_loads = overlay_loads;
+    last_overlay_load_us = overlay_load_us;
+    for (int i = 0; i < 6; i++) last_up[i] = up[i];
+}
+
 static void sdl_audio_update(int turbo_active) {
     if (!sdl_audio_device) return;
     {   /* Tag audio events with the vblank frame counter. */
@@ -900,11 +1088,15 @@ static void sdl_audio_update(int turbo_active) {
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
- * Bit 0 = SELECT, Bit 3 = START, Bit 4 = UP, Bit 5 = RIGHT,
- * Bit 6 = DOWN, Bit 7 = LEFT, Bit 8 = L2, Bit 9 = R2,
- * Bit 10 = L1, Bit 11 = R1, Bit 12 = TRIANGLE, Bit 13 = CIRCLE,
- * Bit 14 = CROSS, Bit 15 = SQUARE */
+ * Bit 0 = SELECT, Bit 1 = L3, Bit 2 = R3, Bit 3 = START,
+ * Bit 4 = UP, Bit 5 = RIGHT, Bit 6 = DOWN, Bit 7 = LEFT,
+ * Bit 8 = L2, Bit 9 = R2, Bit 10 = L1, Bit 11 = R1,
+ * Bit 12 = TRIANGLE, Bit 13 = CIRCLE, Bit 14 = CROSS, Bit 15 = SQUARE.
+ * L3/R3 (stick clicks) exist on a DualShock only; the wire reports them like
+ * Beetle's dualshock.cpp does — straight from the button word, no mode mask. */
 #define PAD_SELECT   (1 << 0)
+#define PAD_L3       (1 << 1)
+#define PAD_R3       (1 << 2)
 #define PAD_START    (1 << 3)
 #define PAD_UP       (1 << 4)
 #define PAD_RIGHT    (1 << 5)
@@ -939,7 +1131,7 @@ struct PsxButtonMap {
 
 static int controller_device_index = 0;
 static int controller_deadzone = 12000;
-static std::array<PsxButtonMap, 14> controller_map = {{
+static std::array<PsxButtonMap, 16> controller_map = {{
     { PAD_UP,       "up",       {} },
     { PAD_DOWN,     "down",     {} },
     { PAD_LEFT,     "left",     {} },
@@ -952,6 +1144,8 @@ static std::array<PsxButtonMap, 14> controller_map = {{
     { PAD_R1,       "r1",       {} },
     { PAD_L2,       "l2",       {} },
     { PAD_R2,       "r2",       {} },
+    { PAD_L3,       "l3",       {} },
+    { PAD_R3,       "r3",       {} },
     { PAD_START,    "start",    {} },
     { PAD_SELECT,   "select",   {} },
 }};
@@ -1096,6 +1290,8 @@ static void set_default_controller_mapping(void) {
     set_sources("r1",       "rightshoulder");
     set_sources("l2",       "lefttrigger");
     set_sources("r2",       "righttrigger");
+    set_sources("l3",       "leftstick");
+    set_sources("r3",       "rightstick");
     set_sources("start",    "start");
     set_sources("select",   "back");
 }
@@ -1104,7 +1300,8 @@ static std::string default_input_ini_text(void) {
     return
         "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
         "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
-        "; lefttrigger,righttrigger,dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
+        "; lefttrigger,righttrigger,leftstick,rightstick (stick clicks -> L3/R3),\n"
+        "; dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
         "\n"
         "[controller]\n"
         "enabled = true\n"
@@ -1124,6 +1321,8 @@ static std::string default_input_ini_text(void) {
         "r1 = rightshoulder\n"
         "l2 = lefttrigger\n"
         "r2 = righttrigger\n"
+        "l3 = leftstick\n"
+        "r3 = rightstick\n"
         "start = start\n"
         "select = back\n";
 }
@@ -1308,7 +1507,7 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
 /* Keyboard -> PSX button word for `player` (1 or 2), via the configurable
  * keybinds.ini map (psx_keybinds). Defaults reproduce the old hardcoded layout
  * (arrows=d-pad, X/S/Z/A=Cross/Circle/Square/Triangle, Q/W/E/R=L1/R1/L2/R2,
- * Return=Start, RShift=Select), so out-of-the-box behaviour is unchanged. */
+ * Return=Start, RShift=Select) plus T/Y=L3/R3 stick clicks. */
 static uint16_t pad_from_keyboard(int player) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     return psx_keybinds_pad_word(keys, player);
@@ -1500,9 +1699,52 @@ static void dev_any_controller_sticks(uint8_t st[4]) {
     }
 }
 
+/* Debug-server input injection: drive the SAME pad model as a physical
+ * device. The old path set only the button word and returned, which left the
+ * pad type/sticks at whatever the real device last was — a hybrid P1 stayed
+ * analog, so injected d-pad bits never moved games that read the stick in
+ * analog mode (menus reacted, walking didn't). Injected d-pad reads as d-pad
+ * activity (hybrid drops to digital), an injected stick override reads as
+ * stick activity (hybrid rises to analog), and the resolved type goes through
+ * the same coherent request channel as real sampling — never slammed mid-
+ * handshake (the v0.5.0 phantom-input lesson). */
+static void apply_input_override_to_sio(int override_word) {
+    PlayerInput& p = g_players[0];
+    const uint16_t w = (uint16_t)override_word;
+    sio_set_pad_state_slot(0, w);
+
+    uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+    int axes = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    axes = debug_server_get_axis_override(st);
+#endif
+    const bool stick_live = axes != 0 && (st[0] != 0x80 || st[1] != 0x80 ||
+                                          st[2] != 0x80 || st[3] != 0x80);
+    const bool dpad_live  = ((uint16_t)~w & 0x00F0u) != 0;   /* up/right/down/left */
+
+    int mode;
+    if (p.kind != 0)                  mode = p.mode;
+    else if (dev_any_input_enabled()) mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+    else                              mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
+
+    int eff_analog;
+    if (mode == (int)PSXRecompV4::PAD_MODE_DIGITAL) {
+        eff_analog = 0;
+    } else if (mode == (int)PSXRecompV4::PAD_MODE_ANALOG) {
+        eff_analog = 1;
+    } else { /* HYBRID: most-recent input source wins, like the real sampler */
+        if (stick_live)     p.hybrid_analog = true;
+        else if (dpad_live) p.hybrid_analog = false;
+        eff_analog = p.hybrid_analog ? 1 : 0;
+    }
+    if (!eff_analog) { st[0] = st[1] = st[2] = st[3] = 0x80; }
+    sio_set_pad_sticks(0, st[0], st[1], st[2], st[3]);
+    sio_request_pad_type(0, eff_analog);
+}
+
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
-        sio_set_pad_state_slot(0, (uint16_t)override);
+        apply_input_override_to_sio(override);
         return;
     }
     for (int s = 0; s < 2; s++) {
@@ -1569,7 +1811,7 @@ static void sample_pad_into_sio(int override) {
 
 static void sample_headless_pad_into_sio(int override) {
     if (override >= 0) {
-        sio_set_pad_state_slot(0, (uint16_t)override);
+        apply_input_override_to_sio(override);
         return;
     }
 #ifdef PSX_COSIM
@@ -1591,8 +1833,19 @@ static void sample_headless_pad_into_sio(int override) {
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
  * and underruns. Uncapped, the host runs the simulation at whatever
- * speed it can — typically several × realtime — and audio glitches. */
+ * speed it can — typically several × realtime — and audio glitches.
+ *
+ * The wall-clock pacer target; nudged to the host display refresh at
+ * window-creation time (sync-to-host-refresh) so the pacer and SDL PRESENTVSYNC
+ * do not fight — a fixed 59.94 pacer against a 60.00 Hz panel makes rendered
+ * frames land on an uneven vblank count (a 2/3/1 beat) that reads as
+ * moving-object judder/flicker. See g_frame_period_ms. */
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
+/* Live pacer period (ms). Defaults to the PSX rate; set to the host refresh
+ * period when the panel is within ~2% of 60 Hz so 30fps content pads evenly to
+ * two host refreshes. Left at the PSX rate on non-~60Hz panels to avoid running
+ * the sim at the wrong speed. */
+static double g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 
 /* ── Host-stack-usage profile (RECURSION_BUG.md §17) ──────────────────────────
  * The decisive instrument for the long-run freeze. The guest call graph mirrors
@@ -1663,6 +1916,47 @@ extern "C" int stack_profile_json(char *out, int cap) {
     return n;
 }
 
+/* ---- Present-classification ring (see present_ring.h) -----------------
+ * Always-on record of how each present was classified, for every backend.
+ * A native-wide present that silently falls back to the canonical width is
+ * indistinguishable on screen from a deliberate stretch, so the decision
+ * has to live in a queryable ring rather than be re-derived after the fact. */
+#define PRES_RING_CAP 4096u   /* power of two; ~68 s at 60 Hz */
+static PresRingEntry s_pres_ring[PRES_RING_CAP];
+static uint64_t      s_pres_ring_total = 0;
+
+extern "C" uint64_t present_ring_total(void) { return s_pres_ring_total; }
+extern "C" int present_ring_get(uint64_t seq, PresRingEntry* out) {
+    if (seq >= s_pres_ring_total) return 0;
+    if (s_pres_ring_total - seq > PRES_RING_CAP) return 0;
+    *out = s_pres_ring[seq & (PRES_RING_CAP - 1u)];
+    return 1;
+}
+
+/* Commit this present's classification. Returns the stored entry so the
+ * software wide-fallback (the only post-decision mutation) can amend it. */
+static PresRingEntry* present_ring_commit(uint8_t path, uint16_t disp_w,
+                                          uint16_t disp_h, uint16_t present_w) {
+    GpuWsDebug ws;
+    gpu_ws_get_debug(&ws);
+    PresRingEntry* e = &s_pres_ring[s_pres_ring_total & (PRES_RING_CAP - 1u)];
+    s_pres_ring_total++;
+    e->frame         = (uint32_t)ws.cur_frame;
+    e->disp_w        = disp_w;
+    e->disp_h        = disp_h;
+    e->present_w     = present_w;
+    e->nw_extra      = (uint16_t)(ws.nw_extra < 0 ? 0 : ws.nw_extra);
+    e->path          = path;
+    e->wide_fellback = 0;
+    e->game_mode     = (uint8_t)ws.game_mode;
+    e->native_43     = (uint8_t)ws.present_native_43;
+    int64_t d = (int64_t)ws.cur_frame - (int64_t)ws.last_tag_frame;
+    e->tag_delta     = (d > INT32_MAX || d < INT32_MIN) ? INT32_MAX : (int32_t)d;
+    e->gte_verts     = (uint16_t)(ws.gte_verts > 0xFFFF ? 0xFFFF : ws.gte_verts);
+    e->ovh_prims     = (uint16_t)(ws.ovh_prims > 0xFFFF ? 0xFFFF : ws.ovh_prims);
+    return e;
+}
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -1715,6 +2009,7 @@ static void sdl_vblank_present(void) {
             fps_last_frame = s_frame_count;
         }
     }
+    runtime_perf_diag_tick();
 
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
@@ -1837,7 +2132,8 @@ static void sdl_vblank_present(void) {
          * satisfy the MDEC+XA detector; with the per-game opt-in, MDEC
          * activity alone qualifies. */
         int detected = mdec_decoding && (xa || g_fmv_skip_no_xa);
-        if (detected) s_fmv_hold = 4;
+        if (detected) s_fmv_hold = (!xa && g_fmv_skip_no_xa)
+                                     ? g_fmv_skip_no_xa_hold : 4;
         else if (s_fmv_hold > 0) s_fmv_hold--;
         fmv_skip_active = (s_fmv_hold > 0) && (xa || g_fmv_skip_no_xa);
         if (fmv_skip_active) {
@@ -1924,7 +2220,7 @@ static void sdl_vblank_present(void) {
      * hard freeze). */
     {
         static FramePacer pacer = { 0 };
-        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
+        frame_pacer_wait(&pacer, g_frame_period_ms);
     }
     latency_ring_mark(LAT_PACED);
 
@@ -1959,11 +2255,15 @@ static void sdl_vblank_present(void) {
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
     bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
+    bool pin_43    = false;  /* pillarbox this present (FMV, or a native-wide
+                                game frame that could not present wide) */
     {
         static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
+            present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
+                                (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
             if (!disabled_frame_presented) {
                 disabled_frame_presented = true;
@@ -1988,6 +2288,14 @@ static void sdl_vblank_present(void) {
          * of truth, shared with the GTE/GPU squash so content and present stay
          * locked: we squash IFF we stretch. */
         fmv_frame = !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* MDEC movies are already decoded at their authored cadence and are
+         * CPU/upload heavy. High-refresh crossfades only contend with decoding
+         * and can starve audio, so present native-4:3/MDEC phases directly.
+         * The classification catches the transition frame before the first
+         * decode; the activity stamp also covers authentic 4:3 configurations. */
+        if (g_gl_active)
+            gl_renderer_set_interpolation_suspended(
+                fmv_frame || mdec_recently_active(2));
 
         /* Canonical present width. Native-wide does NOT widen the canonical read
          * (that bled across adjacent framebuffers); it composites into a separate
@@ -2000,6 +2308,21 @@ static void sdl_vblank_present(void) {
         bool wide_present = (!fmv_frame && g_ws_engaged &&
                              ws_native_wide_active() && gr_wide_supported());
         if (wide_present) present_w = w + (uint32_t)ws_nw_extra();
+
+        /* Native-wide invariant: canonical (320-wide) content is NEVER
+         * stretched across the wide window — a game frame that cannot present
+         * wide (compositor unsupported, or the surface fallback below)
+         * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
+         * stretch: its canonical content is pre-squashed FOR the stretch. */
+        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+
+        /* Ring the classification now that it's final (only the software/CPU
+         * wide path below can still fall back — it amends this entry). A
+         * CANONICAL game frame on a widescreen window IS the stretch. */
+        PresRingEntry* pres_entry = present_ring_commit(
+            fmv_frame ? PRES_PATH_NATIVE_43
+                      : (wide_present ? PRES_PATH_WIDE : PRES_PATH_CANONICAL),
+            (uint16_t)w, (uint16_t)h, (uint16_t)present_w);
 
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
@@ -2022,7 +2345,7 @@ static void sdl_vblank_present(void) {
             } else {
                 gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         fmv_frame ? 1 : 0);
+                                         (fmv_frame || nw_pin) ? 1 : 0);
                 return;
             }
         }
@@ -2052,7 +2375,7 @@ static void sdl_vblank_present(void) {
             } else {
                 vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         fmv_frame ? 1 : 0);
+                                         (fmv_frame || nw_pin) ? 1 : 0);
             }
             return;
         }
@@ -2081,8 +2404,12 @@ static void sdl_vblank_present(void) {
             } else {
                 wide_present = false;
                 present_w = w;
+                pres_entry->path          = PRES_PATH_CANONICAL;
+                pres_entry->wide_fellback = 1;
+                pres_entry->present_w     = (uint16_t)present_w;
             }
         }
+        pin_43 = fmv_frame || (nw_pin && !wide_present);
         if (!wide_present) {
             if (active_scale > 1) {
                 int sw = (int)present_w * active_scale;
@@ -2093,6 +2420,47 @@ static void sdl_vblank_present(void) {
                 for (uint32_t y = 0; y < h; y++) {
                     for (uint32_t x = 0; x < present_w; x++) {
                         sdl_pixel_buf[y * present_w + x] = gpu_display_pixel_argb(&di, x, y);
+                    }
+                }
+            }
+        }
+
+        /* Frame blending (CRT-persistence masker for 30fps double-buffered
+         * content). Some games (e.g. Crash Bash menus/characters) leave a
+         * dynamic object in only one of the two display buffers per 30fps cycle,
+         * so it strobes on/off as the display alternates buffers — the static
+         * background, present in both, stays put. Real CRTs hid this via phosphor
+         * persistence; accurate emulators either time it away (cycle accuracy) or
+         * offer a "blend frames" option that averages the last two presented
+         * frames. This is the latter: presentation only, game logic untouched.
+         * Guarded to the plain software present path (no GL/VK/wide/hires/FMV) so
+         * the buffer is a simple present_w*h ARGB grid. PSX_FRAME_BLEND=0 off. */
+        {
+            static int blend_cfg = -1;   /* -1 unresolved, 0 off, 1 on */
+            if (blend_cfg < 0) {
+                const char* e = getenv("PSX_FRAME_BLEND");
+                blend_cfg = (e && e[0] == '1') ? 1 : 0;   /* default off (masker only) */
+            }
+            const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
+                                   !di.depth24 && active_scale == 1;
+            if (blend_cfg && simple_sw) {
+                static uint32_t prev_buf[640 * 512];
+                static uint32_t prev_px = 0;
+                const uint32_t npx = present_w * h;
+                if (npx <= (uint32_t)(640 * 512)) {
+                    if (prev_px == npx) {
+                        for (uint32_t i = 0; i < npx; i++) {
+                            const uint32_t a = sdl_pixel_buf[i];
+                            const uint32_t b = prev_buf[i];
+                            prev_buf[i] = a;   /* store this frame (pre-blend) */
+                            sdl_pixel_buf[i] =
+                                0xFF000000u |
+                                (((a & 0xFEFEFEu) >> 1) + ((b & 0xFEFEFEu) >> 1));
+                        }
+                    } else {
+                        /* Resolution changed / first frame: seed, no blend. */
+                        for (uint32_t i = 0; i < npx; i++) prev_buf[i] = sdl_pixel_buf[i];
+                        prev_px = npx;
                     }
                 }
             }
@@ -2111,15 +2479,17 @@ static void sdl_vblank_present(void) {
          * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
          * still owns timing. 24-bit (FMV) frames pin to native 4:3. */
         gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0,
-                            fmv_frame ? 1 : 0);
+                            pin_43 ? 1 : 0);
     } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
 
     /* FMV (24-bit) frames are authored 4:3 with no GTE squash to compensate
-     * the widescreen stretch — pillarbox them at native 4:3 instead. */
-    int dst_w = fmv_frame ? 640 * g_video_scale : g_logical_w;
+     * the widescreen stretch — pillarbox them at native 4:3 instead. Same for
+     * native-wide game frames that could not present wide (pin_43): canonical
+     * content is never stretched across the wide window. */
+    int dst_w = pin_43 ? 640 * g_video_scale : g_logical_w;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
@@ -2282,6 +2652,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
+    bool ws_ultrawide_offered = false;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2302,6 +2673,10 @@ int main(int argc, char** argv) {
     bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
     bool       bios_hle      = false;  /* HLE kernel-service tier (bios_hle.c) */
     bool       bios_hle_keep_intro = false;
+    /* Text-image guard source, captured at config load; armed after the disc
+     * path is resolved (arm_text_image_guard). */
+    std::string text_guard_exe_path;
+    uint32_t    text_guard_load_addr = 0;
 
     if (game_config_path) {
         try {
@@ -2338,23 +2713,57 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
+            g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
+            g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
             g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
             g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
             if (gc.runtime.video_fmv_skip_end_total)
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
+            g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            /* [widescreen.bg2d] engine tile-ring layout for the freshness
+             * refill shared by the MMX5/MMX6 2D background hook. */
+            gpu_ws_bg2d_configure(gc.ws_bg2d_layer_base,
+                                  gc.ws_bg2d_ring_base,
+                                  gc.ws_bg2d_map_size_addr,
+                                  gc.ws_bg2d_layer_stride_addr,
+                                  gc.ws_bg2d_ring_cols,
+                                  gc.ws_bg2d_layer_count,
+                                  gc.ws_bg2d_layer_struct_stride,
+                                  gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* Keep titles with known native-wide regressions on the original
+             * projection-squash + stretched-present widescreen path. */
+            g_ws_native_wide = gc.ws_native_wide ? 1 : 0;
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
+            gpu_ws_set_nw_left_hud_packet_range(gc.ws_nw_left_hud_packet_lo,
+                                                gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
+             * in the native-wide mirror, preserving the canonical 4:3 image. */
+            gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
+            /* [widescreen] nw_phase_backdrop — stretch only the textured
+             * backdrop phase emitted before shaded 3D foreground geometry. */
+            gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
+            /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
+             * cleanup of synthetic native-wide margins. */
+            gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
+            gpu_ws_set_explicit_cull_sites(
+                gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+            gte_ws_configure_dome_sites(
+                gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */
@@ -2364,6 +2773,7 @@ int main(int argc, char** argv) {
                 gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
+            ws_ultrawide_offered = gc.ws_ultrawide_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2401,30 +2811,12 @@ int main(int argc, char** argv) {
              * loaded" from "diverged because runtime wrote different code over
              * the original EXE image". Packed/self-modifying games can rewrite
              * their own text; those pages must execute from live RAM, not stale
-             * static native code. Best effort: without the local EXE file, the
-             * guard remains on the existing dirty-page behavior. */
-            if (!gc.exe_path.empty()) {
-                std::ifstream ef(gc.exe_path, std::ios::binary | std::ios::ate);
-                if (ef) {
-                    std::streamsize sz = ef.tellg();
-                    if (sz > 2048) {
-                        uint32_t img_len = (uint32_t)(sz - 2048);
-                        uint8_t *img = (uint8_t *)std::malloc(img_len);
-                        if (img) {
-                            ef.seekg(2048, std::ios::beg);
-                            if (ef.read((char *)img, img_len)) {
-                                dirty_ram_register_text_image(
-                                    gc.load_address & 0x1FFFFFFFu, img, img_len);
-                                std::fprintf(stdout,
-                                    "psxrecomp: text image guard armed (0x%08X..0x%08X)\n",
-                                    gc.load_address, gc.load_address + img_len);
-                            } else {
-                                std::free(img);
-                            }
-                        }
-                    }
-                }
-            }
+             * static native code. Arming is DEFERRED until the disc path is
+             * resolved (arm_text_image_guard below): release installs have no
+             * local EXE file, so the guard extracts the boot EXE from the
+             * user's disc image instead. */
+            text_guard_exe_path  = gc.exe_path.string();
+            text_guard_load_addr = gc.load_address;
             /* HLE-tier scheduler subsystem replacement default (env
              * PSX_HLE_SCHEDULER still wins; latched at first dispatch). */
             psx_hle_scheduler_set_default(gc.runtime.hle_scheduler ? 1 : 0);
@@ -2606,6 +2998,10 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+        if (us.has_frame_interpolation)
+            g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+        if (us.has_frame_interpolation_fps)
+            g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
 
     /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
@@ -2634,11 +3030,24 @@ int main(int argc, char** argv) {
         g_video_aspect_num = 4;
         g_video_aspect_den = 3;
     }
+    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+        std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
+                     ws_offered ? "16:9" : "4:3");
+        g_video_aspect_num = ws_offered ? 16 : 4;
+        g_video_aspect_den = ws_offered ? 9 : 3;
+    }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
-     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
+     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
+     * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
+        g_frame_interpolation = atoi(e) ? 1 : 0;
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
+        int fps = atoi(e);
+        if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
+    }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
@@ -2711,6 +3120,10 @@ int main(int argc, char** argv) {
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
+            seed.frame_interpolation = (g_frame_interpolation != 0);
+            seed.has_frame_interpolation = true;
+            seed.frame_interpolation_fps = g_frame_interpolation_fps;
+            seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
@@ -2766,6 +3179,7 @@ int main(int argc, char** argv) {
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
                     ginfo.lock_device      = ctrl_lock_device;
                     ginfo.ws_offered       = ws_offered;
+                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
@@ -2791,6 +3205,8 @@ int main(int argc, char** argv) {
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
+                g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
+                g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
                 g_audio_spu_hq    = seed.spu_hq;
@@ -2945,6 +3361,11 @@ int main(int argc, char** argv) {
             std::fprintf(stdout, "psxrecomp: disc region %s (serial %s)\n",
                          ident.region.c_str(), ident.detected_serial.c_str());
     }
+    /* Arm the text-image guard now that both possible sources are resolved:
+     * the local EXE file (dev checkouts) and the disc image (every install). */
+    if (game_config_path)
+        arm_text_image_guard(text_guard_exe_path, text_guard_load_addr,
+                             disc_path_str);
     {
         int divisor = 1; /* default: authentic 1x timing */
         if (disc_speed == "instant") divisor = 0;
@@ -3074,6 +3495,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
+     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
+     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
+     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
+     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
+     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
+     * worse than a benign slow beat). */
+    {
+        SDL_DisplayMode dm;
+        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            g_host_refresh_hz = host_hz;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_ms = 1000.0 / host_hz;
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            } else {
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
+            }
+        }
+    }
+
     /* OpenGL backend: create the GL context now. On failure, relabel the
      * facade back to software (rasterization already runs through software in
      * this phase) and fall through to the SDL_Renderer present path below. */
@@ -3088,6 +3533,8 @@ int main(int argc, char** argv) {
          * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
+        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init

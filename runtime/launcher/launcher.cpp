@@ -719,9 +719,16 @@ Result run(SDL_Window* window, void* gl_context,
     m.auto_skip_fmv  = io.auto_skip_fmv;
     m.turbo_loads    = io.turbo_loads;
     m.fullscreen     = io.fullscreen;
+    m.frame_interpolation = io.has_frame_interpolation && io.frame_interpolation;
+    m.frame_interpolation_fps = kInterpFps[interp_fps_index(
+        io.has_frame_interpolation_fps ? io.frame_interpolation_fps : 0)];
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
+    // Games whose widescreen is unported/unvalidated declare [widescreen]
+    // offer=false: hide the toggle AND clamp a stale persisted 16:9 back to
+    // 4:3 so the hack can't engage from an old settings.toml.
+    if (!game.ws_offered && m.aspect_index == 1) m.aspect_index = 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     if (io.has_bios_path) m.bios_path = io.bios_path.generic_string();
     if (io.has_disc_path) m.disc_path = io.disc_path.generic_string();
@@ -1170,6 +1177,10 @@ Result run(SDL_Window* window, void* gl_context,
         io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
+        io.frame_interpolation = m.frame_interpolation;
+        io.has_frame_interpolation = true;
+        io.frame_interpolation_fps = m.frame_interpolation_fps;
+        io.has_frame_interpolation_fps = true;
         io.skip_launcher = m.skip_launcher;   io.has_skip_launcher = true;
         io.spu_hq = m.spu_hq;                io.has_spu_hq = true;
         io.aspect_num = kAspects[m.aspect_index][0];

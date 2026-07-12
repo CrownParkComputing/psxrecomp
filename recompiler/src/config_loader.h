@@ -188,6 +188,8 @@ struct RuntimeConfig {
     // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
     bool                  video_low_latency_input = true;
     int                   video_vsync             = 1;
+    bool                  video_frame_interpolation = false;
+    int                   video_frame_interpolation_fps = 0; // 0 = display refresh
 
     // crt_filter: present-time screen-colour model (verified-enhancement LUT).
     // "raw" (default, byte-identical 5->8 passthrough) | "crt" | "composite" |
@@ -228,6 +230,12 @@ struct RuntimeConfig {
     // side only, guest timeline untouched. Per-game opt-in because MDEC use
     // outside movies (loading-screen stills) would briefly trigger it.
     bool                  video_fmv_skip_no_xa = false;
+    // fmv_skip_no_xa_hold: presentation-side fast-forward latch, in guest
+    // vblanks, after the most recent silent MDEC decode. Silent preloaded
+    // logos can retain an authored post-decode wait; a title may opt into a
+    // longer latch so auto-skip covers that wait too. Default preserves the
+    // generic four-frame inter-decode hysteresis.
+    int                   video_fmv_skip_no_xa_hold = 4;
 
     // aspect_ratio: display aspect "W:H" (default "4:3" = native). A wider
     // aspect (e.g. "16:9") enables the widescreen hack: the GTE squashes
@@ -410,18 +418,23 @@ struct GameConfig {
     // ~the half-extra-width when stretching) into the relevant immediates:
     //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
     //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
-    //   cull_a1_sites:    a nop (load/branch-delay) → a1 += margin (for the
-    //                     caller-supplied-margin classifier variants)
+    //   cull_a1_sites:    a nop → a1 += margin, or move rD,a1 →
+    //                     rD = a1 + margin (caller-margin classifier variants)
     // All Ghidra-evidenced; empty by default. Changing these requires a regen.
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
     std::vector<uint32_t> ws_cull_a1_sites;
+    // Explicit `sltiu rt,sx,W` render rejects for cases where codegen function
+    // splitting separates the paired vertical test from auto_screen_x.
+    std::vector<uint32_t> ws_cull_screen_x_sites;
 
     // [widescreen.cull] slti_sites — explicit signed right-edge widen sites
     // (`slti rt, sx, W` → psx_ws_cull_slti) for funnel functions the
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Extra per-side actor overdraw beyond the visible widescreen edge.
+    int                   ws_cull_guard_pixels = 0;
 
     // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
     // immediates of the GTE screen-extent reject signature, per game (the
@@ -450,6 +463,10 @@ struct GameConfig {
     // OFF for their (far, parallax) draws: the backdrop fills the stretched 16:9
     // frame instead of leaving edge void (8C). Main-EXE addresses; regen-class.
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
+
+    // [widescreen.dome] call_sites: exact guest JAL addresses whose GTE
+    // projections belong to a finite curved backdrop mesh authored for 4:3.
+    std::vector<uint32_t> ws_dome_call_sites;
 
     // [widescreen.cull] auto_screen_x — automatic horizontal-FOV cull widening.
     // GTE-projected render funnels reject a primitive when ALL its vertices fall
@@ -493,16 +510,48 @@ struct GameConfig {
     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
     bool ws_gte_game_mode = false;
 
+    // [widescreen] native_wide — select the newer wide render-target path.
+    // Defaults on for compatibility. Titles can keep the original GTE-squash
+    // + stretched-present path when native-wide is not regression-free.
+    bool ws_native_wide = true;
+
     // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
     // space HUD sprites out to the true wide-frame corners (they otherwise sit
     // inset by the reveal offset). Runtime-only — no regen. Off by default.
     bool ws_nw_hud_corners = false;
+
+    // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
+    // half-open physical-RAM source range for a specifically identified HUD
+    // pool. In native-wide, primitives from this pool anchor by screen third
+    // (left/right), without moving similarly placed scenery from other pools
+    // (essential for pure-2D games whose world is also screen-space prims).
+    // Both values must be present together. Runtime-only; no regen required.
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
 
     // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
     // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
     // fill the wide frame, so it stops pillarboxing at the reveal margins.
     // Runtime-only — no regen. Off by default.
     bool ws_nw_backdrop = false;
+
+    // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
+    // cleanup. A game-specific stage/map boundary can clear only proven-void
+    // sides while preserving the canonical 4:3 surface and guest VRAM. Runtime-
+    // only gate; any game-specific init hook remains regen-class. Off by default.
+    bool ws_clear_reveal = false;
+
+    // [widescreen] nw_flat_backdrop — in the native-wide mirror only, stretch
+    // untextured flat primitives across the wider output. This is for games
+    // whose authored 4:3 sky/backdrop is emitted as flat polygons rather than
+    // a recognizable full-frame textured quad. Runtime-only; off by default.
+    bool ws_nw_flat_backdrop = false;
+
+    // [widescreen] nw_phase_backdrop — stretch textured primitives emitted
+    // before the frame's first shaded 3D primitive. This isolates an authored
+    // 2D sky/backdrop phase from the later textured foreground. Runtime-only;
+    // off by default because draw ordering is title-specific.
+    bool ws_nw_phase_backdrop = false;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
@@ -513,14 +562,21 @@ struct GameConfig {
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
 
+    // [widescreen] offer_ultrawide — expose a separate experimental 21:9
+    // launcher choice for titles that have explicitly tested it. Default off;
+    // ordinary widescreen offer remains the independent 16:9 choice.
+    bool ws_ultrawide_offered = false;
+
     // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
     // whose column count and loop start are rewritten so the loop draws the
     // 16:9 reveal columns on both sides of the 320 view (see gpu.c
-    // psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
-    //   count_site:    the `li rt,21` column-count load (addiu/ori).
+    // psx_ws_bg2d_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
+    //   count_site:    either the `li rt,21` column-count load (addiu/ori), or
+    //                  the loop-closing inline `slti[u] rt,index,21` bound
+    //                  compare (MMX4/MMX5).
     //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
-    //   startx_site:   the `sra rd,rt,sa` start screen-x.
+    //   startx_site:   the `sra rd,rt,sa` or `subu rd,zero,rt` start screen-x.
     // 0 = unset (feature off). Verified by opcode at gen time.
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
@@ -538,6 +594,21 @@ struct GameConfig {
     //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
     uint32_t ws_bg2d_bufbase_site = 0;
     uint32_t ws_bg2d_cap_site     = 0;
+    // Tile-ring layout used by the once-per-frame freshness refill. Defaults
+    // describe MMX6; sibling engines such as MMX5 override the shifted RAM
+    // addresses and smaller ring width in game.toml.
+    uint32_t ws_bg2d_layer_base       = 0x800971F8u;
+    uint32_t ws_bg2d_ring_base        = 0x800A21B8u;
+    uint32_t ws_bg2d_map_size_addr    = 0x800CD338u;
+    uint32_t ws_bg2d_layer_stride_addr = 0x8008EC10u;
+    uint32_t ws_bg2d_ring_cols        = 64;
+    uint32_t ws_bg2d_layer_count      = 3;
+    uint32_t ws_bg2d_layer_struct_stride = 0x54;
+    //   init_func: full tile-ring initializer called only when an independent
+    //   layer's stage data is dirty. A callback at entry invalidates stale host
+    //   reveal pixels once before the new stage background is submitted.
+    uint32_t ws_bg2d_init_func    = 0;
+    uint32_t ws_bg2d_packet_cap       = 1000;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
@@ -581,6 +652,8 @@ struct UserSettings {
     // display latency, may tear), -1=adaptive.
     bool has_low_latency_input = false; bool low_latency_input = true;
     bool has_vsync             = false; int  vsync             = 1;
+    bool has_frame_interpolation = false; bool frame_interpolation = false;
+    bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.

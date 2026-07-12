@@ -674,6 +674,7 @@ static uint32_t execute_ch2_gpu(void) {
          * Each node: bits 24-31 = number of words following header,
          *            bits 0-23  = next node address (0xFFFFFF = end).
          * The words following the header are sent to GP0. */
+        gpu_ws_begin_linked_list();
         uint32_t addr = channels[2].madr & 0x1FFFFCu;
         uint32_t safety = 0;
         const uint32_t MAX_NODES = 0x40000; /* prevent infinite loops */
@@ -917,6 +918,29 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
     }
     for (int ch = 0; ch < 7; ch++) {
         if (delayed_complete[ch].active && delayed_complete[ch].cycles_remaining < best)
+            best = delayed_complete[ch].cycles_remaining;
+    }
+    return best;
+}
+
+uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 3))) return 0xFFFFFFFFu;
+    uint32_t best = 0xFFFFFFFFu;
+    const int async_num[3] = { 0, 1, 3 };
+    const DMAAsyncChannel *async_ch[3] = {
+        &mdec_async[0], &mdec_async[1], &cdrom_async
+    };
+    for (int i = 0; i < 3; i++) {
+        const DMAAsyncChannel *a = async_ch[i];
+        if (!channel_irq_flag_armed(async_num[i]) ||
+            !a->active || a->remaining_words == 0) continue;
+        uint32_t est = a->remaining_words > a->cycles_accum
+                         ? (a->remaining_words - a->cycles_accum) : 0u;
+        if (est < best) best = est;
+    }
+    for (int ch = 0; ch < 7; ch++) {
+        if (channel_irq_flag_armed(ch) && delayed_complete[ch].active &&
+            delayed_complete[ch].cycles_remaining < best)
             best = delayed_complete[ch].cycles_remaining;
     }
     return best;

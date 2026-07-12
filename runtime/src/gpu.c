@@ -88,6 +88,7 @@ static int      ws_cfg_num = 4, ws_cfg_den = 3;
 typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
 static WsTag    ws_tags[WS_TAG_BUCKETS];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
+static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
@@ -100,6 +101,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_w(void);
+static void ws_clear_all_reveal_margins(void);
 
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
  * within the last couple of frames => the actor render funnel is running =>
@@ -113,6 +115,10 @@ static int32_t ws_disp_w(void);
  * engage (gpu_ws_set_full_2d); PSX_WS_FORCE_2D=1 forces it on for testing. */
 static int ws_full_2d = 0;
 void gpu_ws_set_full_2d(int on) { ws_full_2d = on ? 1 : 0; }
+static int ws_clear_reveal = 0;
+static int g_mmx6_void_sides = 0;
+static uint32_t g_mmx6_void_generation = 1;
+void gpu_ws_set_clear_reveal(int on) { ws_clear_reveal = on ? 1 : 0; }
 
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) — the generic
  * 3D-title analog of the sprite-tag stamp. A fully-3D game (e.g. Ape Escape)
@@ -136,12 +142,61 @@ static uint32_t ws_last_gte_stamp = (uint32_t)-1000;
  * this many consecutive frames (save/options/memory-card) — reverts to 4:3. */
 #define WS_GTE_GAME_MODE_HYSTERESIS 45u
 void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
+
+/* World-scale 3D signal for the 2D-only-scene classifier (sprite-tag titles).
+ * Shaded-prim presence proved to be a FALSE world signal: task-clear /
+ * new-task title cards are gouraud-shaded screen-space tiles animated over
+ * many consecutive frames, which defeated both the shaded test and its
+ * sustained guard (room re-stretched whenever a card played). Projection
+ * volume can't be fooled that way: a real 3D world projects hundreds of
+ * verts per frame through RTPS/RTPT, a room interior projects only its
+ * character anchors (a handful), and screen-space overlays project ZERO.
+ * Sustained rule as elsewhere: 2+ consecutive frames over threshold, so an
+ * isolated projection burst can't flip a 2D scene wide. */
+#define WS_WORLD3D_MIN_VERTS 48u
+static uint32_t ws_gte_prev_verts     = 0;  /* final count of last completed frame */
+static uint32_t ws_last_world3d_stamp = (uint32_t)-1000;
+static uint32_t ws_sust_world3d_stamp = (uint32_t)-1000;
+
+/* Natural-overhang world signal — the classifier's actual input. GTE volume
+ * above proved to be a SECOND false world signal: the task-found/task-clear
+ * jingle projects world-scale vert counts inside a room (stamped world3d at
+ * ≥48 while the room idles at 4). What can't be faked is CONTENT: a real 3D
+ * scene always submits polygons whose raw vertex X extent crosses outside
+ * the canonical display window (that overhang is the very content native-
+ * wide reveals — the working outdoor reveal proves it exists), while rooms,
+ * dialogs, HUDs and jingle popups compose everything inside it. Polygons
+ * only (sprites/rects slide in from edges routinely — the task icon enters
+ * from the right edge), ≥3 prims per frame, sustained 2+ consecutive
+ * frames. Counted at gp0_execute_command via prim_sx_extent (raw SX,
+ * pre-draw_offset, so our native-wide offset injection can't feed back). */
+/* Depth qualifier: only polys crossing DEEP past the canonical edge count.
+ * Census-measured (SCUS-94236): outdoor terrain = 55/frame at >=24px (depths
+ * to 128px); the task-jingle sparkles poke <=20px and its sliding icon is a
+ * single prim at 34px — so >=24px depth + >=4 prims excludes every observed
+ * screen-edge effect with ~14x headroom to the real world's count. */
+#define WS_OVERHANG_DEEP_PX   24
+#define WS_OVERHANG_MIN_PRIMS 4u
+static uint32_t ws_ovh_frame      = (uint32_t)-1;
+static uint32_t ws_ovh_count      = 0;
+static uint32_t ws_ovh_prev       = 0;  /* final count of last completed frame */
+static uint32_t ws_last_ovh_stamp = (uint32_t)-1000;
+static uint32_t ws_sust_ovh_stamp = (uint32_t)-1000;
+
 void psx_ws_note_gte_project(int nverts) {
-    if (!ws_gte_game_mode_cfg) return;
     uint32_t f = (uint32_t)s_frame_count;
-    if (f != ws_gte_frame) { ws_gte_frame = f; ws_gte_count = 0; }
+    if (f != ws_gte_frame) {
+        if (f == ws_gte_frame + 1u) ws_gte_prev_verts = ws_gte_count;
+        else                        ws_gte_prev_verts = 0;
+        ws_gte_frame = f; ws_gte_count = 0;
+    }
     ws_gte_count += (uint32_t)nverts;
-    if (ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS) ws_last_gte_stamp = f;
+    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS)
+        ws_last_gte_stamp = f;
+    if (ws_gte_count >= WS_WORLD3D_MIN_VERTS && ws_last_world3d_stamp != f) {
+        if (f == ws_last_world3d_stamp + 1u) ws_sust_world3d_stamp = f;
+        ws_last_world3d_stamp = f;
+    }
 }
 
 /* Full-2D tile-engine mode (MMX6): config [widescreen] full_2d, or the PSX_WS_FORCE_2D
@@ -168,9 +223,31 @@ static int ws_game_mode(void) {
  * UI (dialog boxes built from tiled cap/middle pieces), so such screens get
  * zero squash + a 4:3 pillarbox instead. The FMV check is cached per frame;
  * game_mode is a cheap live check. */
+/* 2D-only gameplay scenes (sprite-tag titles). A room interior or a sky-only
+ * fall is gameplay-classified (the character prims tag every frame) but has
+ * no world-scale GTE projection — there is no 3D world and nothing beyond
+ * the canonical frame to reveal, so wide presents can only stretch flat art
+ * (the backdrop stretch fires wholesale because the background phase never
+ * ends). Present those scenes native 4:3 instead: the canonical buffer is
+ * always faithful. The signal is natural polygon OVERHANG past the canonical
+ * window (ws_sust_ovh_stamp) — content that would actually be revealed.
+ * Shaded-prim presence and GTE projection volume both proved to be false
+ * world signals (title-card letter tiles; the task-jingle's GTE effect) —
+ * see the overhang block for the full lineage. Scoped to the tag-classified
+ * (2.5D) mechanism: full-2D titles (MMX6) are 2D-only by definition and
+ * genuinely reveal more, and GTE-detector titles (Ape) already classify 2D
+ * screens by projection count. The hysteresis rides out 1-2 frame gaps; a
+ * real scene change crosses it in ~0.1 s. */
+#define WS_2D_SCENE_HYSTERESIS 6u
+static int ws_2d_only_scene(void) {
+    if (ws_full_2d_mode() || ws_gte_game_mode_cfg) return 0;
+    return (uint32_t)s_frame_count - ws_sust_ovh_stamp > WS_2D_SCENE_HYSTERESIS;
+}
+
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
+    if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
     static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
     static int      fmv_cached = 0;
     uint32_t f = (uint32_t)s_frame_count;
@@ -221,7 +298,41 @@ int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
  * cull while still stretching; large = over-draw) at a fixed camera position.
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
+static int ws_cull_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
+void gpu_ws_set_cull_guard_pixels(int pixels) {
+    if (pixels < 0) pixels = 0;
+    if (pixels > 256) pixels = 256;
+    ws_cull_guard_pixels = pixels;
+}
+
+#define WS_EXPLICIT_CULL_SITES_MAX 64
+static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_bias_n = 0;
+static int ws_explicit_slti_n = 0;
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti) {
+    if (nbias < 0) nbias = 0;
+    if (nslti < 0) nslti = 0;
+    if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_bias_n = nbias;
+    ws_explicit_slti_n = nslti;
+    for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+}
+static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
+    uint32_t p = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < n; i++) if (sites[i] == p) return 1;
+    return 0;
+}
+int psx_ws_is_cull_bias_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_bias_sites, ws_explicit_bias_n, pc);
+}
+int psx_ws_is_cull_slti_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_slti_sites, ws_explicit_slti_n, pc);
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
@@ -230,13 +341,13 @@ int psx_ws_x_margin(void) {
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset();
+    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
 
-/* ---- MMX6 2D background tile-loop widen ([widescreen.bg2d]) ---------------
- * Mega Man X6 is a pure-2D sprite engine that renders only a 4:3 (320px) field
+/* ---- Capcom 2D background tile-loop widen ([widescreen.bg2d]) --------------
+ * Mega Man X5/X6 use a pure-2D sprite engine that renders only a 4:3 (320px) field
  * of view — there is no overscan to "reveal." Its per-layer background renderer
  * (FUN_800270d0) draws `count` 16px tile columns × 16 rows from a start tile
  * column / start screen-x derived from the camera scroll. To produce a TRUE
@@ -254,7 +365,31 @@ int psx_ws_x_margin(void) {
  * are prepended left and appended right. The 64-column tile ring (mask 0x3f) is
  * far wider than the visible window, so the prepended columns fetch the correct
  * already-streamed adjacent tiles. */
-static int ws_mmx6_left_cols(void) {
+static uint32_t g_bg2d_layer_base = 0x800971F8u;
+static uint32_t g_bg2d_ring_base = 0x800A21B8u;
+static uint32_t g_bg2d_map_size_addr = 0x800CD338u;
+static uint32_t g_bg2d_layer_stride_addr = 0x8008EC10u;
+static uint32_t g_bg2d_ring_cols = 64;
+static uint32_t g_bg2d_layer_count = 3;
+static uint32_t g_bg2d_layer_struct_stride = 0x54;
+static uint32_t g_bg2d_packet_cap = 1000;
+static int g_bg2d_native_cols = 21;
+
+void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
+                           uint32_t map_size_addr, uint32_t layer_stride_addr,
+                           uint32_t ring_cols, uint32_t layer_count,
+                           uint32_t layer_struct_stride, uint32_t packet_cap) {
+    g_bg2d_layer_base = layer_base;
+    g_bg2d_ring_base = ring_base;
+    g_bg2d_map_size_addr = map_size_addr;
+    g_bg2d_layer_stride_addr = layer_stride_addr;
+    g_bg2d_ring_cols = ring_cols;
+    g_bg2d_layer_count = layer_count;
+    g_bg2d_layer_struct_stride = layer_struct_stride;
+    g_bg2d_packet_cap = packet_cap;
+}
+
+static int ws_bg2d_left_cols(void) {
     if (!ws_native_wide_active()) return 0;
     /* Only the ~320 gameplay mode; the engine's 512 hi-res mode (title) draws
      * its own 33 columns and centres itself — never double-shift it. */
@@ -279,16 +414,22 @@ static int mmx6_hostside_active(void) {
     return g_mmx6_hostside && ws_native_wide_active() && ws_disp_w() <= 384
         && ws_nw_offset() > 0;
 }
-/* Column count: native (21) under host-side mode; else base + both-side reveal.
- * Also drives the once-per-frame ring-freshness refill (mmx6_bg_refill_tick): this
- * hook fires at the start of each layer's render, so the first call of a new frame
- * re-streams the widened window for all 3 layers right before they are drawn. */
+/* Column count: native (21) under host-side mode; else base + both-side reveal. */
 static void mmx6_bg_refill_tick(void);   /* defined below (ring-freshness fix) */
-int psx_ws_mmx6_bg_cols(int base)    { mmx6_bg_refill_tick(); return mmx6_hostside_active() ? base : base + 2 * ws_mmx6_left_cols(); }
-/* Start tile column: native under host-side mode; else LEFT earlier (64-col ring). */
-int psx_ws_mmx6_bg_startcol(int col) { return mmx6_hostside_active() ? col : ((col - ws_mmx6_left_cols()) & 0x3f); }
+int psx_ws_bg2d_cols(int base) {
+    g_bg2d_native_cols = base;
+    mmx6_bg_refill_tick();
+    return mmx6_hostside_active() ? base : base + 2 * ws_bg2d_left_cols();
+}
+/* Start tile column: refill before the first column is consumed, then begin LEFT
+ * earlier in the ring. The count hook retains the same tick for layouts that load
+ * their loop bound before calculating the starting column. */
+int psx_ws_bg2d_startcol(int col, unsigned mask) {
+    mmx6_bg_refill_tick();
+    return mmx6_hostside_active() ? col : ((col - ws_bg2d_left_cols()) & (int)mask);
+}
 /* Start screen-x: native under host-side mode; else LEFT*16 further left. */
-int psx_ws_mmx6_bg_startx(int x)     { return mmx6_hostside_active() ? x : (x - ws_mmx6_left_cols() * 16); }
+int psx_ws_bg2d_startx(int x)        { return mmx6_hostside_active() ? x : (x - ws_bg2d_left_cols() * 16); }
 
 /* Tile-RING STREAMER widen (same [widescreen.bg2d], FUN_800273e4). The renderer
  * above now draws LEFT extra columns each side, but the engine's 64-column tile
@@ -300,8 +441,32 @@ int psx_ws_mmx6_bg_startx(int x)     { return mmx6_hostside_active() ? x : (x - 
  * the camera scrolls (the incremental streamer fills each newly-leading column).
  * Identity (no extra streaming) at 4:3 / 512 hi-res, so the ring is byte-identical
  * there. The 64-col ring has ample slack (visible ~21 cols) for ±LEFT more. */
-int psx_ws_mmx6_bg_stream_left(int x)  { return x - ws_mmx6_left_cols() * 16; }
-int psx_ws_mmx6_bg_stream_right(int x) { return x + ws_mmx6_left_cols() * 16; }
+int psx_ws_bg2d_stream_left(int x)  { return x - ws_bg2d_left_cols() * 16; }
+int psx_ws_bg2d_stream_right(int x) { return x + ws_bg2d_left_cols() * 16; }
+int psx_ws_bg2d_undercap(int counter, int native_cap) {
+    int cap = ws_bg2d_left_cols() > 0 ? (int)g_bg2d_packet_cap : native_cap;
+    return counter < cap;
+}
+
+/* Compatibility for generated MMX6 sources predating the generic names. */
+int psx_ws_mmx6_bg_cols(int base)       { return psx_ws_bg2d_cols(base); }
+int psx_ws_mmx6_bg_startcol(int col)    { return psx_ws_bg2d_startcol(col, 0x3fu); }
+int psx_ws_mmx6_bg_startx(int x)        { return psx_ws_bg2d_startx(x); }
+int psx_ws_mmx6_bg_stream_left(int x)   { return psx_ws_bg2d_stream_left(x); }
+int psx_ws_mmx6_bg_stream_right(int x)  { return psx_ws_bg2d_stream_right(x); }
+
+/* Called at entry to MMX6's full tile-ring initializer (FUN_800269F4). The
+ * independent layers invoke it only when stage/background data is dirty; gate
+ * by frame because up to three layers initialize together. This is the exact
+ * point where pixels retained from the old stage cease to be meaningful. */
+void psx_ws_mmx6_bg_stage_init(void) {
+    static uint32_t last_frame = 0xFFFFFFFFu;
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (!ws_clear_reveal || ws_mode != 2 || frame == last_frame) return;
+    last_frame = frame;
+    g_mmx6_void_generation++;
+    ws_clear_all_reveal_margins();
+}
 
 /* ===== MMX6 BG packet-buffer RELOCATION ([widescreen.bg2d] bufbase_site/cap_site) ===
  * The widened BG render (29 cols) overruns the engine's BG packet double-buffer (driver
@@ -329,7 +494,7 @@ static int g_mmx6_reloc = 0;
 void gpu_ws_mmx6_set_reloc(int on) { g_mmx6_reloc = on ? 1 : 0; }
 int  gpu_ws_mmx6_reloc_get(void)   { return g_mmx6_reloc; }
 static int mmx6_bg_reloc_active(void) {
-    return g_mmx6_reloc && !g_mmx6_hostside && ws_mmx6_left_cols() > 0;
+    return g_mmx6_reloc && !g_mmx6_hostside && ws_bg2d_left_cols() > 0;
 }
 
 /* Hook at the driver's buffer-address addu (0x80026DC4): remap base 0x800B91C0 + bufidx*0x4000
@@ -365,8 +530,8 @@ int psx_ws_mmx6_bg_bufbase(int addr) {
 /* Hook at the BG cap slti (0x80027278): counter < cap. Raises the cap to MMX6_RELOC_CAP when
  * relocated (the bigger buffer can hold them); plain 1000 otherwise (byte-identical). */
 int psx_ws_mmx6_bg_undercap(int counter) {
-    int cap = mmx6_bg_reloc_active() ? MMX6_RELOC_CAP : 1000;
-    return (counter < cap) ? 1 : 0;
+    if (mmx6_bg_reloc_active()) return counter < MMX6_RELOC_CAP;
+    return psx_ws_bg2d_undercap(counter, 1000);
 }
 
 /* ===== MMX6 host-side reveal columns ====================================== *
@@ -426,20 +591,21 @@ int  gpu_ws_mmx6_clut_count(void) {
  * vertical band being cleared (band_y / base_x from the GP0 fill). Pure guest reads. */
 void gpu_ws_mmx6_emit_reveal(int base_x, int band_y) {
     if (!mmx6_hostside_active() || !g_mmx6_clut) return;
-    int left = ws_mmx6_left_cols();
+    int left = ws_bg2d_left_cols();
     if (left <= 0) return;
     uint32_t attr_base = psx_read_word(0x1F80000Cu);
     if (attr_base == 0) return;
     g_mmx6_emit_calls++;
     g_mmx6_emit_tiles = 0;
     sw_wide_set_target(base_x);                 /* g_wide_cur = this band's surface */
-    for (int layer = 0; layer < 3; layer++) {
-        uint32_t ls = 0x800971F8u + (uint32_t)layer * 0x54u;
+    for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
+        uint32_t ls = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
         int sx = (int16_t)psx_read_half(ls + 0xa);
         int sy = (int16_t)psx_read_half(ls + 0xe);
         int8_t parent = (int8_t)psx_read_byte(ls + 0x52);
         if (parent >= 0) {                      /* linked layer: add parent's scroll */
-            uint32_t lp = 0x800971F8u + (uint32_t)(uint8_t)parent * 0x54u;
+            uint32_t lp = g_bg2d_layer_base
+                        + (uint32_t)(uint8_t)parent * g_bg2d_layer_struct_stride;
             sx += (int16_t)psx_read_half(lp + 0xa);
             sy += (int16_t)psx_read_half(lp + 0xe);
         }
@@ -447,9 +613,9 @@ void gpu_ws_mmx6_emit_reveal(int base_x, int band_y) {
         int sub_x = -(sx & 0xf);
         int syr = sy; if (syr < 0) syr += 0xf;  int start_row = syr >> 4;
         int sub_y = -(sy & 0xf);
-        uint32_t ring = 0x800A21B8u + (uint32_t)layer * 0x1000u;
+        uint32_t ring = g_bg2d_ring_base + layer * (g_bg2d_ring_cols * 64u);
         for (int side = 0; side < 2; side++) {
-            int ci0 = (side == 0) ? -left : 21;     /* native draws cols 0..20 */
+            int ci0 = (side == 0) ? -left : g_bg2d_native_cols;
             for (int k = 0; k < left; k++) {
                 int ci  = ci0 + k;                  /* column index relative to native start */
                 int col = start_col + ci;
@@ -457,8 +623,8 @@ void gpu_ws_mmx6_emit_reveal(int base_x, int band_y) {
                 for (int row = 0; row < 16; row++) {
                     int trow = start_row + row;
                     uint16_t tile = psx_read_half(ring
-                        + (uint32_t)((col & 0x3f) * 2)
-                        + (uint32_t)((trow & 0x1f) * 0x80));
+                        + (uint32_t)((col & (int)(g_bg2d_ring_cols - 1u)) * 2)
+                        + (uint32_t)((trow & 0x1f) * (int)(g_bg2d_ring_cols * 2u)));
                     if (tile == 0) continue;
                     uint32_t attr = psx_read_word(attr_base + (uint32_t)((tile & 0x3fff) * 4));
                     if ((attr >> 0x18) == 0xff) continue;
@@ -499,21 +665,46 @@ void gpu_ws_mmx6_emit_reveal(int base_x, int band_y) {
  * native-wide + ~320 mode, so 4:3 and the 512 hi-res title stay byte-identical. */
 extern void psx_write_half(uint32_t addr, uint16_t val);
 
+static void bg2d_clear_column(int layer, int ringcol, int worldY) {
+    int rows = 0x12;
+    if (worldY < 0) { worldY = 0; rows = 0x11; }
+    int wrapY = worldY - (((worldY < 0) ? worldY + 0x1ff : worldY) >> 9) * 0x200;
+    int ringrow = ((wrapY < 0) ? wrapY + 0xf : wrapY) >> 4;
+    uint32_t ringbase = g_bg2d_ring_base
+                      + (uint32_t)layer * (g_bg2d_ring_cols * 64u);
+    for (int i = 0; i < rows; i++) {
+        uint32_t cell = ringbase
+                      + (uint32_t)((ringcol & (int)(g_bg2d_ring_cols - 1u)) * 2)
+                      + (uint32_t)((ringrow & 0x1f) * (int)(g_bg2d_ring_cols * 2u));
+        psx_write_half(cell, 0);
+        ringrow = (ringrow + 1) & 0x1f;
+    }
+}
+
 /* Faithful clone of FUN_800274a0's inner fill: stream one tile column at guest pixel
  * (worldX, worldY) of `layer` into the 64x32 ring. Compares mirror the engine's sltu
  * (UNSIGNED). When write!=0 the tiles are written to the ring; when write==0 they are
  * compared against the live ring (validation), counting *cmp_total / *cmp_bad. Returns
  * 1 if the column was streamed, 0 if skipped (map-loop seam early-return). */
-static int mmx6_fill_column(int layer, int worldX, int worldY, int write,
-                            int *cmp_total, int *cmp_bad) {
-    uint32_t lbase = 0x800971F8u + (uint32_t)layer * 0x54u;
+static int bg2d_fill_column(int layer, int worldX, int worldY, int scrollX, int write,
+                             int *cmp_total, int *cmp_bad) {
+    /* The guest column streamer returns immediately for negative world X. Do
+     * not wrap it into the far edge of the map, which produces repeated blocks
+     * in the left reveal near a level boundary. */
+    if (worldX < 0) return 0;
+    uint32_t lbase = g_bg2d_layer_base + (uint32_t)layer * g_bg2d_layer_struct_stride;
     int rows = 0x12;
     if (worldY < 0) { worldY = 0; rows = 0x11; }
     int32_t metaCol = ((worldX < 0) ? worldX + 0xff : worldX) >> 8;     /* t1 */
     int32_t metaRow = ((worldY < 0) ? worldY + 0xff : worldY) >> 8;     /* t4 */
-    int wrapX = worldX - (((worldX < 0) ? worldX + 0x3ff : worldX) >> 10) * 0x400;
+    int worldPeriod = (int)g_bg2d_ring_cols * 16;
+    int worldShift = 0;
+    for (int n = worldPeriod; n > 1; n >>= 1) worldShift++;
+    int wrapX = worldX
+              - (((worldX < 0) ? worldX + worldPeriod - 1 : worldX) >> worldShift)
+                * worldPeriod;
     int colsh = ((wrapX < 0) ? wrapX + 0xf : wrapX) >> 4;               /* t7 = wrapX>>4 */
-    int ringcol = colsh & 0x3f;                                         /* masked (renderer reads &0x3f) */
+    int ringcol = colsh & (int)(g_bg2d_ring_cols - 1u);
     int tcolInMeta = colsh & 0xf;                                       /* s0 = t7 & 0xf */
     int wrapY = worldY - (((worldY < 0) ? worldY + 0x1ff : worldY) >> 9) * 0x200;
     int ringrow = ((wrapY < 0) ? wrapY + 0xf : wrapY) >> 4;             /* a2 */
@@ -521,28 +712,43 @@ static int mmx6_fill_column(int layer, int worldX, int worldY, int write,
 
     int mapLeft  = psx_read_byte(lbase + 0x4d);
     int mapRight = psx_read_byte(lbase + 0x4e);
-    int scrollX  = (int16_t)psx_read_half(lbase + 0xa);
+    /* C integer division toward zero makes worldX -255..-1 resolve to metatile
+     * column 0 below. The native 4:3 streamer never requests those coordinates,
+     * but the widened left window does at a stage starting on mapLeft. Treat
+     * them as finite-map void before the engine's loop/wrap bookkeeping. */
+    if (worldX < mapLeft * 0x100)
+        return 2;
     if ((uint32_t)metaCol < (uint32_t)mapLeft) {
         metaCol = metaCol + 1 + (mapRight - mapLeft);
-        if (scrollX <= (mapLeft - 1) * 0x100) return 0;                 /* engine early-return: skip */
+        if (scrollX <= (mapLeft - 1) * 0x100) {
+            /* The native renderer never sees this column, so the engine leaves
+             * its ring slot alone. Report finite-map void to the DMA-start
+             * cleanup without mutating ring slots canonical draws can alias. */
+            return 2;   /* finite-map void, not merely a normal streamed column */
+        }
     }
     if ((uint32_t)mapRight < (uint32_t)metaCol) {
         metaCol = (metaCol - 1 - mapRight) + mapLeft;
-        if ((mapRight + 1) * 0x100 <= scrollX) return 0;
+        if ((mapRight + 1) * 0x100 <= scrollX) {
+            return 2;
+        }
     }
-    int mapW = psx_read_byte(0x800CD338u);
-    int mapH = psx_read_byte(0x800CD339u);
+    int mapW = psx_read_byte(g_bg2d_map_size_addr);
+    int mapH = psx_read_byte(g_bg2d_map_size_addr + 1u);
     uint32_t mapBase  = psx_read_word(0x1F800004u);
     uint32_t metaBase = psx_read_word(0x1F800008u);
-    int layerStride = (uint16_t)psx_read_half(0x8008EC10u);
+    if (mapBase == 0 || metaBase == 0 || mapW <= 0 || mapH <= 0) return 0;
+    int layerStride = (uint16_t)psx_read_half(g_bg2d_layer_stride_addr);
 
     int metaIdx = 0;
     if ((uint32_t)metaCol < (uint32_t)mapW && (uint32_t)metaRow < (uint32_t)mapH)
         metaIdx = psx_read_byte(mapBase + (uint32_t)(layer * layerStride + mapW * metaRow + metaCol));
 
-    uint32_t ringbase = 0x800A21B8u + (uint32_t)layer * 0x1000u;
+    uint32_t ringbase = g_bg2d_ring_base
+                      + (uint32_t)layer * (g_bg2d_ring_cols * 64u);
     for (int i = 0; i < rows; i++) {
-        uint32_t cell = ringbase + (uint32_t)(ringcol * 2) + (uint32_t)((ringrow & 0x1f) * 0x80);
+        uint32_t cell = ringbase + (uint32_t)(ringcol * 2)
+                      + (uint32_t)((ringrow & 0x1f) * (int)(g_bg2d_ring_cols * 2u));
         uint16_t tile = psx_read_half(metaBase + (uint32_t)metaIdx * 0x200u
                                       + (uint32_t)(trowInMeta * 0x20) + (uint32_t)(tcolInMeta * 2));
         if (write) {
@@ -570,32 +776,50 @@ void gpu_ws_mmx6_set_freshfix(int on) { g_mmx6_freshfix = on ? 1 : 0; }
 int  gpu_ws_mmx6_freshfix_get(void)   { return g_mmx6_freshfix; }
 long gpu_ws_mmx6_refill_cols(void)    { return g_mmx6_refill_cols; }
 
-/* Re-stream every tile column of the widened window for all 3 BG layers, using each
- * layer's OWN scroll (the streamer driver keys the ring on the layer's own scrollX/
- * scrollY, not the parent-coupled value the renderer reads with) and worldY = scrollY
- * - 0x10 (mirrors the driver). ci spans the renderer's widened span [-LEFT, 20+LEFT].
+/* Re-stream every tile column of the widened window for every BG layer. Independent
+ * layers use their own scroll; parent-linked layers use the same combined scroll
+ * that the renderer uses to index their ring. The guest's incremental streamer
+ * skips linked layers because their native 4:3 window is prefilled, but the newly
+ * revealed columns still need to be populated here. worldY = scrollY - 0x10 mirrors
+ * the driver. ci spans the renderer's widened span [-LEFT, 20+LEFT].
  * No-op at 4:3 / 512 hi-res (left==0). Idempotent over the native columns the engine
  * already streamed correctly, so re-streaming them is harmless. */
 void psx_ws_mmx6_bg_refill_all(void) {
     if (!g_mmx6_freshfix) return;
     if (!ws_native_wide_active() || ws_disp_w() > 384) return;
-    int left = ws_mmx6_left_cols();
+    int left = ws_bg2d_left_cols();
     if (left <= 0) return;
     g_mmx6_refill_cols = 0;
-    for (int layer = 0; layer < 3; layer++) {
-        uint32_t lbase = 0x800971F8u + (uint32_t)layer * 0x54u;
+    for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
+        uint32_t lbase = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
-        for (int ci = -left; ci <= 20 + left; ci++) {
-            if (mmx6_fill_column(layer, sx + ci * 16, sy - 0x10, 1, NULL, NULL))
+        int8_t parent = (int8_t)psx_read_byte(lbase + 0x52);
+        if (parent >= 0 && (uint32_t)(uint8_t)parent < g_bg2d_layer_count) {
+            uint32_t pbase = g_bg2d_layer_base
+                           + (uint32_t)(uint8_t)parent * g_bg2d_layer_struct_stride;
+            sx += (int16_t)psx_read_half(pbase + 0xa);
+            sy += (int16_t)psx_read_half(pbase + 0xe);
+        }
+        int sxr = sx;
+        if (sxr < 0) sxr += 0xf;
+        int start_col = sxr >> 4;
+        for (int ci = -left; ci < g_bg2d_native_cols + left; ci++) {
+            int world_x = sx + ci * 16;
+            if (world_x < 0) {
+                bg2d_clear_column((int)layer, start_col + ci, sy - 0x10);
+                continue;
+            }
+            if (bg2d_fill_column((int)layer, world_x, sy - 0x10,
+                                 sx, 1, NULL, NULL))
                 g_mmx6_refill_cols++;
         }
     }
 }
 
-/* Trigger the once-per-frame widened-window refill. Called from the count_site hook
- * (psx_ws_mmx6_bg_cols), which fires at the start of each layer's render — the first
- * call of a new frame refills all 3 layers right before they are drawn. */
+/* Trigger the once-per-frame widened-window refill. Both renderer setup hooks call
+ * this so differing instruction order between games still refreshes the ring before
+ * the first widened column is consumed. */
 static void mmx6_bg_refill_tick(void) {
     uint32_t f = (uint32_t)s_frame_count;
     if (f == g_mmx6_refill_frame) return;
@@ -609,12 +833,20 @@ static void mmx6_bg_refill_tick(void) {
  * ring) is trusted. Returns total cells compared; *bad = mismatches. */
 int gpu_ws_mmx6_validate(int *bad_out) {
     int total = 0, bad = 0;
-    for (int layer = 0; layer < 3; layer++) {
-        uint32_t lbase = 0x800971F8u + (uint32_t)layer * 0x54u;
+    for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
+        uint32_t lbase = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
-        for (int ci = 0; ci <= 20; ci++)
-            mmx6_fill_column(layer, sx + ci * 16, sy - 0x10, 0, &total, &bad);
+        int8_t parent = (int8_t)psx_read_byte(lbase + 0x52);
+        if (parent >= 0 && (uint32_t)(uint8_t)parent < g_bg2d_layer_count) {
+            uint32_t pbase = g_bg2d_layer_base
+                           + (uint32_t)(uint8_t)parent * g_bg2d_layer_struct_stride;
+            sx += (int16_t)psx_read_half(pbase + 0xa);
+            sy += (int16_t)psx_read_half(pbase + 0xe);
+        }
+        for (int ci = 0; ci < g_bg2d_native_cols; ci++)
+            bg2d_fill_column((int)layer, sx + ci * 16, sy - 0x10,
+                             sx, 0, &total, &bad);
     }
     if (bad_out) *bad_out = bad;
     return total;
@@ -864,6 +1096,11 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->nw_extra          = ws_nw_extra();
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;
+    out->last_3d_frame     = ws_last_3d_stamp;
+    out->gte_verts         = ws_gte_prev_verts;
+    out->last_world3d_frame = ws_sust_world3d_stamp;
+    out->ovh_prims         = ws_ovh_prev;
+    out->last_ovh_frame    = ws_sust_ovh_stamp;
 }
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
@@ -945,6 +1182,8 @@ static int ws_tagged_anchor(int32_t *out_ax) {
  * flower-field tiles — the 3D rock/foreground is untagged AND has narrow prims,
  * so tag/narrow heuristics alone mis-stretch and tear it. */
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
+static int ws_nw_phase_backdrop = 0;
+void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -960,6 +1199,8 @@ static uint32_t bdg_src_frame = 0xFFFFFFFFu;
  *   4 tagged     : prim is sprite-tagged (psx_ws_prim_is_tagged)
  *   5 untag-tex  : textured AND not sprite-tagged
  *   6 all-tex    : every textured prim (sanity: should fill void + distort 3D)
+ *   7 all        : every primitive (coarse correlation sanity check)
+ *   8 all-flat   : every untextured primitive
  * Counters (per-frame, snapshotted by the present hook) report how many prims
  * matched and how many of those were sprite-tagged. */
 int      g_dbg_mode = 0;
@@ -983,6 +1224,8 @@ static int dbg_gate_match(void) {
         case 4: m = tagged; break;
         case 5: m = (textured && !tagged); break;
         case 6: m = textured; break;
+        case 7: m = 1; break;
+        case 8: m = !textured; break;
         default: m = 0; break;
     }
     if (m) { s_dbg_match_n++; if (tagged) s_dbg_match_tagged++; }
@@ -1006,7 +1249,11 @@ static int      s_bg_phase_over  = 0;
 void ws_bg_phase_note(uint32_t op) {
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
-    if (op >= 0x30u && op <= 0x3Fu) s_bg_phase_over = 1;   /* shaded = 3D world */
+    if (op >= 0x30u && op <= 0x3Fu) {
+        s_bg_phase_over = 1;   /* shaded = 3D world (within-frame draw order) */
+        ws_last_3d_stamp = f;  /* diagnostic only — see ws_2d_only_scene() for
+                                  why shaded prims are NOT the scene classifier */
+    }
 }
 static int ws_bg_phase_over(void) {
     uint32_t f = (uint32_t)s_frame_count;
@@ -1022,6 +1269,7 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both
      * the flower grid and the sky band; HUD/characters (tagged but post-3D) and the
@@ -1064,6 +1312,25 @@ static int32_t ws_disp_w(void) {
     return di.width ? (int32_t)di.width : 320;
 }
 
+static int32_t ws_disp_h(void) {
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    return di.height ? (int32_t)di.height : 240;
+}
+
+/* Full-screen fades and environmental filters are authored as 320x240 TILEs.
+ * In native-wide mode, grow only primitives that cover the complete native
+ * display; ordinary world-space rectangles remain untouched. */
+static void ws_expand_fullscreen_rect(int32_t *x, int32_t y, int *w, int h) {
+    if (!ws_native_wide_active()) return;
+    int W = (int)ws_disp_w(), H = (int)ws_disp_h();
+    if (*x <= 0 && *x + *w >= W && y <= 0 && y + h >= H) {
+        int off = ws_nw_offset();
+        *x -= off;
+        *w += 2 * off;
+    }
+}
+
 /* In-game HUD pivot for an untagged screen-space SPRT spanning [x, x+w).
  * Only reached during gameplay (ws_active true). HUD elements are sparse and
  * corner-anchored, so pivot by thirds: outer-third elements anchor to their
@@ -1101,24 +1368,70 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
  * ws_nw_offset() per side (the reveal). Screen-space 2D HUD (drawn with fixed
  * rect/sprite GP0 commands, never through the GTE — a 3D title's world is all
  * polygons) therefore lands inset from the true wide edges by exactly the
- * reveal. This pushes an outer-third HUD element the rest of the way to its
+ * reveal. This pushes an outer-third HUD primitive the rest of the way to its
  * wide corner with an additive thirds shift: left third −offset, right third
  * +offset, middle unchanged (matches the squash-path ws_hud_pivot geometry, but
  * as a translate since native-wide does not squash). Composite pieces in one
- * zone share a shift and stay aligned. Identity unless native-wide is engaged
- * AND the game opts in, so 4:3 and non-opted titles are byte-identical.
+ * zone share a shift and stay aligned. A configured command-source range lets
+ * pure-2D games opt in only their HUD packet arena, leaving world primitives
+ * untouched. Identity unless native-wide is engaged AND the game opts in, so
+ * 4:3 and non-opted titles are byte-identical.
  * Returns the signed x delta to add to the prim's x before draw_offset. */
 static int ws_nw_hud_corners = 0;
+static int ws_nw_hud_tag_rects = 0;   /* rects shift even when tagged (A/B) */
+static uint32_t ws_nw_left_hud_packet_lo = 0;
+static uint32_t ws_nw_left_hud_packet_hi = 0;
 void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_hud_tag_rects(int on) { ws_nw_hud_tag_rects = on ? 1 : 0; }
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi) {
+    ws_nw_left_hud_packet_lo = lo & 0x1FFFFFFFu;
+    ws_nw_left_hud_packet_hi = hi & 0x1FFFFFFFu;
+}
+static int ws_nw_left_hud_packet(void) {
+    if (!ws_native_wide_active() || gp0_cmd_source_addr == 0xFFFFFFFFu ||
+        ws_nw_left_hud_packet_hi <= ws_nw_left_hud_packet_lo)
+        return 0;
+    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    int matched = a >= ws_nw_left_hud_packet_lo && a < ws_nw_left_hud_packet_hi;
+    return matched;
+}
 static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
-    if (!ws_nw_hud_corners || !ws_native_wide_active()) return 0;
+    if (!ws_native_wide_active()) return 0;
     int32_t off = ws_nw_offset();
     if (off <= 0) return 0;
+    if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
+    /* Sprite-tag titles (anchor configured): HUD ≡ UNTAGGED rect-family prims
+     * — the same discriminator the squash path's hud_sprt_squash used. Tagged
+     * prims are character billboards positioned from their GTE anchor; they
+     * must never re-anchor. (Poly/line sites are excluded wholesale for tag
+     * titles in ws_nw_hud_shift_vertices — their polys are the world.)
+     * ws_nw_hud_tag_rects (TCP ws_hud_mode) lifts the exclusion for rects,
+     * for live A/B: some HUD composites (Tomba's AP counter) render through
+     * the tagged sprite funnel and stay inset without it. */
+    if (ws_anchor_addr && !ws_nw_hud_tag_rects && psx_ws_prim_is_tagged()) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
     if (3 * cx > 4 * W) return  off;   /* right third -> push to right edge */
     return 0;                          /* middle third -> stay centred      */
+}
+
+/* Re-anchor every X coordinate of a HUD polygon as one rigid composite. The
+ * command-source filter above is what makes this safe for pure-2D titles: only
+ * the game's dedicated HUD packet arena reaches here, never world polygons. */
+static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
+    if (count <= 0) return;
+    /* Sprite-tag titles: polygon/line prims are the GTE world and the tagged
+     * character billboards, never HUD — only the rect-family sites (which
+     * call ws_nw_hud_shift directly, with the untagged filter) re-anchor. */
+    if (ws_anchor_addr) return;
+    int32_t lo = vx[0], hi = vx[0];
+    for (int i = 1; i < count; i++) {
+        if (vx[i] < lo) lo = vx[i];
+        if (vx[i] > hi) hi = vx[i];
+    }
+    int32_t d = ws_nw_hud_shift(lo, hi - lo);
+    if (d) for (int i = 0; i < count; i++) vx[i] += d;
 }
 
 /* ---- Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop) ---
@@ -1135,6 +1448,9 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
  * Transforms vx[0..3] IN PLACE (pre-draw_offset); returns 1 if it applied. */
 static int ws_nw_backdrop = 0;
 void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
+static int ws_nw_flat_backdrop = 0;
+void gpu_ws_set_nw_flat_backdrop(int on) { ws_nw_flat_backdrop = on ? 1 : 0; }
+int gpu_ws_nw_flat_backdrop_enabled(void) { return ws_nw_flat_backdrop; }
 static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
     if (!ws_nw_backdrop || !ws_native_wide_active()) return 0;
     int32_t extra = ws_nw_extra();
@@ -1179,6 +1495,25 @@ static uint16_t vram_write_x, vram_write_y;   /* start coords */
 static uint16_t vram_write_w, vram_write_h;   /* dimensions */
 static uint16_t vram_write_col, vram_write_row; /* current offset */
 static uint32_t vram_write_remaining;          /* words remaining */
+/* Stage one complete GP0(A0) transfer so renderer backends receive one bulk
+ * rectangle instead of hundreds of thousands of single-pixel callbacks. The
+ * CPU-visible transfer remains ordered because GP0 accepts no next command
+ * until this payload is complete. Maximum PS1 transfer = full VRAM (1 MiB). */
+static uint16_t vram_write_pixels[1024 * 512];
+
+static void gp0_commit_cpu_to_vram(void) {
+    for (uint32_t row = 0; row < vram_write_h; row++)
+        for (uint32_t col = 0; col < vram_write_w; col++)
+            vram_write_pixels[row * vram_write_w + col] =
+                vram[((vram_write_y + row) & 511u) * 1024u +
+                     ((vram_write_x + col) & 1023u)];
+    gr_vram_transfer_in(vram_write_x, vram_write_y,
+                        vram_write_w, vram_write_h, vram_write_pixels);
+    gp0_state = GP0_IDLE;
+    vram_write_remaining = 0;
+    text_xlate_vram_upload(vram_write_x, vram_write_y,
+                           vram_write_w, vram_write_h);
+}
 
 /* VRAM read transfer state (VRAM→CPU, command 0xC0) */
 static int      vram_read_active;
@@ -1207,6 +1542,15 @@ static uint32_t draw_area_right, draw_area_bottom;
 
 /* Draw offset (set by GP0(E5h)) */
 static int32_t draw_offset_x, draw_offset_y;
+/* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
+ * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
+ * bands, the game is drawing different parts of the scene into different display
+ * buffers in the same frame (candidate root of a character-in-one-buffer
+ * strobe). Snapshotted each vblank into the *_last copies, exposed via debug. */
+int32_t  g_doff_min_this = 0x7fffffff, g_doff_max_this = -0x7fffffff;
+uint32_t g_doff_cnt_this = 0;
+int32_t  g_doff_min_last = 0, g_doff_max_last = 0;
+uint32_t g_doff_cnt_last = 0;
 
 /* Texture window raw value (set by GP0(E2h), readback via GP1(10h)) */
 static uint32_t texture_window_value;
@@ -1273,6 +1617,18 @@ static void ws_nw_sync_target(void) {
     else                     gr_wide_disable_target();
 }
 
+static void ws_clear_all_reveal_margins(void) {
+    for (int i = 0; i < ws_fb_n; i++)
+        gr_wide_clear_margins((int)ws_fb_base[i], 0, 512, 0, 3);
+}
+
+/* Stage-init already clears both synthetic margins once. Do not keep clearing
+ * a guessed finite-map side here: MMX6's authored layers enter the reveal at
+ * different times, so the side guess produced a moving black trim over valid
+ * stage art. A stale reveal tile is safer than deleting submitted content. */
+void gpu_ws_begin_linked_list(void) { }
+
+
 /* Horizontal display range (GP1(06h)) */
 static uint32_t h_display_x1;
 static uint32_t h_display_x2;
@@ -1317,6 +1673,7 @@ static int sq_cap_armed;
  * flips every ~33,868 GPU clocks (one NTSC frame). */
 #define GPUSTAT_POLL_VBLANK_THRESHOLD 1000
 static uint32_t gpustat_poll_count;
+uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank IRQ count */
 
 /* ---- Initialization ---- */
 
@@ -1398,11 +1755,29 @@ uint32_t gpu_read_gpustat(void) {
     gpustat_poll_count++;
     if (gpustat_poll_count >= GPUSTAT_POLL_VBLANK_THRESHOLD) {
         gpustat_poll_count = 0;
-        lcf ^= 1;
-        psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
-        /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
-         * from the cycle-paced VBlank in psx_check_interrupts). */
-        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        /* The recompiled BIOS + game carry per-block interrupt checks
+         * (psx_check_interrupts_at) and per-block cycle charging, so tight
+         * LCF/VSync poll loops DO advance guest cycles and let the ONE
+         * cycle-paced VBlank authority (interrupts.c) fire on schedule. The old
+         * "spin forever" premise that justified raising VBlank+LCF from a raw
+         * GPUSTAT read-count is stale — and it injected ~38 fake VBlanks/s
+         * (measured on Crash Bash), delivering ~96/s to the game instead of 60,
+         * over-advancing the game's VSync frame counter and jittering animation
+         * (character strobe). Firing is now OFF by default; PSX_POLLHACK_VBLANK=1
+         * restores the legacy behavior for A/B. */
+        static int poll_fire = -1;
+        if (poll_fire < 0) {
+            const char* e = getenv("PSX_POLLHACK_VBLANK");
+            poll_fire = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (poll_fire) {
+            g_pollhack_vblank_count++;   /* count only when actually firing */
+            lcf ^= 1;
+            psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
+            /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
+             * from the cycle-paced VBlank in psx_check_interrupts). */
+            event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        }
     }
 
     uint32_t stat = 0;
@@ -1512,6 +1887,13 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
 
 void gpu_vblank_tick(void) {
     lcf ^= 1;
+    /* snapshot per-frame draw-offset-Y range for the strobe instrumentation */
+    if (g_doff_cnt_this) {
+        g_doff_min_last = g_doff_min_this;
+        g_doff_max_last = g_doff_max_this;
+        g_doff_cnt_last = g_doff_cnt_this;
+    }
+    g_doff_min_this = 0x7fffffff; g_doff_max_this = -0x7fffffff; g_doff_cnt_this = 0;
     gpustat_poll_count = 0;
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (vblank_callback) vblank_callback();
@@ -1759,6 +2141,9 @@ static void gp0_exec_mono_tri(void) {
     int32_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    }
+    ws_nw_hud_shift_vertices(vx, 3);
+    for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1773,7 +2158,30 @@ static void gp0_exec_mono_quad(void) {
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+
+    /* Full-screen filters are commonly encoded as an axis-aligned quad. Drawing
+     * a semi-transparent quad as two independent triangles blends their shared
+     * diagonal twice; render the equivalent rectangle once to avoid that seam.
+     * The full-screen helper also grows the native 320-wide filter across the
+     * sidecar surface in native-wide mode. Ordinary world quads are unchanged. */
+    if (vx[0] == vx[2] && vx[1] == vx[3] &&
+        vy[0] == vy[1] && vy[2] == vy[3] &&
+        vx[1] > vx[0] && vy[2] > vy[0] &&
+        vx[0] <= 0 && vx[1] >= ws_disp_w() &&
+        vy[0] <= 0 && vy[2] >= ws_disp_h()) {
+        int32_t x = vx[0];
+        int32_t y = vy[0];
+        int w = (int)(vx[1] - vx[0]);
+        int h = (int)(vy[2] - vy[0]);
+        ws_expand_fullscreen_rect(&x, y, &w, h);
+        x += draw_offset_x;
+        y += draw_offset_y;
+        gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+        gr_draw_flat_rect(x, y, w, h, color);
+        return;
+    }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1792,6 +2200,9 @@ static void gp0_exec_shaded_tri(void) {
     for (int i = 0; i < 3; i++) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
+    }
+    ws_nw_hud_shift_vertices(vx, 3);
+    for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1819,6 +2230,7 @@ static void gp0_exec_shaded_quad(void) {
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1895,6 +2307,7 @@ static void gp0_exec_textured_tri(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1938,6 +2351,7 @@ static void gp0_exec_textured_quad(void) {
             for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop image stretch (no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
 
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -2005,6 +2419,7 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -2044,6 +2459,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -2067,6 +2483,9 @@ static void gp0_exec_mono_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
+    int32_t vx[2] = { x0, x1 };
+    ws_nw_hud_shift_vertices(vx, 2);
+    x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -2081,6 +2500,9 @@ static void gp0_exec_shaded_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
+    int32_t vx[2] = { x0, x1 };
+    ws_nw_hud_shift_vertices(vx, 2);
+    x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -2097,6 +2519,8 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
+    ws_expand_fullscreen_rect(&x0, y0, &w, h);
+    x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);
@@ -2150,6 +2574,7 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
+    x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x, y, 1, 1, color);
@@ -2185,6 +2610,7 @@ static void gp0_exec_mono_8x8(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, 8, 8, color);
@@ -2197,6 +2623,9 @@ static void gp0_exec_textured_16x16(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    /* Never suppress MMX6 BG packets at a guessed finite-map boundary. The
+     * classifier cannot distinguish an authored layer entering the reveal from
+     * a stale ring slot; suppressing here caused the stage-start black flicker. */
     int ws_w = ws_sprt_fixed_transform(&x0, 16);
     x0 += ws_nw_hud_shift(x0, 16);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -2316,6 +2745,9 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
+    if (draw_offset_y < g_doff_min_this) g_doff_min_this = draw_offset_y;
+    if (draw_offset_y > g_doff_max_this) g_doff_max_this = draw_offset_y;
+    g_doff_cnt_this++;
     /* Native-wide mirrors framebuffer draws into a separate wide surface (canonical
      * VRAM stays faithful); the renderer needs the live draw offset to translate
      * into surface-local coords, so keep gr_set_draw_offset current. */
@@ -2733,7 +3165,7 @@ typedef struct {
     int16_t  xmin, xmax;  /* screen-X extent across the prim's position verts */
     int16_t  base_x;      /* back-buffer origin (draw_area_left) at draw time */
     uint8_t  opcode;
-    uint8_t  pad;
+    uint8_t  tagged;      /* psx_ws_prim_is_tagged() at draw time */
 } WsCensusEntry;
 static WsCensusEntry *ws_census = NULL;
 static uint64_t       ws_census_seq = 0;
@@ -2764,6 +3196,35 @@ static void prim_sx_extent(uint8_t op, int32_t *xmin, int32_t *xmax) {
     *xmin = lo; *xmax = hi;
 }
 
+/* Natural-overhang noter (see the ws_ovh_* block up top for the rationale).
+ * Called for every draw prim; counts POLYGONS whose raw SX extent crosses
+ * outside [0, disp_w] by more than the jitter margin, and stamps the frame
+ * (with the 2-consecutive-frames sustained rule) when enough do. */
+static void ws_note_overhang(uint8_t op) {
+    if (op < 0x20 || op > 0x3F) return;      /* polygons only — the world's prims */
+    /* Sprite-funnel (tagged) prims slide in from off-screen routinely —
+     * title-card letter tiles are tagged poly quads entering from the edges
+     * and stamped a sustained overhang inside the hut (observed at frame
+     * 20245). The WORLD funnel (Cluster-A RTPT terrain) never tags, so
+     * untagged overhang is the uncorrupted "revealable content" signal.
+     * Untagged-only also leaves non-tag titles unchanged (is_tagged == 0). */
+    if (psx_ws_prim_is_tagged()) return;
+    int32_t xmn, xmx;
+    prim_sx_extent(op, &xmn, &xmx);
+    int32_t W = ws_disp_w();
+    if (xmn >= -WS_OVERHANG_DEEP_PX && xmx <= W + WS_OVERHANG_DEEP_PX) return;
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != ws_ovh_frame) {
+        ws_ovh_prev  = (f == ws_ovh_frame + 1u) ? ws_ovh_count : 0;
+        ws_ovh_frame = f; ws_ovh_count = 0;
+    }
+    ws_ovh_count++;
+    if (ws_ovh_count >= WS_OVERHANG_MIN_PRIMS && ws_last_ovh_stamp != f) {
+        if (f == ws_last_ovh_stamp + 1u) ws_sust_ovh_stamp = f;
+        ws_last_ovh_stamp = f;
+    }
+}
+
 static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     if (!ws_census_on) return;
     if (!ws_census) {
@@ -2783,6 +3244,7 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     e->xmax     = (int16_t)xmx;
     e->base_x   = (int16_t)draw_area_left;
     e->opcode   = opcode;
+    e->tagged   = (uint8_t)psx_ws_prim_is_tagged();
     ws_census_seq++;
 }
 
@@ -2791,7 +3253,7 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     if (!ws_census) return 0;
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode\n");
+    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode,tagged\n");
     uint64_t total = ws_census_seq;
     uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
     uint64_t start = total - avail;
@@ -2799,9 +3261,9 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     for (uint64_t s = start; s < total; s++) {
         WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
         if (e->frame < f0 || e->frame > f1) continue;
-        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X\n",
+        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X,%u\n",
                 e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y,
-                e->xmin, e->xmax, e->base_x, e->opcode);
+                e->xmin, e->xmax, e->base_x, e->opcode, e->tagged);
         n++;
     }
     fclose(fp);
@@ -2824,6 +3286,7 @@ static void gp0_execute_command(void) {
         int32_t cvx, cvy;
         parse_vertex(gp0_cmd_buf[1], &cvx, &cvy);
         ws_census_record(opcode, cvx, cvy);
+        ws_note_overhang(opcode);   /* 2D-only-scene classifier world signal */
     }
 
     /* Categorize for diagnostics */
@@ -3062,34 +3525,31 @@ static void gpu_write_gp0_body(uint32_t val) {
             /* Respect mask bit settings. The check reads through the facade:
              * under the GL backend GPU-drawn mask bits live in the FBO, not
              * the CPU array (one sync per burst; free when check is off). */
-            if (check_mask_bit && (gr_vram_read((int)wx, (int)wy) & 0x8000))
+            if (check_mask_bit && (gr_vram_read((int)wx, (int)wy) & 0x8000)) {
                 goto next_pixel;
+            }
 
             if (set_mask_bit)
                 pixel |= 0x8000;
 
-            /* Route through the renderer so the hi-res supersampling mirror
-             * is kept coherent (writes native VRAM identically when off). */
-            gr_vram_write((int)wx, (int)wy, pixel);
+            /* CPU VRAM remains immediately authoritative, preserving mid-DMA
+             * reads/savestates. The renderer mirror is committed in bulk when
+             * the GP0 payload completes. */
+            vram[(uint32_t)wy * 1024u + wx] = pixel;
 
         next_pixel:
             if (++vram_write_col == vram_write_w) {
                 vram_write_col = 0;
                 if (++vram_write_row == vram_write_h) {
                     /* Transfer complete */
-                    gp0_state = GP0_IDLE;
-                    vram_write_remaining = 0;
-                    text_xlate_vram_upload(vram_write_x, vram_write_y,
-                                           vram_write_w, vram_write_h);
+                    gp0_commit_cpu_to_vram();
                     return;
                 }
             }
         }
 
         if (--vram_write_remaining == 0) {
-            gp0_state = GP0_IDLE;
-            text_xlate_vram_upload(vram_write_x, vram_write_y,
-                                   vram_write_w, vram_write_h);
+            gp0_commit_cpu_to_vram();
         }
 
         return;
@@ -3266,7 +3726,16 @@ static void gp1_ack_irq1(void) {
 
 static void gp1_display_enable(uint32_t val) {
     /* GP1(03h): Display enable — bit 0: 0=on, 1=off */
-    display_disabled = val & 1;
+    uint32_t next_disabled = val & 1;
+    /* Native-wide reveal pixels have no guest-VRAM backing, so they cannot be
+     * reconstructed from the canonical framebuffer after a scene change. Treat
+     * the guest's ON->OFF transition as invalidation of those synthetic strips.
+     * This is deliberately transition-scoped: MMX6 retains valid background
+     * pixels across ordinary frames, so per-frame clearing pillarboxes gameplay. */
+    if (ws_clear_reveal && next_disabled && !display_disabled && ws_mode == 2) {
+        ws_clear_all_reveal_margins();
+    }
+    display_disabled = next_disabled;
 }
 
 static void gp1_dma_direction(uint32_t val) {

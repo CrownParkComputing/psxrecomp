@@ -42,6 +42,7 @@ uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
+uint64_t g_dirty_ram_native_handoffs = 0;
 /* Scheduling-contract pump telemetry (see dirty_ram_dispatch). Always-on:
  * g_dirty_pump_max_gap_insns is the largest interpreted-insn gap ever seen
  * between two interrupt pumps — must stay bounded (~4096 + one block) once the
@@ -1528,18 +1529,21 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x09: /* ADDIU rt, rs, simm */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_slti_site(pc) ||
+            (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
@@ -2150,10 +2154,16 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
     } else if (psx_game_address_in_text(addr)) {
-        /* Page diverged from reference image — compiled dispatch blocked.
-         * Still mark as a game-text miss so the interpreter gate at the
-         * bottom does not close (the page may be dirty from a self-mod
-         * that dirty_ram_mark_kernel_write didn't track). */
+        /* RAM at a game-text address diverged from the static EXE image
+         * (runtime-relocated / overlaid / self-modified code the compiled
+         * static function no longer reflects). The live RAM is the truth:
+         * fall through to INTERPRET it here rather than bail (line below) to
+         * the shell shadow (normalize() -> shell ROM). Crash Bash relocates a
+         * code page onto 0x30000 (inside the BIOS shell window); without this
+         * its 0x30FF4 call diverged (native_ok=0) yet was not dirty, so the
+         * interpreter bailed and normalize() shadowed it to dead shell ROM ->
+         * unknown-dispatch abort. Marking it a clean game-text miss lets the
+         * dirty interpreter execute the real RAM bytes. */
         clean_game_text_miss = 1;
     }
 #endif
@@ -2174,10 +2184,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * candidate overlay function, so native and interpreted runs can be diffed
      * by sequence. Additive only — no control-flow change. */
     extern int      overlay_loader_is_candidate(uint32_t phys);
+    extern int      overlay_fp_enabled(void);
     extern void     overlay_regs_snap(uint32_t out[34], const CPUState *cpu);
     extern void     overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                                    const CPUState *cpu, int native);
-    int      _ovfp = overlay_cache_window_contains(phys) &&
+    int      _ovfp = overlay_fp_enabled() &&
+                     overlay_cache_window_contains(phys) &&
                      overlay_loader_is_candidate(phys);
     uint32_t _in_regs[34];
     if (_ovfp) {
@@ -2417,6 +2429,26 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 target != stop_addr &&
                 phys_is_overlay_flow_region(target_phys) &&
                 dirty_ram_is_dirty(target_phys)) {
+                /* A runtime overlay may start executing while its final code
+                 * bytes are still being installed. Entry-time native validation
+                 * must reject that partial image, but local dirty flow used to
+                 * remain here for up to one million instructions after the bytes
+                 * became an exact cached match. Tomba 2's MDEC path turns that
+                 * one early miss into an entire FMV interpreted at ~23 fps.
+                 *
+                 * Re-check exact cached entries at safe guest transfer
+                 * boundaries. The loader re-hashes generation-changed code
+                 * before executing it, so incomplete/self-modified bytes stay on
+                 * this authoritative interpreter path. */
+                if (overlay_loader_is_candidate(target_phys)) {
+                    extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+                    if (overlay_loader_dispatch(cpu, target)) {
+                        g_dirty_ram_native_handoffs++;
+                        g_dirty_ram_blocks_run++;
+                        if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                        OV_FPLOG_RET1();
+                    }
+                }
                 /* Capture freeze gates ONLY the ring write — never flow. */
                 if (!g_insn_log_frozen) {
                     uint64_t s = g_dirty_ram_flow_log_seq++;

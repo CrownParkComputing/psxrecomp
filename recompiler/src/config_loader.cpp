@@ -244,6 +244,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("fmv_skip_no_xa")) {
             rt.video_fmv_skip_no_xa = toml::find<bool>(video, "fmv_skip_no_xa");
         }
+        if (video.contains("fmv_skip_no_xa_hold")) {
+            rt.video_fmv_skip_no_xa_hold =
+                (int)toml::find<int64_t>(video, "fmv_skip_no_xa_hold");
+            if (rt.video_fmv_skip_no_xa_hold < 4 || rt.video_fmv_skip_no_xa_hold > 3600)
+                throw std::runtime_error(
+                    "[video] fmv_skip_no_xa_hold must be between 4 and 3600 vblanks");
+        }
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }
@@ -254,6 +261,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else if (mode == "adaptive")                   rt.video_vsync = -1;
             else throw std::runtime_error(fmt::format(
                 "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
+        }
+        if (video.contains("frame_interpolation")) {
+            rt.video_frame_interpolation =
+                toml::find<bool>(video, "frame_interpolation");
+        }
+        if (video.contains("frame_interpolation_fps")) {
+            rt.video_frame_interpolation_fps =
+                toml::find<int>(video, "frame_interpolation_fps");
+            if (rt.video_frame_interpolation_fps != 0 &&
+                rt.video_frame_interpolation_fps < 90)
+                throw std::runtime_error(
+                    "[video] frame_interpolation_fps must be 0 (display) or >= 90");
         }
         if (video.contains("aspect_ratio")) {
             const auto mode = toml::find<std::string>(video, "aspect_ratio");
@@ -696,9 +715,16 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_hud_sprt_squash = false;
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
+    bool ws_native_wide = true;
     bool ws_nw_hud_corners = false;
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
     bool ws_nw_backdrop = false;
+    bool ws_clear_reveal = false;
+    bool ws_nw_flat_backdrop = false;
+    bool ws_nw_phase_backdrop = false;
     bool ws_offered = true;
+    bool ws_ultrawide_offered = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -722,17 +748,48 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_full_2d = toml::find<bool>(ws, "full_2d");
         if (ws.contains("gte_game_mode"))
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
+        if (ws.contains("native_wide"))
+            ws_native_wide = toml::find<bool>(ws, "native_wide");
         if (ws.contains("nw_hud_corners"))
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
+        const bool has_nw_left_hud_lo = ws.contains("nw_left_hud_packet_lo");
+        const bool has_nw_left_hud_hi = ws.contains("nw_left_hud_packet_hi");
+        if (has_nw_left_hud_lo != has_nw_left_hud_hi)
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] nw_left_hud_packet_lo and "
+                "nw_left_hud_packet_hi must be set together",
+                config_path.string()));
+        if (has_nw_left_hud_lo) {
+            ws_nw_left_hud_packet_lo = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_lo"),
+                "widescreen.nw_left_hud_packet_lo");
+            ws_nw_left_hud_packet_hi = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_hi"),
+                "widescreen.nw_left_hud_packet_hi");
+            if (ws_nw_left_hud_packet_lo >= ws_nw_left_hud_packet_hi)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_left_hud_packet range is empty or reversed",
+                    config_path.string()));
+        }
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("clear_reveal"))
+            ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
+        if (ws.contains("nw_flat_backdrop"))
+            ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
+        if (ws.contains("nw_phase_backdrop"))
+            ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
+        if (ws.contains("offer_ultrawide"))
+            ws_ultrawide_offered = toml::find<bool>(ws, "offer_ultrawide");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
+    std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
     // game with a different display width overrides them (Ape Escape: 0x181).
@@ -752,7 +809,15 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("bias_sites",  ws_cull_bias_sites);
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
+            load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            if (cull.contains("guard_pixels")) {
+                ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
+                if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
+                    throw std::runtime_error(fmt::format(
+                        "{}: [widescreen.cull] guard_pixels must be in [0, 256]",
+                        config_path.string()));
+            }
             if (cull.contains("screen_w_imms")) {
                 ws_cull_w_imms.clear();
                 load_sites("screen_w_imms", ws_cull_w_imms);
@@ -772,6 +837,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
     uint32_t ws_bg2d_stream_left_site = 0, ws_bg2d_stream_right_site = 0;
     uint32_t ws_bg2d_bufbase_site = 0, ws_bg2d_cap_site = 0;
+    uint32_t ws_bg2d_layer_base = 0x800971F8u, ws_bg2d_ring_base = 0x800A21B8u;
+    uint32_t ws_bg2d_map_size_addr = 0x800CD338u, ws_bg2d_layer_stride_addr = 0x8008EC10u;
+    uint32_t ws_bg2d_ring_cols = 64, ws_bg2d_layer_count = 3;
+    uint32_t ws_bg2d_layer_struct_stride = 0x54;
+    uint32_t ws_bg2d_init_func = 0;
+    uint32_t ws_bg2d_packet_cap = 1000;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -789,6 +860,31 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_bg2d_stream_right_site = load1("stream_right_site");
             ws_bg2d_bufbase_site = load1("bufbase_site");
             ws_bg2d_cap_site     = load1("cap_site");
+            if (bg.contains("layer_base"))
+                ws_bg2d_layer_base = load1("layer_base");
+            if (bg.contains("ring_base"))
+                ws_bg2d_ring_base = load1("ring_base");
+            if (bg.contains("map_size_addr"))
+                ws_bg2d_map_size_addr = load1("map_size_addr");
+            if (bg.contains("layer_stride_addr"))
+                ws_bg2d_layer_stride_addr = load1("layer_stride_addr");
+            auto load_positive = [&](const char* key, uint32_t current) -> uint32_t {
+                if (!bg.contains(key)) return current;
+                const int64_t value = toml::find<int64_t>(bg, key);
+                if (value <= 0 || value > UINT32_MAX)
+                    throw std::runtime_error(fmt::format(
+                        "widescreen.bg2d.{} must be a positive 32-bit integer", key));
+                return static_cast<uint32_t>(value);
+            };
+            ws_bg2d_ring_cols = load_positive("ring_cols", ws_bg2d_ring_cols);
+            ws_bg2d_layer_count = load_positive("layer_count", ws_bg2d_layer_count);
+            ws_bg2d_layer_struct_stride = load_positive(
+                "layer_struct_stride", ws_bg2d_layer_struct_stride);
+            ws_bg2d_packet_cap = load_positive("packet_cap", ws_bg2d_packet_cap);
+            if ((ws_bg2d_ring_cols & (ws_bg2d_ring_cols - 1u)) != 0u)
+                throw std::runtime_error(
+                    "widescreen.bg2d.ring_cols must be a power of two");
+            ws_bg2d_init_func    = load1("init_func");
         }
     }
 
@@ -796,6 +892,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // (x_sites) + far-backdrop GTE un-squash (unsquash_funcs).
     std::vector<uint32_t> ws_backdrop_x_sites;
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
+    std::vector<uint32_t> ws_dome_call_sites;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("backdrop")) {
@@ -808,6 +905,19 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 for (const auto& a : toml::find<std::vector<std::string>>(bd, "unsquash_funcs"))
                     ws_backdrop_unsquash_funcs.push_back(
                         parse_hex(a, "widescreen.backdrop.unsquash_funcs"));
+        }
+    }
+
+    // Optional [widescreen.dome] block: exact projection calls belonging to
+    // finite curved background meshes that retain authored 4:3 coverage.
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("dome")) {
+            const toml::value& dome = toml::find(ws, "dome");
+            if (dome.contains("call_sites"))
+                for (const auto& a : toml::find<std::vector<std::string>>(dome, "call_sites"))
+                    ws_dome_call_sites.push_back(
+                        parse_hex(a, "widescreen.dome.call_sites"));
         }
     }
 
@@ -837,18 +947,28 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
+        /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
+        /*ws_dome_call_sites*/    ws_dome_call_sites,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
+        /*ws_native_wide*/        ws_native_wide,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
+        /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
+        /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
+        /*ws_clear_reveal*/       ws_clear_reveal,
+        /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
+        /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
         /*ws_offered*/            ws_offered,
+        /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
         /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,
@@ -856,6 +976,15 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_stream_right_site*/ ws_bg2d_stream_right_site,
         /*ws_bg2d_bufbase_site*/  ws_bg2d_bufbase_site,
         /*ws_bg2d_cap_site*/      ws_bg2d_cap_site,
+        /*ws_bg2d_layer_base*/    ws_bg2d_layer_base,
+        /*ws_bg2d_ring_base*/     ws_bg2d_ring_base,
+        /*ws_bg2d_map_size_addr*/ ws_bg2d_map_size_addr,
+        /*ws_bg2d_layer_stride_addr*/ ws_bg2d_layer_stride_addr,
+        /*ws_bg2d_ring_cols*/     ws_bg2d_ring_cols,
+        /*ws_bg2d_layer_count*/   ws_bg2d_layer_count,
+        /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
+        /*ws_bg2d_init_func*/     ws_bg2d_init_func,
+        /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
     };
 }
 
@@ -969,6 +1098,15 @@ UserSettings load_user_settings(const fs::path& path) {
             if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
             else if (m == "off" || m == "immediate"){ s.vsync = 0;  s.has_vsync = true; }
             else if (m == "adaptive")               { s.vsync = -1; s.has_vsync = true; }
+        });
+        if (v.contains("frame_interpolation")) try_get([&]{
+            s.frame_interpolation = toml::find<bool>(v, "frame_interpolation");
+            s.has_frame_interpolation = true;
+        });
+        if (v.contains("frame_interpolation_fps")) try_get([&]{
+            s.frame_interpolation_fps = toml::find<int>(v, "frame_interpolation_fps");
+            if (s.frame_interpolation_fps == 0 || s.frame_interpolation_fps >= 90)
+                s.has_frame_interpolation_fps = true;
         });
         if (v.contains("aspect_ratio")) try_get([&]{
             const auto m = toml::find<std::string>(v, "aspect_ratio");
@@ -1132,6 +1270,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
     if (s.has_vsync)
         f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive" : "on") << "\"\n";
+    if (s.has_frame_interpolation)
+        f << "frame_interpolation = " << (s.frame_interpolation ? "true" : "false") << "\n";
+    if (s.has_frame_interpolation_fps)
+        f << "frame_interpolation_fps = " << s.frame_interpolation_fps << "\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     f << "\n[audio]\n";

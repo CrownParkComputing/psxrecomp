@@ -26,6 +26,7 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
+#include "present_ring.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -289,6 +290,11 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+/* Optional analog-stick override (set_input lx/ly/rx/ry, 0..255, 0x80 =
+ * centre). Lets injected input drive analog-mode movement; consumed by the
+ * pad sampler alongside the button word. */
+static int     s_axis_override = 0;
+static uint8_t s_axis_st[4]    = { 0x80, 0x80, 0x80, 0x80 };
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -2361,6 +2367,7 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
     extern uint64_t g_dirty_ram_guard_yields;
+    extern uint64_t g_dirty_ram_native_handoffs;
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
@@ -2370,13 +2377,14 @@ static void handle_dirty_ram_stats(int id, const char *json)
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
-             "\"guard_yields\":%llu,"
+             "\"guard_yields\":%llu,\"native_handoffs\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
              (unsigned long long)g_dirty_ram_insns_run,
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_guard_yields,
+             (unsigned long long)g_dirty_ram_native_handoffs,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;
@@ -4591,7 +4599,9 @@ static void handle_gpu_state(int id, const char *json)
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
              "\"mode\":%d,\"nw_extra\":%d,"
-             "\"cur_frame\":%llu,\"last_tag_frame\":%u}}",
+             "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
+             "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
+             "\"ovh_prims\":%u,\"last_ovh_frame\":%u}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -4606,7 +4616,9 @@ static void handle_gpu_state(int id, const char *json)
              ws.configured, ws.active, ws.game_mode,
              ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
              ws.mode, ws.nw_extra,
-             (unsigned long long)ws.cur_frame, ws.last_tag_frame);
+             (unsigned long long)ws.cur_frame, ws.last_tag_frame,
+             ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
+             ws.ovh_prims, ws.last_ovh_frame);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -4676,6 +4688,30 @@ static void handle_irq_state(int id, const char *json)
              s_cpu ? ((s_cpu->cop0[12] >> 10) & 1) : 0,
              s_cpu ? ((s_cpu->cop0[12] >> 22) & 1) : 0,
              dma_get_dpcr(), dma_get_dicr());
+}
+
+/* vblank_rate: report the ONE cycle-paced VBlank authority's raise/deliver
+ * counts, the (normally-off) GPUSTAT-poll fallback raise count, and the
+ * per-frame GP0(E5) draw-offset-Y range/count. Used to confirm the guest is
+ * receiving exactly 60 VBlanks/s (not the ~96/s the stale poll fallback caused)
+ * and to probe double-buffer draw-offset alternation. */
+static void handle_vblank_rate(int id, const char *json)
+{
+    (void)json;
+    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+    extern uint64_t g_pollhack_vblank_count;
+    extern int32_t  g_doff_min_last, g_doff_max_last;
+    extern uint32_t g_doff_cnt_last;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"cycle_paced_raise\":%llu,"
+             "\"delivered\":%llu,"
+             "\"pollhack_raise\":%llu,"
+             "\"doff_min\":%d,\"doff_max\":%d,\"doff_cnt\":%u}",
+             id,
+             (unsigned long long)g_vblank_raise_count,
+             (unsigned long long)g_vblank_deliver_count,
+             (unsigned long long)g_pollhack_vblank_count,
+             g_doff_min_last, g_doff_max_last, g_doff_cnt_last);
 }
 
 static void handle_timers_state(int id, const char *json)
@@ -5411,6 +5447,94 @@ static void handle_gte_state(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+/* Dump recent GTE RTPS/RTPT projections (inputs + outputs) from the always-on
+ * GTE ring. {"cmd":"gte_ring_dump","count":N,"newest":1,"frame":F} — frame
+ * optional (omit or -1 for all). Used to find flattened/degenerate character
+ * projections and split game-code input bugs from GTE-math bugs. */
+static void handle_gte_ring_dump(int id, const char *json)
+{
+    extern unsigned long long gte_rtp_ring_total(void);
+    extern int gte_rtp_ring_dump_json(char *out, int outsz, int max_count,
+                                      int newest_first, long frame_filter);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+
+    size_t BUF_SZ = 256u + (size_t)count * 720u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_rtp_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_rtp_ring_total(), n, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* INTPL (vertex-lerp) ring: inputs (ir0 blend, in=IR1-3 pose A, fc=pose B)
+ * and outputs (mac / out=IR1-3 / flag) per op. offset pages through the
+ * matching entries after the frame filter, so a whole frame is reachable. */
+static void handle_gte_intpl_dump(int id, const char *json)
+{
+    extern unsigned long long gte_intpl_ring_total(void);
+    extern int gte_intpl_ring_dump_json(char *out, int outsz, int max_count,
+                                        int newest_first, long frame_filter,
+                                        int offset);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+    int offset = json_get_int(json, "offset", 0);
+    if (offset < 0) offset = 0;
+
+    size_t BUF_SZ = 256u + (size_t)count * 420u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_intpl_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame, offset);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"offset\":%d,\"entries\":[%s]}",
+             id, gte_intpl_ring_total(), n, offset, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* Per-frame GTE projection stats (nproj / nsat / nflat) over recent frames —
+ * shows the alternating flat/normal render pattern. */
+static void handle_gte_frame_stats(int id, const char *json)
+{
+    extern int gte_fstat_dump_json(char *out, int outsz, int max_frames);
+    int n = json_get_int(json, "frames", 120);
+    if (n < 1) n = 1; if (n > 512) n = 512;
+    size_t BUF = 256u + (size_t)n * 96u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_fstat_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"emitted\":%d,\"frames\":[%s]}",
+             id, emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
+}
+
+/* Latched degenerate (saturated-output) GTE projections with full inputs. */
+static void handle_gte_latch_dump(int id, const char *json)
+{
+    extern unsigned long long gte_latch_total(void);
+    extern int gte_latch_dump_json(char *out, int outsz, int max_count);
+    int n = json_get_int(json, "count", 64);
+    if (n < 1) n = 1; if (n > 256) n = 256;
+    size_t BUF = 256u + (size_t)n * 720u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_latch_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_latch_total(), emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
+}
+
 static void handle_sio_state(int id, const char *json)
 {
     (void)json;
@@ -5595,7 +5719,8 @@ static void handle_spu_voices(int id, const char *json)
             "\"start\":\"0x%05X\",\"loop\":\"0x%05X\","
             "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
             "\"cur_addr\":\"0x%05X\",\"repeat_addr\":\"0x%05X\","
-            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\"}",
+            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\","
+            "\"env\":\"0x%04X\",\"env_phase\":%d}",
             v == 0 ? "" : ",",
             v, s.active,
             s.vol_ctrl_l, s.vol_ctrl_r,
@@ -5604,13 +5729,33 @@ static void handle_spu_voices(int id, const char *json)
             (uint32_t)s.loop_lo  << 3,
             s.adsr_lo, s.adsr_hi,
             s.cur_addr, s.repeat_addr,
-            s.last_flags, s.sample_idx, s.phase);
+            s.last_flags, s.sample_idx, s.phase,
+            s.env_level, s.adsr_phase);
         if (n > 0) off += (size_t)n;
     }
     n = snprintf(out + off, cap - off, "]}");
     if (n > 0) off += (size_t)n;
     send_fmt("%s", out);
     free(out);
+}
+
+/* ---- SPU RAM peek: {"addr":N,"len":M} -> hex bytes. Sample data is the
+ * ground truth for voice-rail triage (what does a parked loop block hold?). */
+static void handle_spu_ram(int id, const char *json)
+{
+    uint32_t addr = (uint32_t)json_get_int(json, "addr", 0);
+    int len = json_get_int(json, "len", 16);
+    if (len < 1) len = 1;
+    if (len > 4096) len = 4096;
+    uint8_t bytes[4096];
+    uint32_t got = spu_ram_peek(addr, bytes, (uint32_t)len);
+    char *hex = (char *)malloc((size_t)got * 2u + 1u);
+    if (!hex) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    for (uint32_t i = 0; i < got; i++)
+        snprintf(hex + i * 2u, 3u, "%02X", bytes[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%05X\",\"len\":%u,\"hex\":\"%s\"}",
+             id, addr, (unsigned)got, hex);
+    free(hex);
 }
 
 /* ---- SPU event ring dump. Returns the most recent N events
@@ -6535,6 +6680,15 @@ static void handle_set_input(int id, const char *json)
     }
     s_input_override = (int)hex_to_u32(val_str);
     s_input_frames = 0;
+    /* Optional stick override: any of lx/ly/rx/ry (0..255) arms it; omitted
+     * axes centre. Absent entirely -> released (buttons-only injection). */
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6574,7 +6728,38 @@ static void handle_clear_input(int id, const char *json)
     (void)json;
     s_input_override = -1;
     s_input_frames   = 0;
+    s_axis_override  = 0;
+    s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
     send_ok(id);
+}
+
+/* Live A/B for the native-wide HUD corner gate:
+ *   {"cmd":"ws_hud_mode","tag_rects":0|1}
+ * tag_rects=1 lets TAGGED rect-family prims re-anchor too (Tomba's AP
+ * counter renders through the tagged sprite funnel). */
+static void handle_ws_hud_mode(int id, const char *json)
+{
+    int v = json_get_int(json, "tag_rects", -1);
+    if (v < 0) { send_err(id, "missing tag_rects (0|1)"); return; }
+    gpu_ws_set_nw_hud_tag_rects(v);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d}", id, v ? 1 : 0);
+}
+
+/* Kernel-image bless state: {"cmd":"kernel_bless"} ->
+ * entries/clean/mismatch/native_hits/verifies/invalidations.
+ * (memory.c psx_kernel_bless_*; PSX_KERNEL_BLESS=0 disables the mechanism.) */
+static void handle_kernel_bless(int id, const char *json)
+{
+    extern void psx_kernel_bless_stats(uint64_t out[6]);
+    (void)json;
+    uint64_t s[6];
+    psx_kernel_bless_stats(s);
+    send_fmt("{\"id\":%d,\"ok\":true,\"entries\":%llu,\"clean\":%llu,"
+             "\"mismatch\":%llu,\"native_hits\":%llu,\"verifies\":%llu,"
+             "\"invalidations\":%llu}",
+             id, (unsigned long long)s[0], (unsigned long long)s[1],
+             (unsigned long long)s[2], (unsigned long long)s[3],
+             (unsigned long long)s[4], (unsigned long long)s[5]);
 }
 
 static void handle_ws_margin(int id, const char *json)
@@ -6630,8 +6815,11 @@ static void handle_frame_perf(int id, const char *json)
     double wcanon = wide[5] - wide[10]; if (wcanon < 0) wcanon = 0;
     double wmpp   = wide[12] > 0 ? wide[10] * 1000.0 / wide[12] : 0.0;
     double tex_frac = 0.0; gl_renderer_perf_prim_split(&tex_frac);
+    uint64_t br[8]; extern void gl_renderer_batch_diag(uint64_t out[8]);
+    gl_renderer_batch_diag(br);
     send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
              "\"tex_frac\":%.3f,\"ws_ablate\":%d,"
+             "\"batch_diag\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
              "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f},"
@@ -6647,6 +6835,10 @@ static void handle_frame_perf(int id, const char *json)
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
              "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f}}",
              id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
+             (unsigned long long)br[0], (unsigned long long)br[1],
+             (unsigned long long)br[2], (unsigned long long)br[3],
+             (unsigned long long)br[4], (unsigned long long)br[5],
+             (unsigned long long)br[6], (unsigned long long)br[7],
              all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8], all[9],
              (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7], wide[9], wpp,
              wide[10], wide[11], wcanon, wide[12], wmpp,
@@ -6664,6 +6856,20 @@ static void handle_gl_ws_ablate(int id, const char *json)
     int mode = json_get_int(json, "mode", -1);
     if (mode >= 0) gl_renderer_set_ws_ablate(mode);
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
+}
+
+static void handle_gl_interp(int id, const char *json)
+{
+    (void)json;
+    int enabled = 0, suspended = 0, history = 0;
+    double host_hz = 0.0, target_hz = 0.0;
+    uint64_t swaps = 0;
+    gl_renderer_interpolation_diag(&enabled, &suspended, &history,
+                                   &host_hz, &target_hz, &swaps);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"suspended\":%d,\"history\":%d,"
+             "\"host_hz\":%.3f,\"target_hz\":%.3f,\"swaps\":%llu}",
+             id, enabled, suspended, history, host_hz, target_hz,
+             (unsigned long long)swaps);
 }
 
 /* gl_wide_fast on=<0|1>: native-wide centre-blit fast path. 1 (default) = skip
@@ -6762,7 +6968,7 @@ static void handle_ws_backdrop_stretch(int id, const char *json)
 /* prim<->pixel correlation gate (ws_dbg_stretch). Forces g_ws_bd_stretch_on=1 and
  * sets the selectable match mode used by the GL native-wide 2D-stretch gate so a
  * probe can stretch an exact prim set and screenshot which one fills the void.
- * Args: mode (0..6), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
+ * Args: mode (0..8), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
  * Reports matched/tagged counts (last frame) + applied. */
 static void handle_ws_dbg_stretch(int id, const char *json)
 {
@@ -6910,15 +7116,24 @@ static void handle_mmx6_freshfix(int id, const char *json)
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
 static void handle_savestate(int id, const char *json)
 {
-    extern void savestate_request_save(int slot);
-    extern void savestate_request_load(int slot);
+    extern int savestate_request_save(int slot);
+    extern int savestate_request_load(int slot);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
-    if      (!strcmp(op, "save")) savestate_request_save(slot);
-    else if (!strcmp(op, "load")) savestate_request_load(slot);
+    int staged;
+    if      (!strcmp(op, "save")) staged = savestate_request_save(slot);
+    else if (!strcmp(op, "load")) staged = savestate_request_load(slot);
     else { send_err(id, "op must be save|load"); return; }
+    if (!staged) {
+        /* Refused: bad slot, not configured, or load on an LLE host-fiber run
+         * (cross-fiber unwind is unsafe there — see savestate_request_load).
+         * The old handler ack'd ok:true anyway, which read as a silent no-op. */
+        send_err(id, "savestate request refused (LLE run cannot load states; "
+                     "check slot / configuration)");
+        return;
+    }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
 }
 
@@ -7345,6 +7560,16 @@ static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
 {
+    /* Full-VRAM GL readback is intentionally expensive and can perturb the
+     * performance issue being measured. Keep the forensic ring default-on, but
+     * allow a controlled acceptance run to disable continuous capture while
+     * retaining the TCP server and one-shot screenshot command. */
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_DISPLAY_RING");
+        enabled = (!e || !*e || *e != '0') ? 1 : 0;
+    }
+    if (!enabled) return;
     if (!s_disp_ring_px) {
         size_t per  = (size_t)DISP_RING_MAX_W * DISP_RING_MAX_H;
         size_t vram = (size_t)1024 * 512;
@@ -7511,6 +7736,45 @@ static void handle_screenshot_file(int id, const char *json)
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
              id, path, w, h);
+}
+
+/* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
+ * PNG, regardless of what the game currently displays. Used to inspect BOTH
+ * double-buffer halves (y=0 and y=256) coherently in one call to see whether a
+ * strobing character is present in one buffer only. */
+static void handle_dump_buffer(int id, const char *json)
+{
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+    extern void vk_renderer_sync_cpu(void);
+    vk_renderer_sync_cpu();
+
+    int y0 = json_get_int(json, "y", 0);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_buffer.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    GpuDisplayInfo di;
+    di.display_x = 0; di.display_y = (uint32_t)y0; di.depth24 = 0;
+    di.disabled = 0; di.width = 512; di.height = 240;
+
+    uint32_t w = 512, h = 240;
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_err(id, "cannot open file"); return; }
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { fclose(f); send_err(id, "alloc failed"); return; }
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
+        }
+    int ok = png_write_rgb(f, rgb, w, h);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"y\":%d}", id, path, y0);
 }
 
 /* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
@@ -7768,7 +8032,7 @@ extern uint64_t gl_renderer_pres_total(void);
 
 static void handle_gl_present_ring(int id, const char *json)
 {
-    static const char *path_name[4] = { "vram", "wide", "cpu", "blank" };
+    static const char *path_name[5] = { "vram", "wide", "cpu", "blank", "interp" };
     int n = json_get_int(json, "n", 300);
     if (n < 1) n = 1;
     if (n > 4096) n = 4096;
@@ -7787,10 +8051,53 @@ static void handle_gl_present_ring(int id, const char *json)
         pos += snprintf(buf + pos, bufsz - pos,
                         "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u]]",
                         first ? "" : ",", (unsigned long long)s, e.frame,
-                        e.path < 4 ? path_name[e.path] : "?", e.t_ms,
+                        e.path < 5 ? path_name[e.path] : "?", e.t_ms,
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
                         e.px_r, e.px_g, e.px_b, e.glerr,
                         e.src_r, e.src_g, e.src_b, e.src_valid);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* Present-classification ring (all backends; see present_ring.h): how each
+ * present was classified — 4:3 pillarbox / native-wide / canonical — and
+ * whether a native-wide present fell back to the canonical width (the
+ * "everything stretched for a while" signature). Always-on; this reads a
+ * window.
+ *   {"cmd":"present_ring","n":600}
+ * -> events: [seq, frame, path, present_w, disp_w, disp_h, game_mode,
+ *             native_43, fellback, tag_delta, nw_extra, gte_verts,
+ *             ovh_prims] */
+static void handle_present_ring(int id, const char *json)
+{
+    static const char *pres_path_name[4] =
+        { "blank", "native43", "wide", "canonical" };
+    int n = json_get_int(json, "n", 300);
+    if (n < 1) n = 1;
+    if (n > 4096) n = 4096;
+    uint64_t total = present_ring_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 96 + n * 112;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 128; s++) {
+        PresRingEntry e;
+        if (!present_ring_get(s, &e)) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%u,%u,%u,%u,%u,%u,%ld,%u,%u,%u]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        e.path < 4 ? pres_path_name[e.path] : "?",
+                        e.present_w, e.disp_w, e.disp_h,
+                        e.game_mode, e.native_43, e.wide_fellback,
+                        (long)e.tag_delta, e.nw_extra,
+                        e.gte_verts, e.ovh_prims);
         first = 0;
     }
     pos += snprintf(buf + pos, bufsz - pos, "]}");
@@ -9641,24 +9948,28 @@ static void handle_mdec_state(int id, const char *json)
 static void handle_fmv_state(int id, const char *json)
 {
     (void)json;
-    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, const char **);
+    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, int *, const char **);
     extern uint32_t mdec_get_decode_count(void);
     extern int cdrom_xa_stream_active(void);
     extern uint16_t sio_get_pad_buttons(void);
     extern uint64_t cdrom_get_dataready_fires(void);
     extern uint64_t g_cdrom_deliver_count;
-    int auto_skip = -1; uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
-    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &cfg);
+    int auto_skip = -1, no_xa_hold = 0;
+    uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
+    char cfg_json[1024];
+    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &no_xa_hold, &cfg);
+    json_escape_string(cfg_json, sizeof(cfg_json), cfg ? cfg : "(null)");
     MDECDebugState s; mdec_debug_get_state(&s);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"config_path\":\"%s\","
              "\"auto_skip_fmv\":%d,"
+             "\"fmv_skip_no_xa_hold\":%d,"
              "\"fmv_skip_total_table\":\"0x%08X\",\"fmv_skip_movie_id\":\"0x%08X\","
              "\"mdec_decode_count\":%u,\"mdec_decode_macroblocks\":%u,\"mdec_dma_out_words\":%u,"
              "\"xa_stream_active\":%d,"
              "\"cd_dataready_fires\":%llu,\"cd_irq_delivered\":%llu,"
              "\"pad1\":\"0x%04X\"}",
-             id, cfg ? cfg : "(null)", auto_skip,
+             id, cfg_json, auto_skip, no_xa_hold,
              total_table, movie_id,
              mdec_get_decode_count(), s.decode_macroblocks, s.dma_out_words,
              cdrom_xa_stream_active(),
@@ -10385,7 +10696,7 @@ static void handle_overlay_loader_status(int id, const char *json)
         if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
         esc_msg[di++] = msg[si];
     }
-    char buf[1536];
+    char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
         "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
@@ -10422,9 +10733,28 @@ static void handle_overlay_loader_status(int id, const char *json)
             ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
             "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
             "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\","
-            "\"gen_fastpath\":%llu",
+            "\"gen_fastpath\":%llu,\"range_links\":%d,\"range_index_overflow\":%d,"
+            "\"lazy_manifests\":%d,\"lazy_manifest_overflow\":%d",
             r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast,
-            (unsigned long long)overlay_loader_gen_fastpath());
+            (unsigned long long)overlay_loader_gen_fastpath(),
+            overlay_loader_range_link_count(),
+            overlay_loader_range_index_overflow(),
+            overlay_loader_lazy_manifest_count(),
+            overlay_loader_lazy_manifest_overflow());
+        uint64_t nd=0, ni=0, sn=0, ss=0, sc=0, sx=0;
+        psx_interrupt_delivery_diag(&nd, &ni, &sn, &ss, &sc, &sx);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"irq_need_defer\":%llu,\"irq_need_delivery\":%llu,"
+            "\"irq_skip_none\":%llu,\"irq_skip_sr\":%llu,"
+            "\"irq_skip_cooldown\":%llu,\"irq_skip_nested\":%llu",
+            (unsigned long long)nd, (unsigned long long)ni,
+            (unsigned long long)sn, (unsigned long long)ss,
+            (unsigned long long)sc, (unsigned long long)sx);
+        extern volatile long g_overlay_image_warm_loaded;
+        extern volatile long g_overlay_image_warm_pending;
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"image_warm_loaded\":%ld,\"image_warm_pending\":%ld",
+            g_overlay_image_warm_loaded, g_overlay_image_warm_pending);
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
@@ -10434,10 +10764,17 @@ static void handle_overlay_loader_status(int id, const char *json)
  * vs live code hash, generation) so reload-on-return can be inspected directly. */
 static void handle_overlay_candidates(int id, const char *json)
 {
-    (void)json;
     extern int overlay_loader_dump_candidates(char *out, int cap);
+    extern int overlay_loader_dump_candidates_at(uint32_t addr, char *out, int cap);
+    extern int overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap);
     static char cbuf[65536];
-    int len = overlay_loader_dump_candidates(cbuf, (int)sizeof(cbuf));
+    char pcbuf[32];
+    int filtered = json_get_str(json, "pc", pcbuf, sizeof(pcbuf)) != NULL;
+    int lazy = json_get_int(json, "lazy", 0);
+    int len = filtered
+        ? (lazy ? overlay_loader_dump_lazy_at(hex_to_u32(pcbuf), cbuf, (int)sizeof(cbuf))
+                : overlay_loader_dump_candidates_at(hex_to_u32(pcbuf), cbuf, (int)sizeof(cbuf)))
+        : overlay_loader_dump_candidates(cbuf, (int)sizeof(cbuf));
     if (len < 0) len = 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"candidates\":%s}\n", id, cbuf);
 }
@@ -11550,6 +11887,8 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
+    { "ws_hud_mode",       handle_ws_hud_mode },
+    { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
@@ -11566,13 +11905,16 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "gl_present_ring",   handle_gl_present_ring },
+    { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
+    { "gl_interp",         handle_gl_interp },
     { "gl_wide_fast",      handle_gl_wide_fast },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "vblank_rate",       handle_vblank_rate },
     { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
@@ -11591,6 +11933,7 @@ static const CmdEntry s_commands[] = {
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },
+    { "spu_ram",           handle_spu_ram },
     { "spu_events",        handle_spu_events },
     { "spu_events_reset",  handle_spu_events_reset },
     { "audio_stats",       handle_audio_stats },
@@ -11727,6 +12070,7 @@ static const CmdEntry s_commands[] = {
     { "display_ring_get",  handle_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },
+    { "dump_buffer",       handle_dump_buffer },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
@@ -11737,6 +12081,10 @@ static const CmdEntry s_commands[] = {
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
+    { "gte_ring_dump",     handle_gte_ring_dump },
+    { "gte_intpl_dump",    handle_gte_intpl_dump },
+    { "gte_frame_stats",   handle_gte_frame_stats },
+    { "gte_latch_dump",    handle_gte_latch_dump },
     { "quit",              handle_quit },
     { "dispatch_stats",    handle_dispatch_stats },
     { "dispatch_check",    handle_dispatch_check },
@@ -12493,6 +12841,14 @@ int debug_server_get_input_override(void)
             s_input_override = -1;
     }
     return s_input_override;
+}
+
+int debug_server_get_axis_override(unsigned char st[4])
+{
+    if (!s_axis_override) return 0;
+    st[0] = s_axis_st[0]; st[1] = s_axis_st[1];
+    st[2] = s_axis_st[2]; st[3] = s_axis_st[3];
+    return 1;
 }
 
 int debug_server_turbo_enabled(void)
