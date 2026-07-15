@@ -6,18 +6,6 @@
 
 namespace PS1 {
 
-// PS1 CD-ROM sector size (Mode 2, Form 1 user data)
-constexpr size_t SECTOR_SIZE = 2048;
-
-// Full sector size including headers/subchannel (2352 bytes for raw BIN files)
-constexpr size_t RAW_SECTOR_SIZE = 2352;
-
-// Offset to user data in raw sector (Mode 2, Form 1)
-constexpr size_t RAW_DATA_OFFSET = 24;
-
-// Primary Volume Descriptor location
-constexpr uint32_t PVD_SECTOR = 16;
-
 ISOReader::ISOReader()
     : is_open_(false) {
     root_dir_.lba = 0;
