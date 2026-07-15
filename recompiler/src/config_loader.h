@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "recompiler_patch.h"
+
 namespace PSXRecompV4 {
 
 // Pad input mode (per player). Replaces the old analog on/off boolean.
@@ -37,6 +39,10 @@ namespace PSXRecompV4 {
 //   digital — always present a digital pad (id 0x41); sticks disabled.
 enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
+struct WidescreenSignedBoundSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded LUI instruction
+};
 // Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
 // "digital" (case-insensitive) and returns `fallback` for anything else.
 int         pad_mode_from_string(const std::string& s, int fallback);
@@ -84,6 +90,19 @@ struct RuntimeConfig {
     bool                  has_instant_max_per_frame = false;
     int                   instant_max_per_frame = 0;
 
+    // Optional, game-specific warm-load route accelerators. A matching SetLoc
+    // at arm_lba followed by the exact ordered lbas sequence switches only
+    // those data reads to the bounded instant cadence. Any sequence mismatch
+    // fails closed to the configured disc_speed. The parser accepts the legacy
+    // [runtime.warm_cd_route] table and the reusable
+    // [[runtime.warm_cd_routes]] array-of-tables.
+    struct WarmCdRoute {
+        int              arm_lba = -1;
+        std::vector<int> lbas;
+        int              instant_max_per_frame = 32;
+    };
+    std::vector<WarmCdRoute> warm_cd_routes;
+
     // fast_boot: DEPRECATED alias for the HLE boot shell-skip (see bios_hle
     // below). The old mechanism (snapshot BIOS state at first handoff, restore
     // on later launches) is gone; fast_boot=true now skips only the BIOS shell
@@ -124,6 +143,18 @@ struct RuntimeConfig {
     // skips wall-clock pacing so the guest runs at host speed — compressing
     // load wall-time. Streaming titles (e.g. Crash) must leave this off.
     bool                  turbo_loads = false;
+
+    // turbo_audio_sink: while turbo_loads is actively running unpaced, keep
+    // rendering the exact guest-time SPU sample budget (so voice/CD state
+    // advances) but discard those samples before the host playback queue.
+    // Opt-in while the experiment is under live audio QA.
+    bool                  turbo_audio_sink = false;
+
+    // idle_skip: proof-gated fast-forward through repeated CPU polling
+    // loops with no stores/MMIO and stable register state. Guest time and
+    // device events still advance exactly. Opt-in per game; the idle_skip
+    // debug command and PSX_IDLE_SKIP environment variable support live A/B.
+    bool                  idle_skip = false;
 
     // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
     // shell command (run via cmd.exe /C, cwd = project root) that compiles
@@ -386,7 +417,11 @@ struct GameConfig {
     std::filesystem::path bios_thunks_path; // optional; empty if not set
     std::filesystem::path out_dir;
     bool                  strict;
+    std::string           discovery;     // "whole-image" (default) or "reachable"
     std::string           out_stem;       // derived if not explicit
+    // Game-owned, exact MIPS word replacements. IDs and physical instruction
+    // addresses are unique within a config; see docs/config_schema.md.
+    std::vector<RecompilerPatch> recompiler_patches;
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;
@@ -409,6 +444,29 @@ struct GameConfig {
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t              ws_sprite_anchor_addr = 0;
     bool                  ws_hud_sprt_squash = false;
+
+    // [data_shards] funcs: functions that get the memoized pure-function
+    // replay entry/return hooks (psx_datashard_enter/psx_datashard_ret).
+    // Enhancement-phase load-time work; see docs/DATA_SHARDS.md. Capture is
+    // self-proving (byte-verified read-set), so listing a function that turns
+    // out to be impure only costs a poisoned capture, never a wrong replay.
+    std::vector<uint32_t> data_shard_funcs;
+
+    // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
+    // implementation.  mode=-1 returns vsync_counter_addr while bypassing two
+    // unused MMIO reads; every other mode executes the original function.
+    uint32_t              vsync_query_func = 0;
+    uint32_t              vsync_counter_addr = 0;
+    uint32_t              vsync_gpustat_ptr_addr = 0;
+    uint32_t              vsync_timer1_ptr_addr = 0;
+    uint32_t              vsync_timer1_cache_addr = 0;
+    // Return addresses of verified CD wait-loop VSync(-1) calls.  At these
+    // sites only, the runtime may advance guest time to the next deliverable
+    // device event while a sustained CD load is active.
+    std::vector<uint32_t> vsync_event_horizon_sites;
+    // Separately togglable second tier for additional verified loops, allowing
+    // per-feature A/B without disabling the accepted base site set.
+    std::vector<uint32_t> vsync_event_horizon_extra_sites;
 
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
@@ -553,6 +611,21 @@ struct GameConfig {
     // off by default because draw ordering is title-specific.
     bool ws_nw_phase_backdrop = false;
 
+    // Expand only textured polygon vertices that already lie beyond the
+    // canonical 4:3 boundary. Useful for finite arena/background meshes while
+    // leaving actors, HUD, sprites, and centre geometry untouched.
+    bool ws_nw_textured_edges = false;
+    int  ws_nw_textured_edge_scale = 0; // percent; 0 = aspect-derived
+
+    // Render the complete wide mirror instead of splicing its centre from
+    // canonical VRAM. Required when edge-crossing polygon interpolation is
+    // transformed in the mirror.
+    bool ws_nw_full_mirror = false;
+
+    // [[widescreen.signed_x_bound]] guarded LUI sites whose signed Q16
+    // constants scale with the active native-wide field and remain identity in
+    // 4:3/menus/FMV. Shared by static codegen, overlay JIT, and interpreter.
+    std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
     // title's widescreen is unported/unvalidated (e.g. MMX4 at bring-up):
@@ -622,6 +695,12 @@ struct GameConfig {
 // Unlike game.toml, paths here are stored verbatim (the user picked them); they
 // are NOT resolved against a project root.
 struct UserSettings {
+    // Set when the file existed but failed to parse as TOML: every field below
+    // is defaults and the caller must warn loudly — silently dropping a user's
+    // hand-edited settings looks like the settings "don't work", and a later
+    // launcher save would overwrite their file with defaults.
+    bool parse_error = false;
+
     // [video]
     bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4

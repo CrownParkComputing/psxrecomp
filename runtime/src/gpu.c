@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gpu_primitive_reject.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "text_xlate.h"
@@ -344,6 +345,35 @@ int psx_ws_x_margin(void) {
     if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+}
+
+int32_t psx_ws_player_x_bound(int32_t vanilla)
+{
+    const int margin = psx_ws_x_margin();
+    if (margin <= 0) return vanilla;
+    return (int32_t)(((int64_t)vanilla * (320 + 2 * margin)) / 320);
+}
+
+#define WS_SIGNED_BOUND_MAX 64
+static uint32_t ws_signed_bound_addr[WS_SIGNED_BOUND_MAX];
+static uint32_t ws_signed_bound_expected[WS_SIGNED_BOUND_MAX];
+static int ws_signed_bound_count = 0;
+void gpu_ws_set_signed_x_bound_sites(const uint32_t *addresses,
+                                     const uint32_t *expected, int count) {
+    if (count < 0) count = 0;
+    if (count > WS_SIGNED_BOUND_MAX) count = WS_SIGNED_BOUND_MAX;
+    ws_signed_bound_count = count;
+    for (int i = 0; i < count; i++) {
+        ws_signed_bound_addr[i] = addresses[i] & 0x1FFFFFFFu;
+        ws_signed_bound_expected[i] = expected[i];
+    }
+}
+int psx_ws_is_signed_x_bound_site(uint32_t pc, uint32_t instr) {
+    const uint32_t phys = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < ws_signed_bound_count; i++)
+        if (ws_signed_bound_addr[i] == phys && ws_signed_bound_expected[i] == instr)
+            return 1;
+    return 0;
 }
 
 /* ---- Capcom 2D background tile-loop widen ([widescreen.bg2d]) --------------
@@ -1184,6 +1214,12 @@ static int ws_tagged_anchor(int32_t *out_ax) {
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
 static int ws_nw_phase_backdrop = 0;
 void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
+static int ws_nw_textured_edges = 0;
+int g_ws_tex_edge_pct = 0;
+void gpu_ws_set_nw_textured_edges(int on, int scale_pct) {
+    ws_nw_textured_edges = on ? 1 : 0;
+    g_ws_tex_edge_pct = scale_pct;
+}
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -1269,6 +1305,11 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_textured_edges) {
+        uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+        if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
+            return 2; /* GL gate: expand only vertices beyond canonical edges */
+    }
     if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both
@@ -2041,6 +2082,75 @@ static void parse_vertex(uint32_t word, int32_t* x, int32_t* y) {
     *y = sign_extend((word >> 16) & 0x7FFu, 11);
 }
 
+extern int gte_geometry_correction_lookup(uint32_t packed,
+                                          int32_t *x16, int32_t *y16);
+extern int gte_geometry_correction_enabled(void);
+static int s_texture_correction_enabled = 0;
+extern void gte_precision_tracking_set(int enabled);
+extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
+                                   int32_t *x16, int32_t *y16, uint16_t *z);
+
+void gpu_texture_correction_set(int enabled) {
+    s_texture_correction_enabled = enabled ? 1 : 0;
+    gte_precision_tracking_set(enabled);
+}
+
+uint32_t gpu_texture_correction_hits(void) {
+    return sw_perspective_triangle_count();
+}
+
+/* Match all three GP0 positions to recent GTE projections. Requiring a full
+ * triangle match prevents screen-space HUD/sprites that happen to share one
+ * coordinate from receiving world-geometry correction. The integer delta
+ * folds in draw offsets and any widescreen adjustment already applied. */
+static void prepare_precise_triangle(uint32_t w0, uint32_t w1, uint32_t w2,
+                                     const int32_t vx[3], const int32_t vy[3]) {
+    uint32_t words[3] = { w0, w1, w2 };
+    int32_t fx[3], fy[3];
+    const int geometry_enabled = gte_geometry_correction_enabled();
+    sw_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+    if (!geometry_enabled) {
+        sw_set_precise_triangle(0, 0,0, 0,0, 0,0);
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        int32_t raw_x, raw_y;
+        parse_vertex(words[i], &raw_x, &raw_y);
+        if (!gte_geometry_correction_lookup(words[i], &fx[i], &fy[i])) {
+            sw_set_precise_triangle(0, 0,0, 0,0, 0,0);
+            return;
+        }
+        fx[i] = (int32_t)((int64_t)fx[i] +
+                          (int64_t)(vx[i] - raw_x) * 65536);
+        fy[i] = (int32_t)((int64_t)fy[i] +
+                          (int64_t)(vy[i] - raw_y) * 65536);
+    }
+    sw_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
+}
+
+/* Enable perspective UVs only when every position word came from an exact
+ * SWC2 projection store at that same DMA packet address. This preserves the
+ * association through ordering-table reordering and rejects CPU-built UI. */
+static void prepare_texture_triangle(int i0, int i1, int i2) {
+    sw_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+    if (!s_texture_correction_enabled || gp0_cmd_source_addr == 0xFFFFFFFFu)
+        return;
+    int indices[3] = { i0, i1, i2 };
+    uint16_t z[3];
+    for (int i = 0; i < 3; i++) {
+        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
+        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
+            z[i] == 0)
+            return;
+    }
+    float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
+    float qmax = q[0];
+    if (q[1] > qmax) qmax = q[1];
+    if (q[2] > qmax) qmax = q[2];
+    if (qmax <= 0.0f) return;
+    sw_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
+}
+
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
 static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
     if (x < (int32_t)draw_area_left || x > (int32_t)draw_area_right) return;
@@ -2142,12 +2252,15 @@ static void gp0_exec_mono_tri(void) {
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     }
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[2], gp0_cmd_buf[3],
+                             vx, vy);
     gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
 }
 
@@ -2158,6 +2271,9 @@ static void gp0_exec_mono_quad(void) {
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
+    int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
+    if (rej_a && rej_b) return;
 
     /* Full-screen filters are commonly encoded as an axis-aligned quad. Drawing
      * a semi-transparent quad as two independent triangles blends their shared
@@ -2187,8 +2303,20 @@ static void gp0_exec_mono_quad(void) {
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    if (!rej_a) {
+        int32_t tx[3] = { vx[0], vx[1], vx[2] };
+        int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[2],
+                                 gp0_cmd_buf[3], tx, ty);
+        gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    }
+    if (!rej_b) {
+        int32_t tx[3] = { vx[2], vx[1], vx[3] };
+        int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_precise_triangle(gp0_cmd_buf[3], gp0_cmd_buf[2],
+                                 gp0_cmd_buf[4], tx, ty);
+        gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    }
 }
 
 /* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
@@ -2201,12 +2329,15 @@ static void gp0_exec_shaded_tri(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
+                             vx, vy);
     gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                              vx[1], vy[1], c[1],
                              vx[2], vy[2], c[2]);
@@ -2229,6 +2360,9 @@ static void gp0_exec_shaded_quad(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
+    int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
+    if (rej_a && rej_b) return;
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
     ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
@@ -2244,12 +2378,24 @@ static void gp0_exec_shaded_quad(void) {
         }
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
-                             vx[1], vy[1], c[1],
-                             vx[2], vy[2], c[2]);
-    gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
-                             vx[1], vy[1], c[1],
-                             vx[3], vy[3], c[3]);
+    if (!rej_a) {
+        int32_t tx[3] = { vx[0], vx[1], vx[2] };
+        int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3],
+                                 gp0_cmd_buf[5], tx, ty);
+        gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
+                                 vx[1], vy[1], c[1],
+                                 vx[2], vy[2], c[2]);
+    }
+    if (!rej_b) {
+        int32_t tx[3] = { vx[2], vx[1], vx[3] };
+        int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_precise_triangle(gp0_cmd_buf[5], gp0_cmd_buf[3],
+                                 gp0_cmd_buf[7], tx, ty);
+        gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
+                                 vx[1], vy[1], c[1],
+                                 vx[3], vy[3], c[3]);
+    }
 }
 
 /* Helper: build texpage word from GPU state for SW renderer.
@@ -2305,7 +2451,8 @@ static void gp0_exec_textured_tri(void) {
     /* Texpage from word 4 bits 16-31 */
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
-    set_tpage_from_poly(tpage_word);
+    set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
 
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -2314,6 +2461,9 @@ static void gp0_exec_textured_tri(void) {
     }
 
     setup_textured_draw(color24, semi_trans, raw_texture);
+    prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
+                             vx, vy);
+    prepare_texture_triangle(1, 3, 5);
     gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -2341,7 +2491,10 @@ static void gp0_exec_textured_quad(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
-    set_tpage_from_poly(tpage_word);
+    set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
+    int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
+    if (rej_a && rej_b) return;
 
     /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
      * GTE squash never saw — re-squash every X around the prim's anchor. */
@@ -2385,14 +2538,28 @@ static void gp0_exec_textured_quad(void) {
         }
     }
 
-    gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[2], vy[2], u[2], v[2],
-                              clut_x, clut_y, tpage);
-    gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[3], vy[3], u[3], v[3],
-                              clut_x, clut_y, tpage);
+    if (!rej_a) {
+        int32_t tx[3] = { vx[0], vx[1], vx[2] };
+        int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3],
+                                 gp0_cmd_buf[5], tx, ty);
+        prepare_texture_triangle(1, 3, 5);
+        gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                                  vx[1], vy[1], u[1], v[1],
+                                  vx[2], vy[2], u[2], v[2],
+                                  clut_x, clut_y, tpage);
+    }
+    if (!rej_b) {
+        int32_t tx[3] = { vx[2], vx[1], vx[3] };
+        int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_precise_triangle(gp0_cmd_buf[5], gp0_cmd_buf[3],
+                                 gp0_cmd_buf[7], tx, ty);
+        prepare_texture_triangle(5, 3, 7);
+        gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
+                                  vx[1], vy[1], u[1], v[1],
+                                  vx[3], vy[3], u[3], v[3],
+                                  clut_x, clut_y, tpage);
+    }
 }
 
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
@@ -2417,7 +2584,8 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
-    set_tpage_from_poly(tpage_word);
+    set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
 
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -2426,6 +2594,9 @@ static void gp0_exec_shaded_textured_tri(void) {
     }
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7],
+                             vx, vy);
+    prepare_texture_triangle(1, 4, 7);
     gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
@@ -2457,7 +2628,10 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
-    set_tpage_from_poly(tpage_word);
+    set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
+    int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
+    if (rej_a && rej_b) return;
 
     ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
@@ -2466,14 +2640,28 @@ static void gp0_exec_shaded_textured_quad(void) {
     }
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
-                                     vx[1], vy[1], u[1], v[1], c[1],
-                                     vx[2], vy[2], u[2], v[2], c[2],
-                                     clut_x, clut_y, tpage, raw_texture);
-    gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
-                                     vx[1], vy[1], u[1], v[1], c[1],
-                                     vx[3], vy[3], u[3], v[3], c[3],
-                                     clut_x, clut_y, tpage, raw_texture);
+    if (!rej_a) {
+        int32_t tx[3] = { vx[0], vx[1], vx[2] };
+        int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[4],
+                                 gp0_cmd_buf[7], tx, ty);
+        prepare_texture_triangle(1, 4, 7);
+        gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+                                         vx[1], vy[1], u[1], v[1], c[1],
+                                         vx[2], vy[2], u[2], v[2], c[2],
+                                         clut_x, clut_y, tpage, raw_texture);
+    }
+    if (!rej_b) {
+        int32_t tx[3] = { vx[2], vx[1], vx[3] };
+        int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_precise_triangle(gp0_cmd_buf[7], gp0_cmd_buf[4],
+                                 gp0_cmd_buf[10], tx, ty);
+        prepare_texture_triangle(7, 4, 10);
+        gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
+                                         vx[1], vy[1], u[1], v[1], c[1],
+                                         vx[3], vy[3], u[3], v[3], c[3],
+                                         clut_x, clut_y, tpage, raw_texture);
+    }
 }
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */
@@ -2483,6 +2671,7 @@ static void gp0_exec_mono_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
+    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
     x0 = vx[0]; x1 = vx[1];
@@ -2500,6 +2689,7 @@ static void gp0_exec_shaded_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
+    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
     x0 = vx[0]; x1 = vx[1];
@@ -3574,7 +3764,8 @@ static void gpu_write_gp0_body(uint32_t val) {
         int32_t x, y;
         parse_vertex(val, &x, &y);
         x += draw_offset_x; y += draw_offset_y;
-        if (polyline_has_prev) {
+        if (polyline_has_prev &&
+            !psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
             gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
         }
         polyline_prev_x = x; polyline_prev_y = y;
@@ -3584,17 +3775,14 @@ static void gpu_write_gp0_body(uint32_t val) {
 
 /* State: shaded polyline — alternating color, vertex words */
     if (gp0_state == GP0_POLYLINE_SHADED) {
-        /* Terminator: hardware ends a polyline ONLY when the masked word
-         * matches 0x50005000 (the 0x55555555 terminator) — Beetle
-         * gpu.cpp:1030, psx-spx. The terminator check MUST be at the top,
-         * like in the mono polyline case, otherwise a terminator at a
-         * vertex position (polyline_has_prev == 2) won't be detected and
-         * will be treated as a vertex, de-phasing the command stream. */
+        /* The terminator can arrive in either the color or vertex position.
+         * Check it before interpreting the alternating shaded-polyline stream;
+         * otherwise a vertex-position terminator is consumed as coordinates and
+         * de-phases all following GP0 commands. */
         if ((val & 0xF000F000u) == 0x50005000u) {
             gp0_state = GP0_IDLE;
             return;
         }
-
         /* Even words (after cmd) are colors, odd words are vertices.
          * Sequence: [cmd+C0] [V0] [C1] [V1] [C2] [V2] ...
          * polyline_has_prev tracks: 0=need V0, 1=need C_next, 2=need V_next */
@@ -3609,12 +3797,7 @@ static void gpu_write_gp0_body(uint32_t val) {
             return;
         }
         if (polyline_has_prev == 1) {
-            /* Expecting color word (or terminator). Same hardware rule as the
-             * mono case: ONLY the masked 0x50005000 pattern terminates. */
-            if ((val & 0xF000F000u) == 0x50005000u) {
-                gp0_state = GP0_IDLE;
-                return;
-            }
+            /* Expecting color word. */
             polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
             polyline_has_prev = 2;
             return;
@@ -3624,8 +3807,9 @@ static void gpu_write_gp0_body(uint32_t val) {
             int32_t x, y;
             parse_vertex(val, &x, &y);
             x += draw_offset_x; y += draw_offset_y;
-            gr_draw_shaded_line(polyline_prev_x, polyline_prev_y, polyline_prev_c,
-                                x, y, polyline_color);
+            if (!psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y))
+                gr_draw_shaded_line(polyline_prev_x, polyline_prev_y,
+                                    polyline_prev_c, x, y, polyline_color);
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;
             polyline_has_prev = 1;

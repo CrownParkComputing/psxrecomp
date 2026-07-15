@@ -27,6 +27,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "present_ring.h"
+#include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -1999,7 +2000,17 @@ void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
+
+/* Last guest function ENTERED, fed unconditionally at every compiled entry
+ * (one u32 store). The wall-time sampler's static histogram keys on THIS, not
+ * g_debug_current_func_addr: the dispatch stamp survives across post-exception
+ * resumption, so under any IRQ cadence it pools most static samples on the
+ * kernel exception-exit body (measured 55% on 0xF40) instead of the code that
+ * actually ran. Entry-stamp attribution is leaf-biased but honest. */
+volatile uint32_t g_psx_last_fn_entry = 0;
+
 void debug_server_log_call_entry(uint32_t func_addr) {
+    g_psx_last_fn_entry = func_addr;
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
@@ -2371,9 +2382,13 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
+    extern uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index);
+    extern uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index);
+    extern void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
+                                                     uint32_t out[5]);
     (void)json;
 
-    char buf[16 * 1024];
+    char buf[32 * 1024];
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
@@ -2400,7 +2415,8 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       (unsigned long long)e->insns,
                       (unsigned long long)e->entry_hits);
         first = 0;
-        if (n >= (int)sizeof(buf) - 128) break;
+        /* Reserve enough tail room for all bitmap/guard diagnostics below. */
+        if (n >= (int)sizeof(buf) - 2048) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "],\"dirty_bitmap_words\":[");
     uint32_t word_count = dirty_ram_get_bitmap_word_count();
@@ -2409,6 +2425,41 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       "%s\"0x%08X\"",
                       i == 0 ? "" : ",",
                       (unsigned)dirty_ram_get_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    uint64_t exact_mismatches = 0;
+    uint32_t exact_last[5] = {0};
+    dirty_ram_text_exact_mismatch_stats(&exact_mismatches, exact_last);
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_native_blocked\":%llu,"
+                  "\"text_diverged_pages\":%u,"
+                  "\"text_exact_mismatches\":%llu,"
+                  "\"text_exact_last_range\":\"0x%08X\","
+                  "\"text_exact_last_len\":%u,"
+                  "\"text_exact_last_mismatch\":\"0x%08X\","
+                  "\"text_exact_last_live\":%u,"
+                  "\"text_exact_last_ref\":%u,"
+                  "\"text_modified_bitmap_words\":[",
+                  (unsigned long long)dirty_ram_text_native_blocked(),
+                  (unsigned)dirty_ram_text_diverged_pages(),
+                  (unsigned long long)exact_mismatches,
+                  (unsigned)exact_last[0], (unsigned)exact_last[1],
+                  (unsigned)exact_last[2], (unsigned)exact_last[3],
+                  (unsigned)exact_last[4]);
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_modified_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_diverged_bitmap_words\":[");
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_diverged_bitmap_word(i));
         if (n >= (int)sizeof(buf) - 64) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
@@ -2683,6 +2734,7 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * argument-passing chains, and answer "who called X with what args"
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
+#include "starvation_ring.h"
 #include "bios_hle.h"
 #include "parity_trace.h"
 #include "device_trace.h"
@@ -5918,7 +5970,7 @@ static void handle_audio_events(int id, const char *json)
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO", "SINK_DROP"
     };
 
     size_t cap = 256u + (size_t)got * 192u;
@@ -6699,6 +6751,13 @@ static void handle_press(int id, const char *json)
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
     s_input_override = buttons;
     s_input_frames   = frames;
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6708,19 +6767,28 @@ extern uint16_t sio_get_pad_buttons(void);
 extern uint16_t sio_get_pad_buttons_slot(int slot);
 extern int sio_get_pad_connected(int slot);
 extern int sio_get_pad_analog(int slot);
+extern void sio_get_pad_sticks(int slot, uint8_t out[4]);
 static void handle_pad_status(int id, const char *json)
 {
     (void)json;
     uint16_t pad0 = sio_get_pad_buttons_slot(0);
     uint16_t pad1 = sio_get_pad_buttons_slot(1);
+    uint8_t sticks0[4], sticks1[4];
+    sio_get_pad_sticks(0, sticks0);
+    sio_get_pad_sticks(1, sticks1);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
-             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
-             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
-             "\"override\":%d,\"override_frames\":%d}\n",
+             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
+             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
+             "\"override\":%d,\"override_frames\":%d,"
+             "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s}\n",
              id, pad0,
              pad0, sio_get_pad_connected(0) ? "true" : "false", sio_get_pad_analog(0) ? "true" : "false",
+             sticks0[0], sticks0[1], sticks0[2], sticks0[3],
              pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
-             s_input_override, s_input_frames);
+             sticks1[0], sticks1[1], sticks1[2], sticks1[3],
+             s_input_override, s_input_frames,
+             s_axis_st[0], s_axis_st[1], s_axis_st[2], s_axis_st[3],
+             s_axis_override ? "true" : "false");
 }
 
 static void handle_clear_input(int id, const char *json)
@@ -10465,6 +10533,46 @@ static void handle_turbo_loads(int id, const char *json)
              (unsigned long long)g_turbo_loads_frames);
 }
 
+/* turbo_audio_sink: opt-in host-output discard while turbo loads run. Guest
+ * SPU state continues advancing; only accelerated playback samples are sunk. */
+static void handle_turbo_audio_sink(int id, const char *json)
+{
+    extern int      g_turbo_audio_sink_enabled;
+    extern int      g_turbo_audio_sink_active;
+    extern uint64_t g_turbo_audio_sink_frames;
+    int n = json_get_int(json, "n", -1);
+    if (n == 0 || n == 1) g_turbo_audio_sink_enabled = n;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"active\":%d,"
+             "\"discarded_spu_frames\":%llu}\n", id,
+             g_turbo_audio_sink_enabled, g_turbo_audio_sink_active,
+             (unsigned long long)g_turbo_audio_sink_frames);
+}
+
+/* load_transitions: state-edge log for physical reads, the bridged logical
+ * load predicate, and host-side turbo pacing. Newest entries are returned
+ * last so adjacent edges can be read as a timeline. */
+static void handle_load_transitions(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    uint64_t total = load_transition_total();
+    uint64_t start = total > (uint64_t)count ? total - (uint64_t)count : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"edges\":[",
+             id, (unsigned long long)total);
+    int emitted = 0;
+    for (uint64_t seq = start; seq < total; seq++) {
+        LoadTransitionEntry e;
+        if (!load_transition_get(seq, &e)) continue;
+        send_fmt("%s{\"seq\":%llu,\"frame\":%u,\"host_ms\":%u,"
+                 "\"read\":%u,\"load\":%u,\"turbo\":%u,\"load_run\":%u}",
+                 emitted++ ? "," : "", (unsigned long long)seq, e.frame,
+                 e.host_ms, e.read_active, e.load_active, e.turbo_active,
+                 e.load_run);
+    }
+    send_fmt("]}\n");
+}
+
 /* cdrom_bursts: dump the always-on CD load-burst ring, newest first. Each
  * record is one gap-separated run of delivered data sectors — i.e. one load.
  * Param "count" (optional, default 32, max 128). */
@@ -10489,6 +10597,18 @@ static void handle_cdrom_bursts(int id, const char *json)
                  b->sectors, b->rate, b->divisor);
     }
     send_fmt("]}\n");
+}
+
+/* cdrom_timing: passive L1.5 physical deadline -> buffer -> INT1 exposure
+ * summary. `reset:1` starts a fresh measurement window without touching the
+ * controller or its schedules. late_bins are exact, 1..64, 65..1024,
+ * 1025..5000, and >5000 guest cycles. */
+static void handle_cdrom_timing(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0) == 1) cdrom_timing_reset();
+    char stats[2048];
+    cdrom_timing_stats_json(stats, (int)sizeof(stats));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, stats);
 }
 
 /* autocompile_status: variant-capture automation state — autocapture
@@ -10696,7 +10816,7 @@ static void handle_overlay_loader_status(int id, const char *json)
         if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
         esc_msg[di++] = msg[si];
     }
-    char buf[2048];
+    char buf[4096];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
         "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
@@ -10755,6 +10875,32 @@ static void handle_overlay_loader_status(int id, const char *json)
         n += snprintf(buf + n, sizeof(buf) - n,
             ",\"image_warm_loaded\":%ld,\"image_warm_pending\":%ld",
             g_overlay_image_warm_loaded, g_overlay_image_warm_pending);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+        {
+            uint64_t checks=0, hits=0, variant_misses=0, address_misses=0;
+            uint64_t rehashes=0, crc_misses=0, static_gen_fastpath=0;
+            extern void psx_overlay_static_get_stats(uint64_t *, uint64_t *,
+                                                     uint64_t *, uint64_t *);
+            extern void overlay_loader_static_match_stats(uint64_t *, uint64_t *,
+                                                          uint64_t *);
+            psx_overlay_static_get_stats(&checks, &hits, &variant_misses,
+                                         &address_misses);
+            overlay_loader_static_match_stats(&rehashes, &crc_misses,
+                                              &static_gen_fastpath);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                ",\"static_checks\":%llu,\"static_hits\":%llu,"
+                "\"static_variant_misses\":%llu,\"static_address_misses\":%llu,"
+                "\"static_rehashes\":%llu,\"static_crc_misses\":%llu,"
+                "\"static_gen_fastpath\":%llu",
+                (unsigned long long)checks,
+                (unsigned long long)hits,
+                (unsigned long long)variant_misses,
+                (unsigned long long)address_misses,
+                (unsigned long long)rehashes,
+                (unsigned long long)crc_misses,
+                (unsigned long long)static_gen_fastpath);
+        }
+#endif
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
@@ -11686,17 +11832,32 @@ static volatile uint32_t s_phot_addr[PHOT_SLOTS];
 static volatile uint64_t s_phot_cnt [PHOT_SLOTS];
 static volatile uint64_t s_phot_native_total = 0, s_phot_drops = 0;
 
-static void phot_add(uint32_t addr)
+/* Same histogram for STATIC-phase samples, keyed on the static-dispatch
+ * stamp (g_debug_current_func_addr). Coarser than the native histogram —
+ * the stamp is per static dispatch, not per C frame — but under CPS the
+ * dispatch cadence is dense enough to attribute wall time to main-EXE
+ * functions (the load-window decompressor question). */
+static volatile uint32_t s_phots_addr[PHOT_SLOTS];
+static volatile uint64_t s_phots_cnt [PHOT_SLOTS];
+static volatile uint64_t s_phot_static_total = 0, s_phots_drops = 0;
+
+static void phot_add_to(volatile uint32_t *ha, volatile uint64_t *hc,
+                        volatile uint64_t *drops, uint32_t addr)
 {
     if (!addr) return;
     uint32_t h = (addr >> 2) * 2654435761u;
     for (uint32_t p = 0; p < 16; p++) {
         uint32_t i = (h + p) & (PHOT_SLOTS - 1u);
-        uint32_t a = s_phot_addr[i];
-        if (a == addr) { s_phot_cnt[i]++; return; }
-        if (a == 0)    { s_phot_addr[i] = addr; s_phot_cnt[i] = 1; return; }
+        uint32_t a = ha[i];
+        if (a == addr) { hc[i]++; return; }
+        if (a == 0)    { ha[i] = addr; hc[i] = 1; return; }
     }
-    s_phot_drops++;
+    (*drops)++;
+}
+
+static void phot_add(uint32_t addr)
+{
+    phot_add_to(s_phot_addr, s_phot_cnt, &s_phot_drops, addr);
 }
 
 #ifdef _WIN32
@@ -11732,7 +11893,14 @@ static void *phase_sampler_main(void *arg)
                 s_phot_native_total++;
                 phot_add(overlay_loader_native_inprogress());
                 break;
-        case 3: s_phase_static[slot]++; break;
+        case 3: s_phase_static[slot]++;
+                s_phot_static_total++;
+                {
+                    extern volatile uint32_t g_psx_last_fn_entry;
+                    phot_add_to(s_phots_addr, s_phots_cnt, &s_phots_drops,
+                                g_psx_last_fn_entry);
+                }
+                break;
         case 4: s_phase_gpu[slot]++; break;
         default: break;                          /* 0 = host/other */
         }
@@ -11795,19 +11963,26 @@ static void handle_phase_profile(int id, const char *json)
 }
 
 /* phase_hot: top guest functions by native wall-time samples (cumulative
- * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N} */
+ * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N}
+ * Optional {"set":"static"} ranks the STATIC-phase histogram instead
+ * (main-EXE functions via the static-dispatch stamp). */
 static void handle_phase_hot(int id, const char *json)
 {
     int top = json_get_int(json, "top", 20);
     if (top < 1)  top = 1;
     if (top > 64) top = 64;
+    char set[16] = "native";
+    json_get_str(json, "set", set, sizeof(set));
+    int is_static = (set[0] == 's');
+    volatile uint32_t *ha = is_static ? s_phots_addr : s_phot_addr;
+    volatile uint64_t *hc = is_static ? s_phots_cnt  : s_phot_cnt;
     uint32_t best_addr[64];
     uint64_t best_cnt[64];
     int n = 0;
     for (int i = 0; i < PHOT_SLOTS; i++) {
-        uint32_t a = s_phot_addr[i];
+        uint32_t a = ha[i];
         if (!a) continue;
-        uint64_t c = s_phot_cnt[i];
+        uint64_t c = hc[i];
         int j = n < top ? n : top - 1;
         if (n < top) n++;
         else if (c <= best_cnt[j]) continue;
@@ -11819,13 +11994,16 @@ static void handle_phase_hot(int id, const char *json)
         best_addr[j] = a;
         best_cnt[j]  = c;
     }
-    uint64_t tot = s_phot_native_total;
+    uint64_t tot = is_static ? s_phot_static_total : s_phot_native_total;
     char buf[4096];
     int len = snprintf(buf, sizeof(buf),
-                       "{\"id\":%d,\"ok\":true,\"native_samples_total\":%llu,"
+                       "{\"id\":%d,\"ok\":true,\"set\":\"%s\","
+                       "\"phase_samples_total\":%llu,"
                        "\"hash_drops\":%llu,\"top\":[",
-                       id, (unsigned long long)tot,
-                       (unsigned long long)s_phot_drops);
+                       id, is_static ? "static" : "native",
+                       (unsigned long long)tot,
+                       (unsigned long long)(is_static ? s_phots_drops
+                                                      : s_phot_drops));
     for (int i = 0; i < n && len < (int)sizeof(buf) - 96; i++) {
         len += snprintf(buf + len, sizeof(buf) - (size_t)len,
                         "%s{\"addr\":\"0x%08X\",\"samples\":%llu,\"share\":%.4f}",
@@ -11857,8 +12035,106 @@ static void handle_idle_skip(int id, const char *json)
              g_idle_skip_last_pc, g_idle_skip_last_quantum);
 }
 
+/* starv_ring: query the always-on starvation/PC-sample ring (16K entries,
+ * continuous since boot). {"cmd":"starv_ring","count":N,"kind":K} -> last N
+ * entries (newest last), K = StarvationEventKind filter (15 = PC samples;
+ * -1/omitted = all kinds). PC samples carry (cyc, host_us, current_func):
+ * consecutive deltas give guest-throughput over wall time, and current_func
+ * localizes where the emu thread was — the ring-buffer answer to "where did
+ * the last N seconds go" without arming anything. */
+static void handle_starv_ring(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    int kind  = json_get_int(json, "kind", -1);
+    if (count < 1)    count = 1;
+    if (count > 2048) count = 2048;
+    uint64_t total = starvation_ring_total();
+    /* Walk backward collecting up to `count` matches, then emit oldest-first. */
+    static uint64_t match_seq[2048];
+    int n = 0;
+    uint64_t seq = total;
+    StarvationEntry e;
+    while (n < count && seq > 0) {
+        seq--;
+        if (!starvation_ring_get(seq, &e)) break;   /* fell off the ring */
+        if (kind >= 0 && e.kind != (uint8_t)kind) continue;
+        match_seq[n++] = seq;
+    }
+    size_t cap = 160u * (size_t)(n + 2);
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "oom"); return; }
+    int len = snprintf(buf, cap,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"returned\":%d,"
+                       "\"entries\":[", id, (unsigned long long)total, n);
+    int emitted = 0;
+    for (int i = n - 1; i >= 0; i--) {              /* oldest first */
+        if (!starvation_ring_get(match_seq[i], &e)) continue;
+        len += snprintf(buf + len, cap - (size_t)len,
+                        "%s{\"seq\":%llu,\"kind\":%u,\"cyc\":%llu,\"us\":%llu,"
+                        "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\",\"in_exc\":%u}",
+                        emitted++ ? "," : "",
+                        (unsigned long long)e.seq, e.kind,
+                        (unsigned long long)e.psx_cycle_count,
+                        (unsigned long long)e.host_us,
+                        e.current_func, e.last_store_pc, e.in_exception);
+        if ((size_t)len + 192 > cap) break;         /* never overrun */
+    }
+    len += snprintf(buf + len, cap - (size_t)len, "]}");
+    (void)len;
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* data_shards: memoized pure-function replay counters (data_shards.c).
+ *   {"cmd":"data_shards"}              -> counters
+ *   {"cmd":"data_shards","enable":0|1} -> toggle, then counters */
+static void handle_data_shards(int id, const char *json)
+{
+    extern void ds_stats_json(char* buf, int cap);
+    extern void ds_set_enabled(int on);
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) ds_set_enabled(en);
+    char body[1024];
+    ds_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* vsync_query_hle: cycle-faithful VSync(-1) query acceleration counters. */
+static void handle_vsync_query_hle(int id, const char *json)
+{
+    extern void psx_vsync_query_hle_stats_json(char* buf, int cap);
+    extern void psx_vsync_query_hle_set_enabled(int on);
+    extern void psx_vsync_query_hle_set_horizon_enabled(int on);
+    extern void psx_vsync_query_hle_set_extra_horizon_enabled(int on);
+    int en = json_get_int(json, "enable", -1);
+    int horizon = json_get_int(json, "horizon", -1);
+    int extra = json_get_int(json, "extra", -1);
+    if (en == 0 || en == 1) psx_vsync_query_hle_set_enabled(en);
+    if (horizon == 0 || horizon == 1)
+        psx_vsync_query_hle_set_horizon_enabled(horizon);
+    if (extra == 0 || extra == 1)
+        psx_vsync_query_hle_set_extra_horizon_enabled(extra);
+    char body[512];
+    psx_vsync_query_hle_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* warm_cd_route: live A/B toggle and fail-closed route counters. */
+static void handle_warm_cd_route(int id, const char *json)
+{
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) cdrom_warm_route_set_enabled(en);
+    char body[512];
+    cdrom_warm_route_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
+}
+
 static const CmdEntry s_commands[] = {
     { "phase_profile",     handle_phase_profile },
+    { "starv_ring",        handle_starv_ring },
+    { "data_shards",       handle_data_shards },
+    { "vsync_query_hle",   handle_vsync_query_hle },
+    { "warm_cd_route",     handle_warm_cd_route },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },
@@ -12129,7 +12405,10 @@ static const CmdEntry s_commands[] = {
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cd_overwrite",         handle_cd_overwrite },
     { "cdrom_bursts",         handle_cdrom_bursts },
+    { "cdrom_timing",         handle_cdrom_timing },
     { "turbo_loads",          handle_turbo_loads },
+    { "turbo_audio_sink",     handle_turbo_audio_sink },
+    { "load_transitions",     handle_load_transitions },
     { "autocompile_status",   handle_autocompile_status },
     { "sljit_status",         handle_sljit_status },
     { "sljit_async",          handle_sljit_async },
@@ -12836,11 +13115,12 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    int current = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0)
             s_input_override = -1;
     }
-    return s_input_override;
+    return current;
 }
 
 int debug_server_get_axis_override(unsigned char st[4])

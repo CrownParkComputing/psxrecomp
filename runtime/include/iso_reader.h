@@ -52,15 +52,32 @@ struct RootDirectoryInfo {
 
 /**
  * A CD track parsed from the .cue sheet (or the synthesized single data
- * track for a bare .bin/.iso). Multi-track discs (Tomba 2 etc.) carry a
+ * track for a bare .bin/.iso). Multi-track discs can carry a
  * Red Book CD-DA audio track after the data track; the CD model's TOC
  * commands (GetTN/GetTD) must report them.
  */
 struct CDTrack {
-    int      number;      // 1-based track number
+    int      number;     // 1-based track number
     bool     is_audio;   // true = CD-DA audio (Red Book); false = data
-    uint32_t start_lba;  // absolute disc LBA (absolute from start of disc)
-    std::string bin_path; // path to the .bin file for this track
+    uint32_t start_lba;  // disc-relative start LBA (cue INDEX 01; track 1 = 0).
+                         // Single-FILE cues: equals the .bin-relative INDEX time.
+                         // Multi-FILE cues (redump "(Track N).bin" dumps): the
+                         // owning file's first disc sector plus its INDEX time.
+    uint32_t pregap_lba; // disc-relative INDEX 00, or INDEX 01 when absent
+};
+
+/**
+ * One BINARY file backing a contiguous run of disc sectors. Single-file
+ * images have exactly one segment; redump-style dumps have one per track
+ * file, concatenated in cue order to form the flat disc-sector space that
+ * ReadSector()/ReadRawSector() address.
+ */
+struct BinSegment {
+    std::string   path;          // resolved on-disk path
+    std::ifstream file;          // opened for the reader's lifetime
+    uint32_t      start_lba;     // first disc-relative sector of this file
+    uint32_t      sector_count;  // sectors stored in this file
+    bool          raw;           // 2352-byte raw sectors (BIN) vs 2048 (ISO)
 };
 
 class ISOReader {
@@ -129,10 +146,11 @@ public:
     /**
      * CD-track TOC accessors (multi-track .cue support).
      * TrackCount() is >= 1 (a bare image synthesizes one data track).
-     * TrackStartLBA(n)/TrackIsAudio(n) take a 1-based track number.
+     * TrackStartLBA(n)/TrackPregapLBA(n)/TrackIsAudio(n) take a 1-based track number.
      */
     int      TrackCount() const;
     uint32_t TrackStartLBA(int track) const;
+    uint32_t TrackPregapLBA(int track) const;
     bool     TrackIsAudio(int track) const;
 
     /**
@@ -202,26 +220,17 @@ private:
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
 
     /**
-     * Find the track index for a given LBA
-     * @param lba Logical Block Address
-     * @return Index in tracks_ vector, or -1 if not found
+     * Helper: find the BinSegment containing a disc-relative LBA.
+     * @return segment pointer, or nullptr when lba is past the disc end
      */
-    int FindTrackForLBA(uint32_t lba) const;
+    BinSegment* SegmentForLBA(uint32_t lba);
 
-    /**
-     * Open a BIN file for a specific track
-     * @param track_idx Index in tracks_ vector
-     * @return true if opened successfully
-     */
-    bool OpenTrackBIN(int track_idx);
-
-std::ifstream file_;
     bool is_open_;
     std::string volume_id_;
-    std::string bin_path_;
+    std::string bin_path_;          // first (data) segment; kept for callers
     RootDirectoryInfo root_dir_;
     std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
-    std::map<std::string, std::ifstream> bin_files_;  // per-track BIN files
+    std::vector<BinSegment> segments_;  // cue FILE entries in disc order; >=1 after Open()
 };
 
 } // namespace PS1

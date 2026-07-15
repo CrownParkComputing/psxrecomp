@@ -464,9 +464,12 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 r.supported = true;
                 r.is_terminator = true;
                 r.terminator_kind = "jr";
+                r.pre_delay_code = fmt::format(
+                    "uint32_t psx_jt_{:08X} = cpu->gpr[{}];",
+                    d.address, static_cast<int>(rs));
                 r.c_code = fmt::format(
-                    "cpu->pc = cpu->gpr[{}]; /* jr {} -- slice terminator (indirect) */ return;",
-                    static_cast<int>(rs), gpr_name(rs));
+                    "cpu->pc = psx_jt_{:08X}; /* jr {} -- slice terminator (latched indirect) */ return;",
+                    d.address, gpr_name(rs));
                 r.comment = fmt::format("jr {}", gpr_name(rs));
                 return r;
             }
@@ -480,9 +483,12 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                         "cpu->gpr[{}] = 0x{:08X}u; /* link */ ",
                         static_cast<int>(rd), d.address + 8);
                 }
+                r.pre_delay_code = fmt::format(
+                    "uint32_t psx_jt_{:08X} = cpu->gpr[{}]; {}",
+                    d.address, static_cast<int>(rs), link);
                 r.c_code = fmt::format(
-                    "{}cpu->pc = cpu->gpr[{}]; /* jalr {}, {} -- slice terminator (indirect) */ return;",
-                    link, static_cast<int>(rs), gpr_name(rd), gpr_name(rs));
+                    "cpu->pc = psx_jt_{:08X}; /* jalr {}, {} -- slice terminator (latched indirect) */ return;",
+                    d.address, gpr_name(rd), gpr_name(rs));
                 r.comment = fmt::format("jalr {}, {}", gpr_name(rd), gpr_name(rs));
                 return r;
             }
@@ -1380,13 +1386,17 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         if (offset == 0) {
             r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word(cpu->gpr[{}], {});",
-                d.address, static_cast<int>(rs), value);
+                "cpu->write_word(cpu->gpr[{}], {}); "
+                "gte_precision_store_word(cpu->gpr[{}], {});",
+                d.address, static_cast<int>(rs), value,
+                static_cast<int>(rs), static_cast<int>(rt));
         } else {
             r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
-                d.address, static_cast<int>(rs), static_cast<int>(offset), value);
+                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {}); "
+                "gte_precision_store_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
+                d.address, static_cast<int>(rs), static_cast<int>(offset), value,
+                static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
         }
         r.comment = fmt::format("swc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));

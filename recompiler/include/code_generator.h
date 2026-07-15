@@ -5,10 +5,13 @@
 #include <vector>
 #include <sstream>
 #include <set>
+#include <map>
+#include <array>
 #include "ps1_exe_parser.h"
 #include "function_analysis.h"
 #include "control_flow.h"
 #include "../src/annotations.hpp"
+#include "../src/config_loader.h"
 
 namespace PSXRecomp {
 
@@ -43,12 +46,26 @@ struct CodeGenConfig {
     // mismatch is EXPECTED (apply the transform only where the bytes match, skip
     // it elsewhere) rather than a hard config error.
     bool overlay_mode = false;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     std::string indent;           // Indentation string (default: "    ")
     // Widescreen sprite-tag hooks ([widescreen] sprite_tag_funcs): functions
     // that get a psx_ws_sprite_tag(cpu) callback emitted at entry, so the
     // runtime can record the per-prim pointer ($a0) + projected anchor for
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
+
+    // Data-shard hooks ([data_shards] funcs): memoized pure-function replay.
+    // Entry gets `if (psx_datashard_enter(cpu, KEY)) return;` (replay path),
+    // every jr-$ra return gets `psx_datashard_ret(cpu)` (capture finalize).
+    // See docs/DATA_SHARDS.md. Empty = no hooks (default).
+    std::set<uint32_t> data_shard_funcs;
+
+    // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
+    // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
+    // guest RAM VBlank counter returned by that query path.  Empty = inert.
+    // value = {VBlank counter, GPUSTAT-pointer global, Timer1-pointer global,
+    //          cached Timer1 global}
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
 
     // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
     // callback at entry so host-only wide pixels cannot survive a stage swap.
@@ -194,6 +211,10 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // Exact manifest for the final function/CFG set emitted by the most recent
+    // generate_file() call, including functions synthesized by its split pass.
+    const std::string& last_ranges_manifest() const { return last_ranges_manifest_; }
+
     // Set known functions for this compilation unit (for linking)
     void set_known_functions(const std::set<uint32_t>& functions) {
         known_functions_ = functions;
@@ -206,6 +227,7 @@ private:
     const PS1Executable& exe_;
     CodeGenConfig config_;
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
+    std::string last_ranges_manifest_;
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
 

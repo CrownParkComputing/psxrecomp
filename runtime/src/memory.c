@@ -19,6 +19,7 @@
 #include "spu.h"
 #include "timers.h"
 #include "lockstep.h"
+#include "data_shards.h"
 #include "psx_cycles.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -298,6 +299,12 @@ static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint64_t g_text_native_blocked = 0;
 static uint32_t g_text_diverged_pages = 0;
+static uint64_t g_text_exact_mismatches = 0;
+static uint32_t g_text_exact_last_range_lo = 0;
+static uint32_t g_text_exact_last_range_len = 0;
+static uint32_t g_text_exact_last_mismatch = 0;
+static uint32_t g_text_exact_last_live = 0;
+static uint32_t g_text_exact_last_ref = 0;
 
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
@@ -310,6 +317,12 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_native_blocked = 0;
     g_text_diverged_pages = 0;
+    g_text_exact_mismatches = 0;
+    g_text_exact_last_range_lo = 0;
+    g_text_exact_last_range_len = 0;
+    g_text_exact_last_mismatch = 0;
+    g_text_exact_last_live = 0;
+    g_text_exact_last_ref = 0;
 }
 
 int dirty_ram_text_image_registered(void) { return text_ref_image != NULL; }
@@ -367,6 +380,61 @@ int dirty_ram_text_native_ok(uint32_t phys) {
     return 0;
 }
 
+/* Validate the exact instruction ranges emitted for a static game function.
+ * Each pair is {virtual/physical lo, byte len}; non-code gaps and mutable data
+ * on the same page are intentionally absent. Unlike the legacy 256-byte probe,
+ * a mismatch never poisons an unrelated 4 KB page forever: every decision is
+ * made from the live bytes the native body will actually execute. */
+int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
+                                    uint32_t count) {
+    if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
+            len > text_ref_hi - phys) {
+            g_text_native_blocked++;
+            return 0;
+        }
+        if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
+            uint32_t off = 0;
+            const uint8_t *live = ram + phys;
+            const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
+            while (off < len && live[off] == ref[off]) off++;
+            g_text_exact_mismatches++;
+            g_text_exact_last_range_lo = phys;
+            g_text_exact_last_range_len = len;
+            g_text_exact_last_mismatch = phys + off;
+            g_text_exact_last_live = off < len ? live[off] : 0;
+            g_text_exact_last_ref = off < len ? ref[off] : 0;
+            uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
+            uint32_t last_page = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+            for (uint32_t page = first_page; page <= last_page; page++) {
+                uint32_t bit = 1u << (page & 31u);
+                uint32_t *word = &text_diverged_bitmap[page >> 5];
+                if (!(*word & bit)) {
+                    *word |= bit;
+                    g_text_diverged_pages++;
+                }
+            }
+            g_text_native_blocked++;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
+                                         uint32_t out[5]) {
+    if (count) *count = g_text_exact_mismatches;
+    if (!out) return;
+    out[0] = g_text_exact_last_range_lo;
+    out[1] = g_text_exact_last_range_len;
+    out[2] = g_text_exact_last_mismatch;
+    out[3] = g_text_exact_last_live;
+    out[4] = g_text_exact_last_ref;
+}
+
 /* Bless an INTENTIONAL data patch into the reference image so the text-divergence
  * guard does not mistake it for self-modifying code. The runtime's own
  * translation layer (text_xlate) patches string/glyph tables that share 4 KB
@@ -398,6 +466,14 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
 
 uint64_t dirty_ram_text_native_blocked(void) { return g_text_native_blocked; }
 uint32_t dirty_ram_text_diverged_pages(void) { return g_text_diverged_pages; }
+uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index) {
+    if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
+    return text_modified_bitmap[word_index];
+}
+uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index) {
+    if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
+    return text_diverged_bitmap[word_index];
+}
 
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
@@ -443,6 +519,10 @@ int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
     if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
+    /* Experimental fallback for overlays copied into their final location by
+     * ordinary guest CPU stores rather than CD DMA. Dispatch above the static
+     * image floor is treated as dynamic and validated by the interpreter. */
+    if (phys >= g_overlay_region_floor) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
@@ -1133,8 +1213,14 @@ extern int g_ls_suppress_record;
 extern int g_dma_exec_depth;
 extern int psx_get_in_exception(void);
 static uint32_t psx_read_word_raw(uint32_t addr);
+/* data-shard capture feed (data_shards.c): record guest reads/writes while a
+ * capture window is armed. Same exclusions as the lockstep hooks: never in
+ * exception context (ISR work replays live), never under DMA (DMA writes
+ * poison the window via ds_note_dma_write instead). */
 uint32_t psx_read_word(uint32_t addr) {
     if (g_ls_mode == 2) return ls_read_hook(addr, 4, 0u);
+    if (g_ds_recording && g_dma_exec_depth == 0 && !psx_get_in_exception())
+        ds_note_read(addr, 4);
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_word_raw(addr);
     s_ls_op_active = 1;
     uint32_t v = psx_read_word_raw(addr);
@@ -1237,10 +1323,15 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
 }
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
+extern void gte_precision_invalidate_word(uint32_t addr);
 void psx_write_word(uint32_t addr, uint32_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
+    if (g_ds_recording) {
+        if (g_dma_exec_depth > 0) ds_note_dma_write();
+        else if (!psx_get_in_exception()) ds_note_write(addr, 4);
+    }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
     s_ls_op_active = 1;
@@ -1249,6 +1340,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
+    gte_precision_invalidate_word(addr);
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
     /* KSEG2 guard — see psx_read_word_raw. */
@@ -1381,6 +1473,8 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
 static uint16_t psx_read_half_raw(uint32_t addr);
 uint16_t psx_read_half(uint32_t addr) {
     if (g_ls_mode == 2) return (uint16_t)ls_read_hook(addr, 2, 0u);
+    if (g_ds_recording && g_dma_exec_depth == 0 && !psx_get_in_exception())
+        ds_note_read(addr, 2);
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_half_raw(addr);
     s_ls_op_active = 1;
     uint16_t v = psx_read_half_raw(addr);
@@ -1417,6 +1511,10 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
+    if (g_ds_recording) {
+        if (g_dma_exec_depth > 0) ds_note_dma_write();
+        else if (!psx_get_in_exception()) ds_note_write(addr, 2);
+    }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
     s_ls_op_active = 1;
@@ -1425,6 +1523,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 }
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     g_guest_store_count++;
+    gte_precision_invalidate_word(addr);
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */
@@ -1616,6 +1715,10 @@ uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t r
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
     return psx_read_word(addr);
 }
+void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
+                                   uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
+}
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
     return psx_read_half(addr);
@@ -1656,6 +1759,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 }
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     g_guest_store_count++;
+    gte_precision_invalidate_word(addr);
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */

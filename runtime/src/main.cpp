@@ -15,6 +15,7 @@
 #include "text_xlate.h"
 #include "boot_state.h"
 #include "bios_hle.h"
+#include "load_accel.h"
 #include "savestate.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
@@ -24,6 +25,7 @@
 #include "overlay_backend.h"
 #include "gpu.h"
 #include "present_ring.h"
+#include "load_transition_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
@@ -56,7 +58,11 @@
 #include "launcher.h"
 #endif
 #include <SDL.h>
+#if defined(PSX_WEB)
+#include <emscripten/emscripten.h>
+#endif
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -92,6 +98,21 @@
 #endif
 
 extern "C" uint64_t gte_get_exec_count(void);
+
+/* Cross-language globals defined in C translation units. Declared extern "C" at
+ * file scope so MSVC gives them C linkage (matching the C definitions); without
+ * this MSVC name-mangles the C++ references and they fail to link. GCC/Clang do
+ * not mangle namespace-scope variables, so this is a no-op there. The existing
+ * block-scope `extern` redeclarations inside functions inherit this C linkage. */
+extern "C" {
+    extern uint64_t psx_cycle_count;
+    extern uint64_t s_frame_count;
+    extern uint32_t g_overlay_region_floor;
+    extern int      g_psx_cps_mode;
+    extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+    extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+    extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+}
 
 /* memory.c */
 extern "C" void     memory_init(const char* bios_path);
@@ -259,6 +280,120 @@ static PlayerInput g_players[2];
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
 
+/* Presentation-only interpolation for software-rendered content that repeats
+ * each guest image for two vblanks. This never changes guest or audio timing. */
+static std::atomic<int> g_smooth_60fps{0};
+
+struct Smooth60State {
+    std::vector<uint32_t> previous_source;
+    uint64_t source_hash = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool have_source = false;
+    bool previous_was_duplicate = false;
+    bool announced = false;
+};
+
+static Smooth60State g_smooth_60_state;
+
+static void smooth_60_reset(void) {
+    g_smooth_60_state.previous_source.clear();
+    g_smooth_60_state.source_hash = 0;
+    g_smooth_60_state.width = 0;
+    g_smooth_60_state.height = 0;
+    g_smooth_60_state.have_source = false;
+    g_smooth_60_state.previous_was_duplicate = false;
+}
+
+static uint64_t smooth_60_frame_hash(const uint32_t* pixels, size_t count) {
+    uint64_t hash = 1469598103934665603ull;
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    for (size_t i = 0; i < count; i += step) {
+        hash ^= pixels[i];
+        hash *= 1099511628211ull;
+    }
+    hash ^= count;
+    return hash * 1099511628211ull;
+}
+
+static bool smooth_60_scene_cut(const uint32_t* current,
+                                const uint32_t* previous,
+                                size_t count) {
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    uint64_t difference = 0;
+    size_t samples = 0;
+    size_t large_changes = 0;
+    for (size_t i = 0; i < count; i += step) {
+        const uint32_t a = current[i];
+        const uint32_t b = previous[i];
+        const unsigned dr = (unsigned)std::abs((int)((a >> 16) & 0xFFu) -
+                                               (int)((b >> 16) & 0xFFu));
+        const unsigned dg = (unsigned)std::abs((int)((a >> 8) & 0xFFu) -
+                                               (int)((b >> 8) & 0xFFu));
+        const unsigned db = (unsigned)std::abs((int)(a & 0xFFu) -
+                                               (int)(b & 0xFFu));
+        const unsigned pixel_difference = dr + dg + db;
+        difference += pixel_difference;
+        if (pixel_difference > 320u) large_changes++;
+        samples++;
+    }
+    return samples && large_changes * 4u > samples * 3u &&
+           difference > (uint64_t)samples * 360u;
+}
+
+static void smooth_60_present(uint32_t* pixels, uint32_t width, uint32_t height,
+                              bool eligible) {
+    if (!eligible || !pixels || !g_smooth_60fps.load(std::memory_order_acquire)) {
+        if (g_smooth_60_state.have_source) smooth_60_reset();
+        return;
+    }
+    Smooth60State& state = g_smooth_60_state;
+    const size_t count = (size_t)width * height;
+    if (!count) { smooth_60_reset(); return; }
+    const uint64_t hash = smooth_60_frame_hash(pixels, count);
+    if (!state.have_source || state.width != width || state.height != height) {
+        state.previous_source.assign(pixels, pixels + count);
+        state.source_hash = hash;
+        state.width = width;
+        state.height = height;
+        state.have_source = true;
+        state.previous_was_duplicate = false;
+        return;
+    }
+    const bool duplicate = hash == state.source_hash &&
+        std::memcmp(pixels, state.previous_source.data(), count * sizeof(uint32_t)) == 0;
+    if (duplicate) { state.previous_was_duplicate = true; return; }
+    const bool interpolate = state.previous_was_duplicate &&
+        !smooth_60_scene_cut(pixels, state.previous_source.data(), count);
+    state.previous_was_duplicate = false;
+    state.source_hash = hash;
+    if (!interpolate) {
+        std::copy(pixels, pixels + count, state.previous_source.begin());
+        return;
+    }
+    if (!state.announced) {
+        std::fprintf(stdout,
+            "psxrecomp: 60 FPS smoothing active (guest timing preserved)\n");
+        state.announced = true;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t current = pixels[i];
+        const uint32_t previous = state.previous_source[i];
+        state.previous_source[i] = current;
+        pixels[i] = 0xFF000000u |
+            (((current & 0x00FEFEFEu) >> 1) + ((previous & 0x00FEFEFEu) >> 1));
+    }
+}
+
+extern "C" void psx_smooth_60fps_set(int enabled) {
+    g_smooth_60fps.store(enabled ? 1 : 0, std::memory_order_release);
+}
+#if defined(PSX_WEB)
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
+    psx_smooth_60fps_set(enabled);
+}
+#endif
+
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
@@ -331,6 +466,8 @@ static bool          g_ws_hud_sprt = false;
 /* Runtime-only transition cleanup; kept out of gpu.h because generated game
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
+extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
+extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -357,6 +494,17 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     }
     *w = width;
     *h = width * den / num;
+}
+
+/* SDL GL attributes are global inputs to the next context creation.  Set the
+ * runtime requirements immediately before every GL window, because launcher
+ * teardown resets them and macOS otherwise supplies a legacy 2.1 context. */
+static void configure_core_gl_context_attributes() {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 }
 
 /* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
@@ -395,14 +543,18 @@ int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
 extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
+int      g_turbo_audio_sink_enabled = 0;
+int      g_turbo_audio_sink_active = 0;
+uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued */
 }
-/* Engage turbo only after a load has been continuously in progress for this many
- * frames. Filters brief incidental reads (e.g. a boss/stage-select screen that
- * streams XA music and reads a few preview sectors as you hover): each 1-2 frame
- * blip would otherwise flip turbo on, muting the music for the audio hangover and
- * stuttering the frame rate. Real loads hold for hundreds of frames, so they
- * lose only this brief authentic-paced prefix. */
-#define TURBO_LOADS_ENGAGE_FRAMES 20
+/* The CD predicate already excludes XA and holds across ordinary inter-file
+ * gaps. A short engage debounce rejects a one-frame controller blip without
+ * leaving a visible authentic-paced prefix on every real load. Once engaged,
+ * a symmetric release debounce rides through tiny late-sector/IRQ gaps. This
+ * changes host presentation/pacing only; guest cycles and input sampling keep
+ * advancing normally. */
+#define TURBO_LOADS_ENGAGE_FRAMES  4
+#define TURBO_LOADS_RELEASE_FRAMES 6
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -782,6 +934,16 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
     // Anchor on the exe directory — never cwd (see exe_dir_from_argv).
     fs::path found = find_upward(exe_dir_from_argv(argv0), p);
     if (!found.empty()) return found / p;
+
+    // Dev-checkout rung: game projects keep the framework at
+    // <game root>/psxrecomp-v4 (junction/worktree), so a relative default like
+    // "bios/SCPH1001.BIN" lives under that prefix rather than at the game root.
+    // A user install has no psxrecomp-v4 directory, so this rung cannot
+    // resolve a build-machine BIOS there — it falls through to bios.cfg or the
+    // interactive picker.
+    const fs::path dev_marker = fs::path("psxrecomp-v4") / p;
+    found = find_upward(exe_dir_from_argv(argv0), dev_marker);
+    if (!found.empty()) return found / dev_marker;
     return p;
 }
 
@@ -827,14 +989,17 @@ static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
 static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
 static int       sdl_audio_fadein_left  = 0;
 
-static void sdl_audio_pump(void) {
+static void sdl_audio_pump(bool discard_output = false) {
     if (!sdl_audio_device) return;
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
     const bool legacy = audio_legacy_mode();
     static int had_audio = 0;
     uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
-    if (legacy) {
+    if (discard_output) {
+        /* Host-only sink: skip all queue/bridge interaction, but continue to
+         * the guest-cycle sample budget and spu_render below. */
+    } else if (legacy) {
         /* Historical push model + baseline measurement: a drained (==0) queue
          * means the device was silence-filling since the last pump = a gap.
          * Only meaningful after the first audio has been queued. */
@@ -900,6 +1065,11 @@ static void sdl_audio_pump(void) {
 
     audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
+    if (discard_output) {
+        g_turbo_audio_sink_frames += (uint64_t)frames;
+        audio_trace_event(AUDIO_EV_SINK_DROP, (uint32_t)frames, 0);
+        return;
+    }
     if (sdl_audio_fadein_left > 0) {
         const float g0 = 1.0f - (float)sdl_audio_fadein_left
                                 / (float)sdl_audio_fade_samples;
@@ -1039,7 +1209,7 @@ static void runtime_perf_diag_tick() {
     for (int i = 0; i < 6; i++) last_up[i] = up[i];
 }
 
-static void sdl_audio_update(int turbo_active) {
+static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
     if (!sdl_audio_device) return;
     {   /* Tag audio events with the vblank frame counter. */
         extern uint64_t s_frame_count;
@@ -1048,8 +1218,9 @@ static void sdl_audio_update(int turbo_active) {
     const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
     static int muted = 0;
     static int hangover = 0;
+    static int sink_was_active = 0;
 
-    if (turbo_active) {
+    if (hard_mute_active) {
         if (!muted) {
             int tail = sdl_audio_fade_samples;
             const int buf_cap = (int)(sizeof(sdl_audio_buf) / (2 * sizeof(int16_t)));
@@ -1084,7 +1255,24 @@ static void sdl_audio_update(int turbo_active) {
         extern int g_audio_unmute_resync;
         g_audio_unmute_resync = 1;
     }
-    sdl_audio_pump();
+    if (turbo_sink_active) {
+        if (!sink_was_active) {
+            sink_was_active = 1;
+            audio_trace_event(AUDIO_EV_MUTE, 0, 2); /* b=2: discard-only sink */
+        }
+        g_turbo_audio_sink_active = 1;
+        sdl_audio_pump(true);
+        return;
+    }
+    g_turbo_audio_sink_active = 0;
+    if (sink_was_active) {
+        sink_was_active = 0;
+        sdl_audio_fadein_left = sdl_audio_fade_samples;
+        audio_trace_event(AUDIO_EV_UNMUTE,
+                          (uint32_t)sdl_audio_fadein_left, 2);
+        g_audio_unmute_resync = 1;
+    }
+    sdl_audio_pump(false);
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
@@ -1513,11 +1701,34 @@ static uint16_t pad_from_keyboard(int player) {
     return psx_keybinds_pad_word(keys, player);
 }
 
-static uint16_t controller_pad_buttons(SDL_GameController* h) {
+/* A left/right ANALOG-STICK axis source (LEFTX/LEFTY/RIGHTX/RIGHTY), as opposed
+ * to a trigger axis (L2/R2) or a button. The default map folds the left stick
+ * onto the D-pad bits (up=dpup,lefty- … right=dpright,leftx+) so the stick works
+ * as a D-pad for DIGITAL games. In ANALOG mode that fold is WRONG: the stick
+ * already drives the analog axes, and on a real DualShock the stick and D-pad
+ * are independent — so a dual-analog game that uses the D-pad as its own control
+ * (e.g. Ape Escape's camera rotate) would see phantom D-pad presses from every
+ * stick movement, and constant rotation from centre drift. controller_pad_buttons
+ * suppresses these sources when the pad presents as analog. Trigger axes and
+ * button sources are never suppressed. */
+static bool source_is_stick_axis(const ControllerSource& s) {
+    if (s.kind != ControllerSource::Kind::AxisPositive &&
+        s.kind != ControllerSource::Kind::AxisNegative) return false;
+    return s.id == SDL_CONTROLLER_AXIS_LEFTX  || s.id == SDL_CONTROLLER_AXIS_LEFTY ||
+           s.id == SDL_CONTROLLER_AXIS_RIGHTX || s.id == SDL_CONTROLLER_AXIS_RIGHTY;
+}
+
+/* Build the active-low PSX button word from a controller's input.ini map. When
+ * suppress_stick_axes is set (the pad is presenting as analog this frame), the
+ * left/right analog-stick axes do NOT contribute button bits — see
+ * source_is_stick_axis above. Digital mode passes false, so the stick still
+ * folds onto the D-pad (its only outlet there). */
+static uint16_t controller_pad_buttons(SDL_GameController* h, bool suppress_stick_axes) {
     uint16_t buttons = 0xFFFF;  /* all released */
     if (!h) return buttons;
     for (const auto& entry : controller_map) {
         for (const auto& source : entry.sources) {
+            if (suppress_stick_axes && source_is_stick_axis(source)) continue;
             if (controller_source_pressed_h(h, source)) {
                 buttons &= (uint16_t)~entry.bit;
                 break;
@@ -1558,9 +1769,9 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby)
 
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
-static uint16_t pad_buttons_for(const PlayerInput& p, int player) {
+static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
     if (p.kind == 1) return pad_from_keyboard(player);
-    if (p.kind == 2) return controller_pad_buttons(p.handle);
+    if (p.kind == 2) return controller_pad_buttons(p.handle, suppress_stick_axes);
     return 0xFFFF;
 }
 
@@ -1664,7 +1875,7 @@ static bool dev_any_input_enabled() {
  * closes a shared device this self-heals by reopening next frame). This does NOT
  * disturb per-slot routing — SDL returns the same handle for an already-open
  * device, so reads are shared and harmless. */
-static uint16_t dev_all_controllers_buttons() {
+static uint16_t dev_all_controllers_buttons(bool suppress_stick_axes) {
     uint16_t btn = 0xFFFF;
     const int n = SDL_NumJoysticks();
     for (int i = 0; i < n; i++) {
@@ -1672,7 +1883,7 @@ static uint16_t dev_all_controllers_buttons() {
         SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
         SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
         if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
-        if (h) btn &= controller_pad_buttons(h);
+        if (h) btn &= controller_pad_buttons(h, suppress_stick_axes);
     }
     return btn;
 }
@@ -1756,38 +1967,57 @@ static void sample_pad_into_sio(int override) {
         const bool dev_here = (dev_any_input_enabled() && s == 0);
         if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
-        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). In dev mode P1
-         * also folds in the keyboard binds and EVERY connected controller. */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
-        if (dev_here) {
-            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
-            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
-        }
-        sio_set_pad_state_slot(s, btn);
-
-        /* Resolve the pad type this frame. An assigned device keeps its configured
-         * mode (a launcher-selected analog DualShock stays analog, so its input
-         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
-         * device but dev-any-input on presents as HYBRID — boots analog like a
-         * DualShock and auto-drops to digital on the d-pad — so any plugged
-         * controller and the keyboard both navigate. */
+        /* Resolve the pad type this frame FIRST — the effective analog/digital
+         * state gates how the left stick is read for BOTH the button word and the
+         * analog axes below. An assigned device keeps its configured mode (a
+         * launcher-selected analog DualShock stays analog, so its input path / SIO
+         * handshake cadence is preserved exactly). A P1 with no assigned device but
+         * dev-any-input on presents as HYBRID — boots analog like a DualShock and
+         * auto-drops to digital on the d-pad — so any plugged controller and the
+         * keyboard both navigate. The hybrid latch reads raw device state, so it is
+         * safe to resolve here before the button word is built. */
         int mode;
         if (p.kind != 0)      mode = p.mode;
         else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
         else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
-        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
         if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
             eff_analog = 0;
         } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             eff_analog = 1;
-            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
             if (hybrid_stick_active(p))                       p.hybrid_analog = true;
             else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
+        }
+
+        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
+         * active-low, so AND combines "pressed on either source"). In dev mode P1
+         * also folds in the keyboard binds and EVERY connected controller. When the
+         * pad presents as ANALOG this frame (eff_analog), the left/right analog-
+         * stick axes are suppressed as button sources so the stick drives ONLY the
+         * analog axes — the D-pad bits then come solely from the physical D-pad,
+         * exactly as on a real DualShock. This is what stops a dual-analog game's
+         * D-pad control (Ape Escape's camera rotate) from being spun by stick
+         * movement or centre drift. Digital mode keeps the stick->D-pad fold. */
+        const bool suppress_stick = (eff_analog != 0);
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player, suppress_stick)
+                                     : (uint16_t)0xFFFF;
+        if (dev_here) {
+            btn &= pad_from_keyboard(1);                        /* keyboard P1 binds  */
+            btn &= dev_all_controllers_buttons(suppress_stick); /* any plugged-in pad */
+        }
+        sio_set_pad_state_slot(s, btn);
+
+        /* Analog axes. Pinned-ANALOG folds the physical D-pad onto the left axes
+         * (fold_dpad) so the D-pad still moves stick-only games; HYBRID feeds the
+         * raw stick when currently analog (no fold — the D-pad drives its own
+         * digital path there); DIGITAL leaves the axes centred. */
+        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+        if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
+            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
+        } else if (eff_analog) {  /* HYBRID, currently presenting analog */
+            pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
         /* Dev mode: fold the keyboard's stick binds AND any connected controller's
          * sticks onto the analog stick, so an analog-mode P1 steers from whatever
@@ -1957,6 +2187,44 @@ static PresRingEntry* present_ring_commit(uint8_t path, uint16_t disp_w,
     return e;
 }
 
+/* ---- Load-transition ring ---------------------------------------------
+ * State edges only, rather than one record per frame. This makes the exact
+ * CD-read -> bridged-load -> turbo -> paced transitions cheap and queryable
+ * without changing any runtime behavior. */
+#define LOAD_TRANSITION_CAP 512u
+static LoadTransitionEntry s_load_transitions[LOAD_TRANSITION_CAP];
+static uint64_t s_load_transition_total = 0;
+
+extern "C" uint64_t load_transition_total(void) {
+    return s_load_transition_total;
+}
+extern "C" int load_transition_get(uint64_t seq, LoadTransitionEntry *out) {
+    if (seq >= s_load_transition_total) return 0;
+    if (s_load_transition_total - seq > LOAD_TRANSITION_CAP) return 0;
+    *out = s_load_transitions[seq & (LOAD_TRANSITION_CAP - 1u)];
+    return 1;
+}
+
+static void load_transition_note(int read_active, int load_active,
+                                 int turbo_active, int load_run) {
+    static int prev_read = -1, prev_load = -1, prev_turbo = -1;
+    if (read_active == prev_read && load_active == prev_load &&
+        turbo_active == prev_turbo) return;
+    extern uint64_t s_frame_count;
+    LoadTransitionEntry *e =
+        &s_load_transitions[s_load_transition_total & (LOAD_TRANSITION_CAP - 1u)];
+    s_load_transition_total++;
+    e->frame = (uint32_t)s_frame_count;
+    e->host_ms = (uint32_t)SDL_GetTicks();
+    e->load_run = (uint16_t)(load_run > 0xFFFF ? 0xFFFF : load_run);
+    e->read_active = (uint8_t)(read_active != 0);
+    e->load_active = (uint8_t)(load_active != 0);
+    e->turbo_active = (uint8_t)(turbo_active != 0);
+    prev_read = read_active;
+    prev_load = load_active;
+    prev_turbo = turbo_active;
+}
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -2010,6 +2278,40 @@ static void sdl_vblank_present(void) {
         }
     }
     runtime_perf_diag_tick();
+
+    /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
+     * than presents so turbo and skipped-frame modes still report game speed. */
+    {
+        static Uint64 fps_last_time = 0;
+        static uint64_t fps_last_frame = 0;
+        static std::string fps_base_title;
+        extern uint64_t s_frame_count;
+        const Uint64 now = SDL_GetPerformanceCounter();
+        const Uint64 frequency = SDL_GetPerformanceFrequency();
+        if (!fps_last_time) {
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+            if (sdl_window) {
+                const char *title = SDL_GetWindowTitle(sdl_window);
+                if (title) fps_base_title = title;
+            }
+        } else if (frequency && now - fps_last_time >= frequency) {
+            const double seconds = (double)(now - fps_last_time) / (double)frequency;
+            const double fps = (double)(s_frame_count - fps_last_frame) / seconds;
+            const double speed = fps / 59.94;
+            if (!g_headless && sdl_window) {
+                char title[256];
+                snprintf(title, sizeof(title), "%s  [%.0f fps %.2fx]",
+                         fps_base_title.c_str(), fps, speed);
+                SDL_SetWindowTitle(sdl_window, title);
+            }
+            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                         fps, speed, (unsigned long long)s_frame_count);
+            std::fflush(stderr);
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+        }
+    }
 
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
@@ -2078,26 +2380,33 @@ static void sdl_vblank_present(void) {
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
     latency_ring_frame_begin();
 
-    /* Turbo-active test, shared by the audio gate here and the pacing/
-     * present gate below. sdl_audio_update owns the mute + fade-in/out +
-     * debounce across turbo transitions (see its comment). */
+    /* Turbo-active test shared by the pacing/present gate below. */
     int turbo_loads_active = 0;
+    extern int fntrace_is_game_started(void);
+    int logical_load_active = fntrace_is_game_started() && cdrom_load_in_progress();
+    int load_run_value = 0;
+    static int load_run = 0;
+    static int release_run = 0;
     if (g_turbo_loads_enabled) {
-        extern int fntrace_is_game_started(void);
-        /* Hysteresis: count consecutive frames the load has held, and only
-         * engage turbo once it is SUSTAINED (TURBO_LOADS_ENGAGE_FRAMES). This
-         * stops brief incidental reads on music screens (boss/stage select) from
-         * flickering turbo on and chopping the audio. cdrom_load_in_progress()
-         * already bridges short intra-load gaps (CD_BURST_GAP_FRAMES), so a real
-         * load's counter does not reset mid-load. */
-        static int load_run = 0;
-        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
+        /* Require a short sustained predicate on entry, then retain turbo over
+         * a short false gap after it has engaged. */
+        if (logical_load_active) {
             if (load_run < (1 << 20)) load_run++;
+            if (load_run >= TURBO_LOADS_ENGAGE_FRAMES || release_run > 0) {
+                turbo_loads_active = 1;
+                release_run = TURBO_LOADS_RELEASE_FRAMES;
+            }
         } else {
             load_run = 0;
+            if (release_run > 0) {
+                turbo_loads_active = 1;
+                release_run--;
+            }
         }
-        if (load_run >= TURBO_LOADS_ENGAGE_FRAMES)
-            turbo_loads_active = 1;
+        load_run_value = load_run;
+    } else {
+        load_run = 0;
+        release_run = 0;
     }
     /* HLE boot-skip window: from reset until the game entry PC first
      * dispatches, run unpaced so the (shell-skipped) BIOS kernel init +
@@ -2105,6 +2414,9 @@ static void sdl_vblank_present(void) {
      * old fast_boot snapshot restore; all guest timing is authentic. */
     if (psx_bios_hle_boot_turbo_active())
         turbo_loads_active = 1;
+
+    load_transition_note(cdrom_data_read_active(), logical_load_active,
+                         turbo_loads_active, load_run_value);
 
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
      * video together. Detect "MDEC produced a frame since the last vblank AND XA
@@ -2151,13 +2463,12 @@ static void sdl_vblank_present(void) {
     }
 
 #ifndef PSX_SDL_NO_AUDIO
-    /* Turbo-loads no longer mutes audio. Loads at 1x+turbo are sub-second, and
-     * the mute/fade/hangover model produced more audible disruption (cuts and
-     * "restarts") than just letting the stream play through; the audio queue is
-     * capped (sdl_audio_pump max_queue_bytes) so a brief turbo burst can't build
-     * unbounded latency. FMV-skip still mutes: it fast-forwards an entire movie,
-     * where rendering the time-compressed audio would be pure noise. */
-    sdl_audio_update(fmv_skip_active);
+    /* Optional turbo host sink advances the canonical SPU on the exact guest
+     * sample budget but drops accelerated output before SDL. This is distinct
+     * from the old mute/freeze model: voice and CD state never pause. FMV skip
+     * retains the hard mute because it deliberately fast-forwards a movie. */
+    sdl_audio_update(fmv_skip_active,
+                     turbo_loads_active && g_turbo_audio_sink_enabled);
 #endif
 
     if (g_headless) return;
@@ -2262,6 +2573,7 @@ static void sdl_vblank_present(void) {
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
+            smooth_60_present(nullptr, 0, 0, false);
             present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
                                 (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
@@ -2425,6 +2737,11 @@ static void sdl_vblank_present(void) {
             }
         }
 
+        smooth_60_present(sdl_pixel_buf,
+                          present_w * (uint32_t)active_scale,
+                          h * (uint32_t)active_scale,
+                          !g_gl_active && !g_vk_active && !di.depth24 && !fmv_frame);
+
         /* Frame blending (CRT-persistence masker for 30fps double-buffered
          * content). Some games (e.g. Crash Bash menus/characters) leave a
          * dynamic object in only one of the two display buffers per 30fps cycle,
@@ -2443,7 +2760,8 @@ static void sdl_vblank_present(void) {
             }
             const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
                                    !di.depth24 && active_scale == 1;
-            if (blend_cfg && simple_sw) {
+            if (blend_cfg && simple_sw &&
+                !g_smooth_60fps.load(std::memory_order_acquire)) {
                 static uint32_t prev_buf[640 * 512];
                 static uint32_t prev_px = 0;
                 const uint32_t npx = present_w * h;
@@ -2587,8 +2905,18 @@ int main(int argc, char** argv) {
             g_headless = 1;
             force_no_launcher = true;
         } else if (argv[i][0] != '-') {
-            bios_path = argv[i];
-            bios_from_cli = true;
+            /* The positional BIOS alias predates the named CLI. Consume it at
+             * most once. In particular, never let a stray split argument
+             * replace an explicit --bios path (for example when a Windows
+             * launcher fails to quote a multi-word --window-title value). */
+            if (!bios_from_cli) {
+                bios_path = argv[i];
+                bios_from_cli = true;
+            } else {
+                std::fprintf(stderr,
+                    "psxrecomp: ignoring unexpected positional argument after BIOS selection: %s\n",
+                    argv[i]);
+            }
         }
     }
     if (const char *e = std::getenv("PSX_HEADLESS")) {
@@ -2669,6 +2997,7 @@ int main(int argc, char** argv) {
     uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
+    std::vector<PSXRecompV4::RuntimeConfig::WarmCdRoute> warm_cd_routes;
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
     bool       bios_hle      = false;  /* HLE kernel-service tier (bios_hle.c) */
@@ -2700,10 +3029,30 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
+            warm_cd_routes = gc.runtime.warm_cd_routes;
             if (gc.runtime.turbo_loads) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
             }
+            if (gc.runtime.turbo_audio_sink) {
+                g_turbo_audio_sink_enabled = 1;
+                std::fprintf(stdout,
+                    "psxrecomp: turbo_audio_sink enabled (opt-in)\n");
+            }
+            {
+                extern int g_idle_skip_enabled;
+                const char *idle_env = std::getenv("PSX_IDLE_SKIP");
+                g_idle_skip_enabled = idle_env
+                    ? (idle_env[0] == '1' ? 1 : 0)
+                    : (gc.runtime.idle_skip ? 1 : 0);
+                std::fprintf(stdout, "psxrecomp: idle_skip %s%s\n",
+                             g_idle_skip_enabled ? "enabled" : "disabled",
+                             idle_env ? " (environment override)" : "");
+            }
+            for (uint32_t site : gc.vsync_event_horizon_sites)
+                psx_vsync_query_hle_add_event_horizon_site(site);
+            for (uint32_t site : gc.vsync_event_horizon_extra_sites)
+                psx_vsync_query_hle_add_extra_event_horizon_site(site);
             g_video_scale      = gc.runtime.video_supersampling;
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_texfilter  = gc.runtime.video_texture_filter;
@@ -2755,6 +3104,20 @@ int main(int argc, char** argv) {
             /* [widescreen] nw_phase_backdrop — stretch only the textured
              * backdrop phase emitted before shaded 3D foreground geometry. */
             gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
+            gpu_ws_set_nw_textured_edges(gc.ws_nw_textured_edges ? 1 : 0,
+                                         gc.ws_nw_textured_edge_scale);
+            gl_renderer_set_wide_fast(gc.ws_nw_full_mirror ? 0 : 1);
+            {
+                std::vector<uint32_t> addresses, expected;
+                addresses.reserve(gc.ws_signed_x_bound_sites.size());
+                expected.reserve(gc.ws_signed_x_bound_sites.size());
+                for (const auto& site : gc.ws_signed_x_bound_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                }
+                gpu_ws_set_signed_x_bound_sites(addresses.data(), expected.data(),
+                                                (int)addresses.size());
+            }
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
@@ -2963,6 +3326,27 @@ int main(int argc, char** argv) {
             exe_dir_from_argv(argv[0]) / "settings.toml";
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
+        if (us.parse_error) {
+            /* The file exists but is not valid TOML: every setting in it (the
+             * user's renderer choice, BIOS/disc paths, ...) is being ignored,
+             * and any later launcher save would overwrite it with defaults.
+             * Preserve their file and say so loudly instead of both failing
+             * silently (GH Tomba2Recomp#1 triage: a stray character disabled a
+             * user's whole settings file with no indication anywhere). */
+            std::error_code rn_ec;
+            std::filesystem::path bad = settings_path;
+            bad += ".bad";
+            std::filesystem::remove(bad, rn_ec);
+            rn_ec.clear();
+            std::filesystem::rename(settings_path, bad, rn_ec);
+            launcher_warning("Settings file ignored",
+                "settings.toml has a TOML syntax error, so ALL settings in it were "
+                "ignored this run (renderer, BIOS/disc paths, everything).\n\n" +
+                (rn_ec ? "The broken file was left at:\n" + settings_path.string()
+                       : "The broken file was preserved as:\n" + bad.string()) +
+                "\n\nFix the syntax error and restore the file, or set your options "
+                "again from the launcher (a fresh settings.toml will be written).");
+        }
         if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
         if (us.has_renderer)       g_video_renderer  = us.renderer;
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
@@ -3042,6 +3426,8 @@ int main(int argc, char** argv) {
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
+        psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
         g_frame_interpolation = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
@@ -3145,10 +3531,7 @@ int main(int argc, char** argv) {
             seed.window_width = g_video_win_w; seed.has_window_width = true;
             // ui_scale: default to 1.0 (no config source yet, launcher reads from settings.toml)
 
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+            configure_core_gl_context_attributes();
 
             /* Launcher opens at the same 4:3 size the game will, so there's no
              * jarring resize on LAUNCH. The dense dashboard needs a usable
@@ -3347,6 +3730,16 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    for (const auto& route : warm_cd_routes) {
+        cdrom_register_warm_route(route.arm_lba, route.lbas.data(),
+                                  (int)route.lbas.size(),
+                                  route.instant_max_per_frame);
+        std::fprintf(stdout,
+                     "psxrecomp: warm CD route armed at LBA %d (%zu entries, "
+                     "%d sectors/frame)\n",
+                     route.arm_lba, route.lbas.size(),
+                     route.instant_max_per_frame);
+    }
     if (!disc_path_str.empty()) {
         /* GetID must report the inserted disc's license region (the BIOS CD
          * driver revalidates it mid-game). Derive it from the disc's boot
@@ -3471,7 +3864,10 @@ int main(int argc, char** argv) {
 #endif
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
+    if (g_video_renderer == 1) {
+        configure_core_gl_context_attributes();
+        win_flags |= SDL_WINDOW_OPENGL;
+    }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
     /* Fullscreen on launch (launcher "Fullscreen on launch" toggle). DESKTOP
      * fullscreen keeps the desktop resolution and letterboxes the image, matching

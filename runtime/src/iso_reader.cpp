@@ -7,10 +7,16 @@
 namespace PS1 {
 
 // PS1 CD-ROM sector size (Mode 2, Form 1 user data)
-// constexpr size_t PS1::SECTOR_SIZE = 2048;
-// constexpr size_t PS1::RAW_SECTOR_SIZE = 2352;
-// constexpr size_t PS1::RAW_DATA_OFFSET = 24;
-// constexpr uint32_t PS1::PVD_SECTOR = 16;
+constexpr size_t SECTOR_SIZE = 2048;
+
+// Full sector size including headers/subchannel (2352 bytes for raw BIN files)
+constexpr size_t RAW_SECTOR_SIZE = 2352;
+
+// Offset to user data in raw sector (Mode 2, Form 1)
+constexpr size_t RAW_DATA_OFFSET = 24;
+
+// Primary Volume Descriptor location
+constexpr uint32_t PVD_SECTOR = 16;
 
 ISOReader::ISOReader()
     : is_open_(false) {
@@ -23,7 +29,7 @@ ISOReader::~ISOReader() {
 }
 
 bool ISOReader::Open(const std::string& filename) {
-    // Close any previously opened file
+    // Close any previously opened image (also resets tracks/segments)
     Close();
 
     // Check if file exists
@@ -31,17 +37,35 @@ bool ISOReader::Open(const std::string& filename) {
         return false;
     }
 
-    // Handle .cue files - parse to find .bin file
-    std::string bin_filename = filename;
+    // Ordered list of BINARY files backing the disc. A bare .bin/.iso is a
+    // single-entry list; a .cue contributes one entry per FILE line (redump
+    // multi-track dumps ship one file per track).
+    std::vector<std::string> bin_files;
+
+    // Tracks parsed from the cue. INDEX times in a cue are relative to the
+    // OWNING FILE, so remember which file each track belongs to and convert
+    // to disc-relative LBAs once the segment table (with each file's first
+    // disc sector) is built below.
+    struct PendingTrack {
+        int      number;
+        bool     is_audio;
+        size_t   file_index;  // index into bin_files
+        uint32_t index01;     // INDEX 01 as a file-relative LBA
+        uint32_t index00;     // INDEX 00 pregap, file-relative
+        bool     has_index00;
+    };
+    std::vector<PendingTrack> pending_tracks;
+
     auto ends_with = [](const std::string& s, const std::string& suffix) {
         return s.size() >= suffix.size() &&
                s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
     if (ends_with(filename, ".cue") || ends_with(filename, ".CUE")) {
-        // Parse the .cue: resolve the FILE, AND build the track TOC from the
-        // TRACK/INDEX lines. A bare .bin/.iso (no .cue) falls through to the
-        // single-track synthesis below; a multi-track disc (data + CD-DA audio)
-        // gets each track so the CD model's GetTN/GetTD report them correctly.
+        // Parse the .cue: resolve every FILE, AND build the track TOC from
+        // the TRACK/INDEX lines. Single-file cues keep their historical
+        // behavior; multi-file cues (data track + CD-DA audio tracks in
+        // separate .bin files) map each file to a contiguous run of disc
+        // sectors, concatenated in cue order.
         std::ifstream cue_file(filename);
         if (!cue_file.is_open()) {
             return false;
@@ -50,22 +74,29 @@ bool ISOReader::Open(const std::string& filename) {
         std::string line;
         int  cur_track_num   = -1;
         bool cur_track_audio = false;
-        std::string current_bin_path;
+        uint32_t cur_index00 = 0;
+        bool cur_has_index00 = false;
         while (std::getline(cue_file, line)) {
             // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
-            size_t binary_pos = line.find("BINARY");
-            if (file_pos != std::string::npos && binary_pos != std::string::npos) {
+            if (file_pos != std::string::npos) {
                 size_t quote1 = line.find('"', file_pos);
-                size_t quote2 = line.find('"', quote1 + 1);
+                size_t quote2 = (quote1 == std::string::npos)
+                                    ? std::string::npos : line.find('"', quote1 + 1);
                 if (quote1 != std::string::npos && quote2 != std::string::npos) {
+                    // Only raw BINARY payloads are supported (WAVE/MP3 audio
+                    // files have no fixed sector geometry). Mis-mapping the
+                    // TOC would be worse than refusing the image.
+                    if (line.find("BINARY", quote2) == std::string::npos) {
+                        return false;
+                    }
                     std::string bin_name = line.substr(quote1 + 1, quote2 - quote1 - 1);
                     std::filesystem::path cue_path(filename);
                     std::filesystem::path bin_path(bin_name);
                     if (bin_path.is_relative()) {
-                        bin_filename = (cue_path.parent_path() / bin_name).string();
+                        bin_files.push_back((cue_path.parent_path() / bin_name).string());
                     } else {
-                        bin_filename = bin_name;
+                        bin_files.push_back(bin_name);
                     }
                 }
                 continue;
@@ -77,40 +108,92 @@ bool ISOReader::Open(const std::string& filename) {
             if (std::sscanf(line.c_str(), " TRACK %d %31s", &tn, type) == 2) {
                 cur_track_num   = tn;
                 cur_track_audio = (std::strstr(type, "AUDIO") != nullptr);
+                cur_index00 = 0;
+                cur_has_index00 = false;
                 continue;
             }
 
             // INDEX 01 MM:SS:FF — the track's start (INDEX 00 is its pregap).
             int idx = 0, mm = 0, ss = 0, ff = 0;
             if (std::sscanf(line.c_str(), " INDEX %d %d:%d:%d", &idx, &mm, &ss, &ff) == 4
-                && idx == 1 && cur_track_num >= 1) {
-                CDTrack t;
-                t.number    = cur_track_num;
-                t.is_audio  = cur_track_audio;
-                t.start_lba = (uint32_t)(((mm * 60 + ss) * 75) + ff);  // .bin-relative LBA
-                tracks_.push_back(t);
+                && cur_track_num >= 1 && !bin_files.empty()) {
+                const uint32_t index_lba = (uint32_t)(((mm * 60 + ss) * 75) + ff);
+                if (idx == 0) {
+                    cur_index00 = index_lba;
+                    cur_has_index00 = true;
+                    continue;
+                }
+                if (idx != 1) continue;
+                PendingTrack t;
+                t.number     = cur_track_num;
+                t.is_audio   = cur_track_audio;
+                t.file_index = bin_files.size() - 1;
+                t.index01    = index_lba;
+                t.index00    = cur_index00;
+                t.has_index00 = cur_has_index00;
+                pending_tracks.push_back(t);
                 cur_track_num = -1;
             }
         }
         cue_file.close();
+
+        // A cue with no FILE line has nothing to mount.
+        if (bin_files.empty()) {
+            return false;
+        }
+    } else {
+        bin_files.push_back(filename);
+    }
+
+    // Build the segment table: open every file and lay it out at the next
+    // disc-relative sector. Every file must open — a multi-file dump with a
+    // missing track file would otherwise silently read the wrong sectors.
+    uint32_t next_lba = 0;
+    for (const std::string& bin_name : bin_files) {
+        BinSegment seg;
+        seg.path = bin_name;
+        seg.file.open(bin_name, std::ios::binary);
+        if (!seg.file.is_open()) {
+            Close();
+            return false;
+        }
+        seg.file.seekg(0, std::ios::end);
+        const std::streampos file_size = seg.file.tellg();
+        seg.file.clear();
+        if (file_size <= 0) {
+            Close();
+            return false;
+        }
+        const uint64_t size = static_cast<uint64_t>(file_size);
+        seg.raw          = (size % RAW_SECTOR_SIZE) == 0;
+        seg.sector_count = static_cast<uint32_t>(size / (seg.raw ? RAW_SECTOR_SIZE
+                                                                 : SECTOR_SIZE));
+        seg.start_lba    = next_lba;
+        next_lba += seg.sector_count;
+        segments_.push_back(std::move(seg));
+    }
+
+    // Convert the pending cue tracks to disc-relative LBAs.
+    for (const PendingTrack& p : pending_tracks) {
+        CDTrack t;
+        t.number    = p.number;
+        t.is_audio  = p.is_audio;
+        t.start_lba = segments_[p.file_index].start_lba + p.index01;
+        t.pregap_lba = segments_[p.file_index].start_lba +
+                       (p.has_index00 ? p.index00 : p.index01);
+        tracks_.push_back(t);
     }
 
     // Synthesize a single data track for a bare .bin/.iso or a .cue with no
     // parseable TRACK entries, so TrackCount() is always >= 1.
     if (tracks_.empty()) {
         CDTrack t;
-        t.number = 1; t.is_audio = false; t.start_lba = 0;
+        t.number = 1; t.is_audio = false; t.start_lba = 0; t.pregap_lba = 0;
         tracks_.push_back(t);
     }
 
-    // Store the resolved bin path for callers (e.g. xa_audio)
-    bin_path_ = bin_filename;
-
-    // Open the ISO/BIN file in binary mode
-    file_.open(bin_filename, std::ios::binary);
-    if (!file_.is_open()) {
-        return false;
-    }
+    // Store the resolved data-track path for callers
+    bin_path_ = segments_.front().path;
 
     is_open_ = true;
 
@@ -118,7 +201,6 @@ bool ISOReader::Open(const std::string& filename) {
     // present. Runtime CD-ROM access only needs sector reads, so keep the
     // image mounted even if an ISO9660 header is missing or nonstandard.
     if (!ParseVolumeDescriptor()) {
-        file_.clear();
         volume_id_.clear();
         root_dir_.lba = 0;
         root_dir_.size = 0;
@@ -128,10 +210,28 @@ bool ISOReader::Open(const std::string& filename) {
 }
 
 void ISOReader::Close() {
-    if (file_.is_open()) {
-        file_.close();
+    for (BinSegment& seg : segments_) {
+        if (seg.file.is_open()) {
+            seg.file.close();
+        }
     }
+    segments_.clear();
+    tracks_.clear();
+    bin_path_.clear();
+    volume_id_.clear();
+    root_dir_.lba = 0;
+    root_dir_.size = 0;
     is_open_ = false;
+}
+
+BinSegment* ISOReader::SegmentForLBA(uint32_t lba) {
+    // Linear scan: images carry a handful of segments (one per track file).
+    for (BinSegment& seg : segments_) {
+        if (lba >= seg.start_lba && lba - seg.start_lba < seg.sector_count) {
+            return &seg;
+        }
+    }
+    return nullptr;
 }
 
 bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
@@ -139,48 +239,45 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
         return false;
     }
 
-    // Clear any error flags
-    file_.clear();
+    BinSegment* seg = SegmentForLBA(lba);
+    if (!seg) {
+        return false;
+    }
+    const uint32_t local_lba = lba - seg->start_lba;
 
-    // Determine sector format by checking file size
-    file_.seekg(0, std::ios::end);
-    std::streampos file_size = file_.tellg();
+    // Clear any error flags from a previous failed read
+    seg->file.clear();
 
-    // Clear error flags after seeking
-    file_.clear();
-
-    // Check if file uses raw sectors (2352 bytes) or cooked sectors (2048 bytes)
-    bool is_raw_format = (file_size % PS1::RAW_SECTOR_SIZE == 0);
-
-    if (is_raw_format) {
+    if (seg->raw) {
         // Raw BIN format - read full sector, extract user data
-        std::streampos offset = static_cast<std::streampos>(lba) * PS1::RAW_SECTOR_SIZE + PS1::RAW_DATA_OFFSET;
-        file_.seekg(offset, std::ios::beg);
+        std::streampos offset =
+            static_cast<std::streampos>(local_lba) * RAW_SECTOR_SIZE + RAW_DATA_OFFSET;
+        seg->file.seekg(offset, std::ios::beg);
 
-        if (!file_.good()) {
-            file_.clear();
+        if (!seg->file.good()) {
+            seg->file.clear();
             return false;
         }
 
-        file_.read(reinterpret_cast<char*>(buffer), PS1::SECTOR_SIZE);
-        std::streamsize bytes_read = file_.gcount();
-        bool success = (bytes_read == PS1::SECTOR_SIZE);
-        file_.clear();
+        seg->file.read(reinterpret_cast<char*>(buffer), SECTOR_SIZE);
+        std::streamsize bytes_read = seg->file.gcount();
+        bool success = (bytes_read == SECTOR_SIZE);
+        seg->file.clear();
         return success;
     } else {
         // ISO format - sectors are already 2048 bytes
-        std::streampos offset = static_cast<std::streampos>(lba) * PS1::SECTOR_SIZE;
-        file_.seekg(offset, std::ios::beg);
+        std::streampos offset = static_cast<std::streampos>(local_lba) * SECTOR_SIZE;
+        seg->file.seekg(offset, std::ios::beg);
 
-        if (!file_.good()) {
-            file_.clear();
+        if (!seg->file.good()) {
+            seg->file.clear();
             return false;
         }
 
-        file_.read(reinterpret_cast<char*>(buffer), PS1::SECTOR_SIZE);
-        std::streamsize bytes_read = file_.gcount();
-        bool success = (bytes_read == PS1::SECTOR_SIZE);
-        file_.clear();
+        seg->file.read(reinterpret_cast<char*>(buffer), SECTOR_SIZE);
+        std::streamsize bytes_read = seg->file.gcount();
+        bool success = (bytes_read == SECTOR_SIZE);
+        seg->file.clear();
         return success;
     }
 }
@@ -190,26 +287,24 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
         return false;
     }
 
-    file_.clear();
-    file_.seekg(0, std::ios::end);
-    std::streampos file_size = file_.tellg();
-    file_.clear();
+    BinSegment* seg = SegmentForLBA(lba);
+    if (!seg || !seg->raw) {
+        return false;
+    }
+    const uint32_t local_lba = lba - seg->start_lba;
 
-    if (file_size <= 0 || (file_size % PS1::RAW_SECTOR_SIZE) != 0) {
+    seg->file.clear();
+    std::streampos offset = static_cast<std::streampos>(local_lba) * RAW_SECTOR_SIZE;
+    seg->file.seekg(offset, std::ios::beg);
+    if (!seg->file.good()) {
+        seg->file.clear();
         return false;
     }
 
-    std::streampos offset = static_cast<std::streampos>(lba) * PS1::RAW_SECTOR_SIZE;
-    file_.seekg(offset, std::ios::beg);
-    if (!file_.good()) {
-        file_.clear();
-        return false;
-    }
-
-    file_.read(reinterpret_cast<char*>(buffer), PS1::RAW_SECTOR_SIZE);
-    std::streamsize bytes_read = file_.gcount();
-    bool success = (bytes_read == PS1::RAW_SECTOR_SIZE);
-    file_.clear();
+    seg->file.read(reinterpret_cast<char*>(buffer), RAW_SECTOR_SIZE);
+    std::streamsize bytes_read = seg->file.gcount();
+    bool success = (bytes_read == RAW_SECTOR_SIZE);
+    seg->file.clear();
     return success;
 }
 
@@ -226,23 +321,12 @@ std::string ISOReader::GetBinPath() const {
 }
 
 uint32_t ISOReader::GetSectorCount() {
-    if (!is_open_) {
+    if (!is_open_ || segments_.empty()) {
         return 0;
     }
 
-    file_.clear();
-    file_.seekg(0, std::ios::end);
-    std::streampos file_size = file_.tellg();
-    file_.clear();
-    if (file_size <= 0) {
-        return 0;
-    }
-
-    const uint64_t size = static_cast<uint64_t>(file_size);
-    if ((size % PS1::RAW_SECTOR_SIZE) == 0) {
-        return static_cast<uint32_t>(size / PS1::RAW_SECTOR_SIZE);
-    }
-    return static_cast<uint32_t>(size / PS1::SECTOR_SIZE);
+    const BinSegment& last = segments_.back();
+    return last.start_lba + last.sector_count;
 }
 
 int ISOReader::TrackCount() const {
@@ -252,6 +336,13 @@ int ISOReader::TrackCount() const {
 uint32_t ISOReader::TrackStartLBA(int track) const {
     for (const auto& t : tracks_) {
         if (t.number == track) return t.start_lba;
+    }
+    return 0;
+}
+
+uint32_t ISOReader::TrackPregapLBA(int track) const {
+    for (const auto& t : tracks_) {
+        if (t.number == track) return t.pregap_lba;
     }
     return 0;
 }
@@ -274,8 +365,8 @@ uint32_t ISOReader::Read733(const uint8_t* data) const {
 
 bool ISOReader::ParseVolumeDescriptor() {
     // Read Primary Volume Descriptor from sector 16
-    uint8_t pvd[PS1::SECTOR_SIZE];
-    if (!ReadSector(PS1::PVD_SECTOR, pvd)) {
+    uint8_t pvd[SECTOR_SIZE];
+    if (!ReadSector(PVD_SECTOR, pvd)) {
         return false;
     }
 
@@ -516,17 +607,17 @@ size_t ISOReader::ReadFile(const std::string& path, uint8_t* buffer, size_t max_
     size_t bytes_to_read = std::min(static_cast<size_t>(entry.size), max_size);
 
     // Calculate number of sectors to read
-    uint32_t sectors_to_read = (bytes_to_read + PS1::SECTOR_SIZE - 1) / PS1::SECTOR_SIZE;
+    uint32_t sectors_to_read = (bytes_to_read + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
     // Read sectors sequentially
     size_t bytes_read = 0;
     for (uint32_t i = 0; i < sectors_to_read; i++) {
         // Calculate how many bytes to read from this sector
         size_t bytes_remaining = bytes_to_read - bytes_read;
-        size_t sector_bytes = std::min(bytes_remaining, PS1::SECTOR_SIZE);
+        size_t sector_bytes = std::min(bytes_remaining, SECTOR_SIZE);
 
         // Read sector into temporary buffer
-        uint8_t sector_buffer[PS1::SECTOR_SIZE];
+        uint8_t sector_buffer[SECTOR_SIZE];
         if (!ReadSector(entry.lba + i, sector_buffer)) {
             return bytes_read;  // Error - return what we've read so far
         }

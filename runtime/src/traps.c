@@ -535,6 +535,9 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
 static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 {
     uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    /* data-shard purity: a green-thread switch inside a capture window would
+     * record OTHER threads' work into the shard — poison the capture. */
+    { extern void ds_note_thread_switch(void); ds_note_thread_switch(); }
     debug_server_log_thread_event(3, cpu, current_tcb, target_tcb, 0);
     if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
         debug_server_log_thread_event(4, cpu, current_tcb, target_tcb, 0);
@@ -1033,9 +1036,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
 
     /* Reject non-word-aligned targets — corrupt function pointer. Hard fail. */
     if (addr & 3) {
-        char buf[4096];
-        int pos = 0;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        char buf[16384];
+        int pos = snprintf(buf, sizeof(buf),
             "DISPATCH FATAL: misaligned target 0x%08X\n"
             "  aligned form: 0x%08X\n"
             "  physical:     0x%08X\n"
@@ -1055,113 +1057,51 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             cpu->gpr[2], cpu->gpr[4], cpu->gpr[5],
             cpu->gpr[6], cpu->gpr[7],
             cpu->cop0[14], cpu->cop0[12], cpu->cop0[13]);
-
-        /* Dispatch ring tail — shows the call chain leading here. */
+        /* Include the dispatch chain that led to the corrupt target. */
         {
             extern uint32_t crash_trace_dispatch_ring_get(int idx);
             extern uint64_t crash_trace_dispatch_seq_get(void);
             uint64_t total = crash_trace_dispatch_seq_get();
             int count = total < 32 ? (int)total : 32;
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "\n  dispatch_tail (last %d of %llu):\n", count,
-                (unsigned long long)total);
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                            "\n  dispatch_tail (last %d of %llu):\n", count,
+                            (unsigned long long)total);
             uint64_t start = total - (uint64_t)count;
             for (int i = 0; i < count && pos < (int)sizeof(buf) - 48; i++) {
-                uint32_t a = crash_trace_dispatch_ring_get((int)((start + i) & 0xFFFF));
-                pos += snprintf(buf + pos, sizeof(buf) - pos, "    [%3d] 0x%08X\n", i, a);
+                uint32_t dispatch = crash_trace_dispatch_ring_get(
+                    (int)((start + (uint64_t)i) & 0xFFFFu));
+                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                "    [%3d] 0x%08X\n", i, dispatch);
             }
         }
 
-        /* Scan PSX RAM for the bad value to find where it was stored.
-         * Check both the raw bad value and word-aligned neighbors. */
+        /* Locate stored copies of both the bad pointer and its aligned form.
+         * This is diagnostic-only and runs immediately before the fatal trap. */
         {
             extern uint8_t *memory_get_ram_ptr(void);
             uint8_t *ram = memory_get_ram_ptr();
-            #define SCAN_RAM_SIZE (2 * 1024 * 1024)
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "\n  RAM scan for value 0x%08X (word-aligned):\n", addr);
-            int hits = 0;
-            for (uint32_t off = 0; off + 4 <= SCAN_RAM_SIZE; off += 4) {
-                uint32_t w;
-                memcpy(&w, ram + off, 4);
-                if (w == addr) {
-                    uint32_t guest_addr = 0x80000000u + off;
-                    /* Show context: 2 words before and 2 after. */
-                    uint32_t ctx[5];
-                    int ci = 0;
-                    for (int j = -2; j <= 2; j++) {
-                        uint32_t co = off + j * 4;
-                        if (co < SCAN_RAM_SIZE && co + 4 <= SCAN_RAM_SIZE) {
-                            memcpy(&ctx[ci], ram + co, 4);
-                        } else {
-                            ctx[ci] = 0xDEADBEEF;
-                        }
-                        ci++;
-                    }
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        "    RAM[0x%08X] = 0x%08X  "
-                        "  ctx: [0x%08X] [0x%08X] **0x%08X** [0x%08X] [0x%08X]\n",
-                        guest_addr, w,
-                        ctx[0], ctx[1], ctx[2], ctx[3], ctx[4]);
-                    hits++;
-                    if (hits >= 16) {
-                        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "    ... (stopped after 16 hits)\n");
-                        break;
-                    }
+            uint32_t needles[2] = { addr, addr & ~3u };
+            int needle_count = needles[0] == needles[1] ? 1 : 2;
+            for (int n = 0; n < needle_count; n++) {
+                int hits = 0;
+                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                "\n  RAM scan for 0x%08X:\n", needles[n]);
+                for (uint32_t off = 0; off + 4 <= 2u * 1024u * 1024u; off += 4) {
+                    uint32_t word;
+                    memcpy(&word, ram + off, sizeof(word));
+                    if (word != needles[n]) continue;
+                    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                    "    RAM[0x%08X] = 0x%08X\n",
+                                    0x80000000u + off, word);
+                    if (++hits == 16 || pos >= (int)sizeof(buf) - 64) break;
                 }
+                if (!hits)
+                    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                    "    (not found in 2MB PSX RAM)\n");
             }
-            if (hits == 0)
-                pos += snprintf(buf + pos, sizeof(buf) - pos,
-                    "    (not found in 2MB PSX RAM)\n");
-            #undef SCAN_RAM_SIZE
         }
 
-        /* Also scan for the aligned form in case the bad low bits were OR'd in. */
-        if ((addr & ~3u) != addr && (addr & ~3u) != 0) {
-            uint32_t aligned = addr & ~3u;
-            extern uint8_t *memory_get_ram_ptr(void);
-            uint8_t *ram = memory_get_ram_ptr();
-            #define SCAN_RAM_SIZE (2 * 1024 * 1024)
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "\n  RAM scan for aligned form 0x%08X:\n", aligned);
-            int hits = 0;
-            for (uint32_t off = 0; off + 4 <= SCAN_RAM_SIZE; off += 4) {
-                uint32_t w;
-                memcpy(&w, ram + off, 4);
-                if (w == aligned) {
-                    uint32_t guest_addr = 0x80000000u + off;
-                    uint32_t ctx[5];
-                    int ci = 0;
-                    for (int j = -2; j <= 2; j++) {
-                        uint32_t co = off + j * 4;
-                        if (co < SCAN_RAM_SIZE && co + 4 <= SCAN_RAM_SIZE) {
-                            memcpy(&ctx[ci], ram + co, 4);
-                        } else {
-                            ctx[ci] = 0xDEADBEEF;
-                        }
-                        ci++;
-                    }
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        "    RAM[0x%08X] = 0x%08X  "
-                        "  ctx: [0x%08X] [0x%08X] **0x%08X** [0x%08X] [0x%08X]\n",
-                        guest_addr, w,
-                        ctx[0], ctx[1], ctx[2], ctx[3], ctx[4]);
-                    hits++;
-                    if (hits >= 16) {
-                        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "    ... (stopped after 16 hits)\n");
-                        break;
-                    }
-                }
-            }
-            if (hits == 0)
-                pos += snprintf(buf + pos, sizeof(buf) - pos,
-                    "    (not found in 2MB PSX RAM)\n");
-            #undef SCAN_RAM_SIZE
-        }
-
-        /* Write to stderr first (before trap_crash blocks in halt-serve). */
+        /* stderr is emitted before trap_crash enters halt-and-serve. */
         fprintf(stderr, "%s", buf);
         fflush(stderr);
         trap_crash(buf);

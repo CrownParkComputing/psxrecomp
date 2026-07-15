@@ -3,7 +3,9 @@
 #include "config_loader.h"
 
 #include <cctype>
+#include <cstdio>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -149,6 +151,74 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.instant_max_per_frame     = static_cast<int>(n);
         rt.has_instant_max_per_frame = true;
     }
+    auto parse_warm_cd_route = [&](const toml::value& route,
+                                   const std::string& label) {
+        if (!route.contains("arm_lba") || !route.contains("lbas")) {
+            throw std::runtime_error(
+                label + " arm_lba and lbas are required");
+        }
+        const auto arm = toml::find<int64_t>(route, "arm_lba");
+        if (arm < 0 || arm > 0x7FFFFFFFll) {
+            throw std::runtime_error(fmt::format(
+                "{} arm_lba out of range: {}", label, arm));
+        }
+        RuntimeConfig::WarmCdRoute parsed;
+        parsed.arm_lba = static_cast<int>(arm);
+        const auto& lbas = toml::find<std::vector<int64_t>>(route, "lbas");
+        if (lbas.empty() || lbas.size() > 64) {
+            throw std::runtime_error(
+                label + " lbas must contain 1..64 entries");
+        }
+        for (const auto lba : lbas) {
+            if (lba < 0 || lba > 0x7FFFFFFFll) {
+                throw std::runtime_error(fmt::format(
+                    "{} LBA out of range: {}", label, lba));
+            }
+            parsed.lbas.push_back(static_cast<int>(lba));
+        }
+        if (route.contains("instant_max_per_frame")) {
+            const auto n = toml::find<int64_t>(route, "instant_max_per_frame");
+            if (n < 1 || n > 4096) {
+                throw std::runtime_error(fmt::format(
+                    "{} instant_max_per_frame out of range (1..4096): {}",
+                    label, n));
+            }
+            parsed.instant_max_per_frame = static_cast<int>(n);
+        }
+        for (const auto& existing : rt.warm_cd_routes) {
+            if (existing.arm_lba == parsed.arm_lba &&
+                existing.lbas.front() == parsed.lbas.front()) {
+                throw std::runtime_error(fmt::format(
+                    "{} duplicates route arm {} / first LBA {}", label,
+                    parsed.arm_lba, parsed.lbas.front()));
+            }
+        }
+        rt.warm_cd_routes.push_back(std::move(parsed));
+    };
+    if (runtime.contains("warm_cd_route")) {
+        std::fprintf(stderr,
+            "psxrecomp: warning: [runtime.warm_cd_route] is deprecated; "
+            "use [[runtime.warm_cd_routes]]\n");
+        parse_warm_cd_route(toml::find(runtime, "warm_cd_route"),
+                            "[runtime.warm_cd_route]");
+    }
+    if (runtime.contains("warm_cd_routes")) {
+        const auto& routes = toml::find(runtime, "warm_cd_routes");
+        if (!routes.is_array() || routes.as_array().empty() ||
+            routes.as_array().size() > 16) {
+            throw std::runtime_error(
+                "[[runtime.warm_cd_routes]] must contain 1..16 routes");
+        }
+        size_t route_index = 0;
+        for (const auto& route : routes.as_array()) {
+            if (!route.is_table()) {
+                throw std::runtime_error(
+                    "[[runtime.warm_cd_routes]] entries must be tables");
+            }
+            parse_warm_cd_route(route, fmt::format(
+                "[[runtime.warm_cd_routes]] entry {}", route_index++));
+        }
+    }
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
@@ -166,6 +236,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     }
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
+    }
+    if (runtime.contains("turbo_audio_sink")) {
+        rt.turbo_audio_sink = toml::find<bool>(runtime, "turbo_audio_sink");
+    }
+    if (runtime.contains("idle_skip")) {
+        rt.idle_skip = toml::find<bool>(runtime, "idle_skip");
     }
     if (runtime.contains("overlay_autocompile_cmd")) {
         rt.overlay_autocompile_cmd =
@@ -702,11 +778,67 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                             ? toml::find<bool>(recomp, "strict")
                             : true;
 
+    const std::string discovery =
+        recomp.contains("discovery")
+            ? toml::find<std::string>(recomp, "discovery")
+            : std::string{"whole-image"};
+    if (discovery != "whole-image" && discovery != "reachable") {
+        throw std::runtime_error(fmt::format(
+            "{}: [recompiler].discovery must be 'whole-image' or 'reachable'",
+            config_path.string()));
+    }
+
     std::string out_stem;
     if (recomp.contains("out_stem")) {
         out_stem = toml::find<std::string>(recomp, "out_stem");
     } else {
         out_stem = derive_out_stem(fs::path(exe_field).filename().string());
+    }
+
+    std::vector<RecompilerPatch> recompiler_patches;
+    if (recomp.contains("patch")) {
+        const auto& patches = toml::find<toml::array>(recomp, "patch");
+        std::set<std::string> seen_ids;
+        std::set<uint32_t> seen_addresses;
+        for (const auto& item : patches) {
+            RecompilerPatch patch;
+            patch.id = toml::find<std::string>(item, "id");
+            patch.address = parse_hex(toml::find<std::string>(item, "address"),
+                                      "recompiler.patch.address");
+            patch.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                       "recompiler.patch.expected");
+            patch.replacement = parse_hex(
+                toml::find<std::string>(item, "replacement"),
+                "recompiler.patch.replacement");
+            if (item.contains("note")) {
+                patch.note = toml::find<std::string>(item, "note");
+            }
+
+            if (patch.id.empty()) {
+                throw std::runtime_error(
+                    "recompiler.patch.id must not be empty");
+            }
+            if ((patch.address & 3u) != 0u) {
+                throw std::runtime_error(fmt::format(
+                    "{}: recompiler patch '{}' address 0x{:08X} is not "
+                    "instruction-aligned",
+                    config_path.string(), patch.id, patch.address));
+            }
+            if (!seen_ids.insert(patch.id).second) {
+                throw std::runtime_error(fmt::format(
+                    "{}: duplicate [[recompiler.patch]] id '{}'",
+                    config_path.string(), patch.id));
+            }
+            const uint32_t address_key =
+                recompiler_patch_address_key(patch.address);
+            if (!seen_addresses.insert(address_key).second) {
+                throw std::runtime_error(fmt::format(
+                    "{}: duplicate [[recompiler.patch]] physical address "
+                    "0x{:08X} (KUSEG/KSEG aliases are one site)",
+                    config_path.string(), address_key));
+            }
+            recompiler_patches.push_back(std::move(patch));
+        }
     }
 
     // Optional [widescreen] block — per-game hooks for the widescreen hack.
@@ -723,8 +855,78 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
+    bool ws_nw_textured_edges = false;
+    int ws_nw_textured_edge_scale = 0;
+    bool ws_nw_full_mirror = false;
+    std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
     bool ws_ultrawide_offered = false;
+    // Optional [data_shards] block — memoized pure-function replay hooks.
+    std::vector<uint32_t> data_shard_funcs;
+    if (cfg.contains("data_shards")) {
+        const toml::value& dsv = toml::find(cfg, "data_shards");
+        if (dsv.contains("funcs")) {
+            const auto& arr = toml::find<std::vector<std::string>>(dsv, "funcs");
+            for (const auto& a : arr)
+                data_shard_funcs.push_back(parse_hex(a, "data_shards.funcs"));
+        }
+    }
+    uint32_t vsync_query_func = 0;
+    uint32_t vsync_counter_addr = 0;
+    uint32_t vsync_gpustat_ptr_addr = 0;
+    uint32_t vsync_timer1_ptr_addr = 0;
+    uint32_t vsync_timer1_cache_addr = 0;
+    std::vector<uint32_t> vsync_event_horizon_sites;
+    std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    if (cfg.contains("load_accel")) {
+        const toml::value& lav = toml::find(cfg, "load_accel");
+        if (lav.contains("vsync_query")) {
+            const toml::value& vq = toml::find(lav, "vsync_query");
+            const bool has_func = vq.contains("func");
+            const bool has_counter = vq.contains("counter_addr");
+            const bool has_gpu_ptr = vq.contains("gpustat_ptr_addr");
+            const bool has_timer_ptr = vq.contains("timer1_ptr_addr");
+            const bool has_timer_cache = vq.contains("timer1_cache_addr");
+            const int present = (int)has_func + (int)has_counter + (int)has_gpu_ptr +
+                                (int)has_timer_ptr + (int)has_timer_cache;
+            if (present != 0 && present != 5)
+                throw std::runtime_error(fmt::format(
+                    "{}: [load_accel.vsync_query] func, counter_addr, gpustat_ptr_addr, "
+                    "timer1_ptr_addr, and timer1_cache_addr must be set together",
+                    config_path.string()));
+            if (has_func) {
+                vsync_query_func = parse_hex(
+                    toml::find<std::string>(vq, "func"),
+                    "load_accel.vsync_query.func");
+                vsync_counter_addr = parse_hex(
+                    toml::find<std::string>(vq, "counter_addr"),
+                    "load_accel.vsync_query.counter_addr");
+                vsync_gpustat_ptr_addr = parse_hex(
+                    toml::find<std::string>(vq, "gpustat_ptr_addr"),
+                    "load_accel.vsync_query.gpustat_ptr_addr");
+                vsync_timer1_ptr_addr = parse_hex(
+                    toml::find<std::string>(vq, "timer1_ptr_addr"),
+                    "load_accel.vsync_query.timer1_ptr_addr");
+                vsync_timer1_cache_addr = parse_hex(
+                    toml::find<std::string>(vq, "timer1_cache_addr"),
+                    "load_accel.vsync_query.timer1_cache_addr");
+                if (vq.contains("event_horizon_sites")) {
+                    const auto& arr = toml::find<std::vector<std::string>>(
+                        vq, "event_horizon_sites");
+                    for (const auto& a : arr)
+                        vsync_event_horizon_sites.push_back(parse_hex(
+                            a, "load_accel.vsync_query.event_horizon_sites"));
+                }
+                if (vq.contains("event_horizon_extra_sites")) {
+                    const auto& arr = toml::find<std::vector<std::string>>(
+                        vq, "event_horizon_extra_sites");
+                    for (const auto& a : arr)
+                        vsync_event_horizon_extra_sites.push_back(parse_hex(
+                            a, "load_accel.vsync_query.event_horizon_extra_sites"));
+                }
+            }
+        }
+    }
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -779,6 +981,37 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
         if (ws.contains("nw_phase_backdrop"))
             ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
+        if (ws.contains("nw_textured_edges"))
+            ws_nw_textured_edges = toml::find<bool>(ws, "nw_textured_edges");
+        if (ws.contains("nw_textured_edge_scale")) {
+            ws_nw_textured_edge_scale = toml::find<int>(ws, "nw_textured_edge_scale");
+            if (ws_nw_textured_edge_scale != 0 &&
+                (ws_nw_textured_edge_scale < 100 || ws_nw_textured_edge_scale > 400))
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_textured_edge_scale must be 0 or in [100, 400]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_full_mirror"))
+            ws_nw_full_mirror = toml::find<bool>(ws, "nw_full_mirror");
+        if (ws.contains("signed_x_bound")) {
+            std::set<uint32_t> seen;
+            for (const auto& item : toml::find<toml::array>(ws, "signed_x_bound")) {
+                WidescreenSignedBoundSite site;
+                site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                         "widescreen.signed_x_bound.address");
+                site.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                          "widescreen.signed_x_bound.expected");
+                if ((site.expected >> 26) != 0x0Fu)
+                    throw std::runtime_error(fmt::format(
+                        "{}: [[widescreen.signed_x_bound]] expected must be LUI",
+                        config_path.string()));
+                if (!seen.insert(site.address & 0x1FFFFFFFu).second)
+                    throw std::runtime_error(fmt::format(
+                        "{}: duplicate [[widescreen.signed_x_bound]] address 0x{:08X}",
+                        config_path.string(), site.address));
+                ws_signed_x_bound_sites.push_back(site);
+            }
+        }
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
         if (ws.contains("offer_ultrawide"))
@@ -939,11 +1172,21 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*bios_thunks_path*/ bios_thunks_path,
         /*out_dir*/          out_dir,
         /*strict*/           strict,
+        /*discovery*/        discovery,
         /*out_stem*/         out_stem,
+        /*recompiler_patches*/ recompiler_patches,
         /*runtime*/          parse_runtime_block(cfg, root),
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
+        /*data_shard_funcs*/      data_shard_funcs,
+        /*vsync_query_func*/      vsync_query_func,
+        /*vsync_counter_addr*/    vsync_counter_addr,
+        /*vsync_gpustat_ptr_addr*/ vsync_gpustat_ptr_addr,
+        /*vsync_timer1_ptr_addr*/ vsync_timer1_ptr_addr,
+        /*vsync_timer1_cache_addr*/ vsync_timer1_cache_addr,
+        /*vsync_event_horizon_sites*/ vsync_event_horizon_sites,
+        /*vsync_event_horizon_extra_sites*/ vsync_event_horizon_extra_sites,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
@@ -967,6 +1210,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
+        /*ws_nw_textured_edges*/ ws_nw_textured_edges,
+        /*ws_nw_textured_edge_scale*/ ws_nw_textured_edge_scale,
+        /*ws_nw_full_mirror*/ ws_nw_full_mirror,
+        /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
@@ -1036,7 +1283,10 @@ UserSettings load_user_settings(const fs::path& path) {
     try {
         doc = toml::parse(path.string());
     } catch (const std::exception&) {
-        // Malformed file: fall back to all-defaults rather than refuse to boot.
+        // Malformed file: fall back to all-defaults rather than refuse to boot,
+        // but tell the caller so the user hears about it (and so the file can
+        // be preserved before any launcher save overwrites it with defaults).
+        s.parse_error = true;
         return s;
     }
 

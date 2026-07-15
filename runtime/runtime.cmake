@@ -119,6 +119,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
+    ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
     ${PSXRECOMP_ROOT}/runtime/src/text_xlate.cpp
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
@@ -146,10 +147,13 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_icache.c
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
+    ${PSXRECOMP_ROOT}/runtime/src/data_shards.c
+    ${PSXRECOMP_ROOT}/runtime/src/load_accel.c
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_posix.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_compile_worker.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
@@ -240,8 +244,22 @@ function(psxrecomp_add_runtime_target target)
     if(NOT PSXRT_WINDOW_TITLE)
         set(PSXRT_WINDOW_TITLE "${target}")
     endif()
+    # The baked default BIOS path must never be absolute: an absolute path is a
+    # build-machine path, and a promoted/release exe carrying it will silently
+    # load the BUILDER'S BIOS wherever that path exists (i.e. on the dev box) —
+    # so the "prompts for a BIOS on a clean install" flow is never exercised
+    # where releases are validated. Dev checkouts still resolve the relative
+    # default without prompting via the exe-dir upward search, which also tries
+    # <ancestor>/psxrecomp-v4/<relative> for game-project layouts.
     if(NOT PSXRT_DEFAULT_BIOS_PATH)
-        set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN")
+        set(PSXRT_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN")
+    elseif(IS_ABSOLUTE "${PSXRT_DEFAULT_BIOS_PATH}")
+        message(WARNING
+            "DEFAULT_BIOS_PATH '${PSXRT_DEFAULT_BIOS_PATH}' is absolute; refusing to "
+            "bake a build-machine path into the binary (release exes must prompt on "
+            "user machines). Using relative 'bios/SCPH1001.BIN' instead — drop the "
+            "DEFAULT_BIOS_PATH argument from this game's CMakeLists.")
+        set(PSXRT_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN")
     endif()
     if(NOT DEFINED PSXRT_DEFAULT_GAME_CONFIG_PATH)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
@@ -257,6 +275,15 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_GENERATED_DISPATCH_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_DISPATCH_C}")
         set(has_game_dispatch TRUE)
+        if(EXISTS "${PSXRT_GAME_GENERATED_DISPATCH_C}")
+            file(STRINGS "${PSXRT_GAME_GENERATED_DISPATCH_C}"
+                game_dispatch_native_ok_decl
+                REGEX "int[ \t]+psx_game_text_native_ok\\("
+                LIMIT_COUNT 1)
+            if(game_dispatch_native_ok_decl)
+                set(has_game_dispatch_native_ok TRUE)
+            endif()
+        endif()
     endif()
     # Layer B: statically-compiled overlay dispatch. Inert unless a game
     # provides a generated overlays_static.c — no target sets this yet.
@@ -392,6 +419,16 @@ function(psxrecomp_add_runtime_target target)
     if(has_game_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_GAME_DISPATCH=1)
     endif()
+    if(has_game_dispatch_native_ok)
+        # Only the compatibility translation unit needs to know whether the
+        # generated dispatcher supplies the modern exact-range predicate.
+        # Keeping this off the target-wide definitions avoids recompiling the
+        # entire runtime when an existing game regenerates its dispatcher.
+        set_property(SOURCE
+            ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
+            APPEND PROPERTY COMPILE_DEFINITIONS
+            PSX_GAME_DISPATCH_HAS_NATIVE_OK=1)
+    endif()
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
     endif()
@@ -434,6 +471,9 @@ function(psxrecomp_add_runtime_target target)
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
     else()
+        if(CMAKE_DL_LIBS)
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+        endif()
         find_package(OpenGL)
         if(OpenGL_FOUND)
             target_link_libraries(${target} PRIVATE OpenGL::GL)

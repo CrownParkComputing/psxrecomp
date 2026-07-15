@@ -119,7 +119,10 @@ int main(int argc, char** argv) {
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
+    bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
+    std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
@@ -129,6 +132,8 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
+    std::vector<PSXRecompV4::RecompilerPatch> instruction_patches;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
                           ws_bg2d_startx_site = 0,
@@ -138,15 +143,24 @@ int main(int argc, char** argv) {
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
+    uint32_t              configured_text_size = 0;
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
         exe_path             = cfg.exe_path;
+        configured_text_size = cfg.text_size;
+        reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
+        instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
+        ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
+        if (cfg.vsync_query_func)
+            vsync_query_hle_funcs[cfg.vsync_query_func] = {
+                cfg.vsync_counter_addr, cfg.vsync_gpustat_ptr_addr,
+                cfg.vsync_timer1_ptr_addr, cfg.vsync_timer1_cache_addr };
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
@@ -166,6 +180,7 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_bufbase_site) ws_bg2d_bufbase_site = cfg.ws_bg2d_bufbase_site;
         if (cfg.ws_bg2d_cap_site)     ws_bg2d_cap_site     = cfg.ws_bg2d_cap_site;
         if (cfg.ws_bg2d_init_func)    ws_bg2d_init_func    = cfg.ws_bg2d_init_func;
+        ws_signed_x_bound_sites = cfg.ws_signed_x_bound_sites;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -237,6 +252,11 @@ int main(int argc, char** argv) {
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
         ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
+        PSXRecompV4::merge_recompiler_patches(
+            instruction_patches, wscfg.recompiler_patches);
+        ws_signed_x_bound_sites.insert(ws_signed_x_bound_sites.end(),
+                                       wscfg.ws_signed_x_bound_sites.begin(),
+                                       wscfg.ws_signed_x_bound_sites.end());
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
@@ -252,6 +272,29 @@ int main(int argc, char** argv) {
         fmt::print(stderr, "Failed to parse PS1-EXE: {}\n", error_msg);
         return 1;
     }
+
+    // [game].text_size is the title-owned static-analysis bound. It may trim a
+    // verified data/padding tail, but it may never widen the parsed payload or
+    // exclude the executable entry. Runtime disc loading remains unchanged.
+    if (!config_path.empty()) {
+        const uint32_t parsed_size = exe->header.file_size;
+        std::string bound_error;
+        if (!PSXRecomp::apply_static_analysis_bound(
+                *exe, configured_text_size, bound_error)) {
+            fmt::print(stderr, "Invalid static analysis bound: {}\n", bound_error);
+            return 1;
+        }
+        if (exe->header.file_size < parsed_size) {
+            fmt::print("Static analysis bound: 0x{:X} bytes from game.text_size "
+                       "(PS-X EXE header: 0x{:X})\n",
+                       exe->header.file_size, parsed_size);
+        }
+    }
+
+    // Patch the bounded image before discovery/CFG analysis so replacements of
+    // control-flow instructions cannot disagree with the generated graph.
+    PSXRecompV4::apply_recompiler_patches_to_executable(
+        *exe, instruction_patches, overlay_mode);
 
     fmt::print("✓ Successfully parsed PS1-EXE!\n\n");
 
@@ -427,8 +470,8 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalysisResult analysis_result;
 
-    if (overlay_mode) {
-        // ── Overlay exact mode: partition seeds into walk roots and interior
+    if (overlay_mode || reachable_discovery) {
+        // ── Exact-entry mode: partition seeds into walk roots and interior
         // alias candidates. `interior`-marked seeds (classifier-proven
         // dispatch targets without a callable boundary) are NEVER walk roots —
         // a root inside a host function hard-caps (truncates) it, the
@@ -453,7 +496,11 @@ int main(int argc, char** argv) {
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
         for (uint32_t a : exact_entries) {
-            if (trusted_root_seeds.count(a)) {
+            if (reachable_discovery && a == exe->header.initial_pc) {
+                // The PS-X EXE header is direct execution evidence for the
+                // main entry even when it uses a nonstandard prologue.
+                roots.insert(a);
+            } else if (trusted_root_seeds.count(a)) {
                 /* Classifier-proven dispatch root (install-slot class): the
                  * static code tail-dispatches into this PC, so it is a real
                  * execution root despite having no callable boundary. */
@@ -546,7 +593,7 @@ int main(int argc, char** argv) {
                        "(range-ownership completeness)\n", jal_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
-        fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
+        fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
     } else {
         // ── Iterative discovery: seed classification + static data-table scan ──
         //
@@ -776,7 +823,10 @@ int main(int argc, char** argv) {
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.overlay_mode = overlay_mode;
+    codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
+    codegen_config.data_shard_funcs = ds_funcs;
+    codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
@@ -884,13 +934,14 @@ int main(int argc, char** argv) {
     // Per-function code-range manifest (design §8): consumed by the overlay
     // loader's per-entry validity hash. Emitted alongside _full.c for every
     // build; only the overlay path actually loads it.
+    const std::string ranges_manifest = codegen.last_ranges_manifest().empty()
+        ? codegen.generate_ranges_manifest(analysis_result.functions, all_cfgs)
+        : codegen.last_ranges_manifest();
     {
         std::filesystem::path ranges_filename = out_dir / (exe_stem + "_full.ranges");
-        std::string ranges = codegen.generate_ranges_manifest(
-            analysis_result.functions, all_cfgs);
         std::ofstream rf(ranges_filename);
         if (rf.is_open()) {
-            rf << ranges;
+            rf << ranges_manifest;
             rf.close();
             fmt::print("✓ Saved code-range manifest to {}\n\n",
                       ranges_filename.string());
@@ -908,6 +959,7 @@ int main(int argc, char** argv) {
         ds << "/* Generated by PSXRecomp - dynamic dispatch table */\n";
         ds << "#include \"psx_runtime.h\"\n\n";
         ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
@@ -934,17 +986,19 @@ int main(int argc, char** argv) {
             uint32_t addr;
             uint32_t resume;
             uint32_t owner;
+            uint32_t range_index;
+            uint32_t range_count;
         };
         std::vector<DispatchRecord> records;
         records.reserve(dispatch_addrs.size() +
                         (codegen.cps_enabled() ? codegen.cps_continuations().size() : 0));
         for (uint32_t addr : dispatch_addrs)
-            records.push_back({addr, 0, addr});
+            records.push_back({addr, 0, addr, 0, 0});
         if (codegen.cps_enabled()) {
             const auto& conts = codegen.cps_continuations();
             for (const auto& [cont, owner] : conts) {
                 if (dispatch_addrs.count(cont)) continue;
-                records.push_back({cont, cont, owner});
+                records.push_back({cont, cont, owner, 0, 0});
             }
         }
         std::sort(records.begin(), records.end(),
@@ -952,16 +1006,82 @@ int main(int argc, char** argv) {
                       return a.addr < b.addr;
                   });
 
+        // Attach the exact CFG instruction ranges from the manifest to every
+        // dispatch owner. Mid-function alias wrappers have no separate F record,
+        // so resolve them to the containing host range. Mutable data and
+        // jump-table gaps sharing a page remain deliberately excluded.
+        using CodeRange = std::pair<uint32_t, uint32_t>;  // virtual lo, byte len
+        std::map<uint32_t, std::vector<CodeRange>> function_ranges;
+        {
+            std::istringstream input(ranges_manifest);
+            std::string line;
+            uint32_t current_owner = 0;
+            while (std::getline(input, line)) {
+                std::istringstream fields(line);
+                char kind = 0;
+                fields >> kind;
+                if (kind == 'F') {
+                    fields >> std::hex >> current_owner;
+                    function_ranges[current_owner];
+                } else if (kind == 'R' && current_owner != 0) {
+                    uint32_t lo = 0, len = 0;
+                    fields >> std::hex >> lo >> len;
+                    if (len != 0)
+                        function_ranges[current_owner].push_back({lo, len});
+                }
+            }
+        }
+        std::vector<CodeRange> flat_ranges;
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> owner_spans;
+        auto resolve_owner_ranges = [&](uint32_t owner)
+            -> const std::vector<CodeRange>* {
+            auto exact = function_ranges.find(owner);
+            if (exact != function_ranges.end() && !exact->second.empty())
+                return &exact->second;
+            for (const auto& [entry, ranges] : function_ranges) {
+                (void)entry;
+                for (const auto& [lo, len] : ranges) {
+                    const uint64_t hi = (uint64_t)lo + len;
+                    if (owner >= lo && (uint64_t)owner < hi) return &ranges;
+                }
+            }
+            return nullptr;
+        };
+        for (auto& rec : records) {
+            auto cached = owner_spans.find(rec.owner);
+            if (cached == owner_spans.end()) {
+                const uint32_t first = (uint32_t)flat_ranges.size();
+                const auto* ranges = resolve_owner_ranges(rec.owner);
+                if (ranges)
+                    flat_ranges.insert(flat_ranges.end(), ranges->begin(), ranges->end());
+                const uint32_t count = (uint32_t)flat_ranges.size() - first;
+                cached = owner_spans.emplace(rec.owner,
+                                             std::make_pair(first, count)).first;
+            }
+            rec.range_index = cached->second.first;
+            rec.range_count = cached->second.second;
+        }
+
+        ds << "typedef struct { uint32_t lo; uint32_t len; } PsxGameCodeRange;\n";
+        ds << "static const PsxGameCodeRange k_psx_game_code_ranges[] = {\n";
+        if (flat_ranges.empty()) ds << "    {0u, 0u},\n";
+        for (const auto& [lo, len] : flat_ranges)
+            ds << fmt::format("    {{0x{:08X}u, 0x{:X}u}},\n", lo, len);
+        ds << "};\n\n";
+
         ds << "typedef void (*PsxGameDispatchFn)(CPUState* cpu);\n";
         ds << "typedef struct {\n";
         ds << "    uint32_t addr;\n";
         ds << "    uint32_t resume_pc;\n";
+        ds << "    uint32_t range_index;\n";
+        ds << "    uint32_t range_count;\n";
         ds << "    PsxGameDispatchFn fn;\n";
         ds << "} PsxGameDispatchEntry;\n\n";
         ds << "static const PsxGameDispatchEntry k_psx_game_dispatch[] = {\n";
         for (const auto& rec : records) {
-            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, func_{:08X}}},\n",
-                              rec.addr, rec.resume, rec.owner);
+            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, {}u, {}u, func_{:08X}}},\n",
+                              rec.addr, rec.resume, rec.range_index,
+                              rec.range_count, rec.owner);
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
@@ -977,10 +1097,20 @@ int main(int argc, char** argv) {
         ds << "    return 0;\n";
         ds << "}\n\n";
 
+        ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
+        ds << "int psx_game_text_native_ok(uint32_t addr) {\n";
+        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
+        ds << "    if (!entry || entry->range_count == 0) return 0;\n";
+        ds << "    return dirty_ram_text_native_ok_ranges(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count);\n";
+        ds << "}\n\n";
+
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry) return 0;\n";
+        ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges(\n";
+        ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count)) return 0;\n";
         ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
         if (codegen.cps_enabled())
             ds << "    cpu->pc = entry->resume_pc;\n";
@@ -1006,9 +1136,17 @@ int main(int argc, char** argv) {
             // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
             // with the BIOS dispatch's marker.
             ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "static void psx_cps_mark_game(void) {\n";
             ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
             ds << "}\n";
+            // Run psx_cps_mark_game before main(). __attribute__((constructor)) is
+            // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
+            ds << "#if defined(_MSC_VER)\n";
+            ds << "#pragma section(\".CRT$XCU\", read)\n";
+            ds << "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_game_ctor)(void) = psx_cps_mark_game;\n";
+            ds << "#else\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game_ctor(void) { psx_cps_mark_game(); }\n";
+            ds << "#endif\n";
         }
 
         std::ofstream dispatch_file(dispatch_filename);

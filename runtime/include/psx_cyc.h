@@ -28,6 +28,9 @@
 #define PSX_CYC_H
 
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
+#endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
 
 #ifdef __cplusplus
@@ -49,7 +52,13 @@ static inline void psx_cyc_base(CPUState* cpu) {
 static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
     while (reg_mask) {
+#if defined(_MSC_VER)
+        unsigned long _psx_ctz_idx;
+        _BitScanForward(&_psx_ctz_idx, reg_mask);
+        unsigned n = (unsigned)_psx_ctz_idx;
+#else
         unsigned n = (unsigned)__builtin_ctz(reg_mask);
+#endif
         cpu->read_absorb[n] = 0u;
         reg_mask &= reg_mask - 1u;
     }
@@ -87,6 +96,12 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
 extern uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 extern uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 extern uint8_t  psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+
+/* Charge the exact timing/pipeline effects of a 32-bit CPU load without
+ * invoking the memory handler.  Enhancement HLE may use this only when static
+ * analysis proves the loaded value and read side effects are unobservable. */
+extern void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
+                                           uint32_t rt, uint32_t reg_mask);
 
 /* LWC2 (GTE load) ReadMemory timing only (completion +1, NO LDWhich arm — the dest
  * is a GTE register). Call AFTER psx_cyc_step(cpu,0) (§1+DO_LDS) and psx_gte_stall.

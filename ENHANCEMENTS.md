@@ -287,6 +287,85 @@ All Tomba2, GL 16:9, worktree `_wt-tomba2-ipr` / `Tomba2Recomp` build-t2.
 - CAUTION: any pace numbers taken in diff mode before ISSUES.md #9's redesign
   lands are garbage (the wedged shadow silently disabled all native dispatch).
 
+## L1 — Load-time-toward-0 burndown (2026-07-14, ACTIVE — guinea pig: Tomba 1)
+
+Full analysis + gates/kill criteria: `docs/LOAD_TIME_ZERO.md` (this branch,
+`spike/load-time-zero`). ChatGPT consult merged (thread "PSXrecomp
+workspace"). Already-settled items are NOT re-tried: turbo_loads (shipped,
+~2x), disc_speed divisor 4x/instant (proven unsafe — MMX6 VSync-callback
+wedge), yield pumps r1/r2 (proven fatal — green-thread corruption), BIOS CD
+HLE (rejected — no landmine, no host win). The frame:
+`wall = guest_time x host_cost_per_guest_sec`; under turbo the window is
+emulation-throughput-bound, so the safe axis is host cost (multiplies with
+turbo), the risky axis is guest time.
+
+**Prioritized burndown (most agnostic + most likely beneficial first):**
+
+- [x] **L1.0 — E0 `load_probe_v2`: load-window decomposition on Tomba 1.**
+  100% agnostic, zero risk, prices every bet below. Split a real pig-load
+  window into guest time (seek / sector cadence / per-sector processing /
+  explicit waits) and host time (native code / decompressors / interp /
+  CD-event machinery / SPU / GPU / pump). Existing rings first
+  (freeze_check, cdrom_bursts, dirty_ram_stats per_pc, phase_profile);
+  extend rings only where attribution is blind. Decisive question: why
+  only ~2x during a presentation-suppressed window? Thresholds: decomp
+  ≥~40% host → shards serious; ≤~8% → kill shards; CD/event/SPU machinery
+  dominates → L1.2; wall-clock limiter found → fix that first.
+- [ ] **L1.1 — Turbo hardening.** (a) re-validate SDL pump under a live
+  burst (fix appears in-tree: pump precedes the turbo early-return);
+  (b) audio at the HOST SINK only (drop excess samples, crossfade on
+  exit; never guest state); (c) root-cause MMX5 dev-tools+turbo 0xE10
+  boot wedge (foundation timing bug).
+- [x] **L1.2 — Event-horizon acceleration + batched device ticking.**
+  Provably side-effect-free poll/idle regions jump to the next scheduled
+  observable event with exact cycle credit + identical event ordering;
+  devices advance to deadlines instead of per-block ticks. Attacks the
+  ~2x ceiling directly; class-level, all titles inherit. Gate set from
+  L1.0's poll/idle share. Shipped: deadline-based device servicing, six Tomba
+  wait sites, and proof-gated generic idle skipping. Default-off cross-game
+  smoke validation passed on MMX5 and MMX6. Kill: <10% gain or ONE event-order
+  divergence.
+- [x] **L1.3 — Load-path overlay coverage (killed by gate).** L1.0 measured
+  zero in-window interpreter instructions, so there is no coverage win to buy.
+- [x] **L1.4 — Data shards (rejected/quarantined): verify-only SHADOW
+  mode, then replay.** Gated on L1.0 (decomp ≥~20-25% host share).
+  Correctness bar: temporal write visibility — replay sound only if
+  IRQs-off across the window OR duration < next observable event.
+- [x] **L1.5 — Authentic drive backlog (killed as acceleration).** Passive
+  deadline-vs-exposure probe measured 1,304/1,304 data sectors available on
+  their exact scheduled cycle, then the intentional fixed 5,000-cycle INT1
+  presentation delay. Zero early/late sectors, holds, pending/lost INT1s, or
+  overwrites: there is no artificial lateness for backlog/catch-up to remove.
+- [x] **L1.6 — Seek-only latency probe (killed on Tomba).** The measured
+  New Game window issued zero seek commands. Read-start latency was only
+  7,676,928 / 298,130,657 cycles (2.57%); pause latency was 8.11% but is an
+  authentic CPU-visible ordering contract, not a safe seek-speedup target.
+- [ ] **L1.7 — Phase-2 doors (open only with cause):** per-title read
+  speedup with XA/CDDA/MDEC exclusions; decompressor HLE (only via L1.4
+  failing for a named reason); load-transition state cache (the only
+  true near-zero; needs thousands-of-frames differential validation).
+
+**Live status / decision ledger (Tomba 1, 2026-07-14):**
+
+| Item | Verdict | Evidence / measured result |
+|---|---|---|
+| L1.0 decomposition | DONE | 761 sectors, ~9.5 s baseline window; zero in-window interp; host/static execution dominated. |
+| L1.1 turbo hardening | IMPLEMENTED ON TOMBA; CROSS-GAME SMOKE PASSED | SDL pump remains before every turbo return; 4-frame engage + 6-frame release debounce passed live QA. Opt-in host-audio sink advances canonical SPU state while discarding only accelerated host output; Tomba listening QA passed after 1,100,752 discarded SPU frames. MMX5 and MMX6 debug-tools builds booted through loads into live gameplay with normal visuals/audio; the historic intermittent MMX5 0xE10 root cause remains a separate long-run investigation. |
+| L1.2 event horizon | IMPLEMENTED; CROSS-GAME SMOKE PASSED | Production cycle advancement already batches device service at event/MMIO deadlines. Six configured PsyQ CD-wait sites delivered ~27% + ~9% stages. Generic idle-loop skip then cut warm bursts 0.53->0.34 s and 2.19->1.73 s, with 4,599 skips / 765M guest cycles and zero CD overwrites. Strictly per-game opt-in; MMX5/MMX6 exercised the default-off compatibility path successfully. |
+| L1.3 overlay coverage | KILLED | Interpreter share was zero in the measured load window. |
+| L1.4 asset/data replay | REJECTED FOR NOW | `FUN_8003EF50` replay produced title/game texture corruption despite zero verifier failures: v1 temporal verifier is unsound. Data shards default off and artifacts removed. |
+| Configurable warm CD routes (L1.7 read-speed branch) | ACCEPTED, STRICTLY PER-GAME OPT-IN | Framework accepts up to 16 strict LBA routes with mismatch fallback and consumer-paced IRQ/DMA. Only data-read cadence accelerates; XA/CDDA, seek, and motor timing remain authentic. Tomba multi-route regression: 3 matches, 1,944 accelerated sectors, zero overwrites. Legacy singular config is deprecated. |
+| L1.5 authentic backlog | DONE / KILLED AS ACCELERATION | 1,304/1,304 sectors exact-deadline; INT1 exposure exactly +5,000 cycles; zero holds, pending/lost, or overwrites. |
+| L1.6 seek-only probe | DONE / KILLED ON TOMBA | Automated New Game: 0 seeks across 792 data sectors. Read-start latency was 2.57% of the data span, below the 10% gate. Pause was 8.11% but remains authentic because early completion is a known race/wedge class. |
+| L1.7 state cache / broader HLE | DEFERRED | User excludes savestates; decompressor replay failed correctness. |
+
+Method, every experiment: measure first via always-on rings; start flag-gated;
+one per session; kill criterion written before code. `idle_skip`, warm CD routes,
+and the turbo host-audio sink are all strictly per-game opt-in. MMX6 remains the
+next deeper corpus/soak target after its successful boot/load/gameplay smoke.
+
+---
+
 ## W2 — Tomba 1 (SCUS-94236) 16:9: HUD at the true wide corners (DEFERRED 2026-07-10)
 
 User ask: in native-wide 16:9, re-anchor the HUD to the wide corners
