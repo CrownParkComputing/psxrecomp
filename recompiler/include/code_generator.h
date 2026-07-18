@@ -236,6 +236,19 @@ public:
         known_functions_ = functions;
     }
 
+    // Set function name map: address -> actual function name (with custom renames)
+    void set_function_names(const std::map<uint32_t, std::string>& names) {
+        function_name_map_ = names;
+    }
+
+    // Set function name map (address -> prefixed name like "func_InitGeom" or "func_80012340")
+    void set_function_name_map(const std::map<uint32_t, std::string>& name_map) {
+        function_name_map_ = name_map;
+    }
+
+    // Helper to get the actual function name (custom or generic) from the name map
+    std::string get_function_name(uint32_t addr) const;
+
     // Set annotation table (optional — no-op if not called)
     void set_annotations(const AnnotationTable* at) { annotations_ = at; }
 
@@ -243,6 +256,7 @@ private:
     const PS1Executable& exe_;
     CodeGenConfig config_;
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
+    std::map<uint32_t, std::string> function_name_map_;  // Address -> prefixed name
     std::string last_ranges_manifest_;
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;

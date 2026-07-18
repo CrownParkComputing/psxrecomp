@@ -1632,10 +1632,10 @@ std::string CodeGenerator::translate_basic_block(
                             ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS taken: split */\n", branch_target);
-                        } else if (known_functions_.count(branch_target)) {
+} else if (known_functions_.count(branch_target)) {
                             ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
-                               << fmt::format("func_{:08X}(cpu); return;  /* taken: split piece */\n", branch_target);
+                               << fmt::format("{}(cpu); return;  /* taken: split piece */\n", get_function_name(branch_target));
                         } else {
                             ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
@@ -1650,10 +1650,10 @@ std::string CodeGenerator::translate_basic_block(
                             ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS not taken: split */\n", fall_through_addr);
-                        } else if (known_functions_.count(fall_through_addr)) {
+} else if (known_functions_.count(fall_through_addr)) {
                             ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
-                               << fmt::format("func_{:08X}(cpu); return;  /* not taken: split piece */\n", fall_through_addr);
+                               << fmt::format("{}(cpu); return;  /* not taken: split piece */\n", get_function_name(fall_through_addr));
                         } else {
                             ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
@@ -1674,12 +1674,11 @@ std::string CodeGenerator::translate_basic_block(
                         ss << config_.indent
                            << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS j: split */\n",
                                           block.exit_instr.target);
-                    } else if (block.exit_instr.target != 0 && known_functions_.count(block.exit_instr.target)) {
+} else if (block.exit_instr.target != 0 && known_functions_.count(block.exit_instr.target)) {
                         // Jump target is out-of-function and is a known function start
                         ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
                         ss << config_.indent
-                           << fmt::format("func_{:08X}(cpu); return;  /* j to split piece */\n",
-                                          block.exit_instr.target);
+                           << fmt::format("{}(); return;  /* j to split piece */\n", get_function_name(block.exit_instr.target));
                     } else if (block.exit_instr.target != 0) {
                         // Jump target is a mid-function address — dispatch dynamically
                         ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
@@ -1920,7 +1919,7 @@ std::string CodeGenerator::translate_basic_block(
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << emit_interrupt_check(target, config_.indent);
                     if (known_functions_.count(target) > 0) {
-                        ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
+                        ss << config_.indent << fmt::format("{}();  /* jal */\n", get_function_name(target));
                         ss << config_.indent << fmt::format("if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n", addr + 8);
                     } else {
                         ss << config_.indent << fmt::format("call_by_address(cpu, 0x{:08X}u);  /* external jal */\n", target);
@@ -1936,7 +1935,7 @@ std::string CodeGenerator::translate_basic_block(
                         // Tail-call to the continuation piece (at exit_addr + 8, past delay slot).
                         if (known_functions_.count(cont_addr)) {
                             ss << config_.indent
-                               << fmt::format("func_{:08X}(cpu); return;  /* jal cont: split piece */\n", cont_addr);
+                               << fmt::format("{}(); return;  /* jal cont: split piece */\n", get_function_name(cont_addr));
                         } else {
                             ss << config_.indent
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* jal cont: split */\n", cont_addr);
@@ -1977,7 +1976,7 @@ std::string CodeGenerator::translate_basic_block(
                         // Split-function: JALR continuation is outside this function piece.
                         if (known_functions_.count(cont_addr)) {
                             ss << config_.indent
-                               << fmt::format("func_{:08X}(cpu); return;  /* jalr cont: split piece */\n", cont_addr);
+                               << fmt::format("{}(); return;  /* jalr cont: split piece */\n", get_function_name(cont_addr));
                         } else {
                             ss << config_.indent
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* jalr cont: split */\n", cont_addr);
@@ -2002,8 +2001,8 @@ std::string CodeGenerator::translate_basic_block(
         uint32_t next_addr = block.end_addr + 4;
         if (known_functions_.count(next_addr) > 0) {
             ss << config_.indent
-               << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
-                              next_addr);
+               << fmt::format("{}(cpu); return;  /* fallthrough to split piece */\n",
+                              get_function_name(next_addr));
         } else {
             ss << emit_interrupt_check(next_addr, config_.indent);
         }
@@ -3083,5 +3082,14 @@ std::string CodeGenerator::generate_ranges_manifest(
     }
     return ss.str();
 }
+
+// Helper to get the actual function name (custom or generic) from the name map
+    std::string CodeGenerator::get_function_name(uint32_t addr) const {
+        auto it = function_name_map_.find(addr);
+        if (it != function_name_map_.end()) {
+            return it->second;
+        }
+        return fmt::format("func_{:08X}", addr);
+    }
 
 } // namespace PSXRecomp
