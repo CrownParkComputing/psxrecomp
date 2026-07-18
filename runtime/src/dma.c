@@ -93,7 +93,7 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
 }
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
-#define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
+#define DMA_MDEC_OUT_CYCLES_PER_WORD  1u
 #define DMA_GPU_CYCLES_PER_WORD       1u
 #define DMA_CDROM_CYCLES_PER_WORD     1u
 /* SPU DMA (ch4) per-word cost. Faithful to the Beetle/mednafen oracle, which
@@ -538,31 +538,42 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
 
     uint32_t addr = channels[ch].madr & 0x1FFFFCu;
     uint32_t moved = 0;
-    /* ch1 (MDEC→RAM) writes guest RAM here in a deferred step; mark it as
-     * DMA-sourced so write-provenance tags these writes with ch1 + the kick PC
-     * (ch0 only reads RAM, so it needs no marking). Mirrors the CDROM async. */
     int mdec_writes_ram = (ch == 1);
+
     if (mdec_writes_ram) {
         g_dma_exec_depth++;
         g_dma_cur_ch = 1; g_dma_cur_bcr = channels[1].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[1];
-    }
-    while (a->remaining_words > 0 && words_budget > 0) {
-        if (ch == 0) {
-            if (!mdec_dma_write_ready()) break;
-            mdec_dma_write_word(psx_read_word(addr));
-        } else {
-            if (!mdec_dma_read_ready()) break;
+
+        // Se calcula el lote de palabras disponibles para transferir de un solo tiro
+        uint32_t avail_words = words_budget;
+        if (a->remaining_words < avail_words) avail_words = a->remaining_words;
+
+        // Bucle limpio y exclusivo para MDEC OUT (ch == 1)
+        while (avail_words > 0 && mdec_dma_read_ready()) {
             g_dma_cur_madr = addr;
             psx_write_word(addr, mdec_dma_read_word());
+
+            addr = (addr + addr_step) & 0x1FFFFCu;
+            a->remaining_words--;
+            words_budget--;
+            avail_words--;
+            moved++;
         }
 
-        addr = (addr + addr_step) & 0x1FFFFCu;
-        a->remaining_words--;
-        words_budget--;
-        moved++;
+        g_dma_cur_ch = -1; g_dma_exec_depth--;
+    } else {
+        // Bucle exclusivo para MDEC IN (ch == 0)
+        while (a->remaining_words > 0 && words_budget > 0) {
+            if (!mdec_dma_write_ready()) break;
+            mdec_dma_write_word(psx_read_word(addr));
+
+            addr = (addr + addr_step) & 0x1FFFFCu;
+            a->remaining_words--;
+            words_budget--;
+            moved++;
+        }
     }
-    if (mdec_writes_ram) { g_dma_cur_ch = -1; g_dma_exec_depth--; }
 
     if (moved == 0) return;
 

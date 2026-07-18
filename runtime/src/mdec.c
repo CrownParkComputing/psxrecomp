@@ -224,22 +224,48 @@ static int mask9_clamp_s8(int v) {
  * holds int8-range samples on return. */
 static void idct_block(int16_t *block) {
     int16_t tmp[64];
+
     /* pass 1 — int16 out, transposed */
     for (int col = 0; col < 8; col++) {
+        const int16_t *block_col = &block[col * 8];
         for (int x = 0; x < 8; x++) {
+            const int16_t *scale_x = &mdec.scale[x * 8];
             int sum = 0;
-            for (int u = 0; u < 8; u++)
-                sum += (int)block[col * 8 + u] * (int)mdec.scale[x * 8 + u];
+
+            sum += (int)block_col[0] * (int)scale_x[0];
+            sum += (int)block_col[1] * (int)scale_x[1];
+            sum += (int)block_col[2] * (int)scale_x[2];
+            sum += (int)block_col[3] * (int)scale_x[3];
+            sum += (int)block_col[4] * (int)scale_x[4];
+            sum += (int)block_col[5] * (int)scale_x[5];
+            sum += (int)block_col[6] * (int)scale_x[6];
+            sum += (int)block_col[7] * (int)scale_x[7];
+
             tmp[x * 8 + col] = (int16_t)((sum + 0x4000) >> 15);
         }
     }
+
     /* pass 2 — int8 out (Mask9ClampS8), no transpose */
     for (int col = 0; col < 8; col++) {
+        const int16_t *tmp_col = &tmp[col * 8];
         for (int x = 0; x < 8; x++) {
+            const int16_t *scale_x = &mdec.scale[x * 8];
             int sum = 0;
-            for (int u = 0; u < 8; u++)
-                sum += (int)tmp[col * 8 + u] * (int)mdec.scale[x * 8 + u];
-            block[col * 8 + x] = (int16_t)mask9_clamp_s8((sum + 0x4000) >> 15);
+
+            sum += (int)tmp_col[0] * (int)scale_x[0];
+            sum += (int)tmp_col[1] * (int)scale_x[1];
+            sum += (int)tmp_col[2] * (int)scale_x[2];
+            sum += (int)tmp_col[3] * (int)scale_x[3];
+            sum += (int)tmp_col[4] * (int)scale_x[4];
+            sum += (int)tmp_col[5] * (int)scale_x[5];
+            sum += (int)tmp_col[6] * (int)scale_x[6];
+            sum += (int)tmp_col[7] * (int)scale_x[7];
+
+            int res = (sum + 0x4000) >> 15;
+            res = (int)(int16_t)(res << 7) >> 7; // Sign extend a 9 bits
+            if (res < -128) res = -128; else if (res > 127) res = 127;
+
+            block[col * 8 + x] = (int16_t)res;
         }
     }
 }
@@ -255,10 +281,6 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
         word = mdec.input[(*pos)++];
     }
 
-    /* Dequant in Beetle's <<4 fixed-point domain (mdec.cpp:439-485), clamp
-     * ±0x4000. DC uses quant[0] with no qscale; AC uses qscale*quant[k]. Each
-     * nonzero coeff gets the sign-magnitude rounding bias (ci<0 ? +8 : -8) the
-     * old +4/÷8 model omitted, and the <<4 domain feeds the >>3 IDCT matrix. */
     uint32_t qscale = (word >> 10) & 0x3Fu;
     uint32_t k = 0;
     int ci = sign_extend_10(word & 0x03FFu);
@@ -299,34 +321,39 @@ static int rgb_to_555_chan(uint8_t c) {
     if (v > 0x1F) v = 0x1F;
     return v;
 }
+static inline void append_byte_fast(uint8_t value) {
+    mdec.output[mdec.output_size++] = value;
+}
 
 static void append_rgb_pixel(int y, int cr, int cb) {
-    /* Beetle YCbCr_to_RGB (mdec.cpp:293-304): /256 coeffs (359,-88/-183,454),
-     * +0x80 rounding, the reduced-precision GREEN mask (-88*cb &~0x1F, -183*cr
-     * &~0x07) — the hardware quirk our old /1024 path lacked, the main green-hue
-     * error — Mask9ClampS8, then ^0x80 to unsigned 0..255. */
-    int r = mask9_clamp_s8(y + (((359 * cr) + 0x80) >> 8));
-    int g = mask9_clamp_s8(y + ((((-88 * cb) & ~0x1F) + ((-183 * cr) & ~0x07) + 0x80) >> 8));
-    int b = mask9_clamp_s8(y + (((454 * cb) + 0x80) >> 8));
-    int ru = r ^ 0x80, gu = g ^ 0x80, bu = b ^ 0x80;   /* signed → unsigned */
+    /* Desenrollamos mask9_clamp_s8 de forma matemática inline para evitar saltos */
+    int r_val = y + (((359 * cr) + 0x80) >> 8);
+    int g_val = y + ((((-88 * cb) & ~0x1F) + ((-183 * cr) & ~0x07) + 0x80) >> 8);
+    int b_val = y + (((454 * cb) + 0x80) >> 8);
+
+    /* Simulación rápida del wrapping de 9 bits y clamp a s8 */
+    r_val = (int)(int16_t)(r_val << 7) >> 7; if (r_val < -128) r_val = -128; else if (r_val > 127) r_val = 127;
+    g_val = (int)(int16_t)(g_val << 7) >> 7; if (g_val < -128) g_val = -128; else if (g_val > 127) g_val = 127;
+    b_val = (int)(int16_t)(b_val << 7) >> 7; if (b_val < -128) b_val = -128; else if (b_val > 127) b_val = 127;
+
+    int ru = r_val ^ 0x80, gu = g_val ^ 0x80, bu = b_val ^ 0x80;
 
     if (mdec.output_depth == 3) {
-        /* 16bpp (mdec.cpp:397-418): RGB555 then pixel_xor = bit15(0x8000) |
-         * signed(0x4210 = MSB of each 5-bit channel). */
-        uint16_t packed = (uint16_t)(rgb_to_555_chan(ru)
-                                     | (rgb_to_555_chan(gu) << 5)
-                                     | (rgb_to_555_chan(bu) << 10));
-        uint16_t pixel_xor = (uint16_t)((mdec.output_bit15 ? 0x8000u : 0u)
-                                        | (mdec.output_signed ? 0x4210u : 0u));
+        int r5 = (ru + 4) >> 3; if (r5 > 0x1F) r5 = 0x1F;
+        int g5 = (gu + 4) >> 3; if (g5 > 0x1F) g5 = 0x1F;
+        int b5 = (bu + 4) >> 3; if (b5 > 0x1F) b5 = 0x1F;
+
+        uint16_t packed = (uint16_t)(r5 | (g5 << 5) | (b5 << 10));
+        uint16_t pixel_xor = (uint16_t)((mdec.output_bit15 ? 0x8000u : 0u) | (mdec.output_signed ? 0x4210u : 0u));
         packed ^= pixel_xor;
-        append_byte((uint8_t)packed);
-        append_byte((uint8_t)(packed >> 8));
+
+        append_byte_fast((uint8_t)packed);
+        append_byte_fast((uint8_t)(packed >> 8));
     } else {
-        /* 24bpp (mdec.cpp:370-393): rgb_xor = signed ? 0x80 : 0x00. */
         uint8_t rgb_xor = mdec.output_signed ? 0x80u : 0x00u;
-        append_byte((uint8_t)(ru ^ rgb_xor));
-        append_byte((uint8_t)(gu ^ rgb_xor));
-        append_byte((uint8_t)(bu ^ rgb_xor));
+        append_byte_fast((uint8_t)(ru ^ rgb_xor));
+        append_byte_fast((uint8_t)(gu ^ rgb_xor));
+        append_byte_fast((uint8_t)(bu ^ rgb_xor));
     }
 }
 
@@ -339,12 +366,22 @@ static void append_luma_block(const int16_t *yblk) {
 static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                     const int16_t yblk[4][64]) {
     for (int py = 0; py < 16; py++) {
+        // Precalculamos la fila de luma alta/baja y la fila de croma para toda esta línea horizontal
+        int y_row_offset = (py >= 8 ? 2 : 0);
+        int ly = py & 7;
+        int ly_offset = ly * 8;
+
+        int chroma_y_offset = (py >> 1) * 8;
+
         for (int px = 0; px < 16; px++) {
-            int y_index = (py >= 8 ? 2 : 0) + (px >= 8 ? 1 : 0);
+            // Evaluamos el índice del bloque de luma (0, 1, 2 o 3)
+            int y_index = y_row_offset + (px >= 8 ? 1 : 0);
             int lx = px & 7;
-            int ly = py & 7;
-            int chroma = (px >> 1) + (py >> 1) * 8;
-            append_rgb_pixel(yblk[y_index][lx + ly * 8], crblk[chroma], cbblk[chroma]);
+
+            // El croma se comparte cada 2 píxeles horizontales
+            int chroma = (px >> 1) + chroma_y_offset;
+
+            append_rgb_pixel(yblk[y_index][lx + ly_offset], crblk[chroma], cbblk[chroma]);
         }
     }
 }
@@ -369,6 +406,13 @@ static void execute_decode(void) {
     mdec.dma_read_underflows = 0;
 
     if (mdec.output_depth < 2) {
+        uint32_t bytes_needed = (mdec.output_depth == 3) ? 512u : 768u;
+        if (!ensure_output_capacity(mdec.output_size + bytes_needed)) {
+            // Si falla la asignación de memoria, salimos de la función limpiamente
+            mdec.decode_input_pos = pos;
+            trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
+            return;
+        }
         int16_t yblk[64];
         while (pos < end && decode_rle_block(yblk, mdec.y_quant, &pos, end)) {
             append_luma_block(yblk);
@@ -381,6 +425,13 @@ static void execute_decode(void) {
     }
 
     while (pos < end) {
+        uint32_t bytes_needed = (mdec.output_depth == 3) ? 512u : 768u;
+        if (!ensure_output_capacity(mdec.output_size + bytes_needed)) {
+            // Si falla la asignación de memoria, salimos de la función limpiamente
+            mdec.decode_input_pos = pos;
+            trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
+            return;
+        }
         int16_t crblk[64];
         int16_t cbblk[64];
         int16_t yblk[4][64];
