@@ -429,6 +429,7 @@ struct GameConfig {
     std::string           discovery;     // "whole-image" (default) or "reachable"
     std::string           out_stem;       // derived if not explicit
     bool                  split_per_function = false; // one C file per function
+    std::filesystem::path funcname_path; // optional CSV with address,name pairs
     // Game-owned, exact MIPS word replacements. IDs and physical instruction
     // addresses are unique within a config; see docs/config_schema.md.
     std::vector<RecompilerPatch> recompiler_patches;

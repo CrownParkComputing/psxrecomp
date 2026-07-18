@@ -160,7 +160,8 @@ struct CodeGenConfig {
 
 // Result of code generation for a function
 struct GeneratedFunction {
-    std::string function_name;    // e.g., "func_80016940"
+    std::string function_name;    // e.g., "func_80016940" or custom name "MyFunction"
+    uint32_t start_addr;          // Original function start address (for filename)
     std::string signature;        // e.g., "void func_80016940(CPUState* cpu)"
     std::string body;             // C code body
     std::string full_code;        // signature + body

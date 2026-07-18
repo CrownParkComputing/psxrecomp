@@ -2096,6 +2096,7 @@ GeneratedFunction CodeGenerator::generate_function(
 
     GeneratedFunction result;
     result.function_name = func.name;
+    result.start_addr = func.start_addr;
     result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
@@ -2513,6 +2514,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         const Function* a = aliases[i];
         GeneratedFunction gf;
         gf.function_name = a->name;
+        gf.start_addr = a->start_addr;
         gf.signature = fmt::format("void {}(CPUState* cpu)", a->name);
         gf.body = fmt::format(
             "{{\n"
@@ -2586,6 +2588,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
         if (func.is_data_section) {
             GeneratedFunction stub;
             stub.function_name = func.name;
+            stub.start_addr = func.start_addr;
             stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
             stub.body = fmt::format(
                 "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
@@ -2638,6 +2641,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
             if (instrs > 0 && todo * 2u >= instrs) {   // >= 50% untranslatable => data
                 GeneratedFunction data_stub;
                 data_stub.function_name = func.name;
+                data_stub.start_addr = func.start_addr;
                 data_stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
                 data_stub.body = fmt::format(
                     "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",

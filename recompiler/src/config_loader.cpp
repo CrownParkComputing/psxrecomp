@@ -805,6 +805,11 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         ? toml::find<bool>(recomp, "split_per_function")
         : false;
 
+    fs::path funcname_path;
+    if (recomp.contains("funcname")) {
+        funcname_path = fs::absolute(root / toml::find<std::string>(recomp, "funcname"));
+    }
+
     std::vector<RecompilerPatch> recompiler_patches;
     if (recomp.contains("patch")) {
         const auto& patches = toml::find<toml::array>(recomp, "patch");
@@ -1187,6 +1192,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*discovery*/        discovery,
         /*out_stem*/         out_stem,
         /*split_per_function*/ split_per_function,
+        /*funcname_path*/  funcname_path,
         /*recompiler_patches*/ recompiler_patches,
         /*runtime*/          parse_runtime_block(cfg, root),
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,

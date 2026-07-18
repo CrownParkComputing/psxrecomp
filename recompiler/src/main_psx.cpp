@@ -142,9 +142,10 @@ int main(int argc, char** argv) {
                           ws_bg2d_bufbase_site = 0,
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
-    std::filesystem::path out_dir = "generated";
+std::filesystem::path out_dir = "generated";
     uint32_t              configured_text_size = 0;
     bool                  split_per_function = false;
+    std::string           funcname_csv_path;
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
@@ -155,6 +156,8 @@ int main(int argc, char** argv) {
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
         instruction_patches  = cfg.recompiler_patches;
+        split_per_function   = cfg.split_per_function;
+        funcname_csv_path    = cfg.funcname_path.string();
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
@@ -206,7 +209,7 @@ int main(int argc, char** argv) {
     } else {
         if (argc < 2) {
             fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
-            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect] [--splitfunc]\n", argv[0]);
+            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect] [--splitfunc] [--funcname <csv>]\n", argv[0]);
             fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
             return 0;
         }
@@ -216,6 +219,8 @@ int main(int argc, char** argv) {
             std::string arg = argv[i];
             if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
                 extra_funcs_path = argv[++i];
+            } else if (arg == "--funcname" && i + 1 < argc) {
+                funcname_csv_path = argv[++i];
             } else if (arg == "--out-dir" && i + 1 < argc) {
                 out_dir = argv[++i];
             } else if (arg == "--strict") {
@@ -264,6 +269,44 @@ int main(int argc, char** argv) {
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
+    }
+
+    // Load custom function names from CSV (--funcname)
+    std::map<uint32_t, std::string> custom_func_names;
+    if (!funcname_csv_path.empty()) {
+        std::ifstream f(funcname_csv_path);
+        if (f.is_open()) {
+            std::string line;
+            size_t line_num = 0;
+            while (std::getline(f, line)) {
+                line_num++;
+                if (line.empty() || line[0] == '#') continue;
+                // Expect format: address,name (hex address, no 0x prefix required)
+                size_t comma = line.find(',');
+                if (comma == std::string::npos) {
+                    fmt::print(stderr, "WARNING: Invalid line {} in funcname CSV (missing comma): {}\n", line_num, line);
+                    continue;
+                }
+                std::string addr_str = line.substr(0, comma);
+                std::string name = line.substr(comma + 1);
+                // Trim whitespace
+                auto trim = [](std::string& s) {
+                    size_t start = s.find_first_not_of(" \t\r\n");
+                    size_t end = s.find_last_not_of(" \t\r\n");
+                    if (start == std::string::npos) { s.clear(); return; }
+                    s = s.substr(start, end - start + 1);
+                };
+                trim(addr_str);
+                trim(name);
+                if (addr_str.empty() || name.empty()) continue;
+                // Parse address (allow with or without 0x prefix)
+                uint32_t addr = (uint32_t)std::strtoul(addr_str.c_str(), nullptr, 0);
+                custom_func_names[addr] = name;
+            }
+            fmt::print("Loaded {} custom function names from {}\n\n", custom_func_names.size(), funcname_csv_path);
+        } else {
+            fmt::print(stderr, "WARNING: Cannot open funcname CSV file: {}\n", funcname_csv_path);
+        }
     }
 
     // Parse the PS1-EXE file
@@ -537,7 +580,7 @@ int main(int argc, char** argv) {
         {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
-            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+            analysis_result = analyzer.analyze_exact_entries(roots_vec, &custom_func_names);
         }
 
         std::vector<AliasEntry> alias_entries;
@@ -631,7 +674,7 @@ int main(int argc, char** argv) {
         for (int iter = 0; iter < kMaxDiscoveryIters; ++iter) {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             for (uint32_t a : forced) analyzer.add_forced_entry(a);
-            analysis_result = analyzer.analyze();
+            analysis_result = analyzer.analyze(&custom_func_names);
 
             std::vector<const PSXRecomp::Function*> code_funcs;
             for (const auto& f : analysis_result.functions) {
@@ -953,16 +996,18 @@ int main(int argc, char** argv) {
         const std::vector<PSXRecomp::GeneratedFunction>& gen_funcs = codegen.last_gen_funcs();
         int func_index = 0;
         for (const auto& gf : gen_funcs) {
-            // Extract address from function name (format: func_XXXXXXXX)
-            uint32_t func_addr = func_index;
-            size_t underscore_pos = gf.function_name.find_last_of('_');
-            if (underscore_pos != std::string::npos && underscore_pos + 1 < gf.function_name.size()) {
-                std::string addr_str = gf.function_name.substr(underscore_pos + 1);
-                func_addr = static_cast<uint32_t>(std::strtoul(addr_str.c_str(), nullptr, 16));
+            // Use custom function name for filename if available, otherwise use address
+            std::string filename_suffix;
+            if (gf.function_name.rfind("func_", 0) == 0) {
+                // Generic name (func_XXXXXXXX) - use address
+                filename_suffix = fmt::format("func_{:08X}", gf.start_addr);
+            } else {
+                // Custom name - use the name directly
+                filename_suffix = gf.function_name;
             }
 
             std::filesystem::path func_filename =
-                out_dir / fmt::format("{}_func_{:08X}.c", exe_stem, func_addr);
+                out_dir / fmt::format("{}_func_{}.c", exe_stem, filename_suffix);
 
             std::ofstream func_file(func_filename);
             if (func_file.is_open()) {

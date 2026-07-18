@@ -541,7 +541,8 @@ static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
 
 } // namespace
 
-FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector<uint32_t>& entries) {
+FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector<uint32_t>& entries,
+    const std::map<uint32_t, std::string>* custom_names) {
     FunctionAnalysisResult result;
     result.total_instructions = 0;
     result.jr_ra_count = 0;
@@ -768,7 +769,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
         if (func.end_addr > hard_cap) func.end_addr = hard_cap;
         if (func.end_addr <= func.start_addr) func.end_addr = func.start_addr + 4u;
         func.size = func.end_addr - func.start_addr;
-        func.name = fmt::format("func_{:08X}", func.start_addr);
+        std::string custom = lookup_custom_name(func.start_addr, custom_names);
+        func.name = custom.empty() ? fmt::format("func_{:08X}", func.start_addr) : custom;
 
         auto first_instr = exe_.read_word(func.start_addr);
         if (first_instr.has_value()) {
@@ -793,7 +795,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
 }
 
 
-FunctionAnalysisResult FunctionAnalyzer::analyze() {
+FunctionAnalysisResult FunctionAnalyzer::analyze(const std::map<uint32_t, std::string>* custom_names) {
     FunctionAnalysisResult result;
     result.total_instructions = 0;
     result.jr_ra_count = 0;
@@ -1370,7 +1372,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         }
 
         func.size = func.end_addr - func.start_addr;
-        func.name = fmt::format("func_{:08X}", func.start_addr);
+        std::string custom = lookup_custom_name(func.start_addr, custom_names);
+        func.name = custom.empty() ? fmt::format("func_{:08X}", func.start_addr) : custom;
 
         // Check for prologue at start
         auto first_instr = exe_.read_word(func.start_addr);
@@ -1398,6 +1401,14 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     }
 
     return result;
+}
+
+std::string FunctionAnalyzer::lookup_custom_name(uint32_t addr,
+    const std::map<uint32_t, std::string>* custom_names) const {
+    if (!custom_names) return "";
+    auto it = custom_names->find(addr);
+    if (it != custom_names->end()) return it->second;
+    return "";
 }
 
 } // namespace PSXRecomp

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <map>
 #include "ps1_exe_parser.h"
 
 namespace PSXRecomp {
@@ -46,13 +47,16 @@ public:
     explicit FunctionAnalyzer(const PS1Executable& exe);
 
     // Scan entire executable for function boundaries
-    FunctionAnalysisResult analyze();
+    // custom_names: optional map of address -> custom function name
+    FunctionAnalysisResult analyze(const std::map<uint32_t, std::string>* custom_names = nullptr);
 
     // Analyze only explicit entry points and callable direct-JAL targets
     // reachable from them. Used by runtime-loaded overlays and opt-in main-EXE
     // reachable discovery. Unresolved jalr/indirect targets do not mint
     // functions; evidence-backed entries must be supplied explicitly.
-    FunctionAnalysisResult analyze_exact_entries(const std::vector<uint32_t>& entries);
+    // custom_names: optional map of address -> custom function name
+    FunctionAnalysisResult analyze_exact_entries(const std::vector<uint32_t>& entries,
+                                                  const std::map<uint32_t, std::string>* custom_names = nullptr);
 
     // Add a forced entry point address that is treated as a function start
     // even if it has no standard ADDIU $sp prologue. The function will be
@@ -92,6 +96,10 @@ private:
 
     // Detect if a region is likely a data section masquerading as code
     bool is_likely_data_section(uint32_t start_addr, uint32_t end_addr) const;
+
+    // Look up custom function name from address->name map
+    std::string lookup_custom_name(uint32_t addr,
+        const std::map<uint32_t, std::string>* custom_names) const;
 };
 
 } // namespace PSXRecomp
