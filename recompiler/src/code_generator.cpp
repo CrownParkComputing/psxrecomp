@@ -2095,7 +2095,8 @@ GeneratedFunction CodeGenerator::generate_function(
     const std::string& fallthrough_name) {
 
     GeneratedFunction result;
-    std::string prefixed_name = "func_" + func.name;
+    // Only add func_ prefix if not already present
+    std::string prefixed_name = (func.name.rfind("func_", 0) == 0) ? func.name : "func_" + func.name;
     result.function_name = prefixed_name;
     result.start_addr = func.start_addr;
     result.signature = fmt::format("void {}(CPUState* cpu)", prefixed_name);
@@ -2513,7 +2514,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // One dispatchable wrapper per alias entry; the first carries the body.
     for (size_t i = 0; i < aliases.size(); ++i) {
         const Function* a = aliases[i];
-        std::string prefixed_name = "func_" + a->name;
+        std::string prefixed_name = (a->name.rfind("func_", 0) == 0) ? a->name : "func_" + a->name;
         GeneratedFunction gf;
         gf.function_name = prefixed_name;
         gf.start_addr = a->start_addr;

@@ -1003,7 +1003,7 @@ std::filesystem::path out_dir = "generated";
             }
 
             std::filesystem::path func_filename =
-                out_dir / fmt::format("{}_func_{}.c", exe_stem, filename_suffix);
+                out_dir / fmt::format("{}_{}.c", exe_stem, filename_suffix);
 
             std::ofstream func_file(func_filename);
             if (func_file.is_open()) {
