@@ -949,10 +949,21 @@ std::filesystem::path out_dir = "generated";
     std::string full_c_code = codegen.generate_file(analysis_result.functions, all_cfgs);
     std::set<uint32_t> dispatch_addrs;
     {
-        // Use the generated functions list which has correct names (custom or generic)
-        const std::vector<PSXRecomp::GeneratedFunction>& gen_funcs = codegen.last_gen_funcs();
-        for (const auto& gf : gen_funcs) {
-            dispatch_addrs.insert(gf.start_addr);
+        const std::string marker = "void func_";
+        size_t pos = 0;
+        while ((pos = full_c_code.find(marker, pos)) != std::string::npos) {
+            size_t hex_pos = pos + marker.size();
+            if (hex_pos + 8 <= full_c_code.size() &&
+                full_c_code.compare(hex_pos + 8, 14, "(CPUState* cpu") == 0) {
+                std::string hex = full_c_code.substr(hex_pos, 8);
+                dispatch_addrs.insert((uint32_t)std::strtoul(hex.c_str(), nullptr, 16));
+            }
+            pos = hex_pos + 8;
+        }
+    }
+    if (dispatch_addrs.empty()) {
+        for (const auto& func : analysis_result.functions) {
+            dispatch_addrs.insert(func.start_addr);
         }
     }
 
