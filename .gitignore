@@ -13,6 +13,7 @@ ghidra/
 
 # Backup of the working state — see CURRENT_STATE.md for what this contains.
 .happypath/
+references/
 
 # Build artifacts
 recompiler/build/
