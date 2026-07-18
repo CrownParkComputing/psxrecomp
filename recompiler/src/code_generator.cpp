@@ -2095,9 +2095,10 @@ GeneratedFunction CodeGenerator::generate_function(
     const std::string& fallthrough_name) {
 
     GeneratedFunction result;
-    result.function_name = func.name;
+    std::string prefixed_name = "func_" + func.name;
+    result.function_name = prefixed_name;
     result.start_addr = func.start_addr;
-    result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+    result.signature = fmt::format("void {}(CPUState* cpu)", prefixed_name);
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
     // translate_instruction widens this function's width compares. Cleared for
@@ -2512,10 +2513,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // One dispatchable wrapper per alias entry; the first carries the body.
     for (size_t i = 0; i < aliases.size(); ++i) {
         const Function* a = aliases[i];
+        std::string prefixed_name = "func_" + a->name;
         GeneratedFunction gf;
-        gf.function_name = a->name;
+        gf.function_name = prefixed_name;
         gf.start_addr = a->start_addr;
-        gf.signature = fmt::format("void {}(CPUState* cpu)", a->name);
+        gf.signature = fmt::format("void {}(CPUState* cpu)", prefixed_name);
         gf.body = fmt::format(
             "{{\n"
             "    debug_server_log_call_entry(0x{:08X}u);\n"
@@ -2552,7 +2554,9 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     // fall-through: the recompiler must emit a tail call to the continuation.
     std::map<uint32_t, std::string> func_name_by_addr;
     for (const Function& f : functions) {
-        func_name_by_addr[f.start_addr] = f.name;
+        // Prefix with "func_" if not already a custom name
+        std::string prefixed = (f.name.rfind("func_", 0) == 0) ? f.name : "func_" + f.name;
+        func_name_by_addr[f.start_addr] = prefixed;
     }
 
     // Group overlapping-alias entries by host: each group is emitted as one
@@ -2586,10 +2590,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
             continue;
         }
         if (func.is_data_section) {
+            std::string prefixed_name = "func_" + func.name;
             GeneratedFunction stub;
-            stub.function_name = func.name;
+            stub.function_name = prefixed_name;
             stub.start_addr = func.start_addr;
-            stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+            stub.signature = fmt::format("void {}(CPUState* cpu)", prefixed_name);
             stub.body = fmt::format(
                 "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
                 func.start_addr, func.start_addr & 0x1FFFFFFFu);
@@ -2639,10 +2644,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
             while ((pos = gen_func.body.find("TODO: SPECIAL", pos)) != std::string::npos) { todo++; pos += 13; }
             uint32_t instrs = func.size / 4u;
             if (instrs > 0 && todo * 2u >= instrs) {   // >= 50% untranslatable => data
+                std::string prefixed_name = "func_" + func.name;
                 GeneratedFunction data_stub;
-                data_stub.function_name = func.name;
+                data_stub.function_name = prefixed_name;
                 data_stub.start_addr = func.start_addr;
-                data_stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+                data_stub.signature = fmt::format("void {}(CPUState* cpu)", prefixed_name);
                 data_stub.body = fmt::format(
                     "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
                     func.start_addr, func.start_addr & 0x1FFFFFFFu);

@@ -986,12 +986,19 @@ std::filesystem::path out_dir = "generated";
         int func_index = 0;
         for (const auto& gf : gen_funcs) {
             // Use custom function name for filename if available, otherwise use address
+            // Generic names are "func_XXXXXXXX" (8 hex chars), custom are "func_Name"
             std::string filename_suffix;
-            if (gf.function_name.rfind("func_", 0) == 0) {
+            std::string suffix = gf.function_name.substr(5); // skip "func_"
+            bool is_generic = (suffix.size() == 8) && 
+                std::all_of(suffix.begin(), suffix.end(), [](char c) {
+                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                });
+            
+            if (is_generic) {
                 // Generic name (func_XXXXXXXX) - use address
                 filename_suffix = fmt::format("func_{:08X}", gf.start_addr);
             } else {
-                // Custom name - use the name directly
+                // Custom name - use the name directly (already has func_ prefix)
                 filename_suffix = gf.function_name;
             }
 
@@ -1122,9 +1129,31 @@ std::filesystem::path out_dir = "generated";
         ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
 
         // Forward declarations
+        // Build address -> function name map from generated functions
+        std::map<uint32_t, std::string> addr_to_funcname;
+        const auto& gen_funcs = codegen.last_gen_funcs();
+        for (const auto& gf : gen_funcs) {
+            addr_to_funcname[gf.start_addr] = gf.function_name;
+        }
+        // Also add CPS continuations
+        if (codegen.cps_enabled()) {
+            const auto& conts = codegen.cps_continuations();
+            for (const auto& [cont, owner] : conts) {
+                if (!addr_to_funcname.count(cont)) {
+                    auto owner_it = addr_to_funcname.find(owner);
+                    if (owner_it != addr_to_funcname.end()) {
+                        addr_to_funcname[cont] = owner_it->second + "_cont_" + fmt::format("{:08X}", cont);
+                    } else {
+                        addr_to_funcname[cont] = fmt::format("func_{:08X}_cont_{:08X}", owner, cont);
+                    }
+                }
+            }
+        }
+
         ds << "/* Forward declarations for all recompiled functions */\n";
         for (uint32_t addr : dispatch_addrs) {
-            ds << fmt::format("extern void func_{:08X}(CPUState* cpu);\n", addr);
+            std::string fn_name = addr_to_funcname.count(addr) ? addr_to_funcname[addr] : fmt::format("func_{:08X}", addr);
+            ds << fmt::format("extern void {}(CPUState* cpu);\n", fn_name);
         }
         ds << "\n";
 
@@ -1239,9 +1268,10 @@ std::filesystem::path out_dir = "generated";
         ds << "} PsxGameDispatchEntry;\n\n";
         ds << "static const PsxGameDispatchEntry k_psx_game_dispatch[] = {\n";
         for (const auto& rec : records) {
-            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, {}u, {}u, func_{:08X}}},\n",
+            std::string fn_name = addr_to_funcname.count(rec.owner) ? addr_to_funcname[rec.owner] : fmt::format("func_{:08X}", rec.owner);
+            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, {}u, {}u, {}}},\n",
                               rec.addr, rec.resume, rec.range_index,
-                              rec.range_count, rec.owner);
+                              rec.range_count, fn_name);
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
