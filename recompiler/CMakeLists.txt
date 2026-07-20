@@ -77,21 +77,41 @@ set(PSXRECOMP_GAME_SOURCES
     src/main_psx.cpp
 )
 
-add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
-target_include_directories(psxrecomp-game PRIVATE
-    include
+set(PSXRECOMP_RABBITIZER_INCLUDES
     lib/rabbitizer/include
     lib/rabbitizer/cplusplus/include
+)
+
+set(PSXRECOMP_GAME_INCLUDES
+    include
+    ${PSXRECOMP_RABBITIZER_INCLUDES}
     lib/fmt/include
     lib/toml11
     lib/ELFIO
 )
-target_link_libraries(psxrecomp-game PRIVATE fmt rabbitizer)
-if(MINGW)
-    target_link_options(psxrecomp-game PRIVATE -Wl,--stack,16777216)
-elseif(MSVC)
-    target_link_options(psxrecomp-game PRIVATE /STACK:16777216)
-endif()
+
+set(PSXRECOMP_DECODER_TEST_INCLUDES
+    include
+    ${PSXRECOMP_RABBITIZER_INCLUDES}
+    lib/fmt/include
+)
+
+function(psxrecomp_set_large_stack target)
+    if(MINGW)
+        target_link_options(${target} PRIVATE -Wl,--stack,16777216)
+    elseif(MSVC)
+        target_link_options(${target} PRIVATE /STACK:16777216)
+    endif()
+endfunction()
+
+function(psxrecomp_configure_game_target target)
+    target_include_directories(${target} PRIVATE ${PSXRECOMP_GAME_INCLUDES})
+    target_link_libraries(${target} PRIVATE fmt rabbitizer)
+    psxrecomp_set_large_stack(${target})
+endfunction()
+
+add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
+psxrecomp_configure_game_target(psxrecomp-game)
 
 # psxrecomp-toml — PS-X EXE → game.toml generator.
 # Standalone tool that analyses a PS-X EXE and generates a complete game.toml
@@ -119,11 +139,7 @@ target_include_directories(psxrecomp PRIVATE
     lib/fmt/include
 )
 target_link_libraries(psxrecomp PRIVATE fmt)
-if(MINGW)
-    target_link_options(psxrecomp PRIVATE -Wl,--stack,16777216)
-elseif(MSVC)
-    target_link_options(psxrecomp PRIVATE /STACK:16777216)
-endif()
+psxrecomp_set_large_stack(psxrecomp)
 
 # ---- baked codegen hash (stale-binary guard) --------------------------------
 # Bake the SAME emitter-source hash the runtime folds into its overlay cache
@@ -154,22 +170,7 @@ set_source_files_properties(src/main_psx.cpp PROPERTIES OBJECT_DEPENDS ${_baked_
 target_include_directories(psxrecomp-game PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(PSXRecomp ${PSXRECOMP_GAME_SOURCES})
-target_include_directories(PSXRecomp PRIVATE
-    include
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
-    lib/toml11
-    lib/ELFIO
-)
-target_link_libraries(PSXRecomp PRIVATE fmt rabbitizer)
-
-# Increase stack size for large binaries (1447+ functions)
-if(MINGW)
-    target_link_options(PSXRecomp PRIVATE -Wl,--stack,16777216)
-elseif(MSVC)
-    target_link_options(PSXRecomp PRIVATE /STACK:16777216)
-endif()
+psxrecomp_configure_game_target(PSXRecomp)
 
 # psxrecomp-bios — Phase 1a BIOS boot slice recompiler.
 # Strict, fail-loud, ingests bios/SCPH1001.BIN as a flat ROM at 0xBFC00000.
@@ -190,17 +191,12 @@ add_executable(psxrecomp-bios
 target_include_directories(psxrecomp-bios PRIVATE
     include
     src
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
+    ${PSXRECOMP_RABBITIZER_INCLUDES}
     lib/fmt/include
     lib/toml11
 )
 target_link_libraries(psxrecomp-bios PRIVATE fmt rabbitizer)
-if(MINGW)
-    target_link_options(psxrecomp-bios PRIVATE -Wl,--stack,16777216)
-elseif(MSVC)
-    target_link_options(psxrecomp-bios PRIVATE /STACK:16777216)
-endif()
+psxrecomp_set_large_stack(psxrecomp-bios)
 
 # Released Windows CLI archives must run without a separate MinGW install.
 # Keep this opt-in so ordinary developer/debug builds retain their normal
@@ -220,10 +216,7 @@ add_executable(l1_decoder_test
     src/ps1_exe_parser.cpp
 )
 target_include_directories(l1_decoder_test PRIVATE
-    include
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
+    ${PSXRECOMP_DECODER_TEST_INCLUDES}
 )
 target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
 
@@ -236,11 +229,8 @@ add_executable(l2_structural_test
     src/strict_translator.cpp
 )
 target_include_directories(l2_structural_test PRIVATE
-    include
+    ${PSXRECOMP_DECODER_TEST_INCLUDES}
     src
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
 )
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
 
@@ -257,13 +247,8 @@ if(BUILD_TESTING)
         src/recompiler_patch.cpp
     )
     target_include_directories(recompiler_patch_test PRIVATE
-        include
+        ${PSXRECOMP_GAME_INCLUDES}
         src
-        lib/rabbitizer/include
-        lib/rabbitizer/cplusplus/include
-        lib/fmt/include
-        lib/toml11
-        lib/ELFIO
     )
     target_link_libraries(recompiler_patch_test PRIVATE fmt rabbitizer)
     add_test(NAME recompiler_patch_test COMMAND recompiler_patch_test)

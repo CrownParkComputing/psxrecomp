@@ -16,12 +16,14 @@ ghidra/
 
 # Build artifacts
 recompiler/build/
+recompiler/build-*/
 recompiler/build-asan/
 recompiler/build-asan2/
 recompiler/build-checked/
 recompiler/build-cli/
 recompiler/build-t2/
 runtime/build/
+runtime/build-*/
 runtime/build-msvc/
 test_msvc/
 
@@ -34,6 +36,7 @@ release-stage/
 
 # Vendored upstream sources (cloned locally, not checked in)
 beetle-psx/
+pcsx-redux/
 
 # Prebuilt SDL2 / dep zips (large, regenerable)
 sdl2-dev.zip
@@ -106,5 +109,5 @@ tools/_options_session/
 # Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
 runtime/tests/*.exe
 
-# transient split-gen build dirs
-recompiler/build-splitgen/
+# Runtime test output next to the checked-in slot-1 fixture
+runtime/tests/test_dir/card2.mcd
