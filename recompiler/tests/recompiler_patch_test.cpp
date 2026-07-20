@@ -58,7 +58,8 @@ void write_word(PSXRecomp::PS1Executable& exe, uint32_t address,
 
 std::string generate_first_instruction(uint32_t first_word,
                                        std::vector<RecompilerPatch> patches,
-                                       bool overlay_mode) {
+                                       bool overlay_mode,
+                                       PSXRecomp::CodeGenConfig config = {}) {
     constexpr uint32_t base = 0x80010000u;
     PSXRecomp::PS1Executable exe{};
     exe.header.load_address = base;
@@ -81,7 +82,6 @@ std::string generate_first_instruction(uint32_t first_word,
 
     PSXRecomp::ControlFlowAnalyzer analyzer(exe);
     const auto cfg = analyzer.analyze_function(function);
-    PSXRecomp::CodeGenConfig config;
     config.overlay_mode = overlay_mode;
     PSXRecomp::CodeGenerator generator(exe, config);
     return generator.generate_function(function, cfg).full_code;
@@ -173,6 +173,15 @@ replacement = "0x24020001"
 )toml");
     check_throws([&] { (void)PSXRecompV4::load_game_config(unaligned); },
                  "instruction-aligned", "parser rejects unaligned sites");
+
+    const auto range = write_config(root, "range-cull", R"toml(
+[widescreen.cull]
+range_sites = ["0x80012340"]
+)toml");
+    const auto range_config = PSXRecompV4::load_game_config(range);
+    check(range_config.ws_cull_range_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves explicit range cull sites");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -252,6 +261,13 @@ void codegen_tests() {
         },
         "conflicting recompiler patches",
         "config merge rejects cross-config ID conflicts");
+
+    PSXRecomp::CodeGenConfig range_config;
+    range_config.ws_cull_range_sites.insert(0x80010000u);
+    const std::string range = generate_first_instruction(
+        0x2C8201C1u, {}, false, range_config); // sltiu v0,a0,0x1c1
+    check(range.find("2*psx_ws_x_margin()") != std::string::npos,
+          "native range emit widens by both horizontal margins");
 }
 
 void jump_table_producer_codegen_test() {
