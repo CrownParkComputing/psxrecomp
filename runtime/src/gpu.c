@@ -85,11 +85,59 @@ static int      ws_cfg_num = 4, ws_cfg_den = 3;
 
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
+#define WS_HUD_TAG_BIT_BYTES (0x200000u / 4u / 8u) /* one bit per RAM word */
+#define WS_HUD_BRACKET_DEPTH 8
 #define WS_FMV_HYSTERESIS 30                 /* frames a colour MDEC decode pins 4:3 */
 typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
+typedef struct {
+    CPUState *cpu;
+    uint32_t sp;
+    uint32_t ra;
+    uint32_t frame;
+} WsHudBracket;
 static WsTag    ws_tags[WS_TAG_BUCKETS];
+static uint8_t  ws_hud_tag_bits[WS_HUD_TAG_BIT_BYTES];
+#ifndef PSX_NO_DEBUG_TOOLS
+/* Diagnostic-only provenance for every word in the configured packet arena.
+ * This lets the draw census name the guest function which last built a
+ * submitted primitive, including untagged UI that a game's bracket list has
+ * not learned yet.  Kept out of shipping builds (2 MiB). */
+static uint32_t ws_hud_writer_func[0x200000u / 4u];
+#endif
+static WsHudBracket ws_hud_brackets[WS_HUD_BRACKET_DEPTH];
+static int      ws_hud_bracket_depth;
+static uint64_t ws_hud_enter_count, ws_hud_armed_count, ws_hud_write_count;
+static uint64_t ws_hud_lookup_count, ws_hud_hit_count, ws_hud_transform_count;
+static uint64_t ws_hud_auto_candidate_count, ws_hud_gte_reject_count;
+static uint64_t ws_hud_auto_transform_count;
+static uint32_t ws_hud_tag_lo = 0xFFFFFFFFu, ws_hud_tag_hi;
+static uint32_t ws_hud_src_lo = 0xFFFFFFFFu, ws_hud_src_hi;
+static uint32_t ws_hud_packet_lo, ws_hud_packet_hi;
+#define WS_HUD_WRITER_FUNCS_MAX 64u
+static uint32_t ws_hud_writer_funcs[WS_HUD_WRITER_FUNCS_MAX];
+static uint32_t ws_hud_writer_func_count;
+static int      ws_auto_ui_squash;
+#define WS_UI_GROUP_SLOTS 256
+typedef struct {
+    uint32_t key, frame;
+    int32_t cur_min_x, cur_max_x;
+    int32_t prev_min_x, prev_max_x;
+    uint8_t cur_valid, prev_valid;
+} WsUiGroup;
+static WsUiGroup ws_ui_groups[WS_UI_GROUP_SLOTS];
+static uint32_t ws_ui_count_frame = 0xFFFFFFFFu;
+static uint32_t ws_ui_count_current, ws_ui_count_previous;
+static int ws_ui_dense_menu;
+extern void gte_precision_tracking_set(int enabled);
+extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
+                                   int32_t *x16, int32_t *y16, uint16_t *z);
+extern void gte_geometry_correction_set(int enabled);
+extern int gte_geometry_correction_lookup(uint32_t packed,
+                                          int32_t *x16, int32_t *y16);
+extern volatile uint32_t g_psx_last_fn_entry;
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
+static uint32_t ws_native_43_scene_stamp = (uint32_t)-1000;
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
@@ -234,11 +282,11 @@ static int ws_game_mode(void) {
  * window (ws_sust_ovh_stamp) — content that would actually be revealed.
  * Shaded-prim presence and GTE projection volume both proved to be false
  * world signals (title-card letter tiles; the task-jingle's GTE effect) —
- * see the overhang block for the full lineage. Scoped to the tag-classified
- * (2.5D) mechanism: full-2D titles (MMX6) are 2D-only by definition and
- * genuinely reveal more, and GTE-detector titles (Ape) already classify 2D
- * screens by projection count. The hysteresis rides out 1-2 frame gaps; a
- * real scene change crosses it in ~0.1 s. */
+ * see the overhang block for the full lineage. Scoped to tag-classified 2.5D
+ * titles: full-2D games genuinely reveal more, while GTE-detector games can
+ * have valid 3D cameras with no naturally overhanging polygon in a given view.
+ * The hysteresis rides out 1-2 frame gaps; a real scene change crosses it in
+ * ~0.1 s. */
 #define WS_2D_SCENE_HYSTERESIS 6u
 static int ws_2d_only_scene(void) {
     if (ws_full_2d_mode() || ws_gte_game_mode_cfg) return 0;
@@ -247,6 +295,7 @@ static int ws_2d_only_scene(void) {
 
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
+    if ((uint32_t)s_frame_count - ws_native_43_scene_stamp <= 2u) return 1;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
     if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
     static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
@@ -258,6 +307,10 @@ int gpu_ws_present_native_43(void) {
         fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
     }
     return fmv_cached;
+}
+
+void psx_ws_note_native_43_scene(void) {
+    ws_native_43_scene_stamp = (uint32_t)s_frame_count;
 }
 
 /* Squash applies only when configured AND the frame is being stretched. */
@@ -1131,6 +1184,22 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->last_world3d_frame = ws_sust_world3d_stamp;
     out->ovh_prims         = ws_ovh_prev;
     out->last_ovh_frame    = ws_sust_ovh_stamp;
+    out->hud_enters        = ws_hud_enter_count;
+    out->hud_armed         = ws_hud_armed_count;
+    out->hud_writes        = ws_hud_write_count;
+    out->hud_lookups       = ws_hud_lookup_count;
+    out->hud_hits          = ws_hud_hit_count;
+    out->hud_transforms    = ws_hud_transform_count;
+    out->hud_auto_candidates = ws_hud_auto_candidate_count;
+    out->hud_gte_rejects     = ws_hud_gte_reject_count;
+    out->hud_auto_transforms = ws_hud_auto_transform_count;
+    out->hud_depth         = ws_hud_bracket_depth;
+    out->hud_writer_func_count = ws_hud_writer_func_count;
+    out->hud_last_func     = g_psx_last_fn_entry;
+    out->hud_tag_lo        = ws_hud_tag_lo;
+    out->hud_tag_hi        = ws_hud_tag_hi;
+    out->hud_src_lo        = ws_hud_src_lo;
+    out->hud_src_hi        = ws_hud_src_hi;
 }
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
@@ -1177,6 +1246,130 @@ void psx_ws_sprite_tag(CPUState* cpu) {
     ws_tags[victim].stamp    = now;
     ws_tags[victim].anchor_x = ax;
     ws_last_tag_stamp = now;
+}
+
+/* Bracket a configured HUD/UI orchestrator. The sp/ra contract makes return
+ * hooks emitted in nested callees harmless and mirrors the proven data-shard
+ * entry/return mechanism. A frame-age guard below fail-closes an abnormal exit
+ * that skipped its return hook instead of tagging unrelated future stores. */
+void psx_ws_hud_enter(CPUState* cpu) {
+    if (!cpu) return;
+    ws_hud_enter_count++;
+    if (!ws_engaged()) return;
+    ws_hud_armed_count++;
+    if (ws_hud_bracket_depth >= WS_HUD_BRACKET_DEPTH)
+        ws_hud_bracket_depth = 0;
+    WsHudBracket *b = &ws_hud_brackets[ws_hud_bracket_depth++];
+    b->cpu = cpu;
+    b->sp = cpu->gpr[29];
+    b->ra = cpu->gpr[31];
+    b->frame = (uint32_t)s_frame_count;
+}
+
+void psx_ws_hud_ret(CPUState* cpu) {
+    if (!cpu || ws_hud_bracket_depth <= 0) return;
+    WsHudBracket *b = &ws_hud_brackets[ws_hud_bracket_depth - 1];
+    if (b->cpu != cpu || b->sp != cpu->gpr[29] || b->ra != cpu->gpr[31])
+        return;
+    ws_hud_bracket_depth--;
+}
+
+void gpu_ws_set_hud_packet_range(uint32_t lo, uint32_t hi) {
+    lo &= 0x1FFFFFFFu;
+    hi &= 0x1FFFFFFFu;
+    ws_hud_packet_lo = lo;
+    ws_hud_packet_hi = hi > lo ? hi : 0;
+    memset(ws_hud_tag_bits, 0, sizeof(ws_hud_tag_bits));
+}
+
+void gpu_ws_set_hud_writer_funcs(const uint32_t* funcs, uint32_t count) {
+    if (count > WS_HUD_WRITER_FUNCS_MAX) count = WS_HUD_WRITER_FUNCS_MAX;
+    ws_hud_writer_func_count = count;
+    for (uint32_t i = 0; i < count; i++) ws_hud_writer_funcs[i] = funcs[i];
+}
+
+void gpu_ws_set_auto_ui_squash(int on) {
+    ws_auto_ui_squash = on ? 1 : 0;
+    /* Exact packet-address provenance is otherwise needed only by the optional
+     * perspective-texture path. Keep it live for this classifier as well. */
+    gte_precision_tracking_set(ws_auto_ui_squash);
+    /* Ape copies projected coordinates through CPU-side packet builders, so
+     * exact SWC2 address provenance is not always retained. The value cache is
+     * the conservative fallback: every polygon position must match a recent
+     * GTE projection before the primitive is protected as 3D. */
+    gte_geometry_correction_set(ws_auto_ui_squash);
+}
+
+static int ws_hud_direct_writer(void) {
+    uint32_t f = g_psx_last_fn_entry;
+    for (uint32_t i = 0; i < ws_hud_writer_func_count; i++)
+        if (ws_hud_writer_funcs[i] == f) return 1;
+    return 0;
+}
+
+static void ws_hud_set_word(uint32_t key, int tagged) {
+    key &= 0x1FFFFCu;
+    if (!key) return;
+    uint32_t word = key >> 2;
+    uint8_t mask = (uint8_t)(1u << (word & 7u));
+    if (tagged) {
+        ws_hud_tag_bits[word >> 3] |= mask;
+        if (key < ws_hud_tag_lo) ws_hud_tag_lo = key;
+        if (key > ws_hud_tag_hi) ws_hud_tag_hi = key;
+    } else {
+        ws_hud_tag_bits[word >> 3] &= (uint8_t)~mask;
+    }
+}
+
+#ifndef PSX_NO_DEBUG_TOOLS
+static void ws_hud_note_writer(uint32_t key) {
+    key &= 0x1FFFFCu;
+    ws_hud_writer_func[key >> 2] = g_psx_last_fn_entry;
+}
+#endif
+
+/* Called only for accepted guest-RAM stores. Tag every aligned word touched by
+ * the write because PsyQ packet builders freely mix byte/half/word stores. */
+void psx_ws_hud_note_write(uint32_t addr, uint32_t size) {
+    if (size == 0 || ws_hud_packet_hi <= ws_hud_packet_lo) return;
+    addr &= 0x1FFFFFFFu;
+    if (addr < ws_hud_packet_lo || addr >= ws_hud_packet_hi) return;
+    int tagged = (ws_hud_bracket_depth > 0 || ws_hud_direct_writer()) && ws_engaged();
+    if (tagged) {
+        uint32_t now = (uint32_t)s_frame_count;
+        WsHudBracket *b = &ws_hud_brackets[ws_hud_bracket_depth - 1];
+        if (now - b->frame > 1) {
+            ws_hud_bracket_depth = 0;
+            tagged = 0;
+        } else {
+            ws_hud_write_count++;
+        }
+    }
+    uint32_t first = addr & ~3u;
+    uint32_t last = (addr + size - 1u) & ~3u;
+#ifndef PSX_NO_DEBUG_TOOLS
+    ws_hud_note_writer(first);
+    if (last != first) ws_hud_note_writer(last);
+#endif
+    ws_hud_set_word(first, tagged);
+    if (last != first) ws_hud_set_word(last, tagged);
+}
+
+static int ws_hud_tagged(void) {
+    if (!ws_active() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    ws_hud_lookup_count++;
+    uint32_t source = gp0_cmd_source_addr & 0x1FFFFCu;
+    if (source < ws_hud_src_lo) ws_hud_src_lo = source;
+    if (source > ws_hud_src_hi) ws_hud_src_hi = source;
+    for (int variant = 0; variant < 2; variant++) {
+        uint32_t key = (gp0_cmd_source_addr - (variant ? 4u : 0u)) & 0x1FFFFCu;
+        uint32_t word = key >> 2;
+        if (ws_hud_tag_bits[word >> 3] & (uint8_t)(1u << (word & 7u))) {
+            ws_hud_hit_count++;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Look up the executing GP0 command's prim in the tag table. The command's
@@ -1387,11 +1580,202 @@ static int32_t ws_hud_pivot(int32_t x, int32_t w) {
     return W / 2;
 }
 
+/* Composite UI is emitted as many independent quads (font glyphs and monkey
+ * counters are the important Ape examples). Give every member of a repeated
+ * texture/row group the previous frame's shared anchor so a group crossing a
+ * thirds boundary cannot be torn apart by per-quad anchoring. */
+static int32_t ws_ui_group_pivot(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (ws_ui_dense_menu) return ws_disp_w() / 2;
+    uint32_t op = gp0_cmd_buf[0] >> 24;
+    uint32_t clut = gp0_cmd_buf[2] >> 16;
+    uint32_t tpage = 0;
+    if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u)) {
+        int tp_index = (op & 0x10u) ? 5 : 4;
+        tpage = (gp0_cmd_buf[tp_index] >> 16) & 0x1FFu;
+    }
+    int32_t cy = y + h / 2;
+    uint32_t band = (uint32_t)(cy < 0 ? 0 : cy / 24) & 0x1Fu;
+    uint32_t key = 1u + ((clut * 2654435761u) ^ (tpage << 11) ^ (band << 3));
+    uint32_t f = (uint32_t)s_frame_count;
+    uint32_t slot = key & (WS_UI_GROUP_SLOTS - 1u);
+    WsUiGroup *g = NULL;
+    for (int probe = 0; probe < 4; probe++) {
+        WsUiGroup *p = &ws_ui_groups[(slot + (uint32_t)probe) & (WS_UI_GROUP_SLOTS - 1u)];
+        if (p->key == key || p->key == 0 || f - p->frame > 2u) { g = p; break; }
+    }
+    if (!g) return ws_hud_pivot(x, w);
+    if (g->key != key) {
+        memset(g, 0, sizeof(*g));
+        g->key = key;
+    }
+    if (g->frame != f) {
+        g->prev_valid = (uint8_t)(g->cur_valid && g->frame + 1u == f);
+        g->prev_min_x = g->cur_min_x;
+        g->prev_max_x = g->cur_max_x;
+        g->cur_valid = 0;
+        g->frame = f;
+    }
+    if (!g->cur_valid) {
+        g->cur_min_x = x;
+        g->cur_max_x = x + w;
+        g->cur_valid = 1;
+    } else {
+        if (x < g->cur_min_x) g->cur_min_x = x;
+        if (x + w > g->cur_max_x) g->cur_max_x = x + w;
+    }
+    if (g->prev_valid)
+        return ws_hud_pivot(g->prev_min_x, g->prev_max_x - g->prev_min_x);
+    return ws_hud_pivot(x, w);
+}
+
+/* True when at least one position word in the current submitted primitive is
+ * the exact RAM word written by SWC2 from a GTE projection. One exact match is
+ * enough to fail closed: characters, world polygons, and projected billboards
+ * must never be mistaken for UI. */
+static int ws_current_prim_has_gte_position(void) {
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    uint32_t op = gp0_cmd_buf[0] >> 24;
+    int indices[4] = { 0, 0, 0, 0 };
+    int count = 0;
+    if (op >= 0x20u && op <= 0x3Fu) {
+        int quad = (op & 0x08u) != 0;
+        int textured = (op & 0x04u) != 0;
+        int gouraud = (op & 0x10u) != 0;
+        count = quad ? 4 : 3;
+        int stride = 1 + textured + gouraud;
+        for (int i = 0; i < count; i++) indices[i] = 1 + i * stride;
+    } else if ((op >= 0x60u && op <= 0x7Fu)) {
+        indices[0] = 1;
+        count = 1;
+    } else {
+        return 0;
+    }
+    int value_matches = 0;
+    for (int i = 0; i < count; i++) {
+        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
+        if (gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, NULL))
+            return 1;
+        if (gte_geometry_correction_lookup(gp0_cmd_buf[indices[i]], NULL, NULL))
+            value_matches++;
+    }
+    return value_matches == count;
+}
+
+static int ws_auto_ui_candidate(void) {
+    if (!ws_auto_ui_squash || !ws_active()) return 0;
+    uint32_t op = gp0_cmd_buf[0] >> 24;
+    /* Limit automatic classification to textured polygons and sprites. Flat
+     * geometry, lines, clears, fades, and masks retain their original path. */
+    int textured_poly = op >= 0x20u && op <= 0x3Fu && (op & 0x04u);
+    int textured_rect = (op >= 0x64u && op <= 0x67u) ||
+                        (op >= 0x74u && op <= 0x77u) ||
+                        (op >= 0x7Cu && op <= 0x7Fu);
+    if (!textured_poly && !textured_rect) return 0;
+    ws_hud_auto_candidate_count++;
+    if (ws_current_prim_has_gte_position()) {
+        ws_hud_gte_reject_count++;
+        return 0;
+    }
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != ws_ui_count_frame) {
+        ws_ui_count_previous = (ws_ui_count_frame + 1u == f)
+            ? ws_ui_count_current : 0u;
+        ws_ui_count_current = 0;
+        ws_ui_count_frame = f;
+        /* Memory-card/options screens emit dozens of independent glyph/icon
+         * quads every frame. Gameplay HUDs are sparse. Use the completed prior
+         * frame so every primitive in the new frame receives one policy. */
+        ws_ui_dense_menu = ws_ui_count_previous >= 32u;
+    }
+    ws_ui_count_current++;
+    return 1;
+}
+
+static int ws_axis_aligned_screen_quad(const int32_t *vx, const int32_t *vy, int n) {
+    if (!vx || !vy || n != 4) return 0;
+    int32_t min_x = vx[0], max_x = vx[0], min_y = vy[0], max_y = vy[0];
+    for (int i = 1; i < 4; i++) {
+        if (vx[i] < min_x) min_x = vx[i];
+        if (vx[i] > max_x) max_x = vx[i];
+        if (vy[i] < min_y) min_y = vy[i];
+        if (vy[i] > max_y) max_y = vy[i];
+    }
+    if (max_x <= min_x || max_y <= min_y) return 0;
+    /* Wide, tall planes are scenery/backdrops (the title sky is the important
+     * Ape counterexample), not HUD. Keep thin copyright/menu bars eligible. */
+    if (max_x - min_x > ws_disp_w() / 2 &&
+        max_y - min_y > ws_disp_h() / 4) return 0;
+    unsigned corners = 0;
+    for (int i = 0; i < 4; i++) {
+        int left = vx[i] == min_x, right = vx[i] == max_x;
+        int top = vy[i] == min_y, bottom = vy[i] == max_y;
+        if ((!left && !right) || (!top && !bottom)) return 0;
+        corners |= 1u << ((bottom ? 2 : 0) | (right ? 1 : 0));
+    }
+    return corners == 0xFu;
+}
+
+static int ws_hud_transform_vertices(int32_t *vx, const int32_t *vy, int n) {
+    int tagged = ws_hud_tagged();
+    int auto_ui = 0;
+    if (!tagged && ws_axis_aligned_screen_quad(vx, vy, n))
+        auto_ui = ws_auto_ui_candidate();
+    if ((!auto_ui && !tagged) || !vx || n <= 0) return 0;
+    int32_t min_x = vx[0], max_x = vx[0];
+    int32_t min_y = vy ? vy[0] : 0, max_y = min_y;
+    for (int i = 1; i < n; i++) {
+        if (vx[i] < min_x) min_x = vx[i];
+        if (vx[i] > max_x) max_x = vx[i];
+        if (vy) {
+            if (vy[i] < min_y) min_y = vy[i];
+            if (vy[i] > max_y) max_y = vy[i];
+        }
+    }
+    /* Full-frame fades/filters must continue covering the stretched present. */
+    if (vy && min_x <= 0 && max_x >= ws_disp_w() &&
+        min_y <= 0 && max_y >= ws_disp_h()) return 0;
+    int32_t pivot = auto_ui
+        ? ws_ui_group_pivot(min_x, min_y, max_x - min_x, max_y - min_y)
+        : ws_hud_pivot(min_x, max_x - min_x);
+    for (int i = 0; i < n; i++) vx[i] = ws_scale_about(vx[i], pivot);
+    ws_hud_transform_count++;
+    if (auto_ui) ws_hud_auto_transform_count++;
+    return 1;
+}
+
+static int ws_hud_transform_rect(int32_t *x, int32_t y, int *w, int h) {
+    int tagged = ws_hud_tagged();
+    int auto_ui = 0;
+    if (!tagged) auto_ui = ws_auto_ui_candidate();
+    if (!x || !w || *w <= 0 || (!auto_ui && !tagged)) return 0;
+    if (auto_ui && *w > ws_disp_w() / 2 && h > ws_disp_h() / 4) return 0;
+    if (*x <= 0 && *x + *w >= ws_disp_w() &&
+        y <= 0 && y + h >= ws_disp_h()) return 0;
+    int32_t pivot = auto_ui
+        ? ws_ui_group_pivot(*x, y, *w, h)
+        : ws_hud_pivot(*x, *w);
+    *x = ws_scale_about(*x, pivot);
+    *w = (int)ws_scale_len(*w);
+    ws_hud_transform_count++;
+    if (auto_ui) ws_hud_auto_transform_count++;
+    return 1;
+}
+
 /* Shared transform for fixed-size textured sprites (8x8 / 16x16 / 1x1 dot):
  * squash *x0 in place (around the tagged anchor, else the HUD pivot) and
  * return the squashed draw width, or 0 = no change. */
-static int ws_sprt_fixed_transform(int32_t *x0, int w) {
+static int ws_sprt_fixed_transform(int32_t *x0, int32_t y0, int w) {
     if (!ws_active()) return 0;
+    if (ws_hud_tagged()) {
+        *x0 = ws_scale_about(*x0, ws_hud_pivot(*x0, w));
+        return (int)ws_scale_len(w);
+    }
+    if (ws_auto_ui_candidate()) {
+        *x0 = ws_scale_about(*x0, ws_ui_group_pivot(*x0, y0, w, w));
+        ws_hud_transform_count++;
+        ws_hud_auto_transform_count++;
+        return (int)ws_scale_len(w);
+    }
     int32_t ax;
     if (ws_tagged_anchor(&ax)) {
         *x0 = ws_scale_about(*x0, ax);
@@ -2082,8 +2466,6 @@ static void parse_vertex(uint32_t word, int32_t* x, int32_t* y) {
     *y = sign_extend((word >> 16) & 0x7FFu, 11);
 }
 
-extern int gte_geometry_correction_lookup(uint32_t packed,
-                                          int32_t *x16, int32_t *y16);
 extern int gte_geometry_correction_enabled(void);
 static int s_texture_correction_enabled = 0;
 extern void gte_precision_tracking_set(int enabled);
@@ -2092,7 +2474,7 @@ extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
 
 void gpu_texture_correction_set(int enabled) {
     s_texture_correction_enabled = enabled ? 1 : 0;
-    gte_precision_tracking_set(enabled);
+    gte_precision_tracking_set(enabled || ws_auto_ui_squash);
 }
 
 uint32_t gpu_texture_correction_hits(void) {
@@ -2252,6 +2634,7 @@ static void gp0_exec_mono_tri(void) {
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     }
+    ws_hud_transform_vertices(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -2271,6 +2654,7 @@ static void gp0_exec_mono_quad(void) {
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    ws_hud_transform_vertices(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -2329,6 +2713,7 @@ static void gp0_exec_shaded_tri(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    ws_hud_transform_vertices(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -2360,6 +2745,7 @@ static void gp0_exec_shaded_quad(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    ws_hud_transform_vertices(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -2452,6 +2838,7 @@ static void gp0_exec_textured_tri(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    ws_hud_transform_vertices(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
 
     ws_nw_hud_shift_vertices(vx, 3);
@@ -2492,6 +2879,7 @@ static void gp0_exec_textured_quad(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    int ws_hud_poly = ws_hud_transform_vertices(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -2500,7 +2888,7 @@ static void gp0_exec_textured_quad(void) {
      * GTE squash never saw — re-squash every X around the prim's anchor. */
     {
         int32_t ws_ax;
-        if (ws_tagged_anchor(&ws_ax))
+        if (!ws_hud_poly && ws_tagged_anchor(&ws_ax))
             for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop image stretch (no-op else) */
@@ -2585,6 +2973,7 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    ws_hud_transform_vertices(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
 
     ws_nw_hud_shift_vertices(vx, 3);
@@ -2629,6 +3018,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
+    ws_hud_transform_vertices(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -2671,6 +3061,8 @@ static void gp0_exec_mono_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
+    { int32_t vx[2] = { x0, x1 }, vy[2] = { y0, y1 };
+      ws_hud_transform_vertices(vx, vy, 2); x0 = vx[0]; x1 = vx[1]; }
     if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
@@ -2689,6 +3081,8 @@ static void gp0_exec_shaded_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
+    { int32_t vx[2] = { x0, x1 }, vy[2] = { y0, y1 };
+      ws_hud_transform_vertices(vx, vy, 2); x0 = vx[0]; x1 = vx[1]; }
     if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
@@ -2709,6 +3103,7 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
+    ws_hud_transform_rect(&x0, y0, &w, h);
     ws_expand_fullscreen_rect(&x0, y0, &w, h);
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -2738,8 +3133,12 @@ static void gp0_exec_textured_rect(void) {
      * display centre. Texels keep full coverage via the scaled-rect path. */
     int ws_w = 0;
     if (ws_active() && w > 0) {
+        int hud_w = w;
+        int hud_rect = ws_hud_transform_rect(&x0, y0, &hud_w, h);
         int32_t ws_ax;
-        if (ws_tagged_anchor(&ws_ax)) {
+        if (hud_rect) {
+            ws_w = hud_w;
+        } else if (ws_tagged_anchor(&ws_ax)) {
             x0 = ws_scale_about(x0, ws_ax);
             ws_w = (int)ws_scale_len(w);
         } else if (ws_hud_sprt) {
@@ -2764,6 +3163,7 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
+    { int w = 1; ws_hud_transform_rect(&x, y, &w, 1); }
     x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -2777,7 +3177,7 @@ static void gp0_exec_textured_8x8(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-    int ws_w = ws_sprt_fixed_transform(&x0, 8);
+    int ws_w = ws_sprt_fixed_transform(&x0, y0, 8);
     x0 += ws_nw_hud_shift(x0, 8);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
@@ -2816,7 +3216,7 @@ static void gp0_exec_textured_16x16(void) {
     /* Never suppress MMX6 BG packets at a guessed finite-map boundary. The
      * classifier cannot distinguish an authored layer entering the reveal from
      * a stale ring slot; suppressing here caused the stage-start black flicker. */
-    int ws_w = ws_sprt_fixed_transform(&x0, 16);
+    int ws_w = ws_sprt_fixed_transform(&x0, y0, 16);
     x0 += ws_nw_hud_shift(x0, 16);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
@@ -3350,6 +3750,7 @@ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
 typedef struct {
     uint32_t frame;
     uint32_t src_addr;
+    uint32_t writer_func;
     int16_t  cam_x, cam_y;
     int16_t  x, y;        /* first vertex (screen / pre-draw_offset) */
     int16_t  xmin, xmax;  /* screen-X extent across the prim's position verts */
@@ -3426,6 +3827,10 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     WsCensusEntry *e = &ws_census[ws_census_seq & (WS_CENSUS_CAP - 1)];
     e->frame    = (uint32_t)s_frame_count;
     e->src_addr = gp0_cmd_source_addr;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (gp0_cmd_source_addr != 0xFFFFFFFFu)
+        e->writer_func = ws_hud_writer_func[(gp0_cmd_source_addr & 0x1FFFFCu) >> 2];
+#endif
     e->cam_x    = (int16_t)psx_read_half(0x1F800176);
     e->cam_y    = (int16_t)psx_read_half(0x1F800186);
     e->x        = (int16_t)x;
@@ -3443,7 +3848,7 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     if (!ws_census) return 0;
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode,tagged\n");
+    fprintf(fp, "frame,src_addr,writer_func,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode,tagged\n");
     uint64_t total = ws_census_seq;
     uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
     uint64_t start = total - avail;
@@ -3451,8 +3856,8 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     for (uint64_t s = start; s < total; s++) {
         WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
         if (e->frame < f0 || e->frame > f1) continue;
-        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X,%u\n",
-                e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y,
+        fprintf(fp, "%u,0x%08X,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X,%u\n",
+                e->frame, e->src_addr, e->writer_func, e->cam_x, e->cam_y, e->x, e->y,
                 e->xmin, e->xmax, e->base_x, e->opcode, e->tagged);
         n++;
     }
@@ -3573,7 +3978,7 @@ static void gp0_execute_command(void) {
             int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-            (void)ws_sprt_fixed_transform(&x0, 1);  /* position only; 1px stays 1px */
+            (void)ws_sprt_fixed_transform(&x0, y0, 1);  /* position only; 1px stays 1px */
             x0 += draw_offset_x; y0 += draw_offset_y;
             int u0 = gp0_cmd_buf[2] & 0xFF;
             int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;

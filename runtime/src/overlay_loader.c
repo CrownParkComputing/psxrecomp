@@ -1567,10 +1567,14 @@ static void init_callbacks(void) {
         extern int  psx_ws_backdrop_x(int x);
         extern int  psx_ws_x_margin(void);
         extern void psx_ws_sprite_tag(CPUState *cpu);
+        extern void psx_ws_hud_enter(CPUState *cpu);
+        extern void psx_ws_hud_ret(CPUState *cpu);
         extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ABI v4 */
         s_callbacks.ws_backdrop_x    = psx_ws_backdrop_x;
         s_callbacks.ws_x_margin      = psx_ws_x_margin;
         s_callbacks.ws_sprite_tag    = psx_ws_sprite_tag;
+        s_callbacks.ws_hud_enter     = psx_ws_hud_enter;
+        s_callbacks.ws_hud_ret       = psx_ws_hud_ret;
         s_callbacks.ws_backdrop_value = psx_ws_backdrop_value;
     }
     /* Faithful-timing functions (ABI v9): overlay code built with

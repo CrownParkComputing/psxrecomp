@@ -3108,6 +3108,7 @@ int main(int argc, char** argv) {
             g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
+            gpu_ws_set_auto_ui_squash(gc.ws_auto_ui_squash ? 1 : 0);
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
@@ -3132,6 +3133,10 @@ int main(int argc, char** argv) {
             /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
             gpu_ws_set_nw_left_hud_packet_range(gc.ws_nw_left_hud_packet_lo,
                                                 gc.ws_nw_left_hud_packet_hi);
+            gpu_ws_set_hud_packet_range(gc.ws_hud_packet_lo,
+                                        gc.ws_hud_packet_hi);
+            gpu_ws_set_hud_writer_funcs(gc.ws_hud_writer_funcs.data(),
+                                        (uint32_t)gc.ws_hud_writer_funcs.size());
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
             /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims

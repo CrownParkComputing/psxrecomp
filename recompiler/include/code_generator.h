@@ -55,6 +55,11 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // Widescreen HUD packet brackets ([widescreen] hud_bracket_funcs).
+    // Entry and matching jr-$ra hooks keep packet-write tagging active across
+    // the configured UI orchestrator's complete nested call tree.
+    std::set<uint32_t> ws_hud_bracket_funcs;
+
     // Data-shard hooks ([data_shards] funcs): memoized pure-function replay.
     // Entry gets `if (psx_datashard_enter(cpu, KEY)) return;` (replay path),
     // every jr-$ra return gets `psx_datashard_ret(cpu)` (capture finalize).

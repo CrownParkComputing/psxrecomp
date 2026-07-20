@@ -299,6 +299,10 @@ def build_cmd(args):
         if len(args) < 2:
             return None, lambda _: "Usage: ws_margin <value|-1>"
         return {"cmd": "ws_margin", "value": int(args[1])}, pretty_json
+    elif cmd == "ws_auto_ui":
+        if len(args) < 2:
+            return None, lambda _: "Usage: ws_auto_ui <0|1>"
+        return {"cmd": "ws_hud_mode", "auto_ui": int(args[1])}, pretty_json
     elif cmd == "ws_census":
         # ws_census on|off   OR   ws_census <start> <end> [outfile]
         if len(args) >= 2 and args[1] in ("on", "off"):

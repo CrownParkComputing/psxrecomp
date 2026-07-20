@@ -67,7 +67,9 @@
  *      must forward or fail to LINK. Surfaced by full static overlay coverage
  *      (play-captured shards rarely compiled a swc2). Appended last; ABI bump
  *      to 14 rejects any pre-shim DLL. */
-#define PSX_OVERLAY_ABI_VERSION 14
+/* v15: ws_hud_enter/ws_hud_ret forwarders keep overlay-resident configured
+ * HUD producer hooks on the runtime's shared packet-write bracket state. */
+#define PSX_OVERLAY_ABI_VERSION 15
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -236,6 +238,10 @@ typedef struct {
      * may be NULL on a host that predates it — the shim no-ops (precision
      * tracking is a widescreen enhancement, off by default). */
     void     (*gte_precision_store_word)(uint32_t addr, uint8_t reg);
+    /* Widescreen HUD packet-producer brackets (ABI v15). Generated overlay
+     * hooks must mutate the host runtime's shared packet-write tag state. */
+    void     (*ws_hud_enter)(CPUState *cpu);
+    void     (*ws_hud_ret)(CPUState *cpu);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

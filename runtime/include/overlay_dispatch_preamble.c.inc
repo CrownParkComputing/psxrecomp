@@ -208,6 +208,14 @@ int psx_ws_cull_bltz(uint32_t v) {
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
+void psx_ws_hud_enter(CPUState *cpu) {
+    overlay_flush_cycles();
+    if (g_cbs.ws_hud_enter) g_cbs.ws_hud_enter(cpu);
+}
+void psx_ws_hud_ret(CPUState *cpu) {
+    overlay_flush_cycles();
+    if (g_cbs.ws_hud_ret) g_cbs.ws_hud_ret(cpu);
+}
 /* Widescreen backdrop column-preload value (ABI v4). Identity fallback if the
  * host predates the callback, so the DLL stays correct (4:3) on an older host. */
 uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
@@ -234,4 +242,3 @@ void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
 }
 /* ----------------------------------------------------------------------- */
-

@@ -1724,6 +1724,10 @@ std::string CodeGenerator::translate_basic_block(
                         ss << config_.indent
                            << "psx_datashard_ret(cpu);  /* data-shard: finalize capture */\n";
                     }
+                    if (config_.ws_hud_bracket_funcs.count(cfg.function_start)) {
+                        ss << config_.indent
+                           << "psx_ws_hud_ret(cpu);  /* widescreen: close matching HUD packet bracket */\n";
+                    }
                     if (ra_loaded_from_non_sp) {
                         ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                         ss << config_.indent
@@ -2163,6 +2167,10 @@ GeneratedFunction CodeGenerator::generate_function(
         body_ss << config_.indent
                 << "psx_ws_sprite_tag(cpu);  /* widescreen: record prim ($a0) + anchor */\n";
     }
+    if (config_.ws_hud_bracket_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << "psx_ws_hud_enter(cpu);  /* widescreen: bracket HUD packet writes */\n";
+    }
     if (config_.ws_bg2d_init_func == func.start_addr) {
         body_ss << config_.indent
                 << "psx_ws_mmx6_bg_stage_init();  /* widescreen: invalidate stale reveal at stage BG init */\n";
@@ -2581,6 +2589,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
+    ss << "extern void psx_ws_hud_enter(CPUState* cpu);   /* widescreen HUD packet bracket (gpu.c) */\n";
+    ss << "extern void psx_ws_hud_ret(CPUState* cpu);     /* widescreen HUD packet bracket return */\n";
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";

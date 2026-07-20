@@ -868,8 +868,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
 
     // Optional [widescreen] block — per-game hooks for the widescreen hack.
     std::vector<uint32_t> ws_sprite_tag_funcs;
+    std::vector<uint32_t> ws_hud_bracket_funcs;
+    std::vector<uint32_t> ws_hud_writer_funcs;
+    uint32_t ws_hud_packet_lo = 0;
+    uint32_t ws_hud_packet_hi = 0;
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
+    bool ws_auto_ui_squash = false;
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
     bool ws_native_wide = true;
@@ -971,6 +976,38 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 config_path.string()));
         if (ws.contains("hud_sprt_squash"))
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
+        if (ws.contains("auto_ui_squash"))
+            ws_auto_ui_squash = toml::find<bool>(ws, "auto_ui_squash");
+        if (ws.contains("hud_bracket_funcs")) {
+            const auto& arr = toml::find<std::vector<std::string>>(
+                ws, "hud_bracket_funcs");
+            for (const auto& a : arr)
+                ws_hud_bracket_funcs.push_back(
+                    parse_hex(a, "widescreen.hud_bracket_funcs"));
+        }
+        if (ws.contains("hud_writer_funcs")) {
+            const auto& arr = toml::find<std::vector<std::string>>(
+                ws, "hud_writer_funcs");
+            for (const auto& a : arr)
+                ws_hud_writer_funcs.push_back(
+                    parse_hex(a, "widescreen.hud_writer_funcs"));
+        }
+        const bool has_hud_packet_lo = ws.contains("hud_packet_lo");
+        const bool has_hud_packet_hi = ws.contains("hud_packet_hi");
+        if (has_hud_packet_lo != has_hud_packet_hi)
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] hud_packet_lo and hud_packet_hi must be set together",
+                config_path.string()));
+        if (has_hud_packet_lo) {
+            ws_hud_packet_lo = parse_hex(toml::find<std::string>(ws, "hud_packet_lo"),
+                                         "widescreen.hud_packet_lo");
+            ws_hud_packet_hi = parse_hex(toml::find<std::string>(ws, "hud_packet_hi"),
+                                         "widescreen.hud_packet_hi");
+            if (ws_hud_packet_lo >= ws_hud_packet_hi)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] hud_packet range is empty or reversed",
+                    config_path.string()));
+        }
         if (ws.contains("full_2d"))
             ws_full_2d = toml::find<bool>(ws, "full_2d");
         if (ws.contains("gte_game_mode"))
@@ -1206,6 +1243,11 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
+        /*ws_auto_ui_squash*/      ws_auto_ui_squash,
+        /*ws_hud_bracket_funcs*/   ws_hud_bracket_funcs,
+        /*ws_hud_writer_funcs*/    ws_hud_writer_funcs,
+        /*ws_hud_packet_lo*/        ws_hud_packet_lo,
+        /*ws_hud_packet_hi*/        ws_hud_packet_hi,
         /*data_shard_funcs*/      data_shard_funcs,
         /*vsync_query_func*/      vsync_query_func,
         /*vsync_counter_addr*/    vsync_counter_addr,

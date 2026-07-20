@@ -1404,6 +1404,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, val, 4);
         overlay_watch_note_write(phys, 4);
+        if (!psx_get_in_exception()) psx_ws_hud_note_write(phys, 4);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
 #endif
@@ -1507,6 +1508,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 2);
         overlay_watch_note_write(phys, 2);
+        if (!psx_get_in_exception()) psx_ws_hud_note_write(phys, 2);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
 #endif
@@ -1743,6 +1745,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 1);
         overlay_watch_note_write(phys, 1);
+        if (!psx_get_in_exception()) psx_ws_hud_note_write(phys, 1);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
 #endif

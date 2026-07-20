@@ -466,6 +466,26 @@ struct GameConfig {
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t              ws_sprite_anchor_addr = 0;
     bool                  ws_hud_sprt_squash = false;
+    // auto_ui_squash: proportion-correct textured screen-space primitives by
+    // rejecting packets whose positions match recent GTE projections (with
+    // exact SWC2 packet-address provenance preferred when available).
+    bool                  ws_auto_ui_squash = false;
+
+    // hud_bracket_funcs: guest UI/HUD orchestrators whose complete call tree
+    // builds screen-space primitive packets. Entry/return hooks bracket guest
+    // RAM writes; packet words written inside the bracket are frame-tagged and
+    // proportion-corrected at GP0 submission. Unlike hud_sprt_squash this also
+    // handles polygon-based HUDs without touching untagged world polygons.
+    std::vector<uint32_t> ws_hud_bracket_funcs;
+    // hud_writer_funcs: leaf packet writers dedicated to UI. Unlike brackets,
+    // these also work for already-built AOT overlays because the runtime's
+    // universal function-entry stamp identifies the writer at each RAM store.
+    std::vector<uint32_t> ws_hud_writer_funcs;
+    // Optional physical main-RAM packet-arena bounds. When present, bracketed
+    // stack/global traffic is ignored so only candidate GP0 packet words enter
+    // the short-lived HUD tag table. Half-open [lo, hi).
+    uint32_t              ws_hud_packet_lo = 0;
+    uint32_t              ws_hud_packet_hi = 0;
 
     // [data_shards] funcs: functions that get the memoized pure-function
     // replay entry/return hooks (psx_datashard_enter/psx_datashard_ret).

@@ -4655,7 +4655,13 @@ static void handle_gpu_state(int id, const char *json)
              "\"mode\":%d,\"nw_extra\":%d,"
              "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
              "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
-             "\"ovh_prims\":%u,\"last_ovh_frame\":%u}}",
+             "\"ovh_prims\":%u,\"last_ovh_frame\":%u,"
+             "\"hud\":{\"enters\":%llu,\"armed\":%llu,\"writes\":%llu,"
+             "\"lookups\":%llu,\"hits\":%llu,\"transforms\":%llu,\"depth\":%d,"
+             "\"auto_candidates\":%llu,\"gte_rejects\":%llu,\"auto_transforms\":%llu,"
+             "\"writer_funcs\":%u,\"last_func\":\"0x%08X\","
+             "\"tag_range\":[\"0x%08X\",\"0x%08X\"],"
+             "\"src_range\":[\"0x%08X\",\"0x%08X\"]}}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -4672,7 +4678,19 @@ static void handle_gpu_state(int id, const char *json)
              ws.mode, ws.nw_extra,
              (unsigned long long)ws.cur_frame, ws.last_tag_frame,
              ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
-             ws.ovh_prims, ws.last_ovh_frame);
+             ws.ovh_prims, ws.last_ovh_frame,
+             (unsigned long long)ws.hud_enters,
+             (unsigned long long)ws.hud_armed,
+             (unsigned long long)ws.hud_writes,
+             (unsigned long long)ws.hud_lookups,
+             (unsigned long long)ws.hud_hits,
+             (unsigned long long)ws.hud_transforms,
+             ws.hud_depth,
+             (unsigned long long)ws.hud_auto_candidates,
+             (unsigned long long)ws.hud_gte_rejects,
+             (unsigned long long)ws.hud_auto_transforms,
+             ws.hud_writer_func_count, ws.hud_last_func,
+             ws.hud_tag_lo, ws.hud_tag_hi, ws.hud_src_lo, ws.hud_src_hi);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -6810,9 +6828,16 @@ static void handle_clear_input(int id, const char *json)
 static void handle_ws_hud_mode(int id, const char *json)
 {
     int v = json_get_int(json, "tag_rects", -1);
-    if (v < 0) { send_err(id, "missing tag_rects (0|1)"); return; }
-    gpu_ws_set_nw_hud_tag_rects(v);
-    send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d}", id, v ? 1 : 0);
+    int auto_ui = json_get_int(json, "auto_ui", -1);
+    if (v < 0 && auto_ui < 0) {
+        send_err(id, "missing tag_rects or auto_ui (0|1)");
+        return;
+    }
+    if (v >= 0) gpu_ws_set_nw_hud_tag_rects(v);
+    if (auto_ui >= 0) gpu_ws_set_auto_ui_squash(auto_ui);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d,\"auto_ui\":%d}",
+             id, v >= 0 ? (v ? 1 : 0) : -1,
+             auto_ui >= 0 ? (auto_ui ? 1 : 0) : -1);
 }
 
 /* Kernel-image bless state: {"cmd":"kernel_bless"} ->

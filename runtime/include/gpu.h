@@ -127,6 +127,17 @@ int psx_ws_mmx6_bg_stream_left(int x);
 int psx_ws_mmx6_bg_stream_right(int x);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
+/* Mark an exact game-specific full-2D/title projection site. The presentation
+ * path keeps that scene at its authored 4:3 aspect ratio. */
+void psx_ws_note_native_43_scene(void);
+/* [widescreen] hud_bracket_funcs: bracket a UI orchestrator's nested packet
+ * writes, then identify and proportion-correct those exact GP0 packets. */
+void psx_ws_hud_enter(struct CPUState* cpu);
+void psx_ws_hud_ret(struct CPUState* cpu);
+void psx_ws_hud_note_write(uint32_t addr, uint32_t size);
+void gpu_ws_set_hud_packet_range(uint32_t lo, uint32_t hi);
+void gpu_ws_set_hud_writer_funcs(const uint32_t* funcs, uint32_t count);
+void gpu_ws_set_auto_ui_squash(int on);
 
 /* Native-wide (mode 2) on a game frame. ws_nw_extra() is the total width the
  * frame grows by, in display pixels (the present path widens the display read
@@ -276,6 +287,12 @@ typedef struct {
     uint32_t ovh_prims;         /* overhanging polys in the last completed frame */
     uint32_t last_ovh_frame;    /* newest SUSTAINED polygon-overhang frame (the
                                    2D-only-scene classifier's world signal) */
+    uint64_t hud_enters, hud_armed, hud_writes;
+    uint64_t hud_lookups, hud_hits, hud_transforms;
+    uint64_t hud_auto_candidates, hud_gte_rejects, hud_auto_transforms;
+    int      hud_depth;
+    uint32_t hud_writer_func_count, hud_last_func;
+    uint32_t hud_tag_lo, hud_tag_hi, hud_src_lo, hud_src_hi;
 } GpuWsDebug;
 void gpu_ws_get_debug(GpuWsDebug* out);
 

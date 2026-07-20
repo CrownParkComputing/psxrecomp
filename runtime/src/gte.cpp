@@ -183,6 +183,7 @@ static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
 // stay aligned with the visible frame.
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
+extern "C" void psx_ws_note_native_43_scene(void);
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 static int s_gte_replay_sandbox = 0;
@@ -766,8 +767,9 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // this frame is being stretched — never on a 4:3-presented frame (FMV /
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
-    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
     const bool dome_call = ws_dome_call_matches();
+    if (dome_call && !s_gte_replay_sandbox) psx_ws_note_native_43_scene();
+    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
     // Curved backdrops are authored to cover the original 4:3 projection.
     // In classic widescreen, leave that projection intact and let the normal
     // final-frame stretch cover the wide output instead of shrinking it first.

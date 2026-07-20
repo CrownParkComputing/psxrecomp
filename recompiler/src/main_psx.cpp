@@ -132,6 +132,7 @@ int main(int argc, char** argv) {
     bool                  overlay_mode = false;
     bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
+    std::set<uint32_t>    ws_hud_bracket_funcs; // [widescreen] hud_bracket_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
     std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
@@ -167,6 +168,8 @@ int main(int argc, char** argv) {
         instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
+        ws_hud_bracket_funcs.insert(cfg.ws_hud_bracket_funcs.begin(),
+                                    cfg.ws_hud_bracket_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
         if (cfg.vsync_query_func)
             vsync_query_hle_funcs[cfg.vsync_query_func] = {
@@ -252,6 +255,8 @@ int main(int argc, char** argv) {
     if (!ws_config_path.empty()) {
         const auto wscfg = PSXRecompV4::load_game_config(ws_config_path);
         ws_tag_funcs.insert(wscfg.ws_sprite_tag_funcs.begin(), wscfg.ws_sprite_tag_funcs.end());
+        ws_hud_bracket_funcs.insert(wscfg.ws_hud_bracket_funcs.begin(),
+                                    wscfg.ws_hud_bracket_funcs.end());
         ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
@@ -905,6 +910,7 @@ int main(int argc, char** argv) {
     codegen_config.overlay_mode = overlay_mode;
     codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
+    codegen_config.ws_hud_bracket_funcs = ws_hud_bracket_funcs;
     codegen_config.data_shard_funcs = ds_funcs;
     codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
