@@ -69,6 +69,13 @@
  *      to 14 rejects any pre-shim DLL. */
 #define PSX_OVERLAY_ABI_VERSION 14
 
+/* Process-lifetime overlay candidate capacity.  Every accepted manifest F
+ * record consumes one slot, even when another DLL carries an identical
+ * (entry, CRC, ranges) identity.  Offline publishers parse this same literal
+ * before adding a cache pair so compiler-side accounting cannot drift from
+ * the loader's fixed arrays. */
+#define PSX_OVERLAY_CANDIDATE_CAP 32768
+
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
  * flavor-BLIND — the same guest overlay yields the same filename whether it was
