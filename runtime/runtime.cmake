@@ -518,7 +518,13 @@ function(psxrecomp_add_runtime_target target)
         )
         target_link_libraries(${target} PRIVATE RmlUi::Core)
         target_compile_definitions(${target} PRIVATE PSX_LAUNCHER=1)
-        # Ship the launcher assets (RML/RCSS/fonts) next to the exe.
+        # Ship the launcher assets (RML/RCSS/fonts) next to the exe.  Make them
+        # link dependencies so an asset-only edit retriggers this POST_BUILD
+        # copy under Ninja instead of leaving a stale launcher beside the exe.
+        file(GLOB_RECURSE PSX_LAUNCHER_ASSET_FILES CONFIGURE_DEPENDS
+            "${PSXRECOMP_ROOT}/runtime/launcher/assets/*")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
+            ${PSX_LAUNCHER_ASSET_FILES})
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${PSXRECOMP_ROOT}/runtime/launcher/assets"

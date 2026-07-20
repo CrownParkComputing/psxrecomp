@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-20 (Ape Escape visual-quality A/B; no timing-model change):**
+  Confirmed the launcher/runtime already expose OpenGL ordered-grid SSAA
+  (1x-4x), linear presentation antialiasing, and nearest/bilinear texture
+  filtering. An aligned 256-frame attract-scene window ending at guest frame
+  1801 measured 1x/2x/4x total frame time at 16.683/16.609/16.357 ms on the
+  local RTX/OpenGL system, with identical 288-primitive workloads; this proves
+  no drop in that window, not full-playthrough headroom. Added resolved renderer
+  quality fields to `gpu_state` (4x was confirmed active), repaired the stale
+  debug-client pause/run-to surface with reconnecting `wait_frame`, fixed TCP
+  quit teardown ordering, and made launcher assets real incremental-build
+  dependencies. The game keeps 1x/nearest as its conservative default.
+
 - **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
   Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
   FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,

@@ -24,6 +24,7 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
+#include "gpu_render.h"
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
@@ -4629,6 +4630,7 @@ static void handle_write_ram(int id, const char *json)
 
 static void handle_gpu_state(int id, const char *json)
 {
+    extern int psx_runtime_video_antialiasing(void);
     (void)json;
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
@@ -4640,11 +4642,16 @@ static void handle_gpu_state(int id, const char *json)
     gpu_get_gp0_stats(&nop, &fill, &draw, &env, &copy);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
+    const GrBackend backend = gr_backend();
+    const char *backend_name = backend == GR_BACKEND_OPENGL ? "opengl" :
+                               backend == GR_BACKEND_VULKAN ? "vulkan" : "software";
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
              "\"depth\":%d,\"depth24\":%d,"
              "\"disabled\":%d,"
+             "\"renderer\":{\"backend\":\"%s\",\"supersampling\":%d,"
+             "\"present_antialiasing\":%d,\"texture_filter\":\"%s\"},"
              "\"gpustat\":\"0x%08X\","
              "\"gp0_writes\":%llu,"
              "\"gp0_nop\":%llu,\"gp0_fill\":%llu,\"gp0_draw\":%llu,\"gp0_env\":%llu,\"gp0_copy\":%llu,"
@@ -4666,6 +4673,8 @@ static void handle_gpu_state(int id, const char *json)
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
              di.disabled,
+             backend_name, gr_scale(), psx_runtime_video_antialiasing(),
+             gr_texture_filter() ? "bilinear" : "nearest",
              gpustat,
              (unsigned long long)gpu_get_gp0_count(),
              (unsigned long long)nop, (unsigned long long)fill,
@@ -10131,11 +10140,15 @@ static void handle_mdec_trace_clear(int id, const char *json)
 
 static void handle_quit(int id, const char *json)
 {
+    extern void psx_runtime_request_quit(void);
     (void)json;
     send_ok(id);
     psx_crash_trace_set_exit_origin("tcp_quit");
-    debug_server_shutdown();
-    exit(0);
+    /* Defer teardown until the next vblank.  This handler runs on the emulation
+     * thread while the I/O thread is waiting for the response buffered by
+     * send_ok(); joining that I/O thread here deadlocks until its 30-second
+     * timeout and makes a successful quit look like "emu busy or frozen". */
+    psx_runtime_request_quit();
 }
 
 /* ---- Command dispatch table ---- */

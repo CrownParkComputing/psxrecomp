@@ -408,6 +408,15 @@ static int           g_video_win_w    = 1280; /* window width (height follows as
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
 static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
+static std::atomic<int> g_tcp_quit_requested{0};
+
+extern "C" void psx_runtime_request_quit(void) {
+    g_tcp_quit_requested.store(1, std::memory_order_release);
+}
+
+extern "C" int psx_runtime_video_antialiasing(void) {
+    return g_video_aa ? 1 : 0;
+}
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
  * movie's per-movie total minus 3; writing the current movie's total down to
@@ -2246,6 +2255,12 @@ static void load_transition_note(int read_active, int load_active,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+    /* A TCP quit is requested from debug_server_poll() on the emulation thread.
+     * Tear down one vblank later, after the I/O thread has delivered send_ok(). */
+    if (g_tcp_quit_requested.exchange(0, std::memory_order_acq_rel)) {
+        shutdown_runtime();
+        std::exit(0);
+    }
 #ifndef PSX_NO_DEBUG_TOOLS
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();

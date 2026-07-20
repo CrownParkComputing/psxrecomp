@@ -24,10 +24,8 @@ Commands (shared — identical on both servers):
     overlay                     Overlay state
     watch <addr>                Set byte watchpoint
     unwatch <addr>              Remove watchpoint
-    pause                       Pause execution
-    continue / c                Resume execution
-    step [n]                    Step N frames (default 1)
-    run_to <frame>              Run to specific frame, then pause
+    wait_frame <frame> [timeout]
+                                Wait until the live frame reaches the target
     history                     Ring buffer stats
     get_frame <n>               Get full frame record from ring buffer
     frame_read <frame> <addr> [len]
@@ -65,6 +63,7 @@ import re
 import socket
 import sys
 import argparse
+import time
 
 DEFAULT_HOST = "127.0.0.1"
 NATIVE_PORT = 4370
@@ -143,9 +142,9 @@ def send_cmd(sock, cmd_dict):
     return json.loads(buf.decode().strip())
 
 
-def query(host, port, cmd_dict):
+def query(host, port, cmd_dict, timeout=10.0):
     """One-shot: connect, send, receive, close."""
-    s = connect(host, port)
+    s = connect(host, port, timeout=timeout)
     try:
         return send_cmd(s, cmd_dict)
     finally:
@@ -230,17 +229,6 @@ def build_cmd(args):
         if len(args) < 2:
             return None, lambda _: "Usage: unwatch <addr>"
         return {"cmd": "unwatch", "addr": args[1]}, pretty_json
-    elif cmd == "pause":
-        return {"cmd": "pause"}, pretty_json
-    elif cmd in ("continue", "c"):
-        return {"cmd": "continue"}, pretty_json
-    elif cmd == "step":
-        n = int(args[1]) if len(args) > 1 else 1
-        return {"cmd": "step", "count": n}, pretty_json
-    elif cmd == "run_to":
-        if len(args) < 2:
-            return None, lambda _: "Usage: run_to <frame>"
-        return {"cmd": "run_to_frame", "frame": int(args[1])}, pretty_json
     elif cmd == "history":
         return {"cmd": "history"}, pretty_json
     elif cmd == "get_frame":
@@ -602,6 +590,49 @@ def run_command(sock, args, host=DEFAULT_HOST):
         if len(args) < 3:
             return "Usage: ts_compare <start> <end>"
         return run_ts_compare(host, int(args[1]), int(args[2]))
+    if cmd == "wait_frame":
+        if len(args) < 2:
+            return "Usage: wait_frame <frame> [timeout_seconds]"
+        target = int(args[1])
+        timeout = float(args[2]) if len(args) > 2 else 60.0
+        deadline = time.monotonic() + timeout
+        # The runtime serves exactly one request per connection and closes it
+        # after the response.  Reconnect for every poll instead of reusing the
+        # CLI's initial socket (which would fail on the second frame query).
+        port = sock.getpeername()[1]
+        last_frame = None
+        first_poll = True
+        while True:
+            try:
+                if first_poll:
+                    resp = send_cmd(sock, {"cmd": "frame"})
+                    first_poll = False
+                else:
+                    resp = query(host, port, {"cmd": "frame"}, timeout=1.0)
+            except (ConnectionRefusedError, ConnectionResetError,
+                    ConnectionAbortedError, TimeoutError, socket.timeout, OSError):
+                if time.monotonic() >= deadline:
+                    return pretty_json({
+                        "ok": False,
+                        "error": "wait_frame timed out",
+                        "target": target,
+                        "frame": last_frame,
+                    })
+                time.sleep(0.05)
+                continue
+            if not resp.get("ok"):
+                return pretty_json(resp)
+            last_frame = int(resp.get("frame", -1))
+            if last_frame >= target:
+                return pretty_json(resp)
+            if time.monotonic() >= deadline:
+                return pretty_json({
+                    "ok": False,
+                    "error": "wait_frame timed out",
+                    "target": target,
+                    "frame": last_frame,
+                })
+            time.sleep(0.05)
 
     cmd_dict, fmt = build_cmd(args)
     if cmd_dict is None:
