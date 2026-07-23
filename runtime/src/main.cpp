@@ -54,6 +54,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include "game_options.h"
+#include "mod_runtime.h"
 #include "crc32.h"
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
@@ -4048,12 +4049,16 @@ namespace {
 #endif
     }
 
-    int ae_np_create(void*, const char* lobby_name, const char* host_port,
+    int ae_np_create(void*, const char* lobby_name, char* host_endpoint,
                      const char* password,
-                     const RecompLauncherCSettings* settings) {
+                     const RecompLauncherCSettings* settings, int lan_only) {
         PsxLobbyMatchCaps caps = ae_netplay_caps_from_settings(settings);
-        const char* endpoint = host_port && host_port[0] ? host_port : "0.0.0.0:7777";
-        ae_np_write_lan_lobby(lobby_name, endpoint, password);
+        const char* endpoint = host_endpoint && host_endpoint[0]
+            ? host_endpoint : "0.0.0.0:7777";
+        if (lan_only) {
+            ae_np_write_lan_lobby(lobby_name, endpoint, password);
+            return 0;
+        }
         return psx_lobby_create(lobby_name && lobby_name[0] ? lobby_name : "Netplay Lobby",
                                 g_lnch_netplay_game_name.c_str(), PSX_GAME_VERSION,
                                 password ? password : "", endpoint, &caps);
@@ -5032,6 +5037,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    {
+        std::string mod_error;
+        if (!PSXRecompV4::mod_runtime_initialize(
+                exe_dir_from_argv(argv[0]) / "mods", game_id,
+                game_entry_pc, text_guard_exe_path, &mod_error)) {
+            std::fprintf(stderr, "psxrecomp: mods unavailable: %s\n",
+                         mod_error.c_str());
+        }
+    }
+
 #if defined(RECOMP_LAUNCHER)
     /* Integrated recomp-ui launcher: shown in its own GL window before the emulator
      * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
@@ -5235,6 +5250,7 @@ int main(int argc, char** argv) {
             g_lnch_has_crc         = game_has_disc_crc;
             gi.disc_verify     = ae_disc_verify;
             gi.memcard_inspect = ae_memcard_inspect;
+            gi.mods            = PSXRecompV4::mod_runtime_launcher_provider();
 #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
             g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
             gi.netplay_supported = (game_players == 2) ? 1 : 0;
@@ -5392,6 +5408,15 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+
+    {
+        std::string mod_error;
+        if (!PSXRecompV4::mod_runtime_commit(resolved_disc, &mod_error)) {
+            std::fprintf(stderr, "psxrecomp: cannot launch with selected mods: %s\n",
+                         mod_error.c_str());
+            return 1;
+        }
+    }
 
     /* Re-apply the resolved language to the translation layer. text_xlate_init
      * (at config load) only saw the game.toml default; this folds in the
@@ -5564,6 +5589,7 @@ session_reboot:
     if (game_config_path)
         arm_text_image_guard(text_guard_exe_path, text_guard_load_addr,
                              disc_path_str);
+    mod_runtime_enable_disc_patches();
     {
         int divisor = 1; /* default: authentic 1x timing */
         if (disc_speed == "instant") divisor = 0;
