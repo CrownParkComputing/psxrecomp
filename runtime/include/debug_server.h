@@ -190,13 +190,31 @@ void debug_server_check_watchpoints(void);
 
 /* ---- Input override ---- */
 
-/* Returns >= 0 if the debug server wants to override pad input,
- * -1 if no override is active. Value is PS1 16-bit button mask. */
+/* Per-SIO-slot input override (0 = port 1, 1 = port 2). Each slot carries its
+ * OWN independent override state (button word, optional analog axes, and
+ * "press" auto-release countdown), armed by the optional "slot" arg on
+ * set_input/press. Arming one slot never disturbs the other slot's state.
+ * Returns >= 0 if that slot wants an override, -1 if none is active on it --
+ * a slot returning -1 must fall through to normal per-frame host sampling for
+ * that slot, NOT be frozen. Value is the PS1 16-bit button mask. Has a side
+ * effect identical in spirit to the old single-slot accessor: decrements that
+ * slot's "press" frames countdown and releases the override at 0. */
+int debug_server_get_input_override_slot(int slot);
+
+/* Back-compat convenience: slot-0 override only, identical to
+ * debug_server_get_input_override_slot(0). set_input/press with no "slot" arg
+ * always target slot 0, so this preserves the exact pre-two-player wire
+ * behaviour for any caller that never touches slot 1. */
 int debug_server_get_input_override(void);
 
 /* Optional analog-stick override set alongside set_input (lx/ly/rx/ry,
- * 0..255, 0x80 = centre). Returns 1 and fills st[lx,ly,rx,ry] when armed,
- * 0 when the injection is buttons-only. */
+ * 0..255, 0x80 = centre) for the given SIO slot. Returns 1 and fills
+ * st[lx,ly,rx,ry] when armed for that slot, 0 when that slot's injection is
+ * buttons-only or no override is armed on it. */
+int debug_server_get_axis_override_slot(int slot, unsigned char st[4]);
+
+/* Back-compat convenience: slot-0 axis override only, identical to
+ * debug_server_get_axis_override_slot(0, st). */
 int debug_server_get_axis_override(unsigned char st[4]);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and

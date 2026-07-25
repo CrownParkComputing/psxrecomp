@@ -1123,6 +1123,39 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         }
     }
 
+    // Optional [coop] block — simultaneous extra player actors (ENHANCEMENT).
+    // Omit it entirely => empty lists => generator emits nothing.
+    std::vector<uint32_t> coop_actor_base_sites, coop_replay_sites;
+    if (cfg.contains("coop")) {
+        const toml::value& cp = toml::find(cfg, "coop");
+        auto load_list = [&](const char* key, std::vector<uint32_t>& out) {
+            if (!cp.contains(key)) return;
+            std::set<uint32_t> seen;
+            for (const auto& item : toml::find<toml::array>(cp, key)) {
+                const uint32_t a2 = parse_hex(item.as_string(),
+                                              fmt::format("coop.{}", key));
+                if (!seen.insert(a2 & 0x1FFFFFFFu).second)
+                    throw std::runtime_error(fmt::format(
+                        "{}: duplicate coop.{} entry 0x{:08X}",
+                        config_path.string(), key, a2));
+                out.push_back(a2);
+            }
+        };
+        load_list("actor_base_sites", coop_actor_base_sites);
+        load_list("replay_sites", coop_replay_sites);
+        // Fail closed on a half-declared feature: replay sites with no actor
+        // sites would re-run stages that never redirect (every pass driving
+        // player 1), and actor sites with no replay sites would redirect
+        // without any extra pass. Both are silently broken.
+        const bool any = !coop_actor_base_sites.empty() || !coop_replay_sites.empty();
+        const bool all = !coop_actor_base_sites.empty() && !coop_replay_sites.empty();
+        if (any && !all)
+            throw std::runtime_error(fmt::format(
+                "{}: [coop] is partially declared — actor_base_sites and "
+                "replay_sites must both be non-empty (or omit the block)",
+                config_path.string()));
+    }
+
     // Optional [widescreen.bg2d] block — pure-2D background tile-loop widen.
     uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
     uint32_t ws_bg2d_stream_left_site = 0, ws_bg2d_stream_right_site = 0;
@@ -1300,6 +1333,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
+        /*coop_actor_base_sites*/ coop_actor_base_sites,
+        /*coop_replay_sites*/     coop_replay_sites,
     };
 }
 

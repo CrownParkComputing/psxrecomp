@@ -2438,10 +2438,12 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
 }
 
 /* Sample each player's live device state into the matching SIO pad slot.
- * override >= 0 forces port-1 buttons (debug-server input injection). Called
- * once at cycle start (covers the turbo/FMV-skip paths that present nothing)
- * and, when g_low_latency_input is set, AGAIN after the pacer wait so the next
- * CPU frame reads near-fresh input instead of input ~one frame stale.
+ * Per-slot debug-server overrides (overrides[s] >= 0) force that slot's
+ * buttons via input injection; each slot is independent (co-op: X on slot 0,
+ * Zero on slot 1). Called once at cycle start (covers the turbo/FMV-skip
+ * paths that present nothing) and, when g_low_latency_input is set, AGAIN
+ * after the pacer wait so the next CPU frame reads near-fresh input instead
+ * of input ~one frame stale.
  *
  * HYBRID mode auto-switches DualShock<->digital from the most-recent input
  * (stick -> analog, D-pad -> digital) so the game runs its own analog or
@@ -2515,15 +2517,21 @@ static void dev_any_controller_sticks(uint8_t st[4]) {
  * stick activity (hybrid rises to analog), and the resolved type goes through
  * the same coherent request channel as real sampling — never slammed mid-
  * handshake (the v0.5.0 phantom-input lesson). */
-static void apply_input_override_to_sio(int override_word) {
-    PlayerInput& p = g_players[0];
+/* Applies a debug-server input override to ONE specific SIO slot (0 = port 1,
+ * 1 = port 2). `slot` is passed explicitly by the caller, which already knows
+ * which slot's per-slot override fired (see debug_server_get_input_override_slot)
+ * -- this function itself does not decide slot routing, so slot 0 and slot 1
+ * overrides can be applied independently, in the same frame, without either
+ * one touching the other's PlayerInput/SIO state. */
+static void apply_input_override_to_sio(int slot, int override_word) {
+    PlayerInput& p = g_players[slot];
     const uint16_t w = (uint16_t)override_word;
-    sio_set_pad_state_slot(0, w);
+    sio_set_pad_state_slot(slot, w);
 
     uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
     int axes = 0;
 #ifndef PSX_NO_DEBUG_TOOLS
-    axes = debug_server_get_axis_override(st);
+    axes = debug_server_get_axis_override_slot(slot, st);
 #endif
     const bool stick_live = axes != 0 && (st[0] != 0x80 || st[1] != 0x80 ||
                                           st[2] != 0x80 || st[3] != 0x80);
@@ -2545,8 +2553,8 @@ static void apply_input_override_to_sio(int override_word) {
         eff_analog = p.hybrid_analog ? 1 : 0;
     }
     if (!eff_analog) { st[0] = st[1] = st[2] = st[3] = 0x80; }
-    sio_set_pad_sticks(0, st[0], st[1], st[2], st[3]);
-    sio_request_pad_type(0, eff_analog);
+    sio_set_pad_sticks(slot, st[0], st[1], st[2], st[3]);
+    sio_request_pad_type(slot, eff_analog);
 }
 
 /* Capture one SIO slot's host pad into a netplay/local blob. Returns 1 if a
@@ -2849,12 +2857,18 @@ static void netplay_barrier_admit(int override) {
     }
 }
 
-static void sample_pad_into_sio(int override) {
-    if (override >= 0) {
-        apply_input_override_to_sio(override);
-        return;
-    }
+/* Sample both SIO slots. `overrides[s] >= 0` means slot s has a debug-server
+ * input override armed (co-op: X on slot 0, Zero on slot 1, independently) --
+ * ONLY that slot is driven from the override. A slot with no override armed
+ * (overrides[s] < 0) falls through to the existing capture_pad_slot /
+ * apply_pad_slot_to_sio host-sampling path exactly as it did with no override
+ * active at all -- arming one slot's override can never starve the other. */
+static void sample_pad_into_sio(const int overrides[2]) {
     for (int s = 0; s < 2; s++) {
+        if (overrides[s] >= 0) {
+            apply_input_override_to_sio(s, overrides[s]);
+            continue;
+        }
         PsxNetPad pad;
         if (!capture_pad_slot(s, &pad)) continue;  /* no device in this port */
         /* Push sticks every frame; request the pad type (digital/analog) through
@@ -2868,24 +2882,29 @@ static void sample_pad_into_sio(int override) {
     }
 }
 
-static void sample_headless_pad_into_sio(int override) {
-    if (override >= 0) {
-        apply_input_override_to_sio(override);
-        return;
-    }
+/* Same per-slot override contract as sample_pad_into_sio, for the headless
+ * (no SDL window / no host device sampling) path. A slot with no override
+ * falls through to its headless default: the cosim hold (PSX_COSIM builds)
+ * or fully-released (0xFFFF). */
+static void sample_headless_pad_into_sio(const int overrides[2]) {
+    for (int s = 0; s < 2; s++) {
+        if (overrides[s] >= 0) {
+            apply_input_override_to_sio(s, overrides[s]);
+            continue;
+        }
 #ifdef PSX_COSIM
-    /* Input-driven cosim (EXPERIMENTAL): the coordinator sets a HELD pad state via the
-     * `setpad` TCP command; the headless sampler applies it every frame so the same
-     * button input is fed to BOTH lockstep instances at the same guest cycle. If the
-     * two instances desync under input, this path is proven nondeterministic and gets
-     * stubbed out (see cosim.c). Default 0xFFFF = all released (PSX pad is active-low). */
-    { extern volatile int g_cosim_pad_hold[2];
-      sio_set_pad_state_slot(0, (uint16_t)g_cosim_pad_hold[0]);
-      sio_set_pad_state_slot(1, (uint16_t)g_cosim_pad_hold[1]);
-      return; }
+        /* Input-driven cosim (EXPERIMENTAL): the coordinator sets a HELD pad state via
+         * the `setpad` TCP command; the headless sampler applies it every frame so the
+         * same button input is fed to BOTH lockstep instances at the same guest cycle.
+         * If the two instances desync under input, this path is proven nondeterministic
+         * and gets stubbed out (see cosim.c). Default 0xFFFF = all released (PSX pad is
+         * active-low). */
+        { extern volatile int g_cosim_pad_hold[2];
+          sio_set_pad_state_slot(s, (uint16_t)g_cosim_pad_hold[s]);
+          continue; }
 #endif
-    sio_set_pad_state_slot(0, 0xFFFFu);
-    sio_set_pad_state_slot(1, 0xFFFFu);
+        sio_set_pad_state_slot(s, 0xFFFFu);
+    }
 }
 
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
@@ -3085,13 +3104,26 @@ static void sdl_vblank_present(void) {
     debug_server_record_frame();
     debug_server_check_watchpoints();
 
-    /* Check debug server input override. */
-    int override = debug_server_get_input_override();
+    /* Check debug server input override, per SIO slot -- slot 0 (port 1, X)
+     * and slot 1 (port 2, Zero) each carry their own independent override, so
+     * arming one never starves the other (see debug_server_get_input_override_slot).
+     * Fetched once per frame here (this call side-effects each slot's "press"
+     * frames countdown); overrides[] is reused below for the low-latency
+     * re-sample so the countdown is never decremented twice in one frame. */
+    int overrides[2];
+    overrides[0] = debug_server_get_input_override_slot(0);
+    overrides[1] = debug_server_get_input_override_slot(1);
+    int override = overrides[0];  /* netplay's local-sample override path
+                                    * (capture_override_pad) only supports a
+                                    * single player and always reads slot 0 --
+                                    * netplay has its own player-selection
+                                    * mechanism and is out of scope here. */
 #else
     /* Production: skip debug server. Still need to advance frame counter
      * locally so anything else that reads it continues to work. */
     extern uint64_t s_frame_count;
     s_frame_count++;
+    int overrides[2] = { -1, -1 };
     int override = -1;
 #endif
 
@@ -3249,10 +3281,12 @@ static void sdl_vblank_present(void) {
     }
 
     /* Sample each player's device and feed the matching SIO pad slot.
-     * Debug server input override (when active) drives port 1 only. With
-     * g_low_latency_input this early sample is re-done after the pacer wait
-     * (below) for the interactive present path; it still covers the turbo /
-     * FMV-skip paths that early-return before pacing.
+     * Debug server input override (when active) drives whichever slot(s)
+     * armed it -- slot 0 (port 1, X) and slot 1 (port 2, Zero) independently,
+     * for co-op; a slot with nothing armed keeps sampling its host device
+     * normally. With g_low_latency_input this early sample is re-done after
+     * the pacer wait (below) for the interactive present path; it still
+     * covers the turbo / FMV-skip paths that early-return before pacing.
      *
      * Delay-sync netplay host FPS (MotK FMV): finish → present → admit/pace.
      * Local Swap overlaps the peer's guest quantum; admit still runs every
@@ -3281,9 +3315,9 @@ static void sdl_vblank_present(void) {
     if (psx_netplay_active()) {
         psx_netplay_finish_frame();
     } else if (g_headless) {
-        sample_headless_pad_into_sio(override);
+        sample_headless_pad_into_sio(overrides);
     } else {
-        sample_pad_into_sio(override);
+        sample_pad_into_sio(overrides);
     }
 
     /* Latency ring: open this present cycle's slot, stamping when input was
@@ -3472,7 +3506,7 @@ static void sdl_vblank_present(void) {
         if (g_low_latency_input) {
             SDL_GameControllerUpdate();  /* refresh pad state after the wait */
             SDL_PumpEvents();            /* refresh keyboard state */
-            sample_pad_into_sio(override);
+            sample_pad_into_sio(overrides);
             latency_ring_restamp_input();
         }
     }

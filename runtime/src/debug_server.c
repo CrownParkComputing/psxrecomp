@@ -304,13 +304,22 @@ static uint32_t s_dirty_break_frame = 0;
 static uint64_t s_dirty_break_hits = 0;
 
 /* ---- Input override ---- */
-static int s_input_override = -1;
-static int s_input_frames   = 0;
+/* Per-SIO-slot (0 = port 1, 1 = port 2): each slot has its OWN independent
+ * override state. The pre-two-player-co-op bug was a single shared override
+ * plus a "which slot does it target" selector -- arming one slot silently
+ * re-pointed the (only) override away from the other slot, freezing whichever
+ * slot lost the last arm. Splitting into per-slot arrays makes arming one
+ * slot incapable of touching the other's state. set_input/press with no
+ * "slot" arg always index [0], preserving the exact single-player wire
+ * behaviour. */
+static int s_input_override[2] = { -1, -1 };
+static int s_input_frames[2]   = { 0, 0 };
 /* Optional analog-stick override (set_input lx/ly/rx/ry, 0..255, 0x80 =
- * centre). Lets injected input drive analog-mode movement; consumed by the
- * pad sampler alongside the button word. */
-static int     s_axis_override = 0;
-static uint8_t s_axis_st[4]    = { 0x80, 0x80, 0x80, 0x80 };
+ * centre), per slot. Lets injected input drive analog-mode movement;
+ * consumed by the pad sampler alongside the button word. */
+static int     s_axis_override[2] = { 0, 0 };
+static uint8_t s_axis_st[2][4]    = { { 0x80, 0x80, 0x80, 0x80 },
+                                      { 0x80, 0x80, 0x80, 0x80 } };
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -4593,6 +4602,123 @@ static void handle_get_registers(int id, const char *json)
     free(buf);
 }
 
+/* Enhancement scratch-RAM capability (runtime/src/memory.c). */
+int      psx_enh_scratch_configure(uint32_t phys_base, uint32_t len);
+uint8_t *psx_enh_scratch_ptr(uint32_t *out_base, uint32_t *out_len);
+
+/* enh_scratch: configure / query the generic enhancement scratch-RAM window
+ * (guest-addressable memory above the main-RAM mirror that the game can never
+ * touch — see psx_enh_scratch_configure in runtime/src/memory.c). With no
+ * args, reports the current window. `len:0` disables it.
+ *   {"cmd":"enh_scratch"}
+ *   {"cmd":"enh_scratch","base":"0x00800000","len":4096}
+ * Exists so the capability can be exercised and validated without any
+ * game-side code: once configured, ordinary read_ram/write_ram at the KSEG0
+ * alias (0x80000000 | base) round-trips through it. */
+static void handle_enh_scratch(int id, const char *json)
+{
+    char base_str[32];
+    int have_base = (json_get_str(json, "base", base_str, sizeof(base_str)) != 0);
+    int len = json_get_int(json, "len", -1);
+
+    if (have_base || len >= 0) {
+        uint32_t base = have_base ? hex_to_u32(base_str) : 0;
+        if (len < 0) { send_err(id, "missing len"); return; }
+        if (!psx_enh_scratch_configure(base, (uint32_t)len)) {
+            send_err(id, "rejected (base must be >= 0x00800000 and window must clear MMIO)");
+            return;
+        }
+    }
+    uint32_t cur_base = 0, cur_len = 0;
+    (void)psx_enh_scratch_ptr(&cur_base, &cur_len);
+    send_fmt("{\"id\":%d,\"ok\":true,\"base\":\"0x%08X\",\"len\":%u,"
+             "\"guest\":\"0x%08X\",\"enabled\":%s}",
+             id, cur_base, cur_len, 0x80000000u | cur_base,
+             cur_len ? "true" : "false");
+}
+
+/* Co-op second-actor capability (runtime/src/coop.c). */
+int      psx_coop_configure(uint32_t primary_base, uint32_t struct_len,
+                            int companions, uint32_t scratch_phys_base);
+int      psx_coop_enabled(void);
+int      psx_coop_gate_open(void);
+int      psx_coop_spawn(int idx);
+void     psx_coop_despawn(int idx);
+int      psx_coop_actor_active(int idx);
+uint32_t psx_coop_actor_guest_base(int idx);
+void     psx_coop_stats(uint64_t *ticks, uint64_t *redirects);
+void     psx_coop_set_gate_state(uint32_t mode_addr, uint8_t mode_val,
+                                 const uint32_t *zero_addrs, int zero_count);
+void     psx_coop_set_input_layout(uint32_t cur_off, uint32_t edge_off,
+                                   uint32_t input_global, int enabled);
+
+/* Co-op second-actor control (ENHANCEMENT, default off). Lets the feature be
+ * configured, spawned and inspected live, so it can be validated before any
+ * permanent game-side wiring exists.
+ *   {"cmd":"coop"}                                    -> status
+ *   {"cmd":"coop","primary":"0x800970A0","struct_len":344,"companions":1,
+ *    "scratch":"0x00800000","mode_addr":"0x800CD3F8","mode_val":6,
+ *    "zero1":"0x80097424","zero2":"0x800C4568"}       -> configure + arm gate
+ *   {"cmd":"coop","companions":0}                     -> disable
+ *   {"cmd":"coop_spawn","idx":0}                      -> clone primary -> companion
+ *   {"cmd":"coop_despawn","idx":0}
+ */
+static void handle_coop(int id, const char *json)
+{
+    char s1[32];
+    int companions = json_get_int(json, "companions", -1);
+    if (companions >= 0) {
+        uint32_t primary = json_get_str(json, "primary", s1, sizeof(s1))
+                         ? hex_to_u32(s1) : 0x800970A0u;
+        int slen = json_get_int(json, "struct_len", 344);
+        uint32_t scratch = json_get_str(json, "scratch", s1, sizeof(s1))
+                         ? hex_to_u32(s1) : 0x00800000u;
+        if (!psx_coop_configure(primary, (uint32_t)slen, companions, scratch)) {
+            send_err(id, "coop configure rejected"); return;
+        }
+        if (json_get_str(json, "mode_addr", s1, sizeof(s1))) {
+            uint32_t mode_addr = hex_to_u32(s1);
+            uint8_t  mode_val  = (uint8_t)json_get_int(json, "mode_val", 0);
+            uint32_t zeros[2]; int nz = 0;
+            if (json_get_str(json, "zero1", s1, sizeof(s1))) zeros[nz++] = hex_to_u32(s1);
+            if (json_get_str(json, "zero2", s1, sizeof(s1))) zeros[nz++] = hex_to_u32(s1);
+            psx_coop_set_gate_state(mode_addr, mode_val, zeros, nz);
+        }
+        /* Optional: where the engine keeps the processed pad word inside the
+         * actor struct, so each companion can be driven by its own port. */
+        int in_cur = json_get_int(json, "in_cur_off", -1);
+        if (in_cur >= 0) {
+            int in_edge = json_get_int(json, "in_edge_off", 0);
+            uint32_t in_glob = json_get_str(json, "in_global", s1, sizeof(s1))
+                             ? hex_to_u32(s1) : 0u;
+            psx_coop_set_input_layout((uint32_t)in_cur, (uint32_t)in_edge, in_glob, 1);
+        }
+    }
+    uint64_t ticks = 0, redirects = 0;
+    psx_coop_stats(&ticks, &redirects);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"gate_open\":%s,"
+             "\"actor0\":\"0x%08X\",\"actor0_active\":%s,"
+             "\"ticks\":%llu,\"redirects\":%llu}",
+             id, psx_coop_enabled() ? "true" : "false",
+             psx_coop_gate_open() ? "true" : "false",
+             psx_coop_actor_guest_base(0),
+             psx_coop_actor_active(0) ? "true" : "false",
+             (unsigned long long)ticks, (unsigned long long)redirects);
+}
+
+static void handle_coop_spawn(int id, const char *json)
+{
+    int idx = json_get_int(json, "idx", 0);
+    if (!psx_coop_spawn(idx)) { send_err(id, "spawn failed (not configured?)"); return; }
+    send_ok(id);
+}
+
+static void handle_coop_despawn(int id, const char *json)
+{
+    psx_coop_despawn(json_get_int(json, "idx", 0));
+    send_ok(id);
+}
+
 static void handle_read_ram(int id, const char *json)
 {
     char addr_str[32];
@@ -6761,16 +6887,21 @@ static void handle_set_input(int id, const char *json)
     if (!json_get_str(json, "buttons", val_str, sizeof(val_str))) {
         send_err(id, "missing buttons"); return;
     }
-    s_input_override = (int)hex_to_u32(val_str);
-    s_input_frames = 0;
+    /* Optional SIO slot target: 0 = port 1 (default, back-compat), 1 = port 2.
+     * Each slot's override state is independent -- arming this slot never
+     * touches the other slot (see s_input_override[2] above). */
+    int slot = json_get_int(json, "slot", 0);
+    if (slot < 0 || slot > 1) { send_err(id, "bad slot"); return; }
+    s_input_override[slot] = (int)hex_to_u32(val_str);
+    s_input_frames[slot] = 0;
     /* Optional stick override: any of lx/ly/rx/ry (0..255) arms it; omitted
      * axes centre. Absent entirely -> released (buttons-only injection). */
     int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
                   json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
-    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    s_axis_override[slot] = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
     for (int i = 0; i < 4; i++) {
         int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
-        s_axis_st[i] = (uint8_t)v;
+        s_axis_st[slot][i] = (uint8_t)v;
     }
     send_ok(id);
 }
@@ -6780,20 +6911,28 @@ static void handle_press(int id, const char *json)
     int buttons = json_get_int(json, "buttons", -1);
     int frames  = json_get_int(json, "frames", 2);
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
-    s_input_override = buttons;
-    s_input_frames   = frames;
+    /* Optional SIO slot target: 0 = port 1 (default, back-compat), 1 = port 2.
+     * Each slot's override state is independent -- arming this slot never
+     * touches the other slot (see s_input_override[2] above). */
+    int slot = json_get_int(json, "slot", 0);
+    if (slot < 0 || slot > 1) { send_err(id, "bad slot"); return; }
+    s_input_override[slot] = buttons;
+    s_input_frames[slot]   = frames;
     int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
                   json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
-    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    s_axis_override[slot] = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
     for (int i = 0; i < 4; i++) {
         int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
-        s_axis_st[i] = (uint8_t)v;
+        s_axis_st[slot][i] = (uint8_t)v;
     }
     send_ok(id);
 }
 
-/* Reports the current pad word(s) and any active input override. `pad` is
- * slot 0 (kept for back-compat); slot0/slot1 report both ports' button word. */
+/* Reports the current pad word(s) and any active input override. `pad` and
+ * the top-level `override*` fields are slot 0 (kept for back-compat);
+ * slot0/slot1 report both ports' button word AND that port's own
+ * independent override state (two-player co-op: X and Zero each arm/hold
+ * their own override without touching the other's). */
 extern uint16_t sio_get_pad_buttons(void);
 extern uint16_t sio_get_pad_buttons_slot(int slot);
 extern int sio_get_pad_connected(int slot);
@@ -6808,27 +6947,47 @@ static void handle_pad_status(int id, const char *json)
     sio_get_pad_sticks(0, sticks0);
     sio_get_pad_sticks(1, sticks1);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
-             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
-             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
+             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u],"
+             "\"override\":%d,\"override_frames\":%d,"
+             "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s},"
+             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u],"
+             "\"override\":%d,\"override_frames\":%d,"
+             "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s},"
              "\"override\":%d,\"override_frames\":%d,"
              "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s}\n",
              id, pad0,
              pad0, sio_get_pad_connected(0) ? "true" : "false", sio_get_pad_analog(0) ? "true" : "false",
              sticks0[0], sticks0[1], sticks0[2], sticks0[3],
+             s_input_override[0], s_input_frames[0],
+             s_axis_st[0][0], s_axis_st[0][1], s_axis_st[0][2], s_axis_st[0][3],
+             s_axis_override[0] ? "true" : "false",
              pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
              sticks1[0], sticks1[1], sticks1[2], sticks1[3],
-             s_input_override, s_input_frames,
-             s_axis_st[0], s_axis_st[1], s_axis_st[2], s_axis_st[3],
-             s_axis_override ? "true" : "false");
+             s_input_override[1], s_input_frames[1],
+             s_axis_st[1][0], s_axis_st[1][1], s_axis_st[1][2], s_axis_st[1][3],
+             s_axis_override[1] ? "true" : "false",
+             s_input_override[0], s_input_frames[0],
+             s_axis_st[0][0], s_axis_st[0][1], s_axis_st[0][2], s_axis_st[0][3],
+             s_axis_override[0] ? "true" : "false");
 }
 
 static void handle_clear_input(int id, const char *json)
 {
-    (void)json;
-    s_input_override = -1;
-    s_input_frames   = 0;
-    s_axis_override  = 0;
-    s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
+    /* No "slot" arg (sentinel -1, the default): clear BOTH slots -- back-
+     * compat with every existing probe/soak script that calls clear_input
+     * with no args and expects whatever is held to be released. Pass
+     * slot=0|1 to release just one slot's override without disturbing the
+     * other (needed for co-op: releasing X's hold must not release Zero's). */
+    int slot = json_get_int(json, "slot", -1);
+    if (slot != -1 && slot != 0 && slot != 1) { send_err(id, "bad slot"); return; }
+    int lo = (slot == -1) ? 0 : slot;
+    int hi = (slot == -1) ? 1 : slot;
+    for (int s = lo; s <= hi; s++) {
+        s_input_override[s] = -1;
+        s_input_frames[s]   = 0;
+        s_axis_override[s]  = 0;
+        s_axis_st[s][0] = s_axis_st[s][1] = s_axis_st[s][2] = s_axis_st[s][3] = 0x80;
+    }
     send_ok(id);
 }
 
@@ -12164,6 +12323,10 @@ static const CmdEntry s_commands[] = {
     { "read_ram",          handle_read_ram },
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
+    { "enh_scratch",       handle_enh_scratch },
+    { "coop",              handle_coop },
+    { "coop_spawn",        handle_coop_spawn },
+    { "coop_despawn",      handle_coop_despawn },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
     { "ws_hud_mode",       handle_ws_hud_mode },
@@ -13136,22 +13299,34 @@ int debug_server_is_connected(void)
     return s_client != SOCK_INVALID;
 }
 
-int debug_server_get_input_override(void)
+int debug_server_get_input_override_slot(int slot)
 {
-    int current = s_input_override;
-    if (s_input_override >= 0 && s_input_frames > 0) {
-        if (--s_input_frames == 0)
-            s_input_override = -1;
+    if (slot < 0 || slot > 1) return -1;
+    int current = s_input_override[slot];
+    if (s_input_override[slot] >= 0 && s_input_frames[slot] > 0) {
+        if (--s_input_frames[slot] == 0)
+            s_input_override[slot] = -1;
     }
     return current;
 }
 
+int debug_server_get_input_override(void)
+{
+    return debug_server_get_input_override_slot(0);
+}
+
+int debug_server_get_axis_override_slot(int slot, unsigned char st[4])
+{
+    if (slot < 0 || slot > 1) return 0;
+    if (!s_axis_override[slot]) return 0;
+    st[0] = s_axis_st[slot][0]; st[1] = s_axis_st[slot][1];
+    st[2] = s_axis_st[slot][2]; st[3] = s_axis_st[slot][3];
+    return 1;
+}
+
 int debug_server_get_axis_override(unsigned char st[4])
 {
-    if (!s_axis_override) return 0;
-    st[0] = s_axis_st[0]; st[1] = s_axis_st[1];
-    st[2] = s_axis_st[2]; st[3] = s_axis_st[3];
-    return 1;
+    return debug_server_get_axis_override_slot(0, st);
 }
 
 int debug_server_turbo_enabled(void)

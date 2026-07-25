@@ -55,6 +55,70 @@ static inline uint32_t psx_phys_addr(uint32_t addr) {
 }
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
+/* ---- Enhancement scratch RAM (generic capability, DEFAULT OFF) -------------
+ *
+ * Enhancements sometimes need guest-addressable memory the game can never
+ * touch. Carving a "free" hole out of main RAM is NOT safe: on MMX6 the
+ * documented free heap->stack gap turned out to be the CD-DMA stage-load
+ * arena (verified by arming the RAM-write ring at boot and watching DMA ch3
+ * overwrite every word of a candidate reservation on the first stage load).
+ *
+ * So instead expose an OPTIONAL window ABOVE the 4x main-RAM mirror
+ * (phys >= 0x00800000). That window is unmapped on real hardware and
+ * open-bus here, so no retail game can legitimately address it, and nothing
+ * the game does can collide with it.
+ *
+ * Inert until a game opts in: enh_scratch_len == 0 makes every check below
+ * false, so behaviour is byte-identical to a build without this feature. The
+ * checks sit AFTER each accessor's `phys < RAM_SIZE` fast path, so ordinary
+ * main-RAM traffic pays nothing at all. */
+#define PSX_ENH_SCRATCH_MIN_PHYS 0x00800000u
+static uint8_t  *enh_scratch      = NULL;
+static uint32_t  enh_scratch_base = 0;   /* physical base */
+static uint32_t  enh_scratch_len  = 0;   /* 0 = disabled */
+
+void psx_enh_scratch_reset(void);
+
+/* Host pointer for a `width`-byte access wholly inside the scratch window, or
+ * NULL. Rejects partial overlaps rather than clamping: a straddling access is a
+ * bug in the enhancement, not something to silently absorb. */
+static inline uint8_t *enh_scratch_at(uint32_t phys, uint32_t width) {
+    if (!enh_scratch_len) return NULL;
+    if (phys < enh_scratch_base) return NULL;
+    uint32_t off = phys - enh_scratch_base;
+    if (off > enh_scratch_len || (enh_scratch_len - off) < width) return NULL;
+    return enh_scratch + off;
+}
+
+/* Opt in. phys_base must sit above the main-RAM mirror so it can never alias
+ * game memory. Returns 1 on success, 0 (and stays disabled) on a bad request. */
+int psx_enh_scratch_configure(uint32_t phys_base, uint32_t len) {
+    if (len == 0) { psx_enh_scratch_reset(); return 1; }
+    if (phys_base < PSX_ENH_SCRATCH_MIN_PHYS) return 0;   /* would alias RAM mirror */
+    if (phys_base + len < phys_base) return 0;            /* wrap */
+    if (phys_base + len > 0x1F000000u) return 0;          /* keep clear of expansion/MMIO/BIOS */
+    uint8_t *buf = (uint8_t *)calloc(1, len);
+    if (!buf) return 0;
+    free(enh_scratch);
+    enh_scratch      = buf;
+    enh_scratch_base = phys_base;
+    enh_scratch_len  = len;
+    return 1;
+}
+
+void psx_enh_scratch_reset(void) {
+    free(enh_scratch);
+    enh_scratch = NULL;
+    enh_scratch_base = 0;
+    enh_scratch_len = 0;
+}
+
+uint8_t *psx_enh_scratch_ptr(uint32_t *out_base, uint32_t *out_len) {
+    if (out_base) *out_base = enh_scratch_base;
+    if (out_len)  *out_len  = enh_scratch_len;
+    return enh_scratch;
+}
+
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
@@ -1304,6 +1368,8 @@ static uint32_t psx_read_word_raw(uint32_t addr) {
         if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
         return v;
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 4);
+      if (sp_) { uint32_t v_; memcpy(&v_, sp_, 4); return v_; } }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — no device, open bus */
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) {
         return 0xFFFFFFFFu;
@@ -1462,6 +1528,8 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         ram[phys + 3] = (uint8_t)(val >> 24);
         return;
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 4);
+      if (sp_) { memcpy(sp_, &val, 4); return; } }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — ignore writes */
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
@@ -1509,6 +1577,8 @@ static uint16_t psx_read_half_raw(uint32_t addr) {
     if (phys < RAM_SIZE) {
         return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 2);
+      if (sp_) return (uint16_t)((uint16_t)sp_[0] | ((uint16_t)sp_[1] << 8)); }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0xFFFFu;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
@@ -1563,6 +1633,8 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 2);
+      if (sp_) { sp_[0] = (uint8_t)val; sp_[1] = (uint8_t)(val >> 8); return; } }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
@@ -1601,6 +1673,8 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
     if (phys < RAM_SIZE) {
         return ram[phys];
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 1);
+      if (sp_) return sp_[0]; }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0xFFu;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         return scratchpad[phys - 0x1F800000u];
@@ -1873,6 +1947,8 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         ram[phys] = val;
         return;
     }
+    { uint8_t *sp_ = enh_scratch_at(phys, 1);
+      if (sp_) { sp_[0] = (uint8_t)val; return; } }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],

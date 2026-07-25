@@ -53,8 +53,9 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `cdrom_sector_history_clear` | ✓ |   | — | Reset the CD-ROM sector history ring |
 | `watch` | ✓ | ✓ | `addr` | Set byte-level memory watchpoint (fires per-frame on change) |
 | `unwatch` | ✓ | ✓ | `addr` | Remove memory watchpoint |
-| `set_input` | ✓ | ✓ | `buttons`, optional `frames`, optional `lx`, `ly`, `rx`, `ry` | Override pad1 buttons and optional analog axes (PS1 inverted bitmask, 0 = pressed; axes 0-255). Holds until `clear_input` on both backends; pass `frames=N` (beetle) to auto-release after N frames |
-| `clear_input` | ✓ | ✓ | — | Remove input and analog axis overrides |
+| `set_input` | ✓ | ✓ | `buttons`, optional `frames`, optional `lx`, `ly`, `rx`, `ry`, optional `slot` (native only) | Override pad buttons and optional analog axes (PS1 inverted bitmask, 0 = pressed; axes 0-255). Holds until `clear_input` on both backends; pass `frames=N` (beetle) to auto-release after N frames. `slot` selects the SIO port to drive: `0` = port 1 (default, back-compat) or `1` = port 2. Each slot's override is fully independent — arming one slot never affects the other, and a slot with no override armed keeps sampling its normal host device every frame. Omitting `slot` behaves exactly as before (drives port 1 only) |
+| `press` | ✓ |   | `buttons`, optional `frames` (default 2), optional `lx`, `ly`, `rx`, `ry`, optional `slot` | Same button/axis override as `set_input` but auto-releases after `frames` vblanks. `slot` selects the SIO port to drive: `0` = port 1 (default, back-compat) or `1` = port 2, independently of the other slot exactly as `set_input` above. Omitting `slot` behaves exactly as before |
+| `clear_input` | ✓ | ✓ | optional `slot` (native only) | Remove input and analog axis overrides. With no `slot` arg, clears BOTH SIO slots (back-compat with every existing probe/soak script). Pass `slot=0` or `slot=1` to release only that port's override without disturbing the other — needed for two-player co-op where each port's hold must be released independently |
 | `turbo` | ✓ |   | `enabled` | Enable/disable TCP-controlled frontend turbo for fast-forward validation |
 | `turbo_state` | ✓ |   | — | Query TCP-controlled turbo state |
 | `pause` | ✓ | ✓ | — | Pause emulation |

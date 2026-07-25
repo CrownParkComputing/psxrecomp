@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
                           ws_bg2d_bufbase_site = 0,
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
+    std::vector<uint32_t> coop_actor_base_sites, coop_replay_sites; // [coop]
     std::filesystem::path out_dir = "generated";
     uint32_t              configured_text_size = 0;
 
@@ -221,6 +222,8 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_bufbase_site) ws_bg2d_bufbase_site = cfg.ws_bg2d_bufbase_site;
         if (cfg.ws_bg2d_cap_site)     ws_bg2d_cap_site     = cfg.ws_bg2d_cap_site;
         if (cfg.ws_bg2d_init_func)    ws_bg2d_init_func    = cfg.ws_bg2d_init_func;
+        if (!cfg.coop_actor_base_sites.empty()) coop_actor_base_sites = cfg.coop_actor_base_sites;
+        if (!cfg.coop_replay_sites.empty())      coop_replay_sites     = cfg.coop_replay_sites;
         ws_signed_x_bound_sites = cfg.ws_signed_x_bound_sites;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
@@ -1072,6 +1075,12 @@ int main(int argc, char** argv) {
     codegen_config.ws_bg2d_stream_right_site = ws_bg2d_stream_right_site;
     codegen_config.ws_bg2d_bufbase_site = ws_bg2d_bufbase_site;
     codegen_config.ws_bg2d_cap_site     = ws_bg2d_cap_site;
+    codegen_config.coop_actor_base_sites = coop_actor_base_sites;
+    codegen_config.coop_replay_sites     = coop_replay_sites;
+    if (!coop_actor_base_sites.empty())
+        fmt::print("  [coop] per-actor stages = ON ({} actor-pointer sites, "
+                   "{} replayed stages)\n",
+                   coop_actor_base_sites.size(), coop_replay_sites.size());
     if (ws_bg2d_count_site || ws_bg2d_startcol_site || ws_bg2d_startx_site)
         fmt::print("  ws_bg2d 2D-background widen = ON (count=0x{:08X} startcol=0x{:08X} startx=0x{:08X})\n",
                    ws_bg2d_count_site, ws_bg2d_startcol_site, ws_bg2d_startx_site);

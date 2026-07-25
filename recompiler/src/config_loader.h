@@ -753,6 +753,46 @@ struct GameConfig {
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
     uint32_t ws_bg2d_packet_cap       = 1000;
+
+    // ---- [coop] — simultaneous extra player actors (ENHANCEMENT) ------------
+    //
+    // MODEL. A game's per-frame player update is a SET OF STAGES inside its
+    // frame pipeline: a sequence of calls (read pad -> advance state ->
+    // integrate motion -> ... -> submit sprites), only SOME of which are
+    // per-player. Co-op replays each per-player stage once per actor, with the
+    // actor pointer redirected to the actor being run.
+    //
+    // A CONTIGUOUS SPAN DOES NOT WORK and must not be attempted: the pipeline
+    // interleaves per-actor and shared stages. Replaying a span that swept in
+    // one shared stage (MMX6's FUN_80020A08) ran it twice per frame and
+    // corrupted the game — the player's spawn beam drew as a column of
+    // duplicated sprites and physics stepped twice, dropping him through the
+    // floor. Hence a LIST of individually-replayed stages, never a range.
+    //
+    //   replay_sites — for each per-actor stage, the DELAY SLOT of its jal.
+    //     The generator rewrites the link register the CPS emitter just stored
+    //     so the callee "returns" to its own jal and the stage runs again for
+    //     the next actor; the natural link is restored once the actor list is
+    //     exhausted. That is the guest's own return path, so no native call
+    //     into guest code is needed (one does not return under CPS — it
+    //     silently skips any restore and latches the actor selection).
+    //     A nop delay slot is replaced outright; a busy one is preserved by
+    //     re-emitting its normal translation after the link rewrite.
+    //
+    //   actor_base_sites — EVERY instruction that forms the player-actor
+    //     pointer, both inside the stages and in the pipeline driver (stages
+    //     that take the pointer as an argument inherit it from the driver).
+    //     Each must be an addiu; its result routes through
+    //     psx_coop_actor_base(), the identity when co-op is off.
+    //
+    // Capability declaration only — inert until the runtime master switch is
+    // enabled. Omit the whole block for pristine gen with zero co-op bytes.
+    //
+    // Declare only the LIVE pipeline. Attract/demo replays recorded inputs
+    // against simulation state, so leaving its caller unhooked keeps attract
+    // vanilla by construction rather than by a runtime predicate.
+    std::vector<uint32_t> coop_actor_base_sites;
+    std::vector<uint32_t> coop_replay_sites;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

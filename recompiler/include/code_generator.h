@@ -170,6 +170,12 @@ struct CodeGenConfig {
     uint32_t ws_bg2d_bufbase_site = 0;       // driver addu: BG packet-buffer address (relocate)
     uint32_t ws_bg2d_cap_site     = 0;       // renderer slti: per-frame BG tile cap (raise)
 
+    // [coop] simultaneous extra player actors (ENHANCEMENT, default off).
+    // Empty/zero => nothing emitted, i.e. pristine gen (standard-asset build).
+    // See config_loader.h for the pipeline-span model.
+    std::vector<uint32_t> coop_actor_base_sites; // addius forming the actor pointer
+    std::vector<uint32_t> coop_replay_sites;     // delay slots of per-actor stage jals
+
     // Persistent game-option init-store hooks ([persist_options] in
     // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a
     // config global's DEFAULT value; the store is rewritten to route the value
@@ -197,6 +203,10 @@ struct GeneratedFunction {
 };
 
 class CodeGenerator {
+    // Set while re-emitting a [coop] replay site's original delay-slot
+    // instruction, so the site check cannot match itself recursively.
+    bool coop_reemit_guard_ = false;
+
 public:
     explicit CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config = CodeGenConfig());
 

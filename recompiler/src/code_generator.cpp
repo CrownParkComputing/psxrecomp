@@ -1177,6 +1177,47 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
     }
 
+    // ---- [coop] simultaneous extra player actors (ENHANCEMENT, default off) ----
+    // See config_loader.h for the model. Two emissions:
+    //
+    //  1. actor_base_sites — every addiu that forms the player pointer, so the
+    //     stage being replayed operates on the selected actor. Identity when
+    //     co-op is off or the primary actor is running.
+    //
+    //  2. replay_sites — the delay slot of each per-actor stage's jal. Rewrites
+    //     the link the CPS emitter just stored so the callee returns to its own
+    //     jal and the stage repeats for the next actor. A nop delay slot is
+    //     replaced outright; a busy one is preserved by appending its normal
+    //     translation (guarded recursion, so the site check cannot re-fire).
+    if (!config_.coop_actor_base_sites.empty() && !coop_reemit_guard_) {
+        for (uint32_t site : config_.coop_actor_base_sites) {
+            if (addr != site) continue;
+            if (opcode == 0x09) {  // addiu rt,rs,imm
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                return fmt::format("{} = psx_coop_actor_base((uint32_t)({} + {}));{}",
+                                   reg_name(rt), reg_name(rs),
+                                   (int16_t)(instr & 0xFFFFu), comment);
+            } else if (!config_.overlay_mode) {
+                fmt::print(stderr, "ERROR: [coop] actor_base_sites entry 0x{:08X} "
+                           "is not addiu (opcode 0x{:02X})\n", addr, opcode);
+                std::exit(1);
+            }
+        }
+    }
+    if (!config_.coop_replay_sites.empty() && !coop_reemit_guard_) {
+        for (uint32_t site : config_.coop_replay_sites) {
+            if (addr != site) continue;
+            const uint32_t jal_addr = addr - 4u;   // the jal this slot belongs to
+            std::string link = fmt::format(
+                "cpu->gpr[31] = psx_coop_stage_link(cpu, cpu->gpr[31], 0x{:08X}u);", jal_addr);
+            if (instr == 0u) return link + comment;   // plain nop: replace outright
+            coop_reemit_guard_ = true;               // preserve a busy delay slot
+            std::string original = translate_instruction(addr, instr);
+            coop_reemit_guard_ = false;
+            return link + "\n    " + original;
+        }
+    }
+
     // Persistent game-option init store ([persist_options] in game_options.toml).
     // The site is the boot-init sb/sh that writes a config global's DEFAULT value
     // (Tomba MESSAGE / SOUND / VIBRATION / ADJUST SCREEN). Route the stored value
@@ -2824,6 +2865,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_mmx6_bg_bufbase(int addr);   /* ws 2D bg packet-buffer relocation (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_undercap(int counter);/* ws 2D bg per-frame tile cap (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
+    ss << "extern uint32_t psx_coop_actor_base(uint32_t vanilla_base);  /* [coop] actor-pointer redirect (coop.c) */\n";
+    ss << "extern uint32_t psx_coop_stage_link(CPUState* cpu, uint32_t natural_link, uint32_t jal_addr); /* [coop] per-actor stage replay (coop.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n";
     ss << "extern uint32_t g_debug_last_store_pc;  /* exact PC of the executing SW/SH/SB — wtrace/readtrace producer attribution (debug_server.c) */\n\n";
