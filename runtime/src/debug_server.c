@@ -4678,6 +4678,12 @@ int      psx_coop_add_swap_region(uint32_t guest_base, uint32_t len);
 int      psx_coop_swap_region_count(void);
 int      psx_coop_swap_region(int i, uint32_t *base, uint32_t *len);
 int      psx_coop_set_raw_pad(uint32_t addr, uint32_t words, int wire);
+void     psx_ctx_region_clear(void);
+int      psx_ctx_region_count(void);
+int      psx_ctx_region_add(uint32_t base, uint32_t len);
+uint32_t psx_ctx_save(const char *path);
+uint32_t psx_ctx_load(const char *path, uint8_t *dst);
+int      psx_coop_seed_from_blob(int idx, const char *path);
 uint8_t *psx_coop_observe_ptr(uint32_t addr, uint32_t len);
 uint32_t psx_coop_raw_pad_addr(void);
 uint32_t psx_coop_raw_pad_words(void);
@@ -4781,6 +4787,63 @@ static void handle_read_watch(int id, const char *json)
     }
     send_fmt("{\"id\":%d,\"ok\":true,\"active\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
              id, g_ram_read_watch_active, s_rwatch_lo, s_rwatch_hi);
+}
+
+/* ---- portable context blobs (runtime/src/coop.c) -------------------------
+ * Capture a set of guest regions to a file and re-install them in a LATER RUN.
+ * On MMX6 this is how an alternate playable character becomes available: the
+ * character is not a flag but an 830 KB data set the loader installs at stage
+ * entry, so it is captured once from a run of that character and replayed.
+ *   {"cmd":"ctx_region","base":"0x80103000","len":4096}  -> add a region
+ *   {"cmd":"ctx_region","clear":1}                       -> reset the list
+ *   {"cmd":"ctx_region"}                                 -> report the list
+ *   {"cmd":"ctx_save","path":"zero.ctx"}                 -> capture
+ *   {"cmd":"ctx_load","path":"zero.ctx"}                 -> install over LIVE memory
+ *   {"cmd":"coop_seed","idx":0,"path":"zero.ctx"}        -> make extra actor 0 that character
+ */
+static void handle_ctx_region(int id, const char *json)
+{
+    char s1[32];
+    if (json_get_int(json, "clear", 0)) psx_ctx_region_clear();
+    if (json_get_str(json, "base", s1, sizeof(s1))) {
+        uint32_t base = hex_to_u32(s1);
+        int len = json_get_int(json, "len", 0);
+        if (!psx_ctx_region_add(base, (uint32_t)len)) {
+            send_err(id, "ctx region rejected (bad range or table full)"); return;
+        }
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"regions\":%d}", id, psx_ctx_region_count());
+}
+
+static void handle_ctx_save(int id, const char *json)
+{
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    uint32_t n = psx_ctx_save(path);
+    if (!n) { send_err(id, "ctx save failed (no regions, or file not writable)"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"bytes\":%u,\"regions\":%d}",
+             id, n, psx_ctx_region_count());
+}
+
+static void handle_ctx_load(int id, const char *json)
+{
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    uint32_t n = psx_ctx_load(path, NULL);
+    if (!n) { send_err(id, "ctx load failed (missing/short/bad-magic file)"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"bytes\":%u}", id, n);
+}
+
+static void handle_coop_seed(int id, const char *json)
+{
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    int idx = json_get_int(json, "idx", 0);
+    if (!psx_coop_seed_from_blob(idx, path)) {
+        send_err(id, "seed failed (co-op off, bad idx, mid-swap, or layout mismatch)");
+        return;
+    }
+    send_ok(id);
 }
 
 static void handle_coop_region(int id, const char *json)
@@ -12442,6 +12505,10 @@ static const CmdEntry s_commands[] = {
     { "enh_scratch",       handle_enh_scratch },
     { "coop",              handle_coop },
     { "read_watch",        handle_read_watch },
+    { "ctx_region",        handle_ctx_region },
+    { "ctx_save",          handle_ctx_save },
+    { "ctx_load",          handle_ctx_load },
+    { "coop_seed",         handle_coop_seed },
     { "coop_region",       handle_coop_region },
     { "coop_spawn",        handle_coop_spawn },
     { "coop_despawn",      handle_coop_despawn },

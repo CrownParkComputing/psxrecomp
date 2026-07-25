@@ -61,6 +61,8 @@
  * Everything here is inert unless a game calls psx_coop_configure().
  */
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cpu_state.h"
@@ -72,7 +74,14 @@ extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint16_t sio_get_pad_buttons_slot(int slot);
 
 #define COOP_MAX_ACTORS  4
-#define COOP_MAX_REGIONS 8
+/* Sized for a whole alternate CHARACTER, not just an actor struct. On MMX6 the
+ * complete X-vs-Zero difference is 830 KB spread over 84 disjoint runs (the
+ * X-vs-X control differs by 866 bytes, so that is signal, not noise), and all
+ * of it is DATA -- no overlay covers it and the dirty-RAM interpreter never
+ * executes there. A host can memcpy that per pass without noticing; this is a
+ * PC enhancement, and the PlayStation is the porting baseline, not the budget. */
+#define COOP_MAX_REGIONS 128
+#define COOP_MAX_REGION_LEN 0x00100000u
 
 /* Actor context for the observability rings: 0 = the game's own actor,
  * N = extra actor N-1. Read by debug_server.c on every recorded write. */
@@ -153,9 +162,15 @@ int psx_coop_companion_active(void) { return s_coop_enabled && s_current >= 0; }
 int psx_coop_add_swap_region(uint32_t guest_base, uint32_t len)
 {
     if (s_region_count >= COOP_MAX_REGIONS) return 0;
-    if (len == 0 || len > 0x4000u) return 0;
+    if (len == 0 || len > COOP_MAX_REGION_LEN) return 0;
     if (!psx_guest_block_ptr(guest_base, len)) return 0;   /* must be real memory */
     if (s_coop_enabled) return 0;      /* layout is fixed once actors exist */
+    /* Overlapping regions would be gathered and scattered twice, so the second
+     * copy would silently win and the context would not round-trip. */
+    for (int i = 0; i < s_region_count; i++) {
+        const uint32_t b = s_region[i].guest_base, e = b + s_region[i].len;
+        if (guest_base < e && b < (guest_base + len)) return 0;
+    }
     s_region[s_region_count].guest_base = guest_base;
     s_region[s_region_count].len        = len;
     s_region_count++;
@@ -198,7 +213,7 @@ int psx_coop_configure(uint32_t primary_base, uint32_t struct_len,
         return 1;
     }
     if (companions > COOP_MAX_ACTORS) return 0;
-    if (struct_len == 0 || struct_len > 0x4000u) return 0;
+    if (struct_len == 0 || struct_len > COOP_MAX_REGION_LEN) return 0;
 
     /* Region 0 = the actor struct. Anything already declared follows it. */
     if (s_region_count == 0 || s_region[0].guest_base != primary_base ||
@@ -296,6 +311,123 @@ static void coop_swap_out(void)
     coop_scatter(s_shadow);
     s_current = -1;
     g_psx_enh_actor_ctx = 0;
+}
+
+/* ---- portable context blobs -----------------------------------------------
+ * Capture a set of guest regions to a file and re-install them later, into a
+ * DIFFERENT run of the game.
+ *
+ * This is what makes "the extra actor is a different CHARACTER" tractable. On
+ * MMX6 an alternate playable character is not a flag: setting the character
+ * byte alone wedges the machine into an exception storm, because the character
+ * is really the DATA SET the loader installs at stage entry. But that data set
+ * is exactly measurable -- run the same stage as each character and diff --
+ * and on MMX6 it is 830 KB of pure data. So capture it once from a run of the
+ * character you want, and re-install it whenever you want that character.
+ *
+ * Deliberately independent of the actor machinery above: the same facility
+ * proves the blob by installing it over the LIVE player (does X become Zero?)
+ * before any of it is wired into a second actor.
+ *
+ * The region list travels IN the file, so a load does not depend on the caller
+ * having declared the same layout that the save used.
+ */
+#define CTX_MAGIC   0x58544350u        /* "PCTX" */
+#define CTX_VERSION 1u
+
+static CoopRegion s_ctx_region[COOP_MAX_REGIONS];
+static int        s_ctx_region_count = 0;
+
+void psx_ctx_region_clear(void) { s_ctx_region_count = 0; }
+int  psx_ctx_region_count(void) { return s_ctx_region_count; }
+
+int psx_ctx_region_add(uint32_t base, uint32_t len)
+{
+    if (s_ctx_region_count >= COOP_MAX_REGIONS) return 0;
+    if (len == 0 || len > COOP_MAX_REGION_LEN) return 0;
+    if (!psx_guest_block_ptr(base, len)) return 0;
+    s_ctx_region[s_ctx_region_count].guest_base = base;
+    s_ctx_region[s_ctx_region_count].len        = len;
+    s_ctx_region_count++;
+    return 1;
+}
+
+/* Write every declared region to `path`. Returns bytes written, or 0. */
+uint32_t psx_ctx_save(const char *path)
+{
+    if (s_ctx_region_count <= 0) return 0;
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    uint32_t hdr[2] = { CTX_MAGIC, CTX_VERSION };
+    uint32_t n = (uint32_t)s_ctx_region_count;
+    uint32_t total = 0;
+    if (fwrite(hdr, 4, 2, f) != 2 || fwrite(&n, 4, 1, f) != 1) { fclose(f); return 0; }
+    for (int i = 0; i < s_ctx_region_count; i++) {
+        if (fwrite(&s_ctx_region[i].guest_base, 4, 1, f) != 1 ||
+            fwrite(&s_ctx_region[i].len, 4, 1, f) != 1) { fclose(f); return 0; }
+    }
+    for (int i = 0; i < s_ctx_region_count; i++) {
+        const uint8_t *p = psx_guest_block_ptr(s_ctx_region[i].guest_base,
+                                               s_ctx_region[i].len);
+        if (!p) { fclose(f); return 0; }
+        if (fwrite(p, 1, s_ctx_region[i].len, f) != s_ctx_region[i].len) {
+            fclose(f); return 0;
+        }
+        total += s_ctx_region[i].len;
+    }
+    fclose(f);
+    return total;
+}
+
+/* Read a blob and scatter it. dst == NULL installs into LIVE guest memory;
+ * otherwise the bytes are packed into `dst` in the file's region order (used to
+ * seed an actor's saved context). Returns bytes installed, or 0.
+ * When seeding an actor, the file's layout must match that actor's swap-region
+ * layout exactly -- otherwise the packed offsets would not line up and the
+ * actor would be assembled from the wrong bytes. That is checked, not assumed. */
+uint32_t psx_ctx_load(const char *path, uint8_t *dst)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t hdr[2] = {0, 0}, n = 0;
+    if (fread(hdr, 4, 2, f) != 2 || hdr[0] != CTX_MAGIC || hdr[1] != CTX_VERSION ||
+        fread(&n, 4, 1, f) != 1 || n == 0 || n > COOP_MAX_REGIONS) {
+        fclose(f); return 0;
+    }
+    CoopRegion r[COOP_MAX_REGIONS];
+    for (uint32_t i = 0; i < n; i++) {
+        if (fread(&r[i].guest_base, 4, 1, f) != 1 ||
+            fread(&r[i].len, 4, 1, f) != 1 ||
+            r[i].len == 0 || r[i].len > COOP_MAX_REGION_LEN) { fclose(f); return 0; }
+    }
+    if (dst) {
+        if ((int)n != s_region_count) { fclose(f); return 0; }
+        for (uint32_t i = 0; i < n; i++)
+            if (r[i].guest_base != s_region[i].guest_base ||
+                r[i].len != s_region[i].len) { fclose(f); return 0; }
+    }
+    uint32_t total = 0, off = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t *p = dst ? (dst + off)
+                         : psx_guest_block_ptr(r[i].guest_base, r[i].len);
+        if (!p) { fclose(f); return 0; }
+        if (fread(p, 1, r[i].len, f) != r[i].len) { fclose(f); return 0; }
+        off   += r[i].len;
+        total += r[i].len;
+    }
+    fclose(f);
+    return total;
+}
+
+/* Seed an extra actor's saved context from a blob instead of cloning the game's
+ * own actor -- i.e. make that actor a different character. */
+int psx_coop_seed_from_blob(int idx, const char *path)
+{
+    if (!s_coop_enabled || idx < 0 || idx >= s_actor_count) return 0;
+    if (s_current >= 0) return 0;            /* never seed a swapped-in context */
+    if (!psx_ctx_load(path, s_actors[idx].store)) return 0;
+    s_actors[idx].active = 1;
+    return 1;
 }
 
 /* ---- observation ----------------------------------------------------------
