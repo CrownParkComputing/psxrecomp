@@ -560,10 +560,36 @@ uint32_t dirty_ram_get_bitmap_word_count(void) {
     return DIRTY_RAM_BITMAP_WORDS;
 }
 
+void dirty_ram_invalidate_code_caches(void);
+
 void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
     if (count > DIRTY_RAM_BITMAP_WORDS) count = DIRTY_RAM_BITMAP_WORDS;
     for (uint32_t i = 0; i < count; i++)
         dirty_ram_bitmap[i] = words[i];
+    /* Wholesale bitmap replacement changes which addresses are RAM-resident
+     * code, so every cached per-PC classification is now potentially wrong.
+     * The per-page mark path bumps the generation on its clean->dirty edge;
+     * this path bypasses it, so bump explicitly. */
+    dirty_ram_invalidate_code_caches();
+}
+
+/* Invalidate every consumer that caches a per-PC classification of RAM
+ * instructions. Bumping the generation is sufficient by construction: each
+ * cache stores the generation it was derived under and re-derives on
+ * mismatch (the interpreter's widescreen site caches, and the overlay
+ * loader's negative "no native owner" cache, which otherwise short-circuits
+ * dispatch before it would ever re-discover the correct overlay).
+ *
+ * This exists for bulk RAM writes that are NOT ordinary guest stores --
+ * savestate restore above all. A savestate replaces all 2 MB at once, so
+ * code identity can change completely while no page ever makes a
+ * clean->dirty transition and no executable range is marked. Without this,
+ * a loaded state keeps executing whatever the host already believed was
+ * resident: observed as a restored player standing frozen while the rest of
+ * the scene animated, because the overlay-resident movement code was never
+ * re-selected. */
+void dirty_ram_invalidate_code_caches(void) {
+    g_dirty_ram_code_gen++;
 }
 
 /* ---- Inc3: watched overlay pages + per-page generation counters ---------

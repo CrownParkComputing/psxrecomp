@@ -19,6 +19,7 @@ extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  dirty_ram_get_bitmap_word(uint32_t word_index);
 extern uint32_t  dirty_ram_get_bitmap_word_count(void);
 extern void      dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count);
+extern void      dirty_ram_invalidate_code_caches(void);
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
 extern uint64_t  psx_cycle_count;
@@ -277,6 +278,20 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         {
             extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
             psx_kernel_bless_note_range(0, RAM_SIZE);
+            /* Replacing all of RAM can change code identity at any address
+             * without any page making a clean->dirty transition, so caches
+             * that key on the RAM code generation would keep serving verdicts
+             * derived from the PREVIOUS contents. The overlay loader's
+             * negative cache is the damaging one: it short-circuits dispatch
+             * before rediscovery, so a stale "no native owner" entry pins an
+             * address to the wrong implementation for the rest of the run.
+             * Symptom when this was missing: loading a gameplay state into a
+             * process that had not itself entered that stage restored RAM
+             * perfectly and kept running at 60fps, but the player stood
+             * frozen -- his overlay-resident movement code was never selected
+             * -- while the rest of the scene animated normally. */
+            extern void dirty_ram_invalidate_code_caches(void);
+            dirty_ram_invalidate_code_caches();
         }
         return 1;
     case BS_SEC_SPAD:
