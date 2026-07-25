@@ -793,6 +793,15 @@ struct GameConfig {
     // vanilla by construction rather than by a runtime predicate.
     std::vector<uint32_t> coop_actor_base_sites;
     std::vector<uint32_t> coop_replay_sites;
+    //   suppress_sites — instructions that must NOT execute while a companion
+    //     actor is the one being run, because they cause a GLOBAL side effect
+    //     that only player 1 is entitled to cause. Redirecting the actor
+    //     pointer is not enough for these: the write target is a game-state
+    //     global, not a field of the actor. Concretely on MMX6 the death path
+    //     sets the stage-fail flag, so a companion dying ended the run and took
+    //     control away from player 1. Each site is emitted guarded, so it still
+    //     runs normally for player 1 and whenever co-op is off.
+    std::vector<uint32_t> coop_suppress_sites;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

@@ -1204,6 +1204,22 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             }
         }
     }
+    //  3. suppress_sites -- an instruction whose GLOBAL side effect only player 1
+    //     is entitled to cause. Redirecting the actor pointer cannot help here:
+    //     the write target is a game-state global, not a field of the actor. On
+    //     MMX6 the death path stores the stage-fail flag, so a companion dying
+    //     ended the run and took control away from player 1. Emitted guarded, so
+    //     player 1 still causes it and co-op-off is unchanged.
+    if (!config_.coop_suppress_sites.empty() && !coop_reemit_guard_) {
+        for (uint32_t site : config_.coop_suppress_sites) {
+            if (addr != site) continue;
+            coop_reemit_guard_ = true;
+            std::string original = translate_instruction(addr, instr);
+            coop_reemit_guard_ = false;
+            return fmt::format("if (!psx_coop_companion_active()) {{ {} }}", original);
+        }
+    }
+
     if (!config_.coop_replay_sites.empty() && !coop_reemit_guard_) {
         for (uint32_t site : config_.coop_replay_sites) {
             if (addr != site) continue;
@@ -2867,6 +2883,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern uint32_t psx_coop_actor_base(uint32_t vanilla_base);  /* [coop] actor-pointer redirect (coop.c) */\n";
     ss << "extern uint32_t psx_coop_stage_link(CPUState* cpu, uint32_t natural_link, uint32_t jal_addr); /* [coop] per-actor stage replay (coop.c) */\n";
+    ss << "extern int psx_coop_companion_active(void); /* [coop] a companion is the actor being run (coop.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n";
     ss << "extern uint32_t g_debug_last_store_pc;  /* exact PC of the executing SW/SH/SB — wtrace/readtrace producer attribution (debug_server.c) */\n\n";

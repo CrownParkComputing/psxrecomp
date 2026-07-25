@@ -175,6 +175,7 @@ struct CodeGenConfig {
     // See config_loader.h for the pipeline-span model.
     std::vector<uint32_t> coop_actor_base_sites; // addius forming the actor pointer
     std::vector<uint32_t> coop_replay_sites;     // delay slots of per-actor stage jals
+    std::vector<uint32_t> coop_suppress_sites;   // global side effects a companion must not cause
 
     // Persistent game-option init-store hooks ([persist_options] in
     // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a

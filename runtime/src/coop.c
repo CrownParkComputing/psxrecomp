@@ -105,6 +105,12 @@ static int coop_gate_open(void)
 
 int psx_coop_gate_open(void) { return coop_gate_open(); }
 
+/* True while a COMPANION (not player 1) is the actor currently being run.
+ * Guards global side effects that only player 1 is entitled to cause -- see the
+ * suppress_sites hook. Always false when co-op is off, so guarded sites behave
+ * exactly as they always did. */
+int psx_coop_companion_active(void) { return s_coop_enabled && s_current >= 0; }
+
 /* Configure. primary_base = the game's vanilla actor struct; struct_len = its
  * size; companions = how many extra actors. Their structs are carved out of the
  * enhancement scratch window, which is allocated here.

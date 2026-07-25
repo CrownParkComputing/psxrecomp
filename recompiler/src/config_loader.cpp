@@ -1125,7 +1125,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
 
     // Optional [coop] block — simultaneous extra player actors (ENHANCEMENT).
     // Omit it entirely => empty lists => generator emits nothing.
-    std::vector<uint32_t> coop_actor_base_sites, coop_replay_sites;
+    std::vector<uint32_t> coop_actor_base_sites, coop_replay_sites, coop_suppress_sites;
     if (cfg.contains("coop")) {
         const toml::value& cp = toml::find(cfg, "coop");
         auto load_list = [&](const char* key, std::vector<uint32_t>& out) {
@@ -1143,6 +1143,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         };
         load_list("actor_base_sites", coop_actor_base_sites);
         load_list("replay_sites", coop_replay_sites);
+        load_list("suppress_sites", coop_suppress_sites);
         // Fail closed on a half-declared feature: replay sites with no actor
         // sites would re-run stages that never redirect (every pass driving
         // player 1), and actor sites with no replay sites would redirect
@@ -1335,6 +1336,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
         /*coop_actor_base_sites*/ coop_actor_base_sites,
         /*coop_replay_sites*/     coop_replay_sites,
+        /*coop_suppress_sites*/   coop_suppress_sites,
     };
 }
 
