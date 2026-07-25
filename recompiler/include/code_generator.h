@@ -173,7 +173,6 @@ struct CodeGenConfig {
     // [coop] simultaneous extra player actors (ENHANCEMENT, default off).
     // Empty/zero => nothing emitted, i.e. pristine gen (standard-asset build).
     // See config_loader.h for the pipeline-span model.
-    std::vector<uint32_t> coop_actor_base_sites; // addius forming the actor pointer
     std::vector<uint32_t> coop_replay_sites;     // delay slots of per-actor stage jals
     std::vector<uint32_t> coop_suppress_sites;   // global side effects a companion must not cause
 
@@ -207,6 +206,10 @@ class CodeGenerator {
     // Set while re-emitting a [coop] replay site's original delay-slot
     // instruction, so the site check cannot match itself recursively.
     bool coop_reemit_guard_ = false;
+    // Leader of the basic block currently being translated. The [coop] replay
+    // hook must send the callee back to a leader (only leaders are dispatch
+    // entries); the jal's own address is one only by coincidence.
+    uint32_t cur_block_start_ = 0;
 
 public:
     explicit CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config = CodeGenConfig());

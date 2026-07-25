@@ -249,7 +249,13 @@ static void fp_snapshot(uint32_t frame)
 #define REC_KIND_MMIO_W  2   /* device-register write */
 #define REC_KIND_MMIO_R  3   /* device-register read  */
 #define REC_KIND_RAM_R   4   /* main-RAM read (targeted watch range only) */
-typedef struct { uint8_t kind; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
+typedef struct { uint8_t kind; uint8_t actor; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
+
+/* Enhancement actor context (runtime/src/coop.c owns it): 0 while the game's
+ * own actor runs, N while extra actor N-1 is being ticked. Tagging every
+ * recorded write with it turns "which stage state is per-actor and which is
+ * shared?" from a decompiler guess into a diff. */
+extern unsigned char g_psx_enh_actor_ctx;
 static RecEntry  s_rec_buf[REC_CAP];
 static uint32_t  s_rec_count = 0;
 static int64_t   s_rec_frame = -1;       /* target guest frame, -1 = off */
@@ -264,6 +270,9 @@ static uint32_t  s_rec_overflow = 0;
  * path checks only the int flag g_ram_read_watch_active (0 = no cost). */
 int             g_ram_read_watch_active = 0;
 static uint32_t s_rwatch_lo = 0, s_rwatch_hi = 0;
+/* Last basic-block leader entered (debug builds; see debug_server_cyc_observe).
+ * Stands in as the "pc" of events that carry none, notably main-RAM reads. */
+uint32_t        g_debug_last_block = 0;
 
 static inline void rec_event(uint8_t kind, uint32_t addr, uint32_t val,
                              uint32_t pc, uint32_t ra)
@@ -272,13 +281,14 @@ static inline void rec_event(uint8_t kind, uint32_t addr, uint32_t val,
     if (s_rec_count >= REC_CAP) { s_rec_overflow++; return; }
     RecEntry *e = &s_rec_buf[s_rec_count++];
     e->kind = kind; e->addr = addr; e->val = val; e->pc = pc; e->ra = ra;
+    e->actor = g_psx_enh_actor_ctx;
     { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
 }
 
 void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val)
 {
     if (phys >= s_rwatch_lo && phys < s_rwatch_hi)
-        rec_event(REC_KIND_RAM_R, phys, val, 0, 0);
+        rec_event(REC_KIND_RAM_R, phys, val, g_debug_last_block, 0);
 }
 
 /* ---- CPU state pointer (set at init) ---- */
@@ -412,7 +422,13 @@ typedef struct {
     uint32_t ra;
     uint32_t frame;
     uint8_t  w;
-    uint8_t  pad[3];
+    uint8_t  actor;      /* enhancement actor context: 0 = the game's own
+                          * (vanilla) actor, N = extra actor N-1. Free in the
+                          * existing padding. Without it a multi-actor
+                          * enhancement's writes are indistinguishable from the
+                          * vanilla ones, and "who wrote this shared global?"
+                          * -- the whole question -- is unanswerable. */
+    uint8_t  pad[2];
 } WriteTraceAllEntry;
 static WriteTraceAllEntry *s_wtrace_all = NULL;
 static uint64_t s_wtrace_all_seq  = 0;
@@ -2262,6 +2278,12 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     (void)block_leader_phys;
     return;
 #else
+    /* Attribution anchor for events that have no PC of their own. Loads carry
+     * no store-PC stamp, so a read watch could only ever report "something read
+     * this" -- useless for "WHICH code reads this address?". The block leader
+     * resolves to a function through the recompiler's .ranges manifest, which
+     * is all that question needs. One store per block, debug builds only. */
+    g_debug_last_block = block_leader_phys;
     if (s_fmv_quiet) return;
     cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
@@ -4527,9 +4549,9 @@ static void handle_record_frame_dump(int id, const char *json)
         RecEntry *e = &s_rec_buf[i];
         if (kfilt >= 0 && (int)e->kind != kfilt) continue;
         pos += snprintf(out + pos, BUF - pos,
-            "%s{\"i\":%d,\"kind\":\"%s\",\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"cyc\":%llu}",
+            "%s{\"i\":%d,\"kind\":\"%s\",\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"actor\":%u,\"cyc\":%llu}",
             emitted ? "," : "", i, rec_kind_str(e->kind), e->addr, e->val, e->pc, e->ra,
-            (unsigned long long)e->cyc);
+            (unsigned)e->actor, (unsigned long long)e->cyc);
         emitted++;
     }
     pos += snprintf(out + pos, BUF - pos, "]}\n");
@@ -4605,6 +4627,7 @@ static void handle_get_registers(int id, const char *json)
 /* Enhancement scratch-RAM capability (runtime/src/memory.c). */
 int      psx_enh_scratch_configure(uint32_t phys_base, uint32_t len);
 uint8_t *psx_enh_scratch_ptr(uint32_t *out_base, uint32_t *out_len);
+int      psx_enh_scratch_contains(uint32_t phys);
 
 /* enh_scratch: configure / query the generic enhancement scratch-RAM window
  * (guest-addressable memory above the main-RAM mirror that the game can never
@@ -4646,11 +4669,19 @@ int      psx_coop_spawn(int idx);
 void     psx_coop_despawn(int idx);
 int      psx_coop_actor_active(int idx);
 uint32_t psx_coop_actor_guest_base(int idx);
-void     psx_coop_stats(uint64_t *ticks, uint64_t *redirects);
+void     psx_coop_stats(uint64_t *ticks, uint64_t *swaps);
 void     psx_coop_set_gate_state(uint32_t mode_addr, uint8_t mode_val,
                                  const uint32_t *zero_addrs, int zero_count);
 void     psx_coop_set_input_layout(uint32_t cur_off, uint32_t edge_off,
-                                   uint32_t input_global, int enabled);
+                                   int enabled);
+int      psx_coop_add_swap_region(uint32_t guest_base, uint32_t len);
+int      psx_coop_swap_region_count(void);
+int      psx_coop_swap_region(int i, uint32_t *base, uint32_t *len);
+int      psx_coop_set_raw_pad(uint32_t addr, uint32_t words, int wire);
+uint8_t *psx_coop_observe_ptr(uint32_t addr, uint32_t len);
+uint32_t psx_coop_raw_pad_addr(void);
+uint32_t psx_coop_raw_pad_words(void);
+int      psx_coop_raw_pad_wire(void);
 
 /* Co-op second-actor control (ENHANCEMENT, default off). Lets the feature be
  * configured, spawned and inspected live, so it can be validated before any
@@ -4662,6 +4693,15 @@ void     psx_coop_set_input_layout(uint32_t cur_off, uint32_t edge_off,
  *   {"cmd":"coop","companions":0}                     -> disable
  *   {"cmd":"coop_spawn","idx":0}                      -> clone primary -> companion
  *   {"cmd":"coop_despawn","idx":0}
+ *   {"cmd":"coop_region","base":"0x800E1234","len":64} -> add a swap region
+ *   {"cmd":"coop_region"}                              -> list swap regions
+ *
+ * Swap regions are per-actor state the engine keeps OUTSIDE the actor struct.
+ * They must be added before `coop` configures the actors (the per-actor context
+ * size depends on them), and exist as a live command precisely so the set can
+ * be discovered by experiment rather than guessed: tag the write rings by actor
+ * (every recorded write carries "actor"), find state an extra actor's pass
+ * writes outside its own regions, declare it, and re-check.
  */
 static void handle_coop(int id, const char *json)
 {
@@ -4689,21 +4729,81 @@ static void handle_coop(int id, const char *json)
         int in_cur = json_get_int(json, "in_cur_off", -1);
         if (in_cur >= 0) {
             int in_edge = json_get_int(json, "in_edge_off", 0);
-            uint32_t in_glob = json_get_str(json, "in_global", s1, sizeof(s1))
-                             ? hex_to_u32(s1) : 0u;
-            psx_coop_set_input_layout((uint32_t)in_cur, (uint32_t)in_edge, in_glob, 1);
+            psx_coop_set_input_layout((uint32_t)in_cur, (uint32_t)in_edge, 1);
+        }
+        /* Preferred: where the game's controller poll leaves port 1's RAW
+         * button halfword, so a replayed pad stage decodes each actor's own
+         * pad. Must be inside a declared swap region. */
+        if (json_get_str(json, "raw_pad", s1, sizeof(s1))) {
+            uint32_t words = (uint32_t)json_get_int(json, "raw_pad_words", 1);
+            int wire = json_get_int(json, "raw_pad_wire", 1);
+            if (!psx_coop_set_raw_pad(hex_to_u32(s1), words, wire)) {
+                send_err(id, "raw_pad address is not inside a declared swap region");
+                return;
+            }
         }
     }
-    uint64_t ticks = 0, redirects = 0;
-    psx_coop_stats(&ticks, &redirects);
+    uint64_t ticks = 0, swaps = 0;
+    psx_coop_stats(&ticks, &swaps);
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"gate_open\":%s,"
-             "\"actor0\":\"0x%08X\",\"actor0_active\":%s,"
-             "\"ticks\":%llu,\"redirects\":%llu}",
+             "\"actor0\":\"0x%08X\",\"actor0_active\":%s,\"regions\":%d,"
+             "\"raw_pad\":\"0x%08X\",\"raw_pad_words\":%u,\"raw_pad_wire\":%d,"
+             "\"ticks\":%llu,\"swaps\":%llu}",
              id, psx_coop_enabled() ? "true" : "false",
              psx_coop_gate_open() ? "true" : "false",
              psx_coop_actor_guest_base(0),
              psx_coop_actor_active(0) ? "true" : "false",
-             (unsigned long long)ticks, (unsigned long long)redirects);
+             psx_coop_swap_region_count(), psx_coop_raw_pad_addr(),
+             psx_coop_raw_pad_words(), psx_coop_raw_pad_wire(),
+             (unsigned long long)ticks, (unsigned long long)swaps);
+}
+
+/* Arm/disarm the targeted main-RAM READ watch live.
+ *   {"cmd":"read_watch","lo":"0x800CF920","hi":"0x800CF930"}  -> arm
+ *   {"cmd":"read_watch"}                                      -> disarm + report
+ * Reads in [lo,hi) during a recorded frame land in the unified record buffer as
+ * REC_KIND_RAM_R, so `record_frame` + `record_frame_dump kind=4` answers "which
+ * code reads this address?". Previously this could only be set from a boot-time
+ * environment variable, which meant deciding what to watch before the run --
+ * exactly the arm-first-and-hope shape that misses whatever already happened. */
+static void handle_read_watch(int id, const char *json)
+{
+    char lo_str[32], hi_str[32];
+    if (json_get_str(json, "lo", lo_str, sizeof(lo_str)) &&
+        json_get_str(json, "hi", hi_str, sizeof(hi_str))) {
+        uint32_t lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+        uint32_t hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+        if (hi > lo) { s_rwatch_lo = lo; s_rwatch_hi = hi; g_ram_read_watch_active = 1; }
+        else         { send_err(id, "hi must be > lo"); return; }
+    } else {
+        s_rwatch_lo = s_rwatch_hi = 0;
+        g_ram_read_watch_active = 0;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+             id, g_ram_read_watch_active, s_rwatch_lo, s_rwatch_hi);
+}
+
+static void handle_coop_region(int id, const char *json)
+{
+    char s1[32];
+    if (json_get_str(json, "base", s1, sizeof(s1))) {
+        uint32_t base = hex_to_u32(s1);
+        int len = json_get_int(json, "len", 0);
+        if (!psx_coop_add_swap_region(base, (uint32_t)len)) {
+            send_err(id, "region rejected (bad range, table full, or actors already configured)");
+            return;
+        }
+    }
+    char buf[1024];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"regions\":[", id);
+    for (int i = 0; i < psx_coop_swap_region_count(); i++) {
+        uint32_t b = 0, l = 0;
+        psx_coop_swap_region(i, &b, &l);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{\"base\":\"0x%08X\",\"len\":%u}",
+                        i ? "," : "", b, l);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_fmt("%s", buf);
 }
 
 static void handle_coop_spawn(int id, const char *json)
@@ -4746,7 +4846,15 @@ static void handle_read_ram(int id, const char *json)
      * event loop) long enough to look like a wedge. */
     static const char H[] = "0123456789abcdef";
     for (int i = 0; i < len; i++) {
-        uint8_t b = psx_read_byte(addr + (uint32_t)i);
+        /* Owner-correct read while a multi-actor enhancement has an extra actor
+         * swapped into the game's own storage: this thread races the swap, and
+         * a raw read would hand back whichever actor is momentarily resident.
+         * Byte-at-a-time so a range spanning a region boundary still resolves
+         * per byte. Returns NULL (and costs one branch) whenever nothing is
+         * swapped, which is always the case with the feature off. */
+        const uint32_t a = addr + (uint32_t)i;
+        const uint8_t *o = psx_coop_observe_ptr(a, 1);
+        uint8_t b = o ? *o : psx_read_byte(a);
         hex[(size_t)i * 2]     = H[b >> 4];
         hex[(size_t)i * 2 + 1] = H[b & 0xF];
     }
@@ -4773,7 +4881,10 @@ static void handle_write_ram(int id, const char *json)
     }
     uint32_t addr = hex_to_u32(addr_str);
     uint8_t val = (uint8_t)hex_to_u32(val_str);
-    psx_write_byte(addr, val);
+    /* Same owner-correct resolution as read_ram: poking an actor's field must
+     * land on that actor, not on whoever is swapped in this instant. */
+    uint8_t *o = psx_coop_observe_ptr(addr, 1);
+    if (o) *o = val; else psx_write_byte(addr, val);
     send_ok(id);
 }
 
@@ -8469,6 +8580,7 @@ static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
     e->ra      = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
     e->frame   = (uint32_t)s_frame_count;
     e->w       = width;
+    e->actor   = g_psx_enh_actor_ctx;
     s_wtrace_all_head = (s_wtrace_all_head + 1) % WRITE_TRACE_ALL_CAP;
 }
 
@@ -8604,7 +8716,11 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
-        if (phys < 0x200000u)
+        /* The enhancement scratch window is guest-addressable memory an
+         * enhancement's actors actually live in, so it records as RAM here --
+         * otherwise a per-frame recording of "everything the player pipeline
+         * wrote" silently omits the extra actor's entire struct. */
+        if (phys < 0x200000u || psx_enh_scratch_contains(phys))
             rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
         else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
             rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
@@ -9635,11 +9751,11 @@ static void handle_wtrace_all_dump(int id, const char *json)
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\","
                         "\"new\":\"0x%08X\",\"pc\":\"0x%08X\","
-                        "\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                        "\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u,\"actor\":%u}",
                         (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
                         e->addr, e->new_val, e->pc, e->ra,
-                        e->frame, (unsigned)e->w);
+                        e->frame, (unsigned)e->w, (unsigned)e->actor);
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
@@ -12325,6 +12441,8 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "enh_scratch",       handle_enh_scratch },
     { "coop",              handle_coop },
+    { "read_watch",        handle_read_watch },
+    { "coop_region",       handle_coop_region },
     { "coop_spawn",        handle_coop_spawn },
     { "coop_despawn",      handle_coop_despawn },
     { "gpu_state",         handle_gpu_state },

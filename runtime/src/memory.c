@@ -78,6 +78,8 @@ static uint32_t  enh_scratch_base = 0;   /* physical base */
 static uint32_t  enh_scratch_len  = 0;   /* 0 = disabled */
 
 void psx_enh_scratch_reset(void);
+void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+                                    uint32_t new_val, uint8_t width);
 
 /* Host pointer for a `width`-byte access wholly inside the scratch window, or
  * NULL. Rejects partial overlaps rather than clamping: a straddling access is a
@@ -88,6 +90,28 @@ static inline uint8_t *enh_scratch_at(uint32_t phys, uint32_t width) {
     uint32_t off = phys - enh_scratch_base;
     if (off > enh_scratch_len || (enh_scratch_len - off) < width) return NULL;
     return enh_scratch + off;
+}
+
+/* Route a scratch-window STORE through the same write-trace fan-out as a
+ * main-RAM store. Without this the trace hooks live only inside each accessor's
+ * `phys < RAM_SIZE` block, so every observability tool built on them (the
+ * always-on write ring, wtrace ranges, the per-frame recorder, RAM-claim
+ * reports) is blind to the enhancement window -- and reports "nothing was
+ * written here" for a region being written every frame. A tool that silently
+ * under-reports is worse than a missing one, so the window is traced exactly
+ * like RAM. Inert when the window is unconfigured: no store reaches here. */
+static inline void enh_scratch_trace_store(uint32_t phys, const uint8_t *p,
+                                           uint32_t width, uint32_t val) {
+    uint32_t old = 0;
+    for (uint32_t i = 0; i < width; i++) old |= (uint32_t)p[i] << (8u * i);
+    debug_server_trace_write_check(phys, old, val, (uint8_t)width);
+}
+
+/* True for a physical address inside the configured enhancement window. Lets
+ * the debug server treat those addresses as first-class guest memory. */
+int psx_enh_scratch_contains(uint32_t phys) {
+    return enh_scratch_len != 0 && phys >= enh_scratch_base &&
+           (phys - enh_scratch_base) < enh_scratch_len;
 }
 
 /* Opt in. phys_base must sit above the main-RAM mirror so it can never alias
@@ -117,6 +141,21 @@ uint8_t *psx_enh_scratch_ptr(uint32_t *out_base, uint32_t *out_len) {
     if (out_base) *out_base = enh_scratch_base;
     if (out_len)  *out_len  = enh_scratch_len;
     return enh_scratch;
+}
+
+/* Host pointer for a `len`-byte guest DATA block in main RAM or the
+ * enhancement scratch window, or NULL if the block is not wholly inside one of
+ * them. For bulk block moves an enhancement makes on its own behalf (saving and
+ * restoring an actor context, say) -- not a substitute for psx_read/write_*,
+ * which is what guest-visible accesses must keep using. Deliberately bypasses
+ * the write-trace fan-out: a per-frame context save/restore would otherwise
+ * bury every ring under thousands of bookkeeping bytes and destroy the
+ * observability it is there to provide. */
+uint8_t *psx_guest_block_ptr(uint32_t addr, uint32_t len) {
+    if (len == 0) return NULL;
+    uint32_t phys = psx_phys_addr(addr);   /* folds the 4x main-RAM mirrors */
+    if (phys < RAM_SIZE) return (RAM_SIZE - phys) >= len ? (ram + phys) : NULL;
+    return enh_scratch_at(phys, len);
 }
 
 uint8_t *memory_get_ram_ptr(void) { return ram; }
@@ -1529,7 +1568,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         return;
     }
     { uint8_t *sp_ = enh_scratch_at(phys, 4);
-      if (sp_) { memcpy(sp_, &val, 4); return; } }
+      if (sp_) { enh_scratch_trace_store(phys, sp_, 4, val); memcpy(sp_, &val, 4); return; } }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — ignore writes */
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
@@ -1575,7 +1614,13 @@ static uint16_t psx_read_half_raw(uint32_t addr) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
-        return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
+        uint16_t v = (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
+        /* Watch every width, not just words: a 16-bit field (a controller
+         * button word, say) is read with LHU and would otherwise be invisible,
+         * making the watch answer "nobody reads this" about an address read
+         * every frame. */
+        if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
+        return v;
     }
     { uint8_t *sp_ = enh_scratch_at(phys, 2);
       if (sp_) return (uint16_t)((uint16_t)sp_[0] | ((uint16_t)sp_[1] << 8)); }
@@ -1634,7 +1679,8 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         return;
     }
     { uint8_t *sp_ = enh_scratch_at(phys, 2);
-      if (sp_) { sp_[0] = (uint8_t)val; sp_[1] = (uint8_t)(val >> 8); return; } }
+      if (sp_) { enh_scratch_trace_store(phys, sp_, 2, (uint32_t)val);
+                 sp_[0] = (uint8_t)val; sp_[1] = (uint8_t)(val >> 8); return; } }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
@@ -1671,7 +1717,9 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
-        return ram[phys];
+        uint8_t v = ram[phys];
+        if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
+        return v;
     }
     { uint8_t *sp_ = enh_scratch_at(phys, 1);
       if (sp_) return sp_[0]; }
@@ -1948,7 +1996,8 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         return;
     }
     { uint8_t *sp_ = enh_scratch_at(phys, 1);
-      if (sp_) { sp_[0] = (uint8_t)val; return; } }
+      if (sp_) { enh_scratch_trace_store(phys, sp_, 1, (uint32_t)val);
+                 sp_[0] = (uint8_t)val; return; } }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],

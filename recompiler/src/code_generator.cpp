@@ -1180,32 +1180,17 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     // ---- [coop] simultaneous extra player actors (ENHANCEMENT, default off) ----
     // See config_loader.h for the model. Two emissions:
     //
-    //  1. actor_base_sites — every addiu that forms the player pointer, so the
-    //     stage being replayed operates on the selected actor. Identity when
-    //     co-op is off or the primary actor is running.
-    //
-    //  2. replay_sites — the delay slot of each per-actor stage's jal. Rewrites
+    //  1. replay_sites — the delay slot of each per-actor stage's jal. Rewrites
     //     the link the CPS emitter just stored so the callee returns to its own
     //     jal and the stage repeats for the next actor. A nop delay slot is
     //     replaced outright; a busy one is preserved by appending its normal
     //     translation (guarded recursion, so the site check cannot re-fire).
-    if (!config_.coop_actor_base_sites.empty() && !coop_reemit_guard_) {
-        for (uint32_t site : config_.coop_actor_base_sites) {
-            if (addr != site) continue;
-            if (opcode == 0x09) {  // addiu rt,rs,imm
-                uint32_t rs = get_rs(instr), rt = get_rt(instr);
-                return fmt::format("{} = psx_coop_actor_base((uint32_t)({} + {}));{}",
-                                   reg_name(rt), reg_name(rs),
-                                   (int16_t)(instr & 0xFFFFu), comment);
-            } else if (!config_.overlay_mode) {
-                fmt::print(stderr, "ERROR: [coop] actor_base_sites entry 0x{:08X} "
-                           "is not addiu (opcode 0x{:02X})\n", addr, opcode);
-                std::exit(1);
-            }
-        }
-    }
-    //  3. suppress_sites -- an instruction whose GLOBAL side effect only player 1
-    //     is entitled to cause. Redirecting the actor pointer cannot help here:
+    //     The actor being run is swapped into the storage the game keeps its
+    //     player in, so NOTHING about how the game addresses that player needs
+    //     generated code — there is no pointer-redirect emission here by design.
+    //
+    //  2. suppress_sites -- an instruction whose GLOBAL side effect only player 1
+    //     is entitled to cause. Swapping the actor context cannot help here:
     //     the write target is a game-state global, not a field of the actor. On
     //     MMX6 the death path stores the stage-fail flag, so a companion dying
     //     ended the run and took control away from player 1. Emitted guarded, so
@@ -1223,9 +1208,18 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (!config_.coop_replay_sites.empty() && !coop_reemit_guard_) {
         for (uint32_t site : config_.coop_replay_sites) {
             if (addr != site) continue;
-            const uint32_t jal_addr = addr - 4u;   // the jal this slot belongs to
+            // Send the callee back to the LEADER of the block holding this jal,
+            // not to the jal itself. Only leaders are dispatch entries, and the
+            // jal is one only when it happens to sit at a previous call's return
+            // address — true for some pipeline slots and not others. Getting it
+            // wrong returns into an address the dispatcher does not know, so the
+            // replay silently does not happen (MMX6's sprite-submission stage:
+            // jal at 0x80020D00, leader at 0x80020CF8, and the extra actor was
+            // never drawn). Re-running the leader also re-runs the argument
+            // setup that precedes the jal, which is what a repeat needs anyway.
+            const uint32_t entry = cur_block_start_ ? cur_block_start_ : (addr - 4u);
             std::string link = fmt::format(
-                "cpu->gpr[31] = psx_coop_stage_link(cpu, cpu->gpr[31], 0x{:08X}u);", jal_addr);
+                "cpu->gpr[31] = psx_coop_stage_link(cpu, cpu->gpr[31], 0x{:08X}u);", entry);
             if (instr == 0u) return link + comment;   // plain nop: replace outright
             coop_reemit_guard_ = true;               // preserve a busy delay slot
             std::string original = translate_instruction(addr, instr);
@@ -1487,6 +1481,10 @@ std::string CodeGenerator::translate_basic_block(
 
     // Block label
     ss << fmt::format("block_{:08X}:\n", block.start_addr);
+
+    // The [coop] stage-replay hook needs a return target that is a real
+    // dispatch entry; only block LEADERS are. Remember which one we are in.
+    cur_block_start_ = block.start_addr;
 
     // Per-block-leader cycle observe (cyc_watch ruler — universal with the BIOS
     // emitter). Sampled at the block leader BEFORE any cycle is charged, matching
@@ -2881,7 +2879,6 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_mmx6_bg_bufbase(int addr);   /* ws 2D bg packet-buffer relocation (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_undercap(int counter);/* ws 2D bg per-frame tile cap (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
-    ss << "extern uint32_t psx_coop_actor_base(uint32_t vanilla_base);  /* [coop] actor-pointer redirect (coop.c) */\n";
     ss << "extern uint32_t psx_coop_stage_link(CPUState* cpu, uint32_t natural_link, uint32_t jal_addr); /* [coop] per-actor stage replay (coop.c) */\n";
     ss << "extern int psx_coop_companion_active(void); /* [coop] a companion is the actor being run (coop.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";

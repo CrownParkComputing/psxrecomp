@@ -760,7 +760,9 @@ struct GameConfig {
     // frame pipeline: a sequence of calls (read pad -> advance state ->
     // integrate motion -> ... -> submit sprites), only SOME of which are
     // per-player. Co-op replays each per-player stage once per actor, with the
-    // actor pointer redirected to the actor being run.
+    // actor being run swapped into the storage the game keeps its player in
+    // (runtime/src/coop.c) — so only the REPLAY needs generated code; nothing
+    // about how the game addresses its player does.
     //
     // A CONTIGUOUS SPAN DOES NOT WORK and must not be attempted: the pipeline
     // interleaves per-actor and shared stages. Replaying a span that swept in
@@ -779,11 +781,14 @@ struct GameConfig {
     //     A nop delay slot is replaced outright; a busy one is preserved by
     //     re-emitting its normal translation after the link rewrite.
     //
-    //   actor_base_sites — EVERY instruction that forms the player-actor
-    //     pointer, both inside the stages and in the pipeline driver (stages
-    //     that take the pointer as an argument inherit it from the driver).
-    //     Each must be an addiu; its result routes through
-    //     psx_coop_actor_base(), the identity when co-op is off.
+    // There is deliberately NO list of instructions that form the actor
+    // pointer. An earlier design redirected the pointer at each such site and
+    // was abandoned: it needs every one of them enumerated per game, silently
+    // misses every access that does not go through one (on MMX6 damage landed
+    // on player 1 because one function formed the pointer outside the list),
+    // cannot reach streamed overlay code at all, and leaves any cached pointer
+    // aimed at the wrong actor. Swapping the actor's bytes into the address the
+    // game already uses covers all of that with no per-site knowledge.
     //
     // Capability declaration only — inert until the runtime master switch is
     // enabled. Omit the whole block for pristine gen with zero co-op bytes.
@@ -791,7 +796,6 @@ struct GameConfig {
     // Declare only the LIVE pipeline. Attract/demo replays recorded inputs
     // against simulation state, so leaving its caller unhooked keeps attract
     // vanilla by construction rather than by a runtime predicate.
-    std::vector<uint32_t> coop_actor_base_sites;
     std::vector<uint32_t> coop_replay_sites;
     //   suppress_sites — instructions that must NOT execute while a companion
     //     actor is the one being run, because they cause a GLOBAL side effect

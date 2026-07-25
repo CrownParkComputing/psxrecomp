@@ -1125,7 +1125,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
 
     // Optional [coop] block — simultaneous extra player actors (ENHANCEMENT).
     // Omit it entirely => empty lists => generator emits nothing.
-    std::vector<uint32_t> coop_actor_base_sites, coop_replay_sites, coop_suppress_sites;
+    std::vector<uint32_t> coop_replay_sites, coop_suppress_sites;
     if (cfg.contains("coop")) {
         const toml::value& cp = toml::find(cfg, "coop");
         auto load_list = [&](const char* key, std::vector<uint32_t>& out) {
@@ -1141,20 +1141,24 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 out.push_back(a2);
             }
         };
-        load_list("actor_base_sites", coop_actor_base_sites);
         load_list("replay_sites", coop_replay_sites);
         load_list("suppress_sites", coop_suppress_sites);
-        // Fail closed on a half-declared feature: replay sites with no actor
-        // sites would re-run stages that never redirect (every pass driving
-        // player 1), and actor sites with no replay sites would redirect
-        // without any extra pass. Both are silently broken.
-        const bool any = !coop_actor_base_sites.empty() || !coop_replay_sites.empty();
-        const bool all = !coop_actor_base_sites.empty() && !coop_replay_sites.empty();
-        if (any && !all)
+        // Fail closed on a config written against the retired pointer-redirect
+        // model: silently ignoring the key would leave a game declaring a set of
+        // sites that no longer does anything, and the loss would show up only as
+        // subtly wrong behaviour much later.
+        if (cp.contains("actor_base_sites"))
             throw std::runtime_error(fmt::format(
-                "{}: [coop] is partially declared — actor_base_sites and "
-                "replay_sites must both be non-empty (or omit the block)",
+                "{}: [coop] actor_base_sites is no longer supported — extra "
+                "actors are swapped into the game's own actor storage, so no "
+                "pointer-redirect sites are needed. Delete the key.",
                 config_path.string()));
+        // Fail closed on a half-declared feature: suppress sites alone would
+        // guard writes for an actor that never runs.
+        if (!coop_suppress_sites.empty() && coop_replay_sites.empty())
+            throw std::runtime_error(fmt::format(
+                "{}: [coop] is partially declared — suppress_sites without "
+                "replay_sites (or omit the block)", config_path.string()));
     }
 
     // Optional [widescreen.bg2d] block — pure-2D background tile-loop widen.
@@ -1334,7 +1338,6 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
-        /*coop_actor_base_sites*/ coop_actor_base_sites,
         /*coop_replay_sites*/     coop_replay_sites,
         /*coop_suppress_sites*/   coop_suppress_sites,
     };
