@@ -321,13 +321,16 @@ audio production cadence:
 ```toml
 [audio]
 buffer_ms = 60
+offer_buffer_ms = true
 ```
 
-`buffer_ms` accepts 30–500 milliseconds and defaults to 180. Lower values
-reduce audible input-to-sound delay, but leave less reserve for frames where a
-game temporarily produces no audio and can therefore crackle on affected
-titles. This is deliberately a per-game developer choice; it is not read from
-the player's `settings.toml`.
+`buffer_ms` defaults to 180. Lower values reduce audible input-to-sound delay,
+but leave less reserve for frames where a game temporarily produces no audio
+and can therefore crackle on affected titles. `offer_buffer_ms` defaults to
+false. When a game explicitly enables it, recomp-ui shows a raw, unconstrained
+Audio latency debug field and persists the player's choice as
+`[audio] buffer_ms` in `settings.toml`. Games that do not opt in keep their
+validated developer value and show no control.
 
 ## Video Block
 

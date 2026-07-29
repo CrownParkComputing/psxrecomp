@@ -4931,6 +4931,7 @@ int main(int argc, char** argv) {
     bool ws_adaptive_view_supported = false;
     bool frame_interpolation_offered = true;
     bool skip_fmv_offered = true;
+    bool audio_buffer_offered = false;
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
@@ -5195,6 +5196,7 @@ int main(int argc, char** argv) {
                                           (int)gc.ws_backdrop_x_sites.size());
             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
             g_audio_buffer_ms  = (double)gc.runtime.audio_buffer_ms;
+            audio_buffer_offered = gc.runtime.audio_offer_buffer_ms;
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             /* [controller] game-declared input defaults (settings.toml/launcher
              * still override below). */
@@ -5514,6 +5516,8 @@ int main(int argc, char** argv) {
         }
         if (us.has_adaptive_view) g_ws_adaptive_view = us.adaptive_view;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
+        if (audio_buffer_offered && us.has_audio_buffer_ms)
+            g_audio_buffer_ms = (double)us.audio_buffer_ms;
         /* Bundled BIOS: ignore any persisted bios_path (same clamp-as-well-
          * as-hide treatment as lock_mode / ws_offered below) so a stale
          * settings.toml or launcher-less build can never point a bundled
@@ -5775,6 +5779,8 @@ int main(int argc, char** argv) {
             seed.adaptive_view = g_ws_adaptive_view;
             seed.has_adaptive_view = ws_offered;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
+            seed.audio_buffer_ms = (int)g_audio_buffer_ms;
+            seed.has_audio_buffer_ms = audio_buffer_offered;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (has_netplay_player_name) {
                 seed.netplay_player_name = netplay_player_name;
@@ -5865,6 +5871,7 @@ int main(int argc, char** argv) {
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
+            ls.audio_buffer_ms    = seed.audio_buffer_ms;
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
@@ -5976,6 +5983,7 @@ int main(int argc, char** argv) {
             gi.renderer_labels      = kPsxRendererLabels;
             gi.num_renderers        = vulkan_offered ? 3 : 2;
             gi.has_skip_fmv         = skip_fmv_offered ? 1 : 0;
+            gi.has_audio_buffer_ms  = audio_buffer_offered ? 1 : 0;
             /* Localization menu: shown only when the game declares languages. */
             if (!rui_lang_labels.empty()) {
                 gi.language_labels = rui_lang_labels.data();
@@ -6077,6 +6085,10 @@ int main(int argc, char** argv) {
                 seed.frame_interpolation_fps = ls.frame_interp_fps;
                 seed.has_frame_interpolation_fps = frame_interpolation_offered;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
+                if (audio_buffer_offered) {
+                    seed.audio_buffer_ms = ls.audio_buffer_ms;
+                    seed.has_audio_buffer_ms = true;
+                }
                 seed.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 seed.has_auto_skip_fmv = skip_fmv_offered;
                 seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
@@ -6167,6 +6179,8 @@ int main(int argc, char** argv) {
                 g_video_aspect_den = ws_offered ? seed.aspect_den : 3;
                 g_ws_adaptive_view = ws_offered && seed.adaptive_view;
                 g_audio_spu_hq    = seed.spu_hq;
+                if (audio_buffer_offered)
+                    g_audio_buffer_ms = (double)seed.audio_buffer_ms;
                 skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
                     settings_bios_storage = seed.bios_path.string();

@@ -278,7 +278,12 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
     double dt_ms = (double)pull_frames * 1000.0 / c->host_rate;
     if (dt_ms < 0.1) dt_ms = 0.1;
     if (dt_ms > 100.0) dt_ms = 100.0;
-    double err = (fill_ms - c->target_ms) / c->target_ms;
+    /* `target_ms` may be exposed as an unconstrained debug value. Keep zero
+     * mathematically defined without silently changing the requested target. */
+    double norm_ms = fabs(c->target_ms);
+    if (norm_ms < 1000.0 / c->source_rate)
+        norm_ms = 1000.0 / c->source_rate;
+    double err = (fill_ms - c->target_ms) / norm_ms;
     if (fill_ms > c->target_ms - c->deadband_ms &&
         fill_ms < c->target_ms + c->deadband_ms) {
         err = 0.0; /* deadband */

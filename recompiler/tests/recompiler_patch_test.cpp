@@ -137,21 +137,44 @@ note = "Test-only fixture"
 
 [audio]
 buffer_ms = 60
+offer_buffer_ms = true
 )toml");
     const auto audio_config = PSXRecompV4::load_game_config(audio_buffer);
-    check(audio_config.runtime.audio_buffer_ms == 60,
-          "parser preserves per-game audio buffer target");
+    check(audio_config.runtime.audio_buffer_ms == 60 &&
+          audio_config.runtime.audio_offer_buffer_ms,
+          "parser preserves per-game audio buffer target and UI opt-in");
 
-    const auto bad_audio_buffer = write_config(root, "bad-audio-buffer", R"toml(
+    const auto audio_settings = write_config(root, "audio-settings", R"toml(
+[audio]
+buffer_ms = 30
+)toml");
+    const auto user_audio =
+        PSXRecompV4::load_user_settings(audio_settings);
+    check(user_audio.has_audio_buffer_ms && user_audio.audio_buffer_ms == 30,
+          "user settings preserve an opted-in audio buffer choice");
+
+    PSXRecompV4::UserSettings raw_user_audio;
+    raw_user_audio.has_audio_buffer_ms = true;
+    raw_user_audio.audio_buffer_ms = -7;
+    const auto raw_audio_settings = root / "raw-audio-settings.toml";
+    check(PSXRecompV4::save_user_settings(raw_audio_settings, raw_user_audio),
+          "user settings write a raw audio buffer choice");
+    const auto raw_audio_roundtrip =
+        PSXRecompV4::load_user_settings(raw_audio_settings);
+    check(raw_audio_roundtrip.has_audio_buffer_ms &&
+          raw_audio_roundtrip.audio_buffer_ms == -7,
+          "user settings round-trip raw audio buffer choices without clamping");
+
+    const auto raw_audio_buffer = write_config(root, "raw-audio-buffer", R"toml(
 [runtime]
 
 [audio]
-buffer_ms = 20
+buffer_ms = 1
 )toml");
-    check_throws(
-        [&] { (void)PSXRecompV4::load_game_config(bad_audio_buffer); },
-        "[audio] buffer_ms out of range (30..500)",
-        "parser rejects unsafe audio buffer target");
+    const auto raw_audio_config =
+        PSXRecompV4::load_game_config(raw_audio_buffer);
+    check(raw_audio_config.runtime.audio_buffer_ms == 1,
+          "parser leaves debug audio buffer targets unconstrained");
 
     const auto duplicate_address = write_config(root, "duplicate-address", R"toml(
 [[recompiler.patch]]

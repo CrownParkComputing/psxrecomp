@@ -551,11 +551,11 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         const toml::value& audio = toml::find(cfg, "audio");
         if (audio.contains("buffer_ms")) {
             const auto n = toml::find<int64_t>(audio, "buffer_ms");
-            if (n < 30 || n > 500) {
-                throw std::runtime_error(fmt::format(
-                    "[audio] buffer_ms out of range (30..500): {}", n));
-            }
             rt.audio_buffer_ms = static_cast<int>(n);
+        }
+        if (audio.contains("offer_buffer_ms")) {
+            rt.audio_offer_buffer_ms =
+                toml::find<bool>(audio, "offer_buffer_ms");
         }
         if (audio.contains("spu_hq")) {
             rt.audio_spu_hq = toml::find<bool>(audio, "spu_hq");
@@ -2012,6 +2012,10 @@ UserSettings load_user_settings(const fs::path& path) {
     }
     if (doc.contains("audio")) {
         const toml::value& a = toml::find(doc, "audio");
+        if (a.contains("buffer_ms")) try_get([&]{
+            const int n = toml::find<int>(a, "buffer_ms");
+            s.audio_buffer_ms = n; s.has_audio_buffer_ms = true;
+        });
         if (a.contains("spu_hq")) try_get([&]{
             s.spu_hq = toml::find<bool>(a, "spu_hq"); s.has_spu_hq = true;
         });
@@ -2174,6 +2178,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_adaptive_view)
         f << "adaptive_view     = " << (s.adaptive_view ? "true" : "false") << "\n";
     f << "\n[audio]\n";
+    if (s.has_audio_buffer_ms)
+        f << "buffer_ms = " << s.audio_buffer_ms << "\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
     if (s.has_skip_launcher)

@@ -401,9 +401,14 @@ struct RuntimeConfig {
     // buffer_ms: steady-state host playback cushion. The ecosystem default
     // remains 180 ms because it survives long streamed-stage production gaps;
     // games with smoother production cadence may opt into a lower value to
-    // reduce controller-to-sound latency. This is a game-developer setting,
-    // not a player preference.
+    // reduce controller-to-sound latency.
+    // When exposed through offer_buffer_ms this is intentionally a raw debug
+    // value: recomp-ui does not clamp or quantize it.
     int                   audio_buffer_ms = 180;
+    // offer_buffer_ms: expose the buffer target in recomp-ui for this game.
+    // Hidden by default because many games need their validated developer
+    // value to survive irregular audio-production stalls.
+    bool                  audio_offer_buffer_ms = false;
 
     // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
     // headroom). Verified-enhancement, default OFF — spu_render output is
@@ -980,6 +985,7 @@ struct UserSettings {
     bool has_adaptive_view  = false; bool adaptive_view  = false;
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
+    bool has_audio_buffer_ms = false; int audio_buffer_ms = 180;
     // [bios] / [disc] / [memcard]
     bool has_bios_path      = false; std::filesystem::path bios_path;
     bool has_disc_path      = false; std::filesystem::path disc_path;
