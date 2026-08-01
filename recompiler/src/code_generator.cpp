@@ -1469,13 +1469,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     const std::string gte_read = fmt::format(
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", rt);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
-                        if (PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))) {
+                        // The GTE stall/give-back side effect (gte_read) must still
+                        // run, but a write to $zero is discarded on real hardware.
+                        if (config_.optimize_zero_reg && rt == 0) {
+                            code = gte_read + "/* discarded mfc2 to $zero */";
+                        } else if (PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_read + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
                         } else {
                             code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
                         }
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
-                        if (PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))) {
+                        if (config_.optimize_zero_reg && rt == 0) {
+                            code = gte_read + "/* discarded cfc2 to $zero */";
+                        } else if (PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_read + fmt::format("{} = gte_read_ctrl(cpu, {});  /* cfc2 */", reg_name(rt), rd);
                         } else {
                             code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
