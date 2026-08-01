@@ -491,6 +491,7 @@ struct ExactCf {
 
 struct ExactWalkResult {
     std::set<uint32_t> visited;
+    std::set<uint32_t> explored;
     std::set<uint32_t> direct_jal_targets;
     // target -> reachable (source PC, was resolved jalr/jr) evidence
     std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> transfer_sources;
@@ -1185,11 +1186,19 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
             uint32_t pc = work.front();
             work.pop();
 
-            if (wr.visited.count(pc) || !in_function(pc)) continue;
+            // `visited` is also populated from delay slots: a word may be a
+            // delay slot of a prior branch/jump AND the taken target of an
+            // earlier conditional branch (MIPS compilers commonly jump to the
+            // shared delay-slot word). Marking it visited but never exploring
+            // it drops its own successors (e.g. the fall-through past the
+            // aliased word), truncating the function mid-body. Track expansion
+            // separately so every reached instruction is explored exactly once.
+            if (wr.explored.count(pc) || !in_function(pc)) continue;
             auto word_opt = exe_.read_word(pc);
             if (!word_opt.has_value()) continue;
 
             uint32_t instr = *word_opt;
+            wr.explored.insert(pc);
             wr.visited.insert(pc);
             ExactCf cf = exact_classify_cf(pc, instr);
             uint32_t delay = pc + 4u;
@@ -1865,6 +1874,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     struct ExtentP3 { uint32_t terminus; bool clean_code; bool hit_invalid; bool resolved_jt; bool unresolved_indirect; };
     auto compute_extent_p3 = [&](uint32_t entry, uint32_t hard_cap) -> ExtentP3 {
         std::set<uint32_t> visited;
+        std::set<uint32_t> explored;
         std::queue<uint32_t> work;
         work.push(entry);
         bool hit_invalid = false, reached_exit = false, unresolved_indirect = false;
@@ -1872,10 +1882,14 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         auto in_fn = [&](uint32_t a) { return in_exe_p3(a) && a >= entry && a < hard_cap; };
         while (!work.empty()) {
             uint32_t pc = work.front(); work.pop();
-            if (visited.count(pc) || !in_fn(pc)) continue;
+            // Delay-slot aliasing (branch taken target == prior j's delay slot)
+            // must not freeze a word out of successor expansion; track
+            // exploration separately from the executed-instruction set.
+            if (explored.count(pc) || !in_fn(pc)) continue;
             auto word_opt = exe_.read_word(pc);
             if (!word_opt.has_value()) continue;
             uint32_t instr = *word_opt;
+            explored.insert(pc);
             visited.insert(pc);
             if (!valid_primary_p3(instr)) { hit_invalid = true; continue; }
             ExactCf cf = exact_classify_cf(pc, instr);

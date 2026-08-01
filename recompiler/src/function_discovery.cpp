@@ -170,6 +170,7 @@ FunctionDiscovery::SingleFunctionResult FunctionDiscovery::walk_function(
     SingleFunctionResult result;
 
     std::set<uint32_t> visited;
+    std::set<uint32_t> explored;
     std::queue<uint32_t> work;
     work.push(entry);
 
@@ -189,14 +190,20 @@ FunctionDiscovery::SingleFunctionResult FunctionDiscovery::walk_function(
     };
 
     // BFS: visit instructions, follow in-function control flow.
+    // `visited` also records delay slots; a word can be a delay slot of a
+    // prior branch/jump AND the taken target of an earlier conditional branch
+    // (compilers jump to the shared delay-slot word). If that word is merely
+    // marked visited but never expanded, its own successors (the fall-through
+    // past the aliased word) are dropped and the function truncates mid-body.
     while (!work.empty()) {
         uint32_t addr = work.front();
         work.pop();
 
-        if (visited.count(addr)) continue;
+        if (explored.count(addr)) continue;
         if (!in_bounds(addr)) continue;
 
         uint32_t raw = fetch(addr);
+        explored.insert(addr);
         visited.insert(addr);
 
         // Validate through strict translator.
