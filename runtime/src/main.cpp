@@ -5788,7 +5788,14 @@ int main(int argc, char** argv) {
                 seed.netplay_lobby_url = g_lnch_lobby_url;
                 seed.has_netplay_lobby_url = true;
             }
-            if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
+            /* The compile-time retail path is only a fallback constant, not a
+             * player selection. Seeding it made a clean bundled build show
+             * SCPH1001.BIN even though runtime resolution correctly defaults
+             * to OpenBIOS. Only surface an explicit CLI/settings choice. */
+            if (bios_explicit && bios_path && bios_path[0]) {
+                seed.bios_path = bios_path;
+                seed.has_bios_path = true;
+            }
             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
             seed.memcard_dir = memcard_dir;          seed.has_memcard_dir = true;
             seed.memcard1_enabled = memcard1_enabled; seed.has_memcard1_enabled = true;
