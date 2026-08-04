@@ -23,7 +23,8 @@ int psx_mod_register_vblank_plugin(const char* id,
 /*
  * Register the single narrow guest-function boundary used by a trusted
  * game-specific render mod. The callback runs immediately before that guest
- * function body. Registration fails if a different boundary is already owned.
+ * function body. KSEG aliases are normalized to the same physical address.
+ * Registration fails if a different boundary is already owned.
  */
 int psx_mod_register_guest_function_hook(
     uint32_t function_address, PSXModGuestFunctionCallback callback);

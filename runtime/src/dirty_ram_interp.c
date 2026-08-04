@@ -2119,8 +2119,6 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
-    if (addr == g_psx_mod_guest_function_hook_address)
-        psx_mod_guest_function_entry(addr);
 #ifndef PSX_NO_DEBUG_TOOLS
     /* A0/B0/C0 kernel-vector stubs are runtime-written, so calls to them
      * land HERE, not in the static dispatcher — which meant the bioscall
@@ -2665,6 +2663,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     uint32_t current_page = phys >> 12;
     int current_page_dirty = dirty_ram_is_dirty(phys);
     int insns_executed = 0;
+    const uint32_t guest_hook_address =
+        g_psx_mod_guest_function_hook_address;
 #ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_cyc_observe(uint32_t block_leader_phys);
 #endif
@@ -2692,6 +2692,14 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
+        /* Interpreted local flow can chain calls, jumps, and precise slices
+         * without returning through a dispatcher. Observe the actual next
+         * instruction PC so the trusted function-entry boundary is invariant
+         * across every interpreter transfer path. Native/generated entries
+         * use their existing logger hooks before reaching this loop. */
+        if (guest_hook_address != 0 &&
+            (pc & 0x1FFFFFFFu) == guest_hook_address)
+            psx_mod_guest_function_entry(pc);
 #ifndef PSX_NO_DEBUG_TOOLS
         /* Interp-path cycle ruler: make every interpreted PC anchorable by
          * cyc_watch (parity with the compiled emitter's block-leader observe).

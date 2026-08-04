@@ -3203,18 +3203,24 @@ static PSXModGuestFunctionCallback g_psx_mod_guest_function_hook = nullptr;
 extern "C" int psx_mod_register_guest_function_hook(
     uint32_t function_address, PSXModGuestFunctionCallback callback) {
     if (!function_address || !callback) return 0;
+    const uint32_t canonical_address = function_address & 0x1FFFFFFFu;
     if (g_psx_mod_guest_function_hook_address != 0 &&
-        (g_psx_mod_guest_function_hook_address != function_address ||
+        (g_psx_mod_guest_function_hook_address != canonical_address ||
          g_psx_mod_guest_function_hook != callback)) {
         return 0;
     }
     g_psx_mod_guest_function_hook = callback;
-    g_psx_mod_guest_function_hook_address = function_address;
+    /* Dispatchers do not all preserve the caller's KSEG alias. Generated
+     * functions report 0x800xxxxx while dirty/interpreted overlay paths may
+     * report the same entry as 0x000xxxxx. Keep one physical address so the
+     * trusted boundary fires identically through either execution tier. */
+    g_psx_mod_guest_function_hook_address = canonical_address;
     return 1;
 }
 
 extern "C" void psx_mod_guest_function_entry(uint32_t function_address) {
-    if (function_address == g_psx_mod_guest_function_hook_address &&
+    if ((function_address & 0x1FFFFFFFu) ==
+            g_psx_mod_guest_function_hook_address &&
         g_psx_mod_guest_function_hook) {
         g_psx_mod_guest_function_hook();
     }

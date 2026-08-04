@@ -2037,7 +2037,8 @@ volatile uint32_t g_psx_last_fn_entry = 0;
 void debug_server_log_call_entry_fn(uint32_t func_addr) {
 #ifdef PSX_NO_DEBUG_TOOLS
     g_psx_last_fn_entry = func_addr;
-    if (func_addr == g_psx_mod_guest_function_hook_address)
+    if ((func_addr & 0x1FFFFFFFu) ==
+            g_psx_mod_guest_function_hook_address)
         psx_mod_guest_function_entry(func_addr);
 #else
     debug_server_log_call_entry(func_addr);
@@ -2053,7 +2054,8 @@ void debug_server_log_call_entry(uint32_t func_addr) {
      * compared by the caller; these observers are intentionally inert. */
     { extern int g_ls_replay_active; if (g_ls_replay_active) return; }
     g_psx_last_fn_entry = func_addr;
-    if (func_addr == g_psx_mod_guest_function_hook_address)
+    if ((func_addr & 0x1FFFFFFFu) ==
+            g_psx_mod_guest_function_hook_address)
         psx_mod_guest_function_entry(func_addr);
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;

@@ -316,7 +316,8 @@ void debug_server_log_call_entry(uint32_t func_addr);
 #else
 static inline void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_last_fn_entry = func_addr;
-    if (func_addr == g_psx_mod_guest_function_hook_address)
+    if ((func_addr & 0x1FFFFFFFu) ==
+            g_psx_mod_guest_function_hook_address)
         psx_mod_guest_function_entry(func_addr);
 }
 #endif

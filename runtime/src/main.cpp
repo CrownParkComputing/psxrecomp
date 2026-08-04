@@ -2259,6 +2259,12 @@ static ControllerSource parse_controller_source(const std::string& raw) {
     if (s == "back" || s == "view" || s == "select") {
         out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_BACK; return out;
     }
+    if (s == "misc1" || s == "share" || s == "create") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_MISC1; return out;
+    }
+    if (s == "touchpad") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_TOUCHPAD; return out;
+    }
     if (s == "start" || s == "menu") {
         out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_START; return out;
     }
@@ -2369,13 +2375,13 @@ static void set_default_controller_mapping(void) {
     set_sources("l3",       "leftstick");
     set_sources("r3",       "rightstick");
     set_sources("start",    "start");
-    set_sources("select",   "back");
+    set_sources("select",   "back,misc1,touchpad");
 }
 
 static std::string default_input_ini_text(void) {
     return
         "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
-        "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
+        "; Sources use SDL/Xbox names: a,b,x,y,back,misc1,touchpad,start,leftshoulder,rightshoulder,\n"
         "; lefttrigger,righttrigger,leftstick,rightstick (stick clicks -> L3/R3),\n"
         "; dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
         "\n"
@@ -2400,7 +2406,7 @@ static std::string default_input_ini_text(void) {
         "l3 = leftstick\n"
         "r3 = rightstick\n"
         "start = start\n"
-        "select = back\n";
+        "select = back,misc1,touchpad\n";
 }
 
 static void load_input_config(const char* argv0) {
@@ -4932,6 +4938,7 @@ int main(int argc, char** argv) {
     bool ws_adaptive_view_supported = false;
     bool frame_interpolation_offered = true;
     bool skip_fmv_offered = true;
+    bool turbo_loads_offered = false;
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
@@ -4992,6 +4999,7 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
             warm_cd_routes = gc.runtime.warm_cd_routes;
+            turbo_loads_offered = gc.runtime.turbo_loads;
             if (gc.runtime.turbo_loads) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
@@ -5498,7 +5506,12 @@ int main(int argc, char** argv) {
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
-        if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
+        if (us.has_turbo_loads) {
+            /* Turbo-through-loads is a per-game opt-in. A stale user setting
+             * cannot enable it for a title whose game.toml leaves it off. */
+            g_turbo_loads_enabled =
+                turbo_loads_offered && us.turbo_loads ? 1 : 0;
+        }
         /* fast_boot is deliberately NOT restored from settings.toml: the
          * launcher exposes no control for it, so the persisted row can only
          * echo whatever game.toml said on some EARLIER run — a write-only
@@ -5762,7 +5775,8 @@ int main(int argc, char** argv) {
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);
             seed.has_auto_skip_fmv = skip_fmv_offered;
-            seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
+            seed.turbo_loads = (g_turbo_loads_enabled != 0);
+            seed.has_turbo_loads = turbo_loads_offered;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle_requested;          seed.has_bios_hle  = true;
             seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
@@ -5977,6 +5991,7 @@ int main(int argc, char** argv) {
             gi.renderer_labels      = kPsxRendererLabels;
             gi.num_renderers        = vulkan_offered ? 3 : 2;
             gi.has_skip_fmv         = skip_fmv_offered ? 1 : 0;
+            gi.has_turbo_loads      = turbo_loads_offered ? 1 : 0;
             /* Localization menu: shown only when the game declares languages. */
             if (!rui_lang_labels.empty()) {
                 gi.language_labels = rui_lang_labels.data();
@@ -6080,7 +6095,8 @@ int main(int argc, char** argv) {
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
                 seed.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 seed.has_auto_skip_fmv = skip_fmv_offered;
-                seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
+                seed.turbo_loads = ls.turbo_loads != 0;
+                seed.has_turbo_loads = turbo_loads_offered;
                 /* Bundled-BIOS builds ignore any launcher-supplied path (the
                  * picker is hidden, but a stale settings file could still
                  * carry one) — resolve_bios_for_runtime would reject it and
@@ -6155,7 +6171,8 @@ int main(int argc, char** argv) {
                 g_video_texfilter = seed.texture_filter;
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
-                g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
+                g_turbo_loads_enabled =
+                    turbo_loads_offered && seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
                 bios_hle_requested = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen;
