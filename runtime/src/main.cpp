@@ -2911,20 +2911,21 @@ static int capture_pad_slot(int s, PsxNetPad* out) {
         btn &= dev_all_controllers_buttons(suppress_stick); /* any plugged-in pad */
     }
 
-    /* Analog axes. Pinned-ANALOG folds the physical D-pad onto the left axes
-     * (fold_dpad) so the D-pad still moves stick-only games; HYBRID feeds the
-     * raw stick when currently analog (no fold — the D-pad drives its own
-     * digital path there); DIGITAL leaves the axes centred. */
+    /* Physical axes are retained even while the guest-visible pad is digital.
+     * A digital 0x41 poll never exposes these bytes, but trusted host-side mods
+     * can read them through sio_get_pad_sticks without forcing a game through
+     * a broken DualShock handshake. Pinned-ANALOG additionally folds the D-pad
+     * onto the left axes; every other mode keeps the raw sticks independent. */
     uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
     if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
         pad_sticks_for(p, player, st, /*fold_dpad=*/true);
-    } else if (eff_analog) {  /* HYBRID, currently presenting analog */
+    } else {
         pad_sticks_for(p, player, st, /*fold_dpad=*/false);
     }
     /* Dev mode: fold the keyboard's stick binds AND any connected controller's
      * sticks onto the analog stick, so an analog-mode P1 steers from whatever
      * is plugged in (P1 binds). */
-    if (dev_here && eff_analog) {
+    if (dev_here) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         psx_keybinds_sticks(keys, 1, st);
         dev_any_controller_sticks(st);
@@ -2970,7 +2971,7 @@ static int capture_pad_slot_exclusive(int s, PsxNetPad* out) {
     uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
     if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
         pad_sticks_for(p, player, st, /*fold_dpad=*/true);
-    } else if (eff_analog) {  /* HYBRID, currently presenting analog */
+    } else {
         pad_sticks_for(p, player, st, /*fold_dpad=*/false);
     }
 

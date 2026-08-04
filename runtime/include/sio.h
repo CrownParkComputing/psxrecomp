@@ -106,7 +106,9 @@ uint16_t sio_peek_stat(void);
 uint16_t sio_peek_ctrl(void);
 uint8_t  sio_peek_rx_data(void);
 
-/* Debug accessors: is a pad connected on the slot, and is it in analog mode. */
+/* Debug/plugin accessors: connection, guest-visible pad type, and physical
+ * stick samples. Stick samples remain available when the guest-visible pad is
+ * digital; a digital 0x41 guest poll still exposes buttons only. */
 int sio_get_pad_connected(int slot);
 int sio_get_pad_analog(int slot);
 void sio_get_pad_sticks(int slot, uint8_t out[4]);
