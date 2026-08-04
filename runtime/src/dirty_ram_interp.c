@@ -26,6 +26,7 @@
 #include "dirty_ram_interp.h"
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "mod_plugins.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"
@@ -2118,6 +2119,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
+    if (addr == g_psx_mod_guest_function_hook_address)
+        psx_mod_guest_function_entry(addr);
 #ifndef PSX_NO_DEBUG_TOOLS
     /* A0/B0/C0 kernel-vector stubs are runtime-written, so calls to them
      * land HERE, not in the static dispatcher — which meant the bioscall

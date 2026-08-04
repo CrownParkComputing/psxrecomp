@@ -309,11 +309,15 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
 extern "C" {
 #endif
 extern volatile uint32_t g_psx_last_fn_entry;
+extern volatile uint32_t g_psx_mod_guest_function_hook_address;
+void psx_mod_guest_function_entry(uint32_t func_addr);
 #ifdef PSX_OVERLAY_DLL_BUILD
 void debug_server_log_call_entry(uint32_t func_addr);
 #else
 static inline void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_last_fn_entry = func_addr;
+    if (func_addr == g_psx_mod_guest_function_hook_address)
+        psx_mod_guest_function_entry(func_addr);
 }
 #endif
 #ifdef __cplusplus

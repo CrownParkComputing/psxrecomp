@@ -8,6 +8,7 @@ extern "C" {
 
 typedef void (*PSXModVBlankCallback)(void);
 typedef void (*PSXModActivationCallback)(void);
+typedef void (*PSXModGuestFunctionCallback)(void);
 
 /*
  * Register a trusted, statically linked plugin implementation. Package
@@ -18,6 +19,16 @@ int psx_mod_register_activation_plugin(const char* id,
                                        PSXModActivationCallback callback);
 int psx_mod_register_vblank_plugin(const char* id,
                                    PSXModVBlankCallback callback);
+
+/*
+ * Register the single narrow guest-function boundary used by a trusted
+ * game-specific render mod. The callback runs immediately before that guest
+ * function body. Registration fails if a different boundary is already owned.
+ */
+int psx_mod_register_guest_function_hook(
+    uint32_t function_address, PSXModGuestFunctionCallback callback);
+void psx_mod_guest_function_entry(uint32_t function_address);
+extern volatile uint32_t g_psx_mod_guest_function_hook_address;
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);

@@ -3194,6 +3194,32 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
 
 } // namespace PSXRecompV4
 
+extern "C" {
+volatile uint32_t g_psx_mod_guest_function_hook_address = 0;
+}
+
+static PSXModGuestFunctionCallback g_psx_mod_guest_function_hook = nullptr;
+
+extern "C" int psx_mod_register_guest_function_hook(
+    uint32_t function_address, PSXModGuestFunctionCallback callback) {
+    if (!function_address || !callback) return 0;
+    if (g_psx_mod_guest_function_hook_address != 0 &&
+        (g_psx_mod_guest_function_hook_address != function_address ||
+         g_psx_mod_guest_function_hook != callback)) {
+        return 0;
+    }
+    g_psx_mod_guest_function_hook = callback;
+    g_psx_mod_guest_function_hook_address = function_address;
+    return 1;
+}
+
+extern "C" void psx_mod_guest_function_entry(uint32_t function_address) {
+    if (function_address == g_psx_mod_guest_function_hook_address &&
+        g_psx_mod_guest_function_hook) {
+        g_psx_mod_guest_function_hook();
+    }
+}
+
 extern "C" int psx_mod_register_vblank_plugin(
     const char* id, PSXModVBlankCallback callback) {
     return id &&
