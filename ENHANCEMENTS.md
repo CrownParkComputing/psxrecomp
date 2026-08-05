@@ -738,3 +738,61 @@ PGXP dataflow of G1.2/G1.3 to reach coverage where meshes move as one.
 launcher row; withdraw the `geometry_correction` row until value propagation
 lands (leave the setting readable from game.toml/settings.toml so the work
 stays testable, but do not present it to players).
+
+### G1.9 — PARKED (2026-08-05). This branch is the park. Do not ship it.
+
+G1.8's disposition was executed. The work was split across two branches:
+
+| branch | contents | status |
+|---|---|---|
+| `feat/pgxp-perspective-textures` | both features; `geometry_correction` compiled in but default-false and readable **only** from `game.toml` / `settings.toml`, with no launcher row | the shippable line |
+| `park/pgxp-geometry-correction` **(this branch)** | identical code plus the `geometry_correction` launcher row | parked; **not shippable** |
+
+The split is deliberately *not* a code excision. `geometry_correction` stays
+compiled into the ship branch because the setting is only useful as a testbed if
+the code behind it still runs; what was withdrawn is the launcher row, i.e. the
+only surface a player could reach it through. A player cannot enable this by
+accident — it is default-false and has no UI. This branch exists so the row, and
+any future work on the feature, has a home that is not the shipping line.
+
+**Why it is still broken** — see G1.8. Short version: the correction moves
+vertices, position-keyed lookup only recovers ~5% of them, and a corrected
+triangle meeting an uncorrected neighbour splits their shared edge. The census
+on Ape Escape (4,860,057 cumulative lookups, attract mode) is the ceiling for
+*any* position-keyed scheme, not a tuning artifact:
+
+| outcome | share |
+|---|---|
+| hit | 5.2% |
+| never recorded | 1.7% |
+| **ambiguous** (distinct projections rounding to one pixel) | **93.1%** |
+
+**What finishing it actually requires.** Not a bigger table — a different
+mechanism. The full PGXP dataflow: a per-word shadow of RAM and scratchpad plus
+per-GPR and per-GTE-register shadows, propagated through ~47 instruction classes,
+with a `Validate(value)` on every read so a shadow is only trusted when the
+integer value it shadows still matches. References are vendored in-tree —
+`beetle-psx/pgxp/` (47 `PGXP_CPU_*` hooks) and
+`duckstation/src/core/cpu_pgxp.cpp`.
+
+**The static-recompiler constraint that makes this expensive.** In an
+interpreter those hooks are a branch in an existing dispatch loop. Here they are
+*emitted C on the hot path*, so they cannot hide behind a runtime toggle — they
+have to be gated at codegen time as a separate generated flavour. That reaches
+the build matrix and every title's regen, which is why this is its own project
+with its own scoping decision rather than a continuation of G1.
+
+**How to re-test, whenever that happens.** The three wrong conclusions in
+G1.1–G1.7 all came from judging on a single observation, so:
+
+1. Run the **OFF/OFF control first** and confirm the scene is clean. Two of the
+   retractions exist because a defect was attributed to this feature on a build
+   where it was already present with both toggles off.
+2. Then same-scene OFF-vs-ON, changing one toggle at a time — the isolation
+   table in G1.8 is the format.
+3. Capture with **`screenshot_hires`**. Plain `screenshot` / `screenshot_file`
+   resolve native 15-bit VRAM and are structurally blind to defects that live in
+   the supersampled mirror, which is exactly where this feature lives.
+4. Read the census with the `geom` TCP verb before trusting any visual read —
+   if coverage has not moved off ~5%, the mechanism has not changed and the
+   seams are expected.
