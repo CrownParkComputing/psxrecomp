@@ -73,6 +73,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
 #endif
 #include "psx_sdl.h"
+#include "fullscreen_control.h"
 #if defined(PSX_SDL3)
 /*
  * SDL_main.h is a single-header implementation in SDL3. Keep it in the one
@@ -628,15 +629,6 @@ static int           g_mod_load_wall_multiplier = -1;
 static int           g_mod_load_release_frames = -1;
 static int           g_mod_disc_speed_divisor = -1;
 static int           g_mod_disc_instant_rate = -1;
-
-/* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
- * window-fullscreen flag: used both to open the window in that mode and to
- * pick the hotkey's fullscreen target. */
-static Uint32 psx_fullscreen_flag_for_mode(int mode) {
-    if (mode == 2) return SDL_WINDOW_FULLSCREEN;         /* exclusive */
-    if (mode == 1) return SDL_WINDOW_FULLSCREEN_DESKTOP; /* borderless */
-    return 0;                                            /* windowed */
-}
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -1627,6 +1619,7 @@ static void shutdown_runtime(void) {
     }
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
+    psx_fullscreen_shutdown();
     debug_server_shutdown();
 }
 
@@ -1653,7 +1646,11 @@ static void teardown_game_session_keep_lobby(void) {
     }
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
-    if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
+    if (sdl_window) {
+        psx_fullscreen_shutdown();
+        SDL_DestroyWindow(sdl_window);
+        sdl_window = nullptr;
+    }
     if (sdl_pixel_buf) { std::free(sdl_pixel_buf); sdl_pixel_buf = nullptr; }
     psx_lobby_set_ready(0);
     psx_lobby_clear_launch_pending();
@@ -3642,6 +3639,7 @@ static void sdl_vblank_present(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            psx_fullscreen_handle_event(&ev);
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");
@@ -3699,28 +3697,12 @@ static void sdl_vblank_present(void) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
                 }
-                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
-                 * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
-                 * borderless desktop fullscreen keeping the desktop resolution
-                 * and letterboxing the image, or 2 exclusive fullscreen — a
-                 * real display-mode change). SDL_WINDOW_FULLSCREEN's bit is
-                 * set in both SDL_WINDOW_FULLSCREEN and
-                 * SDL_WINDOW_FULLSCREEN_DESKTOP, so testing just that bit
-                 * detects "currently fullscreen, either mode". */
+                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. The display
+                 * controller owns the tri-state implementation and preserves
+                 * the configured target while temporarily returning windowed. */
                 else if ((key == SDLK_RETURN && (mod & KMOD_ALT)) ||
-                         (key == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
-                    Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                                   SDL_WINDOW_FULLSCREEN;
-                    if (is_fs) {
-                        SDL_SetWindowFullscreen(sdl_window, 0);
-                    } else {
-                        /* If the configured mode is "off", the hotkey still
-                         * needs a mode to switch INTO — default to borderless,
-                         * matching the historical (pre-tri-state) behaviour. */
-                        Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
-                        if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
-                        SDL_SetWindowFullscreen(sdl_window, target);
-                    }
+                          (key == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
+                    (void)psx_fullscreen_toggle(g_fullscreen);
                 }
             }
         }
@@ -6873,11 +6855,10 @@ session_reboot:
         win_flags |= SDL_WINDOW_OPENGL;
     }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
-    /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
-     * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
-     * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
-     * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
-    win_flags |= psx_fullscreen_flag_for_mode(g_fullscreen);
+    /* Always create a normal window first. The display controller applies the
+     * requested mode after creation: mode 1 is a true monitor-sized borderless
+     * window with no fullscreen flag; mode 2 selects an explicit exclusive
+     * SDL3 display mode. */
     /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
      * height follows the configured display aspect (4:3 native, wider for the
@@ -6894,6 +6875,11 @@ session_reboot:
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
+    }
+    if (!psx_fullscreen_init(sdl_window, g_fullscreen)) {
+        launcher_warning("Display Mode Failed",
+                         "The requested display mode could not be applied. "
+                         "The game will continue in a normal window.");
     }
 
     /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock

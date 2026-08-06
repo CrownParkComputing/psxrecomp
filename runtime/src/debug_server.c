@@ -16,6 +16,7 @@
 #endif
 #include <time.h>
 #include "debug_server.h"
+#include "fullscreen_control.h"
 #include "latency_ring.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
@@ -4637,6 +4638,25 @@ static void handle_ping(int id, const char *json)
              id, (unsigned long long)s_frame_count,
              (unsigned long long)s_unknown_seq,
              s_unknown_unique_count);
+}
+
+static void handle_fullscreen_diag(int id, const char *json)
+{
+    (void)json;
+    enum { CAPACITY = 131072 };
+    char *report = (char *)malloc(CAPACITY);
+    if (!report) {
+        send_err(id, "fullscreen diagnostic allocation failed");
+        return;
+    }
+    const int length = psx_fullscreen_debug_json(report, CAPACITY, id);
+    if (length <= 0) {
+        free(report);
+        send_err(id, "fullscreen diagnostic report unavailable");
+        return;
+    }
+    send_line(report);
+    free(report);
 }
 
 static void handle_frame(int id, const char *json)
@@ -12728,6 +12748,7 @@ static const CmdEntry s_commands[] = {
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
+    { "fullscreen_diag",   handle_fullscreen_diag },
     { "xlate",             handle_xlate },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },
