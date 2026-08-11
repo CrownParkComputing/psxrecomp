@@ -436,10 +436,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         validate_project_relative(rt.overlay_capture_persist_dir,
                                   "runtime.overlay_capture_persist_dir");
     }
+    // turbo_loads / offer_turbo_loads are deprecated and ignored (see
+    // config_loader.h). Still parsed so old configs load, and the presence
+    // flags let the runtime name the dead key in its deprecation notice.
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
+        rt.has_turbo_loads = true;
     }
     if (runtime.contains("offer_turbo_loads")) {
+        rt.has_offer_turbo_loads = true;
         rt.offer_turbo_loads =
             toml::find<bool>(runtime, "offer_turbo_loads");
     }
@@ -2066,6 +2071,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
         });
+        // Deprecated and ignored: read only so the runtime can report that a
+        // stale value was found (and so the next save drops it). Never applied
+        // — see UserSettings::turbo_loads in config_loader.h.
         if (v.contains("turbo_loads")) try_get([&]{
             s.turbo_loads = toml::find<bool>(v, "turbo_loads"); s.has_turbo_loads = true;
         });
@@ -2293,8 +2301,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     }
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
-    if (s.has_turbo_loads)
-        f << "turbo_loads       = " << (s.turbo_loads ? "true" : "false") << "\n";
+    /* turbo_loads is deliberately NOT written back: it is deprecated and no
+     * longer restored, so re-emitting it would preserve a dead row that looks
+     * authoritative. Omitting it lets an existing settings.toml self-clean on
+     * the first save after the update. */
     if (s.has_fast_boot)
         f << "fast_boot         = " << (s.fast_boot ? "true" : "false") << "\n";
     if (s.has_bios_hle)
