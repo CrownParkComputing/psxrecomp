@@ -9,8 +9,9 @@ disc into a native executable — MIPS R3000A translated to C, compiled to x64,
 linked against a hardware-accurate runtime. Not an emulator: the game becomes a
 program your CPU runs directly.
 
-Titles brought up on it ship as standalone builds with widescreen, mods, live
-language switching and a launcher. They can run on either the bundled,
+Titles brought up on it ship as standalone builds with widescreen, mods,
+rewind, save states, live language switching and a launcher. They can run on
+either the bundled,
 open-source **OpenBIOS** or a compatible **retail BIOS** supplied by the player;
 OpenBIOS is the default, so a retail BIOS dump is not normally required. The
 framework is general-purpose: bringing up a new game is a matter of
@@ -31,6 +32,8 @@ configuration and reverse engineering, not new engine work.
 
 Background on the original prototype:
 [I Built a PS1 Static Recompiler With No Prior Experience (and Claude Code)](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)
+
+[![PSXRecomp rewind and save states demo](https://img.youtube.com/vi/L36ppNkuJG0/maxresdefault.jpg)](https://www.youtube.com/watch?v=L36ppNkuJG0)
 
 ## Games
 
@@ -71,7 +74,7 @@ foundation and the correctness oracle.** Everything is architected LLE-first:
 accuracy comes first, and convenience is layered on top, opt-in, never
 underneath.
 
-Three things sit on that foundation:
+Four things sit on that foundation:
 
 - **An optional HLE tier.** A high-level BIOS layer can be laid over the
   selected recompiled kernel — OpenBIOS or retail BIOS — to skip the boot
@@ -95,6 +98,12 @@ Three things sit on that foundation:
   cached native shards in the background. The more a game runs, the less the
   interpreter is doing — the goal state is an idle interpreter and 100% native
   execution.
+
+- **Local snapshots for rewind and save states.** The PSX runtime can keep a
+  rolling in-memory rewind buffer and user-managed on-disk save-state slots.
+  Downstream games expose the controls through the shared launcher and runtime
+  hotkeys, while the underlying state capture restores CPU, RAM, GPU, SPU, CD,
+  SIO, memory-card and BIOS state together.
 
 PSXRecomp is a **framework**. Game-specific projects live in their own
 repositories with **`psxrecomp/` and `recomp-ui/` as root-level submodules**
@@ -183,6 +192,20 @@ BIOS instead and say so up front.
 
 > Developers: see [`docs/BIOS_SELECTION.md`](docs/BIOS_SELECTION.md) for the
 > `[runtime] openbios` setting and the selection rules.
+
+## Rewind and Save States
+
+PSXRecomp supports local rewind and save states in the shared PSX runtime. Game
+builds can offer a rolling rewind buffer for recent gameplay and a twelve-slot
+save-state menu for explicit snapshots; the default hotkeys are F8 for rewind
+and F7 for the save-state menu, with launcher-configurable bindings where the
+game ships the shared UI.
+
+Save states are full machine snapshots, not memory-card replacements. They are
+stored with the game's local save data and are intentionally tied to the BIOS
+backend that created them: OpenBIOS states load under OpenBIOS, retail BIOS
+states load under the matching retail BIOS, and memory cards remain the portable
+save format shared across BIOS choices and external emulators.
 
 ## Widescreen
 
