@@ -1909,7 +1909,11 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    emitted.replace(pos, lhs.size(), "uint32_t " + temp + " =");
+                    /* Assign into a function-scope temp. PGXP wraps loads in
+                     * `{{ ... }}`; declaring the temp inside that block left
+                     * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
+                    emitted.replace(pos, lhs.size(), temp + " =");
+                    ss << config_.indent << "uint32_t " << temp << ";\n";
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
@@ -2585,11 +2589,23 @@ GeneratedFunction CodeGenerator::generate_function(
     }
     body_ss << "#endif\n";
 
+    // Cadence / RAM-prep mod hooks must run on CPS mid-function re-entry too:
+    // AOT interior blocks still `lw` guest RAM (e.g. SimVblankGate skip). Other
+    // entry hooks (debug log, widescreen) stay AFTER the switch so they only
+    // fire on a true prologue entry (cpu->pc == 0).
+    if (config_.mod_function_entry_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << fmt::format(
+                       "psx_mod_function_entry(cpu, 0x{:08X}u);"
+                       "  /* trusted opt-in game-mod hook (pre-CPS) */\n",
+                       func.start_addr);
+    }
+
     // CPS entry-switch: when the unified flat trampoline dispatches a
     // continuation address (a callee published cpu->pc = $ra back to us), route
-    // into the owning block. Emitted BEFORE the entry hooks so a continuation
-    // re-entry bypasses debug_server_log_call_entry / widescreen entry hooks
-    // (those must run only on a true function entry, cpu->pc == 0).
+    // into the owning block. Emitted before debug/widescreen entry hooks so a
+    // continuation re-entry bypasses those (true-entry only). mod_function_entry
+    // is intentionally above so cadence plugins still run.
     // Overlay mode must emit the cpu->pc guard even when the continuation set
     // is EMPTY: a range re-entry can still request an interior PC of a
     // single-block function, and without the guard the body runs from its top
@@ -2666,13 +2682,6 @@ GeneratedFunction CodeGenerator::generate_function(
                 << fmt::format("if (psx_datashard_enter(cpu, 0x{:08X}u)) return;"
                                "  /* data-shard: replay or arm capture */\n",
                                func.start_addr);
-    }
-    if (config_.mod_function_entry_funcs.count(func.start_addr)) {
-        body_ss << config_.indent
-                << fmt::format(
-                       "psx_mod_function_entry(cpu, 0x{:08X}u);"
-                       "  /* trusted opt-in game-mod hook */\n",
-                       func.start_addr);
     }
     if (config_.ws_sprite_tag_funcs.count(func.start_addr)) {
         body_ss << config_.indent
