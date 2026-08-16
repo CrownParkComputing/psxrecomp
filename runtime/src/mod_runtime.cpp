@@ -4,6 +4,7 @@
 #include "iso_reader.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "psx_lobby_client.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -964,7 +965,8 @@ int provider_commit(void*, const char* image_path) {
 int provider_commit_netplay(void*, const char* image_path) {
     (void)image_path;
     std::string error;
-    if (!mod_runtime_clear_for_netplay(&error)) {
+    if (!mod_runtime_commit_for_netplay(image_path ? std::filesystem::path(image_path) :
+                                                    std::filesystem::path(), &error)) {
         set_error(error);
         return 0;
     }
@@ -1070,7 +1072,143 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     return true;
 }
 
+static bool feat_csv_wants(const char* csv, const std::string& id) {
+    if (!csv || !csv[0]) return true;
+    const char* p = csv;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') ++p;
+        if (std::string(start, p) == id) return true;
+        if (*p == ',') ++p;
+    }
+    return false;
+}
+
+static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* error) {
+    RuntimeMods& s = state();
+    if (!s.initialized) return true;
+    for (int pass = 0; pass < 8; ++pass) {
+        bool changed = false;
+        for (const auto& [package_id, versions] : s.manager.packages()) {
+            (void)versions;
+            const ModPackage* package = s.manager.selected_package(package_id);
+            if (!package) continue;
+            int required = -1;
+            for (int i = 0; i < caps.mod_count; ++i) {
+                if (package_id == caps.mods[i].id) {
+                    required = i;
+                    break;
+                }
+            }
+            const bool legacy = package->features.size() == 1 &&
+                                package->features.front().legacy;
+            if (legacy) {
+                const bool want = required >= 0;
+                std::string err;
+                if (!s.manager.set_enabled(package_id, want, &err) && want) {
+                    if (error) *error = err;
+                    return false;
+                }
+                continue;
+            }
+            for (const ModFeature& feature : package->features) {
+                const bool want = required >= 0 &&
+                    feat_csv_wants(caps.mods[required].feats, feature.id);
+                const bool have = s.manager.feature_enabled(package_id, feature.id);
+                if (want == have) continue;
+                std::string err;
+                if (!s.manager.set_feature_enabled(package_id, feature.id, want, &err)) {
+                    if (want) {
+                        if (error) *error = err;
+                        return false;
+                    }
+                    continue;
+                }
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    for (int i = 0; i < caps.mod_count; ++i) {
+        const PsxLobbyModPkg& pkg = caps.mods[i];
+        if (!pkg.id[0] || !pkg.ver[0]) continue;
+        std::string err;
+        if (!s.manager.select_version(pkg.id, pkg.ver, &err)) {
+            if (error) *error = err.empty() ? (std::string(pkg.id) + " is not installed") : err;
+            return false;
+        }
+        const ModPackage* package = s.manager.selected_package(pkg.id);
+        if (!package) {
+            if (error) *error = std::string(pkg.id) + " is not installed";
+            return false;
+        }
+        const bool legacy = package->features.size() == 1 &&
+                            package->features.front().legacy;
+        if (legacy) {
+            if (!s.manager.set_enabled(pkg.id, true, &err)) {
+                if (error) *error = err;
+                return false;
+            }
+            continue;
+        }
+        for (const ModFeature& feature : package->features) {
+            const bool want = feat_csv_wants(pkg.feats, feature.id);
+            if (!s.manager.set_feature_enabled(pkg.id, feature.id, want, &err) && want) {
+                if (error) *error = err;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path,
+                                    std::string* error) {
+    if (!psx_lobby_in_lobby())
+        return mod_runtime_clear_for_netplay(error);
+    const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+    if (!caps || !caps->valid || caps->mod_count <= 0)
+        return mod_runtime_clear_for_netplay(error);
+    if (!apply_host_mod_plan(*caps, error)) return false;
+    return mod_runtime_commit(disc_path, error, false);
+}
+
+bool mod_runtime_export_package(const std::string& id, const std::string& version,
+                                std::vector<uint8_t>& out, std::string* sha256_hex,
+                                std::string* error) {
+    if (!state().manager.export_archive(id, version, out, error)) return false;
+    if (sha256_hex) {
+        uint8_t digest[32];
+        psx_sha256_compute(out.data(), out.size(), digest);
+        sha256_hex->assign(64, '0');
+        static const char* kHex = "0123456789abcdef";
+        for (int i = 0; i < 32; ++i) {
+            (*sha256_hex)[(size_t)i * 2] = kHex[digest[i] >> 4];
+            (*sha256_hex)[(size_t)i * 2 + 1] = kHex[digest[i] & 0xf];
+        }
+    }
+    return true;
+}
+
+bool mod_runtime_install_bytes(const uint8_t* data, size_t size, std::string* error) {
+    std::string err;
+    if (!state().manager.install_archive_bytes(data, size, nullptr, nullptr, &err)) {
+        if (err.find("already installed") != std::string::npos) {
+            if (error) error->clear();
+            return true;
+        }
+        if (error) *error = err;
+        return false;
+    }
+    return true;
+}
+
 bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error) {
+    return mod_runtime_commit(disc_path, error, true);
+}
+
+bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error,
+                        bool persist) {
     RuntimeMods& s = state();
     if (!s.initialized) return true;
     if (disc_path != s.disc_path) {
@@ -1111,7 +1249,7 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
         if (error) *error = s.error;
         return false;
     }
-    if (!s.manager.save_state(&s.error)) {
+    if (persist && !s.manager.save_state(&s.error)) {
         if (error) *error = s.error;
         return false;
     }

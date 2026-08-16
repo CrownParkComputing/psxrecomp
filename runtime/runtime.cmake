@@ -331,6 +331,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_speed.c
+    ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_ram.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_packages.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_runtime.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_keybinds.c
@@ -1206,7 +1207,7 @@ function(psxrecomp_add_runtime_target target)
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}")
         endif()
 
-    # Framework-owned mod catalog (loading speed). These target game_id "*" and
+    # Framework-owned mod catalog (loading speed, 8 MB RAM). These target game_id "*" and
     # are emulator features rather than per-disc content, so every game gets
     # them without carrying a copy of the manifests. Staged BEFORE the game's
     # own POST_BUILD copy so a title may still override an id if it ever needs
@@ -1223,7 +1224,7 @@ function(psxrecomp_add_runtime_target target)
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${PSXRECOMP_ROOT}/mods/builtin"
                 "$<TARGET_FILE_DIR:${target}>/mods"
-            COMMENT "Staging framework-owned mod catalog (loading speed)"
+            COMMENT "Staging framework-owned mod catalog"
             VERBATIM)
     endif()
     endif()

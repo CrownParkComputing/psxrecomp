@@ -158,6 +158,14 @@ int psx_mod_set_disc_speed(uint32_t divisor,
                            uint32_t instant_max_per_frame);
 
 /*
+ * DuckStation-style unique 8 MiB main RAM (no 2 MiB × 4 mirroring). Must be
+ * called from an activation plugin before memory_init. Default is retail 2 MB.
+ * Games that park $sp in a RAM mirror will break; title patches that allocate
+ * heaps above 2 MB need this on. Both netplay peers must match.
+ */
+int psx_mod_set_main_ram_8mb(int enabled);
+
+/*
  * Override one player's resolved controller presentation mode for this launch.
  * This is intentionally a trusted-plugin API, not a generic launcher setting:
  * games may hide Hybrid from their normal selector while offering it as an

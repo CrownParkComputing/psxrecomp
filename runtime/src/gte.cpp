@@ -1,6 +1,7 @@
 #include "gte.h"
 #include "cpu_state.h"
 #include "nd_intro_ot.h"
+#include "psx_ram.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -306,7 +307,7 @@ static inline uint32_t precision_hash(uint32_t addr) {
 static inline int precision_ram_address(uint32_t addr, uint32_t *physical) {
     uint32_t mapped = addr & 0x1FFFFFFFu;
     if (mapped >= 0x00800000u) return 0;
-    *physical = mapped & 0x1FFFFCu;
+    *physical = mapped & (g_psx_ram_mask & ~3u);
     return 1;
 }
 
