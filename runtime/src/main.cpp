@@ -13093,6 +13093,7 @@ session_reboot:
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
   }
     log_present_cadence();
+  }
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
