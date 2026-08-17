@@ -2596,6 +2596,47 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
  * wall-clock pacer double-blocks the vblank callback (present is before the
  * guest resumes), which shows up as MotK FMV ~30–40 FPS in netplay vs ~50+
  * offline. Force immediate swaps for the session; restore on soft-exit. */
+static int g_present_half_rate_healed = 0; /* 1 once 0.50x double-block healed */
+
+/* Plausible panel rates only. SDL/Wayland has stuffed pixel width (e.g. 3840
+ * for 4K) into refresh_rate; treating that as Hz forces wall-pacer + swap0
+ * while the compositor still blocks → exact 30 fps / 0.50x. */
+static double sanitize_host_refresh_hz(double hz, int mode_w, int mode_h,
+                                       double raw_hz, const char **reject_why) {
+    if (reject_why) *reject_why = nullptr;
+    if (!(hz > 0.0))
+        return 0.0;
+    if (hz < 20.0 || hz > 500.0) {
+        if (reject_why) *reject_why = "out of range";
+        return 0.0;
+    }
+    if (mode_w > 0 && std::fabs(hz - (double)mode_w) < 0.5) {
+        if (reject_why) *reject_why = "matches mode width";
+        return 0.0;
+    }
+    if (mode_h > 0 && std::fabs(hz - (double)mode_h) < 0.5) {
+        if (reject_why) *reject_why = "matches mode height";
+        return 0.0;
+    }
+    (void)raw_hz;
+    return hz;
+}
+
+static double display_mode_refresh_hz(const SDL_DisplayMode &dm,
+                                      const char **reject_why) {
+    double hz = 0.0;
+#if defined(PSX_SDL3)
+    /* Prefer rational rate: float refresh_rate is what Wayland has corrupted. */
+    if (dm.refresh_rate_numerator > 0 && dm.refresh_rate_denominator > 0)
+        hz = (double)dm.refresh_rate_numerator /
+             (double)dm.refresh_rate_denominator;
+#endif
+    if (!(hz >= 20.0 && hz <= 500.0) && dm.refresh_rate > 0)
+        hz = (double)dm.refresh_rate;
+    return sanitize_host_refresh_hz(hz, dm.w, dm.h, (double)dm.refresh_rate,
+                                    reject_why);
+}
+
 static int host_refresh_matches_crtc(void) {
     const double psx_hz = psx_crtc_frame_hz();
     return g_host_refresh_hz >= psx_hz * 0.98 &&
@@ -6079,6 +6120,40 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              fps, speed, (unsigned long long)s_frame_count);
             }
             std::fflush(stderr);
+
+            /* Wayland/Mesa: wall-clock pacer + compositor-forced present sync
+             * double-blocks to ~0.50x when host refresh was unknown/bogus.
+             * After a few steady half-rate windows, claim CRTC-matched refresh
+             * so driver vsync owns cadence (single wait). */
+            {
+                static int s_half_rate_windows = 0;
+                const int half = (speed >= 0.45 && speed <= 0.55) ? 1 : 0;
+                if (!g_present_half_rate_healed &&
+                    !g_frame_interpolation &&
+                    !psx_netplay_active() &&
+                    g_video_vsync != 0 &&
+                    !g_present_vsync_disabled &&
+                    present_should_wall_pace() &&
+                    half) {
+                    s_half_rate_windows++;
+                    if (s_half_rate_windows >= 2) {
+                        g_present_half_rate_healed = 1;
+                        g_host_refresh_hz = psx_crtc_frame_hz();
+                        refresh_frame_pacer_period();
+                        apply_present_cadence();
+                        std::printf("psxrecomp: present half-rate self-heal: "
+                                    "assuming %.2f Hz panel so driver vsync owns "
+                                    "cadence (was wall-pacer + compositor sync)\n",
+                                    g_host_refresh_hz);
+                        log_present_cadence();
+                        std::fflush(stdout);
+                        s_half_rate_windows = 0;
+                    }
+                } else if (!half) {
+                    s_half_rate_windows = 0;
+                }
+            }
+
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
         }
@@ -13064,12 +13139,32 @@ session_reboot:
     /* Host refresh: if the panel is within ~2% of the live CRTC rate (NTSC
      * 59.94 / PAL 50), record it so driver vsync can own cadence. Otherwise
      * keep the PSX CRTC period and force swap interval 0. Mods that own
-     * native VBlank keep their cadence. */
+     * native VBlank keep their cadence.
+     *
+     * Sanitize aggressively: Wayland/SDL has reported pixel width (3840) as
+     * refresh_rate, which selects wall-pacer+swap0 while the compositor still
+     * blocks → 30 Hz / 0.50x. Prefer SDL3 numerator/denominator when present. */
     {
-        SDL_DisplayMode dm;
+        SDL_DisplayMode dm{};
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
-        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0)
-            g_host_refresh_hz = (double)dm.refresh_rate;
+        const char *reject_why = nullptr;
+        double raw_hz = 0.0;
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0) {
+            const double float_hz = (double)dm.refresh_rate;
+            raw_hz = float_hz;
+#if defined(PSX_SDL3)
+            if (dm.refresh_rate_numerator > 0 && dm.refresh_rate_denominator > 0) {
+                raw_hz = (double)dm.refresh_rate_numerator /
+                         (double)dm.refresh_rate_denominator;
+            }
+#endif
+            g_host_refresh_hz = display_mode_refresh_hz(dm, &reject_why);
+            if (reject_why) {
+                std::printf("psxrecomp: ignoring bogus host refresh %.0f Hz "
+                            "(%s; mode %dx%d, sdl float %.0f); treating as unknown\n",
+                            raw_hz, reject_why, dm.w, dm.h, float_hz);
+            }
+        }
         refresh_frame_pacer_period();
         if (!g_mod_native_vblank_rate) {
             const double psx_hz = psx_crtc_frame_hz();
@@ -13078,9 +13173,14 @@ session_reboot:
                             "(%.4f ms/frame, %s CRTC)\n",
                             (int)(g_host_refresh_hz + 0.5), g_frame_period_ms,
                             gpu_display_is_pal() ? "PAL" : "NTSC");
-            } else {
+            } else if (g_host_refresh_hz > 0.0) {
                 std::printf("psxrecomp: host panel %.0f Hz; keeping %s %.2f Hz pacing\n",
                             g_host_refresh_hz,
+                            gpu_display_is_pal() ? "PAL" : "NTSC",
+                            psx_hz);
+            } else {
+                std::printf("psxrecomp: host refresh unknown; keeping %s %.2f Hz "
+                            "pacing (wall-clock; swap interval 0)\n",
                             gpu_display_is_pal() ? "PAL" : "NTSC",
                             psx_hz);
             }
