@@ -6823,10 +6823,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. Either SwapWindow vsync OR the wall-clock pacer owns timing,
          * never both. 24-bit (FMV) frames pin to native 4:3. */
-        /* FMV: nearest present — linear filtering fringes the right edge of
-         * low-res 24-bit scanouts into adjacent (often garbage) texels. */
+        /* FMV follows the same AA setting as everything else. It used to be
+         * pinned to nearest because plain GL_LINEAR fringed the right edge of
+         * low-res 24-bit scanouts into adjacent (often garbage) texels — but
+         * gl_renderer_present now half-texel-insets its UV rect (and crops the
+         * depth24 margin via content_w), which is exactly that bleed, and it
+         * reconstructs a filtered low-res source properly (PSX_FMV_FILTER,
+         * default bicubic) instead of smearing whole texels. Measured: the
+         * right-edge jump the old comment describes is 0 with filtering on.
+         * Set video AA off to get nearest back. */
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
-                            (g_video_aa && !depth24_frame) ? 1 : 0,
+                            g_video_aa ? 1 : 0,
                             pin_43 ? 1 : 0, 0 /* full width */);
         netplay_note_present();
     } else {
