@@ -55,6 +55,33 @@ inline constexpr int VIDEO_RENDERER_OPENGL = 1;
 inline constexpr int VIDEO_RENDERER_VULKAN = 2;
 inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
 
+// FMV present reconstruction, ordered least → most smoothing. See
+// RuntimeConfig::video_fmv_filter for what each one does and why bicubic is
+// the default. Shared by game.toml/settings parsing and runtime startup.
+inline constexpr int VIDEO_FMV_FILTER_NEAREST  = 0;
+inline constexpr int VIDEO_FMV_FILTER_BILINEAR = 1;
+inline constexpr int VIDEO_FMV_FILTER_SHARP    = 2;
+inline constexpr int VIDEO_FMV_FILTER_BICUBIC  = 3;
+inline constexpr int VIDEO_FMV_FILTER_COUNT    = 4;
+inline constexpr int VIDEO_FMV_FILTER_DEFAULT  = VIDEO_FMV_FILTER_BICUBIC;
+
+// Canonical settings.toml / game.toml spelling for each value, and its parse.
+inline const char* video_fmv_filter_name(int v) {
+    switch (v) {
+        case VIDEO_FMV_FILTER_NEAREST:  return "nearest";
+        case VIDEO_FMV_FILTER_BILINEAR: return "bilinear";
+        case VIDEO_FMV_FILTER_SHARP:    return "sharp";
+        default:                        return "bicubic";
+    }
+}
+inline bool video_fmv_filter_parse(const std::string& s, int* out) {
+    if (s == "nearest")       { *out = VIDEO_FMV_FILTER_NEAREST;  return true; }
+    else if (s == "bilinear") { *out = VIDEO_FMV_FILTER_BILINEAR; return true; }
+    else if (s == "sharp")    { *out = VIDEO_FMV_FILTER_SHARP;    return true; }
+    else if (s == "bicubic")  { *out = VIDEO_FMV_FILTER_BICUBIC;  return true; }
+    return false;
+}
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
@@ -344,6 +371,18 @@ struct RuntimeConfig {
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
+
+    // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+    // (a 320x192-class movie blown up to the window). Only consulted when
+    // antialiasing is on — AA off means nearest, as it does everywhere else.
+    //   0 nearest   point-sampled; hard pixels, uneven pixel widths at a
+    //               non-integer scale
+    //   1 bilinear  plain GL_LINEAR; smoothest, but blurs the whole texel
+    //   2 sharp     sharp-bilinear; flat texel interiors, ramp confined to a
+    //               one-output-pixel band at the boundary
+    //   3 bicubic   Catmull-Rom (default) — removes most of the staircase
+    //               while holding overall sharpness at the nearest level
+    int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
 
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
@@ -1110,6 +1149,9 @@ struct UserSettings {
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+    // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+    bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
     // Sub-pixel vertex precision / perspective-correct UVs (see RuntimeConfig).
     // Both default off — the faithful floor — and are player-selectable.
     bool has_geometry_correction   = false; bool geometry_correction   = false;

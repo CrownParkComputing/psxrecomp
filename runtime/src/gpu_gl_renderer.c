@@ -2668,6 +2668,33 @@ static void present_dump_drawable(int lx, int ly, int lw, int lh) {
     free(px);
 }
 
+/* FMV present reconstruction. Config-owned (settings.toml [video] fmv_filter,
+ * via gl_renderer_set_fmv_filter); PSX_FMV_FILTER overrides for a single run
+ * without touching the user's settings. Values are the config enum
+ * VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic); the shader
+ * mode is -1/0/1/2, so the two differ by one. */
+static int s_fmv_filter_cfg = 3;          /* bicubic */
+
+void gl_renderer_set_fmv_filter(int cfg_value) {
+    if (cfg_value >= 0 && cfg_value <= 3) s_fmv_filter_cfg = cfg_value;
+}
+
+static int fmv_filter_mode(void) {
+    static int env_mode = -2;             /* -2 = not yet looked up */
+    if (env_mode == -2) {
+        const char *e = getenv("PSX_FMV_FILTER");
+        env_mode = -3;                    /* -3 = no override */
+        if (e && e[0]) {
+            if (!strcmp(e, "nearest"))       env_mode = -1;
+            else if (!strcmp(e, "bilinear")) env_mode = 0;
+            else if (!strcmp(e, "sharp"))    env_mode = 1;
+            else if (!strcmp(e, "bicubic"))  env_mode = 2;
+        }
+    }
+    if (env_mode != -3) return env_mode;
+    return s_fmv_filter_cfg - 1;
+}
+
 /* Select the present-program sampling mode. s_present_prog is shared by the CPU
  * present and both VRAM/FBO quad paths, and program uniforms persist, so every
  * user states its choice rather than inheriting the last one's. sharp=0 keeps
@@ -3118,23 +3145,8 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * bilinear 0.14%/0.930. Bicubic removes two thirds of the staircase while
      * holding gradient at the nearest level; bilinear removes the most but
      * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
-    int filt_mode;
-    if (linear) {
-        static int mode_cached = -2;
-        if (mode_cached == -2) {
-            const char *e = getenv("PSX_FMV_FILTER");
-            mode_cached = 2;
-            if (e && e[0]) {
-                if (!strcmp(e, "nearest"))       mode_cached = -1;
-                else if (!strcmp(e, "bilinear")) mode_cached = 0;
-                else if (!strcmp(e, "sharp"))    mode_cached = 1;
-                else                             mode_cached = 2;
-            }
-        }
-        filt_mode = mode_cached;
-    } else {
-        filt_mode = -1;                   /* AA off: nearest, no shader work */
-    }
+    int filt_mode = linear ? fmv_filter_mode()
+                           : -1;          /* AA off: nearest, no shader work */
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
