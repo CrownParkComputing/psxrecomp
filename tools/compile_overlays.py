@@ -439,7 +439,10 @@ NON_AUTHORITY_MANIFEST_PROVENANCES = {
 HOSTED_MANIFEST_MARKER = (
     f'# psxrecomp overlay provenance {HOSTED_MANIFEST_PROVENANCE}')
 HOSTED_UNIQUE_GUARDED_BYTE_CAP = 1024 * 1024
-PSX_RAM_SIZE = 2 * 1024 * 1024
+# Full 8 MiB host capacity (PSX_RAM_CAPACITY): 8 MB-mod captures carry
+# high-bank enhancement code (e.g. WipEout 3 ntscfull8 at 0x781000+) and
+# their ranges must validate. Mirrors the runtime's OVERLAY_RAM_SIZE.
+PSX_RAM_SIZE = 8 * 1024 * 1024
 
 
 class ShardCandidateCapacityError(RuntimeError):
