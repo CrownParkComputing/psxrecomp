@@ -4664,6 +4664,8 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
         ws_auto_ui_group_key_words(words, op, min_y, height);
     item->group.x = min_x - X;
     item->group.width = width;
+    item->group.y = min_y;
+    item->group.height = height;
     item->group.anchor = 0;
     item->group.root = ws_ui_prepass_count - 1u;
     item->src_addr = psx_ram_map_read(source_addr & 0x1FFFFFFFu) & ~3u;
