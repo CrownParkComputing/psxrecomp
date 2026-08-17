@@ -38,6 +38,30 @@ def sanitize_github_name(name: str) -> str:
     return s[:100] or "repo"
 
 
+def install_dir_name(name: str) -> str:
+    """Local checkout / launcher ``apps/`` folder — same slug as the GitHub repo name.
+
+    New-project wizard must create this folder (not the display name with spaces)
+    so Studio catalog matching and RetComM ``install_dir_name`` stay consistent.
+    """
+    return sanitize_github_name(name)
+
+
+def normalize_repo_key(name: str) -> str:
+    """Casefold + collapse whitespace/underscores to hyphens for folder/catalog match.
+
+    Lets ``Wipeout 3 Special Edition Recomp`` match catalog
+    ``Wipeout-3-Special-Edition-Recomp`` / github short name without renaming.
+    """
+    s = (name or "").strip().lower()
+    if not s:
+        return ""
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"[^a-z0-9._-]+", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return s.strip(".-")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("src")
