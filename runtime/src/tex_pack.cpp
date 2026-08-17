@@ -16,6 +16,7 @@
 #include "png_write.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -69,6 +70,10 @@ struct State {
 
     /* GP0(E2h), decoded. mask == 0 on both axes means "no texture window". */
     int tw_mask_x = 0, tw_mask_y = 0, tw_off_x = 0, tw_off_y = 0;
+
+    /* Session clock for the coverage report — how long the pack was actually
+     * exercised, so a 10-second boot isn't read as "this pack covers 8%". */
+    std::chrono::steady_clock::time_point started;
 
     /* Diagnostics. */
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
@@ -248,7 +253,8 @@ void dump_upload(const Upload &up, int depth, int clut_x, int clut_y, uint32_t p
 /* ---- public API -------------------------------------------------------- */
 
 extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
-                              int enable_dump, const char *dir_override) {
+                              int enable_dump, const char *dir_override,
+                              const char *pack_dir) {
     std::lock_guard<std::mutex> lk(g.mu);
 
     g.replace_on = false;
@@ -259,6 +265,7 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     g.dumped.clear();
     g.matched.clear();
     g.dump_dir_ready = false;
+    g.started        = std::chrono::steady_clock::now();
 
     if ((!enable_replace && !enable_dump) || !disc_path || !disc_path[0]) return;
 
@@ -270,7 +277,11 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
         (dir_override && dir_override[0]) ? std::filesystem::path(dir_override)
                                           : disc.parent_path();
 
-    g.pack_dir = parent / (stem + "-texture-replacements");
+    /* A managed pack folder is addressed directly; the Beetle disc-stem
+     * convention is the fallback for a pack dropped next to the disc. */
+    g.pack_dir = (pack_dir && pack_dir[0])
+                     ? std::filesystem::path(pack_dir)
+                     : parent / (stem + "-texture-replacements");
     g.dump_dir = parent / (stem + "-texture-dump");
     g.replace_on = enable_replace != 0;
     g.dump_on    = enable_dump != 0;
@@ -295,6 +306,50 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     std::printf("[tex_pack] replace=%d dump=%d pack=%s (%zu entries) dump_dir=%s\n",
                 (int)g.replace_on, (int)g.dump_on, g.pack_dir.string().c_str(),
                 g.known.size(), g.dump_dir.string().c_str());
+}
+
+extern "C" void tex_pack_write_coverage(void) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.replace_on || g.pack_dir.empty() || g.known.empty()) return;
+
+    /* Hand-rolled JSON: this is a flat object, and the runtime has no JSON
+     * writer. The launcher reads it with nlohmann, which it already vendors. */
+    const std::filesystem::path temp = g.pack_dir / "coverage.json.tmp";
+    const std::filesystem::path final = g.pack_dir / "coverage.json";
+
+    FILE *f = std::fopen(temp.string().c_str(), "wb");
+    if (!f) return;
+
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now() - g.started).count();
+
+    std::fprintf(f, "{\n");
+    std::fprintf(f, "  \"format_version\": 1,\n");
+    std::fprintf(f, "  \"pack_entries\": %zu,\n", g.known.size());
+    std::fprintf(f, "  \"matched\": %zu,\n", g.matched.size());
+    std::fprintf(f, "  \"session_seconds\": %lld,\n", (long long)secs);
+
+    /* The entries no draw ever asked for. This is the authoring view — it is
+     * what tells a pack author whether a texture is genuinely unused or whether
+     * the tracker simply never saw it. Capped so a pathological pack cannot
+     * write an unbounded file. */
+    std::fprintf(f, "  \"unmatched\": [");
+    size_t written = 0;
+    for (size_t i = 0; i < g.known.size() && written < 4096; i++) {
+        if (key_set_contains(g.matched, g.known[i])) continue;
+        std::fprintf(f, "%s\n    \"%x-%x\"", written ? "," : "",
+                     (unsigned)(g.known[i] >> 32),
+                     (unsigned)(g.known[i] & 0xFFFFFFFFu));
+        written++;
+    }
+    std::fprintf(f, "%s]\n}\n", written ? "\n  " : "");
+    std::fclose(f);
+
+    /* Atomic replace, matching how mods/state.toml is persisted — a report
+     * half-written by a crash on exit must not read as "0% coverage". */
+    std::error_code ec;
+    std::filesystem::rename(temp, final, ec);
+    if (ec) std::filesystem::remove(temp, ec);
 }
 
 extern "C" void tex_pack_shutdown(void) {
