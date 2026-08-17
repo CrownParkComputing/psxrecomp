@@ -15,7 +15,9 @@ typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
 /*
  * Register a trusted, statically linked plugin implementation. Package
  * manifests select implementations by this stable id; archives never provide
- * native code or symbol names.
+ * native code or symbol names. Activation / VBlank / function-entry ids all
+ * count as registered for package resolve; function-entry callbacks only run
+ * when the committed plan lists that id.
  */
 int psx_mod_register_activation_plugin(const char* id,
                                        PSXModActivationCallback callback);
@@ -172,12 +174,15 @@ int psx_mod_set_disc_speed(uint32_t divisor,
                            uint32_t instant_max_per_frame);
 
 /*
- * DuckStation-style unique 8 MiB main RAM (no 2 MiB × 4 mirroring). Must be
- * called from an activation plugin before memory_init. Default is retail 2 MB.
- * Games that park $sp in a RAM mirror will break; title patches that allocate
- * heaps above 2 MB need this on. Both netplay peers must match.
+ * DuckStation-style unique 8 MiB main RAM (full high window registered).
+ * Must be called from an activation plugin before memory_init. Default is
+ * retail 2 MB. Still-aliased code PCs fold to low 2 MiB for AOT. Both
+ * netplay peers must match.
  */
 int psx_mod_set_main_ram_8mb(int enabled);
+
+/* Mark a guest main-RAM range unique under 8 MB mode (optional narrowing). */
+void psx_ram_register_unique(uint32_t addr, uint32_t len);
 
 /*
  * Override one player's resolved controller presentation mode for this launch.

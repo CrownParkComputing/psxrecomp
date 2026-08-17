@@ -1701,7 +1701,7 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
  * start (the first character of a frame would be suppressed forever). */
 void psx_ws_sprite_tag(CPUState* cpu) {
     if (!ws_engaged() || !ws_anchor_addr) return;
-    uint32_t key = cpu->gpr[4] & (g_psx_ram_mask & ~3u);
+    uint32_t key = psx_ram_map_read(cpu->gpr[4] & 0x1FFFFFFFu) & ~3u;
     if (!key) return;
     uint32_t sxy = cpu->read_word(ws_anchor_addr);
     int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
@@ -1727,7 +1727,7 @@ static int ws_tagged_anchor(int32_t *out_ax) {
     if (!ws_active() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
     uint32_t now = (uint32_t)s_frame_count;
     for (int variant = 0; variant < 2; variant++) {
-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & (g_psx_ram_mask & ~3u);
+        uint32_t key = psx_ram_map_read((gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFFFFu) & ~3u;
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
@@ -1864,7 +1864,7 @@ int psx_ws_prim_is_tagged(void) {
     if (!ws_engaged() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
     uint32_t now = (uint32_t)s_frame_count;
     for (int variant = 0; variant < 2; variant++) {
-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & (g_psx_ram_mask & ~3u);
+        uint32_t key = psx_ram_map_read((gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFFFFu) & ~3u;
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
@@ -1952,7 +1952,7 @@ static int ws_auto_ui_anchor(int32_t *out_anchor) {
     if (!ws_auto_ui_squash || !ws_active() ||
         gp0_cmd_source_addr == 0xFFFFFFFFu)
         return 0;
-    uint32_t src = gp0_cmd_source_addr & (g_psx_ram_mask & ~3u);
+    uint32_t src = psx_ram_map_read(gp0_cmd_source_addr & 0x1FFFFFFFu) & ~3u;
     for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
         if (ws_ui_prepass[i].src_addr != src) continue;
         if (out_anchor) *out_anchor = ws_ui_prepass[i].group.anchor;
@@ -3291,7 +3291,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     int indices[3] = { i0, i1, i2 };
     uint16_t z[3];
     for (int i = 0; i < 3; i++) {
-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & (g_psx_ram_mask & ~3u);
+        uint32_t addr = psx_ram_map_read((gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFFFFu) & ~3u;
         if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
             z[i] == 0)
             return;
@@ -4327,7 +4327,7 @@ static void gp0_exec_cpu_to_vram(void) {
             a0_history[slot].s2_val = debug_cpu_ptr->gpr[18]; /* $s2 = source ptr */
             a0_history[slot].a0_val = debug_cpu_ptr->gpr[4];  /* $a0 */
             a0_history[slot].a1_val = debug_cpu_ptr->gpr[5];  /* $a1 */
-            uint32_t sp_phys = sp & g_psx_ram_mask;
+            uint32_t sp_phys = psx_ram_map_read(sp & 0x1FFFFFFFu);
             for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= g_psx_ram_size; si++)
                 a0_history[slot].stack[si] = psx_read_word(sp + si * 4);
         }
@@ -4546,7 +4546,7 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
     item->group.x = min_x - X;
     item->group.width = width;
     item->group.anchor = 0;
-    item->src_addr = source_addr & (g_psx_ram_mask & ~3u);
+    item->src_addr = psx_ram_map_read(source_addr & 0x1FFFFFFFu) & ~3u;
     item->ot_rank = rank;
 }
 
@@ -4676,21 +4676,22 @@ static void gp0_capture_builder_chain(uint32_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = 0;
     uint8_t *ram = memory_get_ram_ptr();
     if (!ram) return;
-    const uint32_t RMASK = g_psx_ram_mask;             /* live DRAM fold */
+    /* live DRAM fold — registered unique high pages via psx_ram_map_read */
+    #define RMASK_APPLY(a) (psx_ram_map_read((uint32_t)(a) & 0x1FFFFFFFu))
     uint32_t rawsp = debug_guest_sp();
     g_gp0_last_copy_sp = rawsp;
     if ((rawsp & 0x1FFFFFFFu) >= 0x00800000u) return; /* not in RAM/mirror */
-    uint32_t sp = rawsp & RMASK & ~3u;              /* fold to 2MB, word-align */
+    uint32_t sp = RMASK_APPLY(rawsp) & ~3u;              /* fold to 2MB, word-align */
     /* Two-pass: prefer words that are genuine return addresses (call at ret-8),
      * but if guest code validation yields none, fall back to any code-range
      * stack word so the chain is never silently empty. */
     int found = 0;
     for (int pass = 0; pass < 2 && found == 0; pass++) {
         for (uint32_t off = 0; off + 4 <= 0x400u && found < 6; off += 4) {
-            uint32_t w; memcpy(&w, ram + ((sp + off) & RMASK), 4);
+            uint32_t w; memcpy(&w, ram + (RMASK_APPLY(sp + off)), 4);
             if ((w & 3u) || w < 0x80010000u || w >= 0x80120000u) continue;
             if (pass == 0) {
-                uint32_t ins; memcpy(&ins, ram + ((w - 8u) & RMASK), 4);
+                uint32_t ins; memcpy(&ins, ram + (RMASK_APPLY(w - 8u)), 4);
                 uint32_t op = ins >> 26;
                 int is_call = (op == 3u) || (op == 0u && (ins & 0x3Fu) == 9u);
                 if (!is_call) continue;
