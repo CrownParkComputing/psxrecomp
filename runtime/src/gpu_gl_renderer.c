@@ -806,6 +806,32 @@ static void pres_record(int path, int dx, int dy, int w, int h,
         const char *cfg = getenv("PSX_GL_PRESENT_PROBE");
         probe_pixels = (cfg && cfg[0] == '1') ? 1 : 0;
     }
+    /* PSX_PRESENT_DIAG=1: log every change of present path / display mode
+     * (path, 24-bit flag, scanout band, letterbox rect). FMV display bugs are
+     * hard to reason about from source because the band, the buffer the game
+     * is writing, and the band it is scanning out all move independently —
+     * this prints the transitions so they can be read off directly. Pairs with
+     * PSX_PRESENT_DUMP below, which writes the actual presented pixels. */
+    {
+        static int diag = -1;
+        if (diag < 0) {
+            const char *e2 = getenv("PSX_PRESENT_DIAG");
+            diag = (e2 && e2[0] && e2[0] != '0') ? 1 : 0;
+        }
+        if (diag) {
+            static int last_path = -1, last_d24 = -1, last_h = -1, last_dy = -1;
+            int d24 = gpu_display_is_depth24();
+            if (path != last_path || d24 != last_d24 || h != last_h ||
+                dy != last_dy) {
+                fprintf(stderr,
+                        "[PRES] f=%llu path=%d depth24=%d disp=(%d,%d %dx%d) "
+                        "letterbox=(%d,%d %dx%d)\n",
+                        (unsigned long long)s_frame_count, path, d24,
+                        dx, dy, w, h, lx, ly, lw, lh);
+                last_path = path; last_d24 = d24; last_h = h; last_dy = dy;
+            }
+        }
+    }
     GlPresEvent *e = &s_pres_ring[s_pres_seq % GL_PRES_RING_CAP];
     e->frame = (uint32_t)s_frame_count;
     e->t_ms  = (uint32_t)SDL_GetTicks();
@@ -1409,6 +1435,10 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
 }
 
 /* ---- coherency: GPU -> CPU readback -------------------------------------- */
+/* Defined with the depth24 policy below; needed here for the readback guard. */
+static int s_depth24_skip_up;
+static DirtyRect s_d24_skip_fb;
+
 static void ensure_cpu(void) {
     extern int psx_netplay_active(void);
     if (!s_raster_ok || !s_gpu_dirty) return;
@@ -1887,6 +1917,7 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
  * implementation for GL/VK/SW, see gpu_uv.h. */
 #include "gpu_uv.h"
+#include "png_write.h"
 
 /* Textured triangle. Always two passes split by the per-texel STP bit so the
  * stencil (mask) write value is constant within each pass; the semi pass is
@@ -2339,8 +2370,7 @@ static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int 
  * smaller texture A0s so post-FMV menus keep VRAM pages coherent.
  * On leave: clear the skipped FB union in the FBO — do NOT restage CPU RGB888
  * as 1555 (that painted MotK title rainbow/static). */
-static int s_depth24_skip_up = 0;
-static DirtyRect s_d24_skip_fb; /* union of skipped MDEC FB rects (VRAM halfwords) */
+/* (forward-declared above ensure_cpu) union of skipped MDEC FB rects, VRAM halfwords */
 
 static int depth24_is_fb_transfer(int x, int y, int w, int h) {
     if (!gpu_display_is_depth24() || w <= 0 || h <= 0) return 0;
@@ -2424,6 +2454,23 @@ static void depth24_clear_skipped_fb(void) {
 static void depth24_upload_policy(void) {
     int d24 = gpu_display_is_depth24();
     if (d24 && !s_depth24_skip_up) {
+        /* Entering 24-bit: from here the frame is presented from the CPU
+         * mirror, and MDEC only writes the movie's own rows. A letterboxed
+         * movie leaves the bars untouched, so they scan out whatever the
+         * mirror already held — and anything the game drew as a GPU PRIMITIVE
+         * (its pre-movie clear of those bars) lives only in the FBO and never
+         * reached the mirror. Sync once, here, at the transition.
+         *
+         * WipEout 3 intro without this: the movie is 320x192 written at +32
+         * inside a 320x240 band, double-buffered (rows 32-223 shown as band
+         * 0-239, rows 288-479 shown as band 256-495). The uncleared bars kept
+         * the previous SCEA screen, and because the two buffers hold it at
+         * different rows it alternated between the top and bottom bar every
+         * couple of frames — a flicker, not a static smear.
+         *
+         * Cost is one full-VRAM readback per 24-bit ENTRY (a handful per movie),
+         * not per frame; ensure_cpu is a no-op when the FBO is already clean. */
+        ensure_cpu();
         s_up_nrects = 0;
         rect_clear(&s_d24_skip_fb);
     } else if (!d24 && s_depth24_skip_up) {
@@ -2876,6 +2923,45 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
         uv_x1 = (float)content_w / (float)src_w;
         lw = (lw * content_w) / src_w;
         if (lw < 1) lw = 1;
+    }
+    /* PSX_PRESENT_DUMP=<dir>: write the CPU-present source (what the 24bpp FMV
+     * path actually shows) as PNGs, PSX_PRESENT_DUMP_FIRST..+COUNT frames. */
+    {
+        static int dump_init = 0;
+        static const char *dump_dir = NULL;
+        static long dump_first = 0, dump_count = 0, dumped = 0;
+        if (!dump_init) {
+            dump_init = 1;
+            dump_dir = getenv("PSX_PRESENT_DUMP");
+            const char *f = getenv("PSX_PRESENT_DUMP_FIRST");
+            const char *c = getenv("PSX_PRESENT_DUMP_COUNT");
+            dump_first = f ? atol(f) : 0;
+            dump_count = c ? atol(c) : 8;
+        }
+        if (dump_dir && dump_dir[0] && dumped < dump_count &&
+            (long)s_frame_count >= dump_first && src_w > 0 && src_h > 0) {
+            uint8_t *rgb = (uint8_t *)malloc((size_t)src_w * src_h * 3);
+            if (rgb) {
+                for (int i = 0; i < src_w * src_h; i++) {
+                    uint32_t p = pixels[i];          /* BGRA in memory */
+                    rgb[i * 3 + 0] = (uint8_t)(p >> 16);
+                    rgb[i * 3 + 1] = (uint8_t)(p >> 8);
+                    rgb[i * 3 + 2] = (uint8_t)(p);
+                }
+                char path[512];
+                snprintf(path, sizeof path, "%s/pres_%06llu.png", dump_dir,
+                         (unsigned long long)s_frame_count);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    png_write_rgb(fp, rgb, (uint32_t)src_w, (uint32_t)src_h);
+                    fclose(fp);
+                    fprintf(stderr, "[PRESDUMP] %s (%dx%d)\n", path,
+                            src_w, src_h);
+                    dumped++;
+                }
+                free(rgb);
+            }
+        }
     }
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
