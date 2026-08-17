@@ -62,6 +62,24 @@ def normalize_repo_key(name: str) -> str:
     return s.strip(".-")
 
 
+def repo_match_keys(name: str) -> set[str]:
+    """Match keys for a folder / install_dir / github short name.
+
+    Includes the normalized form and a form with a trailing ``-recomp`` /
+    ``-recompiled`` stripped so local ``… Recomp`` checkouts still match
+    catalog ``install_dir_name`` / github slugs that omit that suffix
+    (e.g. Klonoa).
+    """
+    k = normalize_repo_key(name)
+    if not k:
+        return set()
+    out = {k}
+    stripped = re.sub(r"(-recomp(iled)?)+$", "", k).strip("-")
+    if stripped:
+        out.add(stripped)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("src")

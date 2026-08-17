@@ -511,10 +511,10 @@ def resolve_catalog_root(studio_toml: Path | None = None) -> Path | None:
 def _catalog_name_keys(catalog_root: Path) -> set[str]:
     """Folder / github short-name keys for every catalog title.
 
-    Stores both raw lowercased names and ``normalize_repo_key`` forms so
-    spacey legacy checkouts still match hyphenated ``install_dir_name``.
+    Stores raw lowercased names plus ``repo_match_keys`` forms so spacey /
+    ``… Recomp`` legacy checkouts still match hyphenated ``install_dir_name``.
     """
-    from fill_tokens import normalize_repo_key
+    from fill_tokens import repo_match_keys
 
     index_path = catalog_root / "index.json"
     titles_dir = catalog_root / "titles"
@@ -531,9 +531,7 @@ def _catalog_name_keys(catalog_root: Path) -> set[str]:
         if not s:
             return
         keys.add(s.lower())
-        nk = normalize_repo_key(s)
-        if nk:
-            keys.add(nk)
+        keys.update(repo_match_keys(s))
 
     for tid in ids:
         _add(str(tid))
@@ -574,7 +572,7 @@ def catalog_title_id_for_root(
     catalog_root: Path | None = None,
 ) -> str | None:
     """Best-effort catalog title id for a local checkout (install_dir / github slug)."""
-    from fill_tokens import normalize_repo_key
+    from fill_tokens import repo_match_keys
 
     cat = catalog_root or resolve_catalog_root()
     if cat is None:
@@ -588,7 +586,7 @@ def catalog_title_id_for_root(
     except (OSError, json.JSONDecodeError):
         return None
 
-    want = {normalize_repo_key(root.name)}
+    want = set(repo_match_keys(root.name))
     try:
         from .gitops import _git
 
@@ -601,7 +599,7 @@ def catalog_title_id_for_root(
                 # git@github.com:Owner/Repo or https://github.com/Owner/Repo
                 tail = u.replace(":", "/").split("github.com/")[-1]
                 if "/" in tail:
-                    want.add(normalize_repo_key(tail.split("/")[-1]))
+                    want.update(repo_match_keys(tail.split("/")[-1]))
     except Exception:
         pass
     want.discard("")
@@ -624,7 +622,7 @@ def catalog_title_id_for_root(
             if "/" in tail:
                 candidates.append(tail.split("/")[-1])
         for c in candidates:
-            if normalize_repo_key(c) in want:
+            if repo_match_keys(c) & want:
                 return str(tid)
     return None
 
@@ -718,7 +716,7 @@ def repo_has_catalog_entry(
     studio_toml: Path | None = None,
 ) -> bool:
     """True if this indexed checkout maps to a retcomm-catalog title."""
-    from fill_tokens import normalize_repo_key
+    from fill_tokens import repo_match_keys
 
     try:
         root = entry.resolved()
@@ -733,12 +731,34 @@ def repo_has_catalog_entry(
     keys = _catalog_name_keys(cat)
     if not keys:
         return False
-    basename = root.name.lower()
-    if basename in keys or normalize_repo_key(root.name) in keys:
+
+    def _hits(label: str) -> bool:
+        s = (label or "").strip()
+        if not s:
+            return False
+        if s.lower() in keys:
+            return True
+        return bool(repo_match_keys(s) & keys)
+
+    if _hits(root.name):
         return True
-    name = (entry.name or "").strip()
-    if name and (name.lower() in keys or normalize_repo_key(name) in keys):
+    if _hits(entry.name or ""):
         return True
+    # GitHub origin short name (catalog often matches repo slug, not local folder).
+    try:
+        from .gitops import _git
+
+        code, url, _ = _git(root, "remote", "get-url", "origin")
+        if code == 0 and url:
+            u = url.strip().rstrip("/")
+            if u.endswith(".git"):
+                u = u[:-4]
+            if "github.com" in u.lower():
+                tail = u.replace(":", "/").split("github.com/")[-1]
+                if "/" in tail and _hits(tail.split("/")[-1]):
+                    return True
+    except Exception:
+        pass
     return False
 
 
