@@ -1162,7 +1162,9 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * Driver vsync and the wall-clock pacer are XOR. Waiting on both (pacer then
  * FIFO SwapBuffers) double-blocks on Linux compositors: ~16.7 ms + ~16.7 ms
  * = 30 Hz / 0.50x with the CPU idle. ~60 Hz panels may use vsync as the clock;
- * otherwise the pacer holds 59.94 Hz and present must not wait on the swap. */
+ * otherwise the pacer holds 59.94 Hz and present must not wait on the swap.
+ * Wayland: never let driver vsync own cadence by default (same effective
+ * policy as PSX_VSYNC=0); opt in with PSX_WAYLAND_ALLOW_VSYNC=1. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
@@ -2596,11 +2598,20 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
  * wall-clock pacer double-blocks the vblank callback (present is before the
  * guest resumes), which shows up as MotK FMV ~30–40 FPS in netplay vs ~50+
  * offline. Force immediate swaps for the session; restore on soft-exit. */
-static int g_present_half_rate_healed = 0; /* 1 once 0.50x double-block healed */
+static int g_present_half_rate_healed = 0; /* 1 once 0.50x heal tripped */
+/* Wayland: driver vsync + wall pacer (or compositor-forced FIFO with pacer)
+ * lands at ~0.50x. Empirically PSX_VSYNC=0 (pacer + immediate swap) holds
+ * 60 fps; so never let driver vsync own cadence on Wayland unless opted in. */
+static int g_wayland_allow_vsync = 0;
+
+static int host_video_is_wayland(void) {
+    const char *driver = SDL_GetCurrentVideoDriver();
+    return driver && std::strcmp(driver, "wayland") == 0;
+}
 
 /* Plausible panel rates only. SDL/Wayland has stuffed pixel width (e.g. 3840
- * for 4K) into refresh_rate; treating that as Hz forces wall-pacer + swap0
- * while the compositor still blocks → exact 30 fps / 0.50x. */
+ * for 4K) into refresh_rate; treating that as Hz selects the wrong cadence
+ * path and pairs badly with compositor present sync. */
 static double sanitize_host_refresh_hz(double hz, int mode_w, int mode_h,
                                        double raw_hz, const char **reject_why) {
     if (reject_why) *reject_why = nullptr;
@@ -2652,6 +2663,9 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
+    /* Wayland default: wall-clock pacer + swap interval 0 (same as PSX_VSYNC=0). */
+    if (host_video_is_wayland() && !g_wayland_allow_vsync)
+        return 0;
     return host_refresh_matches_crtc();
 }
 
@@ -2690,8 +2704,15 @@ static void log_present_cadence(void) {
                     "wall-clock pacer skipped)\n",
                     g_host_refresh_hz);
     } else if (g_frame_period_ms > 0.0) {
-        if (g_video_vsync != 0 && !g_frame_interpolation &&
+        if (host_video_is_wayland() && !g_wayland_allow_vsync &&
+            g_video_vsync != 0 && !g_frame_interpolation &&
             !g_netplay_vsync_forced_off) {
+            std::printf("psxrecomp: present cadence: wall-clock pacer "
+                        "(%.4f ms/frame); Wayland forces swap interval 0 "
+                        "(set PSX_WAYLAND_ALLOW_VSYNC=1 to opt into driver vsync)\n",
+                        g_frame_period_ms);
+        } else if (g_video_vsync != 0 && !g_frame_interpolation &&
+                   !g_netplay_vsync_forced_off) {
             if (g_host_refresh_hz > 0.0) {
                 std::printf("psxrecomp: present cadence: wall-clock pacer "
                             "(%.4f ms/frame); driver vsync off on %.0f Hz panel\n",
@@ -6121,10 +6142,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
             std::fflush(stderr);
 
-            /* Wayland/Mesa: wall-clock pacer + compositor-forced present sync
-             * double-blocks to ~0.50x when host refresh was unknown/bogus.
-             * After a few steady half-rate windows, claim CRTC-matched refresh
-             * so driver vsync owns cadence (single wait). */
+            /* Half-rate (~0.50x) with driver vsync still requested: force the
+             * proven Wayland-safe policy (PSX_VSYNC=0) — wall-clock pacer +
+             * immediate swap. Do NOT hand cadence to driver vsync. */
             {
                 static int s_half_rate_windows = 0;
                 const int half = (speed >= 0.45 && speed <= 0.55) ? 1 : 0;
@@ -6132,19 +6152,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     !g_frame_interpolation &&
                     !psx_netplay_active() &&
                     g_video_vsync != 0 &&
-                    !g_present_vsync_disabled &&
-                    present_should_wall_pace() &&
                     half) {
                     s_half_rate_windows++;
                     if (s_half_rate_windows >= 2) {
                         g_present_half_rate_healed = 1;
-                        g_host_refresh_hz = psx_crtc_frame_hz();
-                        refresh_frame_pacer_period();
+                        g_video_vsync = 0;
+                        g_wayland_allow_vsync = 0;
                         apply_present_cadence();
                         std::printf("psxrecomp: present half-rate self-heal: "
-                                    "assuming %.2f Hz panel so driver vsync owns "
-                                    "cadence (was wall-pacer + compositor sync)\n",
-                                    g_host_refresh_hz);
+                                    "forcing PSX_VSYNC=0 (wall-clock pacer + "
+                                    "immediate swap); driver vsync was "
+                                    "halving the frame rate\n");
                         log_present_cadence();
                         std::fflush(stdout);
                         s_half_rate_windows = 0;
@@ -11584,10 +11602,14 @@ int main(int argc, char** argv) {
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive)
-     * (vsync XOR wall-clock pacer — vsync clocks only ~60 Hz panels);
+     * (vsync XOR wall-clock pacer — vsync clocks only ~60 Hz panels;
+     * on Wayland driver vsync is disabled for cadence unless
+     * PSX_WAYLAND_ALLOW_VSYNC=1);
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_WAYLAND_ALLOW_VSYNC"))
+        g_wayland_allow_vsync = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
