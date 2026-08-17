@@ -2568,6 +2568,16 @@ static void shutdown_runtime(void);
  * there instead of killing the process. */
 static int g_netplay_from_lobby = 0;
 static int g_netplay_vsync_forced_off = 0;
+/* Manual fast-forward drops the swap interval to 0 for its duration. With
+ * driver vsync on, every present blocks ~one refresh, so turbo was capped at
+ * (present_every x refresh) regardless of CPU headroom — present_every is 2 at
+ * the default 4x multiplier, i.e. a hard 2x ceiling, and even
+ * PSX_FAST_FORWARD_SPEED=max could not exceed 4x. Deliberately consulted only
+ * by present_effective_swap_interval(), NOT by present_vsync_owns_cadence():
+ * vsync must keep "owning cadence" so present_should_wall_pace() stays false
+ * and the 60 Hz wall pacer does not replace the ceiling it just removed. The
+ * turbo block's own frame_pacer_wait(period / mult) remains the limiter. */
+static int g_turbo_vsync_forced_off = 0;
 
 static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
     if (!netplay_enabled ||
@@ -2671,6 +2681,8 @@ static int present_vsync_owns_cadence(void) {
 
 static int present_effective_swap_interval(void) {
     if (g_netplay_vsync_forced_off || psx_netplay_active())
+        return 0;
+    if (g_turbo_vsync_forced_off)
         return 0;
     if (g_frame_interpolation)
         return 0;
@@ -6058,6 +6070,61 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     RuntimePerfFrameScope runtime_perf_frame_scope;
     runtime_perf_diag_tick();
 
+    /* PSX_HITCH_DIAG=<ms>: per-frame hitch tracer. The 1 s FPS average hides
+     * single-frame spikes ("fps is fine but weapon impacts stutter"), so log
+     * one line whenever the wall time between vblanks exceeds the threshold,
+     * with the emu/pacer split and deltas of the usual burst suspects. The
+     * wall - guest - pacer remainder is host-side work (present, GL, audio). */
+    {
+        static double hitch_thresh_ms = -1.0;
+        if (hitch_thresh_ms < 0.0) {
+            const char *e = std::getenv("PSX_HITCH_DIAG");
+            hitch_thresh_ms = (e && *e) ? atof(e) : 0.0;
+        }
+        if (hitch_thresh_ms > 0.0) {
+            extern uint64_t g_dirty_ram_insns_run;
+            extern uint32_t g_dirty_ram_code_gen;
+            extern uint64_t s_frame_count;
+            static Uint64 h_last_pc = 0;
+            static uint64_t h_guest = 0, h_pace = 0, h_dirty = 0, h_ldus = 0;
+            static uint32_t h_cg = 0;
+            uint64_t ld_tot = 0, ld_max = 0, ld_last = 0;
+            overlay_loader_get_load_timing(&ld_tot, &ld_max, &ld_last);
+            Uint64 pc_now = SDL_GetPerformanceCounter();
+            if (h_last_pc) {
+                /* g_runtime_perf.frequency is only initialized under
+                 * PSX_RUNTIME_PERF_DIAG; fall back to the SDL clock so the
+                 * split never prints NaN when the tracer runs alone. */
+                double tick_freq = (double)g_runtime_perf.frequency;
+                if (tick_freq <= 0.0)
+                    tick_freq = (double)SDL_GetPerformanceFrequency();
+                double wall = (double)(pc_now - h_last_pc) * 1000.0 /
+                              (double)SDL_GetPerformanceFrequency();
+                double guest = (double)(g_runtime_perf.guest_work_ticks -
+                                        h_guest) * 1000.0 / tick_freq;
+                double pace = (double)(g_runtime_perf.pacer_ticks -
+                                       h_pace) * 1000.0 / tick_freq;
+                if (wall > hitch_thresh_ms) {
+                    std::fprintf(stderr,
+                        "[HITCH] f=%llu wall=%.1fms guest=%.1f pacer=%.1f "
+                        "host=%.1f | dirty_insns=+%llu ovl_load=+%.2fms "
+                        "code_gen=+%u\n",
+                        (unsigned long long)s_frame_count, wall, guest, pace,
+                        wall - guest - pace,
+                        (unsigned long long)(g_dirty_ram_insns_run - h_dirty),
+                        (double)(ld_tot - h_ldus) / 1000.0,
+                        g_dirty_ram_code_gen - h_cg);
+                }
+            }
+            h_last_pc = pc_now;
+            h_guest = g_runtime_perf.guest_work_ticks;
+            h_pace  = g_runtime_perf.pacer_ticks;
+            h_dirty = g_dirty_ram_insns_run;
+            h_ldus  = ld_tot;
+            h_cg    = g_dirty_ram_code_gen;
+        }
+    }
+
     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
      * than presents so turbo and skipped-frame modes still report game speed.
      * Skip during netplay post-load barrier — admit is stalled and the window
@@ -6493,7 +6560,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         static int turbo_skip = 0;
         static int turbo_was_down = 0;
-        if (host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
+        /* PSX_TURBO_HOLD=1: benchmarking override — behave as if the turbo key
+         * were held for the whole session. Headless fixtures (PSX_LOAD_SLOT)
+         * have no keyboard, and measuring the fast-forward ceiling / profiling
+         * under turbo requires the exact production code path, not a synthetic
+         * unpaced mode. */
+        static int turbo_hold_env = -1;
+        if (turbo_hold_env < 0) {
+            const char *th = std::getenv("PSX_TURBO_HOLD");
+            turbo_hold_env = (th && th[0] == '1') ? 1 : 0;
+        }
+        if (turbo_hold_env ||
+            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
@@ -6504,6 +6582,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 else
                     snprintf(msg, sizeof(msg), "Fast forward: %dx", mult);
                 host_osd_push(msg, 900);
+                /* Release the vsync ceiling for the duration of the hold. */
+                g_turbo_vsync_forced_off = 1;
+                apply_present_cadence();
             }
             turbo_was_down = 1;
             if (mult >= 2 && g_frame_period_ms > 0.0) {
@@ -6521,6 +6602,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
         } else {
             turbo_skip = 0;
+            if (turbo_was_down && g_turbo_vsync_forced_off) {
+                /* Restore the configured present cadence on release. */
+                g_turbo_vsync_forced_off = 0;
+                apply_present_cadence();
+            }
             turbo_was_down = 0;
         }
     }
@@ -10898,6 +10984,10 @@ int main(int argc, char** argv) {
     g_active_config_path = game_config_path;
 
     std::filesystem::path memcard_dir;
+    /* [savestate] dir — slot .pst root. Empty => use memcard_dir (historical
+     * layout). Set independently so sibling builds of one game can share
+     * memory cards while keeping their savestates apart. */
+    std::filesystem::path savestate_dir;
     std::filesystem::path memcard1_path;   /* explicit slot-1 .mcd (empty => dir/card1.mcd) */
     std::filesystem::path memcard2_path;   /* explicit slot-2 .mcd (empty => dir/card2.mcd) */
     bool memcard1_enabled = true;
@@ -11494,6 +11584,7 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
         if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
+        if (us.has_savestate_dir)    savestate_dir    = us.savestate_dir;
         if (us.has_multitap_enabled) multitap_enabled = us.multitap_enabled;
         if (us.has_multitap_analog) {
             multitap_analog = us.multitap_analog;
@@ -11629,6 +11720,10 @@ int main(int argc, char** argv) {
         memcard_dir = memcard_dir.lexically_normal();
         memcard1_path.clear();
         memcard2_path.clear();
+        /* Same rationale as the card paths: this flag exists to isolate ALL
+         * writable state, so a settings.toml [savestate] dir pointing outside
+         * the isolated directory must not survive it. */
+        savestate_dir.clear();
         std::error_code memcard_ec;
         std::filesystem::create_directories(memcard_dir, memcard_ec);
         if (memcard_ec) {
@@ -11645,6 +11740,25 @@ int main(int argc, char** argv) {
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+
+    /* Savestate root. Unset => the memcard dir, i.e. exactly the historical
+     * <memcard_dir>/<bios_token>/state_*.pst layout. A relative setting is
+     * resolved against the executable directory, matching --memcard-dir. */
+    if (!savestate_dir.empty()) {
+        if (savestate_dir.is_relative())
+            savestate_dir = exe_dir_from_argv(argv[0]) / savestate_dir;
+        savestate_dir = savestate_dir.lexically_normal();
+        std::error_code ss_ec;
+        std::filesystem::create_directories(savestate_dir, ss_ec);
+        if (ss_ec) {
+            std::fprintf(stderr,
+                "psxrecomp: cannot create [savestate] dir %s: %s — "
+                "falling back to the memory-card directory\n",
+                savestate_dir.string().c_str(), ss_ec.message().c_str());
+            savestate_dir.clear();
+        }
+    }
+    if (savestate_dir.empty()) savestate_dir = memcard_dir;
 
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml
@@ -13552,7 +13666,10 @@ session_reboot:
             if (bundled->image)
                 openbios_ws = bundled->image->image_wordsum;
         }
-        savestate_configure(memcard_dir.string().c_str(),
+        /* savestate_dir, not memcard_dir: sibling builds of one game may share
+         * memory cards while keeping slot .pst files apart (see [savestate]
+         * dir). Defaults to memcard_dir when unset. */
+        savestate_configure(savestate_dir.string().c_str(),
                             memory_get_bios_checksum(), game_entry_pc,
                             bios_token, openbios_ws);
         psx_rewind_set_depth((uint32_t)g_rewind_depth);

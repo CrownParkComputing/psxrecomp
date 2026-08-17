@@ -221,6 +221,11 @@ static PFN_glActiveTexture     p_glActiveTexture;
 static PFN_glGenBuffers        p_glGenBuffers;
 static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
+typedef void *(APIENTRY *PFN_glMapBufferRange)(GLenum, ptrdiff_t, ptrdiff_t,
+                                               unsigned int);
+typedef GLboolean (APIENTRY *PFN_glUnmapBuffer)(GLenum);
+static PFN_glMapBufferRange    p_glMapBufferRange;
+static PFN_glUnmapBuffer       p_glUnmapBuffer;
 static PFN_glVertexAttribPointer p_glVertexAttribPointer;
 static PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
 static PFN_glBindFragDataLocationIndexed p_glBindFragDataLocationIndexed;
@@ -291,6 +296,11 @@ static int load_modern_gl(void) {
     LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
     LOAD(p_glRenderbufferStorage, "glRenderbufferStorage");
     LOAD(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer");
+    /* Optional: PBO map for the async rewind VRAM readback. Absent ⇒
+     * gl_renderer_vram_readback_begin() returns 0 and rewind keeps the
+     * synchronous ensure_cpu path. */
+    p_glMapBufferRange = (void *)SDL_GL_GetProcAddress("glMapBufferRange");
+    p_glUnmapBuffer    = (void *)SDL_GL_GetProcAddress("glUnmapBuffer");
     /* GPU timer queries — optional (frame_perf). Don't fail the renderer if
      * absent; gl_perf just stays disabled. */
     p_glGenQueries          = (void *)SDL_GL_GetProcAddress("glGenQueries");
@@ -1427,6 +1437,63 @@ static void ensure_cpu(void) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     s_gpu_dirty = 0;
     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+}
+
+/* ---- Async VRAM readback (rewind snapshots) -----------------------------
+ * ensure_cpu()'s synchronous glReadPixels drains the whole GL pipeline
+ * mid-frame — measured 8-17 ms per rewind capture (PSX_HITCH_DIAG). Rewind
+ * knows a capture is coming one frame ahead, so it kicks the readback into a
+ * PBO here (CPU-side non-blocking; the GPU copies FBO->PBO on its own time)
+ * and maps the result next frame, when the copy has long retired. The mapped
+ * snapshot is the VRAM of the PREVIOUS frame — one frame of skew inside a
+ * rewind snapshot, invisible in practice and worth the removed stall. This
+ * path deliberately does NOT touch s_vram / s_gpu_dirty / coherence state:
+ * it is a private copy for the caller, not a mirror sync. */
+#define PSXGL_PIXEL_PACK_BUFFER 0x88EB
+#define PSXGL_STREAM_READ       0x88E1
+#define PSXGL_MAP_READ_BIT      0x0001
+static GLuint s_rb_pbo = 0;
+static int    s_rb_pending = 0;
+
+int gl_renderer_vram_readback_begin(void) {
+    if (!s_ctx || !s_raster_ok || !p_glMapBufferRange || !p_glUnmapBuffer)
+        return 0;
+    /* Dual-raster / netplay: CPU VRAM is authoritative and cheap — no need. */
+    if (s_cpu_auth_dual) return 0;
+    if (!s_rb_pbo) p_glGenBuffers(1, &s_rb_pbo);
+    if (!s_rb_pbo) return 0;
+    /* Queued draws must be submitted (not drained) so the copy sees them. */
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    pack_flush();
+    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, s_rb_pbo);
+    /* Fresh store each time: orphans any previous unconsumed readback. */
+    p_glBufferData(PSXGL_PIXEL_PACK_BUFFER,
+                   (ptrdiff_t)(VRAM_W * VRAM_H * 2), NULL, PSXGL_STREAM_READ);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+    glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
+                 (void *)0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, 0);
+    s_rb_pending = 1;
+    return 1;
+}
+
+int gl_renderer_vram_readback_finish(uint16_t *dst) {
+    if (!s_rb_pending || !s_ctx || !dst)
+        return 0;
+    s_rb_pending = 0;
+    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, s_rb_pbo);
+    void *p = p_glMapBufferRange(PSXGL_PIXEL_PACK_BUFFER, 0,
+                                 (ptrdiff_t)(VRAM_W * VRAM_H * 2),
+                                 PSXGL_MAP_READ_BIT);
+    if (p) {
+        memcpy(dst, p, (size_t)VRAM_W * VRAM_H * 2);
+        p_glUnmapBuffer(PSXGL_PIXEL_PACK_BUFFER);
+    }
+    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, 0);
+    return p != NULL;
 }
 
 /* ---- GPU primitives ------------------------------------------------------ */

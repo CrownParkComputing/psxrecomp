@@ -88,16 +88,12 @@ void psx_ram_register_unique(uint32_t addr, uint32_t len) {
         psx_ram_high_page_mark(page);
 }
 
+/* Definition retained for the generated-code ABI (the game's dispatch table
+ * calls it by symbol). The body now lives in psx_ram.h as a static inline so
+ * the per-dispatch call in psx_game_find_entry resolves without leaving the
+ * translation unit — the build has no LTO. */
 uint32_t psx_ram_canon_code_addr(uint32_t addr) {
-    uint32_t seg = addr & 0xE0000000u;
-    uint32_t phys = addr & 0x1FFFFFFFu;
-    /* Fold high→low only while the page is still a 2 MiB mirror alias.
-     * Registered unique high pages may hold real enhancement code (Wipeout
-     * 0x80781xxx); folding those onto low RAM executes the wrong bytes. */
-    if (phys < PSX_RAM_WINDOW && phys >= PSX_RAM_2MB &&
-        !psx_ram_high_page_unique(phys >> 12))
-        phys &= (PSX_RAM_2MB - 1u);
-    return seg | phys;
+    return psx_ram_canon_code_addr_inline(addr);
 }
 
 void psx_ram_resync_high_after_restore(void) {
@@ -502,6 +498,7 @@ int dirty_ram_is_dirty(uint32_t phys);
  * at 0x180000). Baselining from the kernel-window end instead of the real text
  * base wiped that whole region's dirty bits. See dirty_ram_interp.h. */
 extern uint32_t g_overlay_region_floor;
+static int text_page_matches_ref_image(uint32_t page);
 void dirty_ram_clear_image_baseline(void) {
     uint32_t floor = g_overlay_region_floor;
     if (floor <= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
@@ -511,8 +508,41 @@ void dirty_ram_clear_image_baseline(void) {
     if (base >= floor) return;
     uint32_t first_page = base >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
-    for (uint32_t page = first_page; page <= last_page; page++)
+    /* PSX_BASELINE_KEEP_DIVERGENT=0 restores the historical unconditional
+     * clear, so the change below can be A/B'd inside one build against the
+     * same scene (fps here is dominated by on-track racer count, which makes
+     * cross-run comparison worthless). */
+    static int keep_divergent = -1;
+    if (keep_divergent < 0) {
+        const char *e = getenv("PSX_BASELINE_KEEP_DIVERGENT");
+        keep_divergent = (e && *e == '0') ? 0 : 1;
+    }
+    uint32_t kept = 0;
+    for (uint32_t page = first_page; page <= last_page; page++) {
+        if (!keep_divergent) {
+            dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+            continue;
+        }
+        /* "False positive" only holds when RAM really equals the compiled
+         * image. A boot EXE loaded from a MOD-PATCHED disc (target=disc_user
+         * overlays, e.g. WipEout 3 ntscfull8) arrives with text that already
+         * diverges from the reference image the recompiler consumed. Clearing
+         * those pages (a) sends dispatch into the static function until the
+         * text guard re-diverges it 256 bytes at a time — measured in-race as
+         * ~1.7M native↔interp round trips/s at ~2 guest insns each, the whole
+         * frame budget — and (b) keeps the pages out of
+         * overlay_cache_window_contains(), so the overlay pipeline can never
+         * capture or shard them: the code is stuck at 1-2 insns per dispatch
+         * forever. Keep the dirty bit wherever live bytes differ from the
+         * reference; such a page is real overlay-class code, not a false
+         * positive. Pages outside the registered image keep historical
+         * behavior (cleared). */
+        if (!text_page_matches_ref_image(page)) { kept++; continue; }
         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+    }
+    if (kept)
+        fprintf(stderr, "psxrecomp: game-start baseline kept %u divergent "
+                "text page(s) dirty (mod-patched boot EXE)\n", kept);
 }
 
 /* Text-image divergence guard.
@@ -542,11 +572,77 @@ static uint64_t g_text_exact_mismatches = 0;
 static uint32_t g_text_exact_last_range_lo = 0;
 static uint32_t g_text_exact_last_range_len = 0;
 static uint32_t g_text_exact_last_mismatch = 0;
+
+/* Game-start baseline helper: does this whole page still equal the registered
+ * boot-EXE reference image?  1 = matches (or no image / page outside it —
+ * historical clear behavior applies); 0 = live bytes diverge, keep it dirty.
+ * See dirty_ram_clear_image_baseline. */
+static int text_page_matches_ref_image(uint32_t page) {
+    if (!text_ref_image) return 1;
+    uint32_t lo = page << DIRTY_RAM_PAGE_SHIFT;
+    uint32_t hi = lo + (1u << DIRTY_RAM_PAGE_SHIFT);
+    if (hi <= text_ref_lo || lo >= text_ref_hi) return 1;
+    if (lo < text_ref_lo) lo = text_ref_lo;
+    if (hi > text_ref_hi) hi = text_ref_hi;
+    return memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) == 0;
+}
 static uint32_t g_text_exact_last_live = 0;
 static uint32_t g_text_exact_last_ref = 0;
 
+/* ---- Text-guard verdict memo -------------------------------------------
+ *
+ * dirty_ram_text_native_ok_ranges_from() memcmp'd every emitted code range of
+ * the callee against the reference image on EVERY dispatch, uncached. In the
+ * WipEout 3 ntscfull8 mod that is ~33k dispatches/frame each re-comparing a
+ * whole function body — hundreds of MB/s of pure validation traffic, and the
+ * verdict is almost always the same "no" (the mod patches text via
+ * apply_main_write without blessing the reference, so patched functions are
+ * permanently non-native and fall to the interpreter after a full compare).
+ *
+ * The verdict is a pure function of (ranges, exec_pc, live text bytes,
+ * reference image). g_text_guard_gen advances whenever anything in the last
+ * two can change, so a memo keyed on it is exact:
+ *
+ *   - text_guard_note_write  — a CPU store into text that DIFFERS from the
+ *     reference (a store that MATCHES can only flip a verdict no->yes, and a
+ *     stale "no" is conservative: it costs interpretation, never correctness)
+ *   - dirty_ram_text_bless   — the reference image itself changed
+ *   - dirty_ram_mark_executable_range — DMA/mod wrote new code bytes
+ *   - register / reset_for_boot / resync_after_restore — wholesale re-arm
+ *
+ * PSX_TEXT_GUARD_MEMO=0 disables the memo (bisect switch: if a stale-native
+ * class ever appears, this proves or clears the memo in one run). */
+static uint32_t g_text_guard_gen = 1u;
+
+#define TEXT_OK_MEMO_SLOTS 8192u          /* power of two */
+typedef struct {
+    const uint32_t *key;                  /* &k_psx_game_code_ranges[i].lo */
+    uint32_t        exec_pc;
+    uint32_t        count;
+    uint32_t        gen;
+    int             ok;
+} TextOkMemo;
+static TextOkMemo s_text_ok_memo[TEXT_OK_MEMO_SLOTS];
+
+static int text_ok_memo_enabled(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("PSX_TEXT_GUARD_MEMO");
+        s = (e && e[0] == '0') ? 0 : 1;
+    }
+    return s;
+}
+
+static inline uint32_t text_ok_memo_slot(const uint32_t *key, uint32_t exec_pc) {
+    uintptr_t p = (uintptr_t)key;
+    uint32_t h = (uint32_t)(p >> 3) * 2654435761u;
+    h ^= exec_pc * 2246822519u;
+    return (h >> 7) & (TEXT_OK_MEMO_SLOTS - 1u);
+}
+
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
+    g_text_guard_gen++;
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
     if (len > RAM_SIZE - phys_lo) len = RAM_SIZE - phys_lo;
     text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
@@ -575,6 +671,11 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        /* Live text now diverges here: any memoized "native ok" covering this
+         * address must be re-decided. A store that MATCHES the reference is
+         * deliberately not invalidated — it can only flip a verdict no->yes,
+         * and keeping the stale "no" costs interpretation, not correctness. */
+        g_text_guard_gen++;
     }
 }
 
@@ -625,6 +726,20 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                          uint32_t count,
                                          uint32_t exec_pc) {
     if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+
+    /* Memo hit: same ranges, same entry PC, nothing has touched live text or
+     * the reference image since the verdict was computed (see g_text_guard_gen
+     * above). The diagnostic counters below are deliberately NOT re-bumped on
+     * a hit — they count compares performed, not dispatches rejected. */
+    TextOkMemo *memo = NULL;
+    if (text_ok_memo_enabled()) {
+        memo = &s_text_ok_memo[text_ok_memo_slot(lo_len_pairs, exec_pc)];
+        if (memo->key == lo_len_pairs && memo->exec_pc == exec_pc &&
+            memo->count == count && memo->gen == g_text_guard_gen)
+            return memo->ok;
+    }
+
+    int ok = 0;
     uint32_t at = exec_pc & 0x1FFFFFFFu;
     int any = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -633,7 +748,7 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
         if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
             len > text_ref_hi - phys) {
             g_text_native_blocked++;
-            return 0;
+            goto done;
         }
         if (phys + len <= at) continue;
         if (phys < at) {
@@ -655,14 +770,24 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             /* Do not sticky-poison the page. A continuation on the same page
              * may still match its clipped ranges. */
             g_text_native_blocked++;
-            return 0;
+            goto done;
         }
     }
     if (!any) {
         g_text_native_blocked++;
-        return 0;
+        goto done;
     }
-    return 1;
+    ok = 1;
+
+done:
+    if (memo) {
+        memo->key     = lo_len_pairs;
+        memo->exec_pc = exec_pc;
+        memo->count   = count;
+        memo->gen     = g_text_guard_gen;
+        memo->ok      = ok;
+    }
+    return ok;
 }
 
 /* Preserve the generated-code ABI used by existing game projects. */
@@ -703,6 +828,7 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
     memcpy(ref, src, hi - lo);
+    g_text_guard_gen++;   /* reference image changed — drop memoized verdicts */
     /* Re-open the affected pages: clear the sticky diverged bit so the next
      * dispatch re-runs the compare against the now-updated reference. */
     uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
@@ -734,6 +860,9 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
         dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
     }
     g_dirty_ram_code_gen++;
+    /* DMA / mod-plan wrote new code bytes over this range (this is the path
+     * apply_main_write uses): live text may now differ from the reference. */
+    g_text_guard_gen++;
 }
 
 /* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
@@ -825,6 +954,7 @@ static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
 void dirty_ram_reset_for_boot(void) {
+    g_text_guard_gen++;
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
@@ -877,6 +1007,9 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
  * fast path and run native code against restored bytes they were not validated
  * for — hang / freeze after the restored frame presents. */
 void dirty_ram_text_guard_resync_after_restore(void) {
+    /* Restored RAM replaced live text wholesale — every memoized verdict was
+     * decided against the pre-load bytes. */
+    g_text_guard_gen++;
     /* text_diverged_bitmap is sticky: once a page's entry bytes fail the
      * reference compare, native stays blocked forever. That is correct for
      * forward sim, but after a savestate/RB rewind the restored RAM may
@@ -907,16 +1040,46 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
     if (pg >= DIRTY_RAM_PAGE_COUNT) return;
     /* Never attach pre-write PC evidence to post-write bytes, including for
      * completely unknown/self-modifying code. This is deliberately a compact
-     * page clear, not a capture: serializing snapshots from this universal
+     * bit clear, not a capture: serializing snapshots from this universal
      * guest-store hook caused unbounded queues and multi-second stalls. CD DMA
-     * and periodic coherent capture remain the durable variant boundaries. */
+     * and periodic coherent capture remain the durable variant boundaries.
+     *
+     * The clear is scoped to the WORDS this store actually rewrote. The
+     * invariant only concerns bytes that changed, so a whole-page clear was
+     * far broader than needed: on a page that mixes code and data — exactly
+     * how the mod's 8 MB high-bank payload is laid out, since it is installed
+     * with CPU stores rather than CD DMA — every adjacent data write erased
+     * the executed-PC evidence for code words it never touched. capture_
+     * executed_pages() then saw no evidence there, so the high bank was never
+     * enumerated into a capture and never got a shard (measured on WipEout 3
+     * ntscfull8: 0 of 26 captured regions high-bank, 5 of 655 across all
+     * history, 16 of 1087 shards, ~27M interpreted high-bank insns/race). */
     if ((g_dirty_ram_exec_page_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
-        uint32_t bitmap_word = pg * (4096u / 4u / 32u);
-        memset(&g_dirty_ram_exec_pc_bitmap[bitmap_word], 0,
-               (4096u / 4u / 32u) * sizeof(uint32_t));
-        memset(&g_dirty_ram_dispatch_pc_bitmap[bitmap_word], 0,
-               (4096u / 4u / 32u) * sizeof(uint32_t));
-        g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+        uint32_t page_lo_w = pg * (4096u / 4u);
+        uint32_t page_hi_w = page_lo_w + (4096u / 4u) - 1u;
+        uint32_t lo_w = phys >> 2;
+        uint32_t hi_w = (phys + (size ? size - 1u : 0u)) >> 2;
+        uint32_t cleared = 0;
+        if (lo_w < page_lo_w) lo_w = page_lo_w;
+        if (hi_w > page_hi_w) hi_w = page_hi_w;
+        for (uint32_t w = lo_w; w <= hi_w; w++) {
+            uint32_t m = 1u << (w & 31u);
+            cleared |= g_dirty_ram_exec_pc_bitmap[w >> 5] & m;
+            g_dirty_ram_exec_pc_bitmap[w >> 5] &= ~m;
+            g_dirty_ram_dispatch_pc_bitmap[w >> 5] &= ~m;
+        }
+        /* Retire the page gate only once no executed-PC evidence survives.
+         * Scanning only when this store actually removed some keeps the
+         * universal store hook at a few bit ops in the common case (a data
+         * write into a code page clears nothing and skips the scan). */
+        if (cleared) {
+            uint32_t bw0 = pg * (4096u / 4u / 32u);
+            uint32_t any = 0;
+            for (uint32_t b = 0; b < (4096u / 4u / 32u); b++)
+                any |= g_dirty_ram_exec_pc_bitmap[bw0 + b];
+            if (!any)
+                g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+        }
     }
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
         overlay_page_gen[pg]++;
