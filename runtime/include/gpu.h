@@ -39,6 +39,14 @@ typedef struct {
 } GpuDisplayInfo;
 
 void gpu_get_display_info(GpuDisplayInfo* out);
+
+/* Perspective-correct UV arming rate, per condition. armed/attempts is the
+ * real perspective coverage: attempts counts only textured triangles, so it is
+ * the denominator that gp0_draw (which includes untextured primitives that are
+ * correctly never armed) cannot provide. Diagnostic; any pointer may be NULL. */
+void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
+                                  uint64_t *no_correction,
+                                  uint64_t *no_source, uint64_t *no_depth);
 /* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
@@ -260,6 +268,11 @@ void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_cull_keep_sites(const uint32_t *addresses,
                                 const uint32_t *expected,
                                 const uint32_t *results, int nsites);
+/* [[widescreen.cull.widen]] sites, so the dirty-RAM interpreter and any overlay
+ * shard reach the same widened verdict the AOT image does. */
+void gpu_ws_set_cull_widen_sites(const uint32_t *addresses,
+                                 const uint32_t *expected,
+                                 const uint32_t *modes, int nsites);
 void gpu_ws_set_angle_sites(const uint32_t *addresses,
                             const uint32_t *expected, int nsites);
 void gpu_ws_set_aspect_cone(const uint32_t *addresses,
@@ -293,6 +306,8 @@ uint32_t psx_ws_xclip_bound(uint32_t vanilla);
 uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced);
 int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
                           uint32_t *out);
+int psx_ws_cull_widen_site(uint32_t pc, uint32_t instr, uint32_t rs,
+                           uint32_t rt, uint32_t imm, uint32_t *out);
 uint32_t psx_ws_angle_widen(uint32_t vanilla);
 int psx_ws_angle_site(uint32_t pc, uint32_t instr, uint32_t *out);
 uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla,
@@ -317,6 +332,11 @@ int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
 int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm);
+/* Register-bound widen for SLT ([[widescreen.cull.widen]]). bound_is_rt picks
+ * which operand carries the bound: 1 -> rs < rt + m, 0 -> rs + m < rt. Identity
+ * at margin 0. Use instead of pinning a clip classifier, which stops the
+ * clipper subdividing and gets whole primitives dropped by the GPU. */
+int  psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt);
 int  psx_ws_cull_bltz(uint32_t v);
 int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 /* True if a run of instruction words carries the screen-extent reject signature

@@ -1,9 +1,17 @@
 /* tex_pack.cpp — HD texture replacement / dumping. See tex_pack.h for the
  * on-disk format and the Beetle PSX HW compatibility contract.
  *
- * Phase 1 scope: upload tracking, texture + palette hashing, and the dumper.
- * Nothing here touches rendering yet — the point of this stage is to prove our
- * filenames match Beetle's byte-for-byte before any shader work is done.
+ * Phase 1 was upload tracking, texture + palette hashing, and the dumper: prove
+ * our filenames match Beetle's byte-for-byte before any shader work. That held,
+ * and the counters said so (292 pack entries indexed, 80 asked for by a draw in
+ * a single race) — but "matched" only ever meant "a draw wanted this key". No
+ * pixels were substituted, because nothing here decoded a replacement and no
+ * renderer sampled one, so a pack could look like it was working while changing
+ * nothing on screen.
+ *
+ * Phase 2 closes that: decode a matched entry (lazily, on first use), and hand
+ * the draw path the image plus the mapping from texture-page UVs into it.
+ * Binding and sampling is the backend's job — see gr_set_replacement.
  *
  * C++ rather than C purely for <filesystem> (directory creation and the pack
  * scan), the same reason text_xlate.cpp is C++; the API is extern "C".
@@ -14,6 +22,13 @@
 #include "gpu.h"
 #include "crc32.h"
 #include "png_write.h"
+
+/* Declarations only — STB_IMAGE_IMPLEMENTATION is compiled in
+ * psx_window_icon.cpp. Its STBI_NO_STDIO must be matched here or the
+ * declarations disagree with the definitions that exist: that build has no
+ * stbi_load(), only the from-memory entry point, so we read the file. */
+#define STBI_NO_STDIO
+#include "../third_party/stb_image.h"
 
 #include <algorithm>
 #include <chrono>
@@ -63,6 +78,19 @@ struct State {
     std::vector<Upload>  uploads;
     std::vector<PalMemo> pal_memo;
 
+    /* Texture hashes the pack must NOT replace, from an optional exclude.txt
+     * in the pack directory (one lowercase %x texture hash per line, '#'
+     * comments). Matched on the TEXTURE hash alone, so one line covers every
+     * palette variant of the same image.
+     *
+     * This exists because a single bad entry can be catastrophic rather than
+     * cosmetic: WipEout 3 draws all of its text from four font atlases, so
+     * replacing those with images that render wrong erases every glyph in the
+     * game — menus, HUD, everything — while the rest of the pack is fine. Being
+     * able to drop one texture beats disabling the whole pack, and keeps the
+     * pack itself unmodified. */
+    std::vector<uint32_t> excluded;
+
     /* Sorted (hash << 32) | palette_hash key sets. */
     std::vector<uint64_t> known;    /* files present in the pack on disk       */
     std::vector<uint64_t> dumped;   /* keys written this session (dedup)       */
@@ -71,11 +99,71 @@ struct State {
     /* GP0(E2h), decoded. mask == 0 on both axes means "no texture window". */
     int tw_mask_x = 0, tw_mask_y = 0, tw_off_x = 0, tw_off_y = 0;
 
+    /* Distinct sample rects per texture, in TEXEL coordinates relative to the
+     * texture page (lim, exactly as the primitive addressed it).
+     *
+     * Authoring a replacement for an ATLAS needs to know where its cells are,
+     * and a proportional font atlas has no grid to infer: the dumped bitmap
+     * packs rows with no separating scanline and each glyph is a different
+     * width, so reading cells back out of the image is guesswork. The game
+     * already states every cell exactly, once per draw — this just records the
+     * distinct ones. Authoring aid; nothing in the replace path reads it. */
+    struct UvRect {
+        uint64_t key;                    /* (tex hash << 32) | palette hash */
+        uint16_t u0, v0, u1, v1;         /* inclusive texel bounds          */
+        int16_t  origin_u, origin_v;     /* upload's texel origin in-page   */
+        uint32_t hits;
+    };
+    std::vector<UvRect> uv_rects;
+
+    /* Decoded replacement images, keyed like everything else. Loaded lazily on
+     * the first draw that asks for one — indexing the pack reads filenames
+     * only, so a 292-entry pack costs nothing until its textures are actually
+     * on screen, and a pack far larger than VRAM never has to fit at once.
+     * `pixels` empty with `tried` set means the file failed to decode; we
+     * remember that so a broken entry is not re-opened every frame. */
+    struct Repl {
+        uint64_t key;
+        int      w = 0, h = 0;        /* replacement image, pixels        */
+        int      src_w = 0, src_h = 0;/* source texture, TEXELS           */
+        int      origin_u = 0, origin_v = 0; /* upload origin in the page */
+        bool     tried = false;
+        bool     mask = false;        /* single ink colour: safe to recolour */
+        int      ink_index = -1;      /* palette index this image inks        */
+        uint8_t  img_max = 0;         /* full-ink max channel, 1..255         */
+        int      dec_shift = 0;       /* depth shift it was analysed at       */
+        int      ana_src_w = 0, ana_src_h = 0; /* texel grid it was analysed at */
+        std::vector<uint8_t> pixels;  /* RGBA8, w*h*4                     */
+        uint32_t gl_handle = 0;       /* backend-owned; 0 = not uploaded  */
+    };
+    std::vector<Repl> repl;
+
+    /* Live override for substitution (tex_pack_replace_enabled). Separate from
+     * replace_on so the pack stays indexed and the counters keep working while
+     * the actual pixel swap is toggled for an A/B. */
+    bool repl_apply = true;
+
+    /* Which primitives were armed, and where they landed on screen. */
+    struct Armed {
+        uint64_t id;                     /* (tex hash << 32) | palette hash */
+        int16_t  x0, y0, x1, y1;         /* primitive screen bounds         */
+        uint32_t hits;
+    };
+    std::vector<Armed> armed;
     /* Session clock for the coverage report — how long the pack was actually
      * exercised, so a 10-second boot isn't read as "this pack covers 8%". */
     std::chrono::steady_clock::time_point started;
 
     /* Diagnostics. */
+    uint64_t n_repl_hit = 0, n_repl_miss = 0, n_repl_decoded = 0, n_repl_failed = 0;
+    /* Draws served by the palette-agnostic fallback, and draws it declined
+     * because the pack image carries real colour structure. The second number
+     * is the one that says whether the gate is doing its job. */
+    uint64_t n_repl_recolour = 0, n_repl_multicol = 0;
+    /* Why a lookup produced nothing. "hit + miss" alone cannot tell "the pack
+     * has no image for this texture" from "no upload backs this primitive",
+     * and those want opposite fixes. */
+    uint64_t n_repl_calls = 0, n_repl_nocontain = 0, n_repl_notex = 0;
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
     uint64_t n_dump_written = 0, n_dump_failed = 0;
@@ -92,6 +180,21 @@ bool rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int b
 
 bool key_set_contains(const std::vector<uint64_t> &s, uint64_t k) {
     return std::binary_search(s.begin(), s.end(), k);
+}
+
+/* Lowest pack key for this texture hash, or 0.
+ *
+ * pack_key puts the texture hash in the HIGH 32 bits and g.known is sorted
+ * ascending, so a texture's palette variants form one contiguous run and this
+ * lands on the lowest palette hash. That determinism is the point: the first
+ * cut picked whichever filename directory_iterator happened to yield first,
+ * and that order is unspecified -- so which variant donated a texture's shape
+ * could differ between runs and between machines. */
+uint64_t key_set_first_tex(const std::vector<uint64_t> &s, uint32_t hash) {
+    const uint64_t lo = (uint64_t)hash << 32;
+    auto it = std::lower_bound(s.begin(), s.end(), lo);
+    if (it == s.end() || (uint32_t)(*it >> 32) != hash) return 0;
+    return *it;
 }
 
 /* Returns true if the key was newly inserted. */
@@ -301,6 +404,19 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
             if (std::strcmp(ext, "png") != 0) continue;   /* v1 decodes PNG only */
             key_set_insert(g.known, pack_key(h, p));
         }
+
+        /* Optional per-pack exclusions. */
+        if (FILE *f = std::fopen((g.pack_dir / "exclude.txt").string().c_str(), "r")) {
+            char line[128];
+            while (std::fgets(line, sizeof(line), f)) {
+                char *s = line;
+                while (*s == ' ' || *s == '\t') s++;
+                if (*s == '#' || *s == '\n' || *s == '\r' || *s == '\0') continue;
+                unsigned h = 0;
+                if (std::sscanf(s, "%x", &h) == 1) g.excluded.push_back(h);
+            }
+            std::fclose(f);
+        }
     }
 
     std::printf("[tex_pack] replace=%d dump=%d pack=%s (%zu entries) dump_dir=%s\n",
@@ -435,6 +551,269 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
     g.n_uploads++;
 }
 
+/* Is this replacement a single-colour MASK -- one ink colour plus holes?
+ *
+ * This is the gate on palette-agnostic substitution, and it has to be a
+ * property of the DATA, not a list of texture hashes we happen to know are
+ * fonts. Recolouring means throwing the image's RGB away and taking the colour
+ * from the live CLUT instead. That is exact when the image only ever had one
+ * colour to begin with -- a glyph, an icon, a HUD symbol -- and wrong for
+ * anything with internal colour structure, where it would flatten the artwork
+ * to a single hue. So: allow it only where there is nothing to lose.
+ *
+ * Alpha here is meaning, not opacity (0 = colour index 0, the cutout hole), so
+ * a pixel only counts as ink once it is past the same threshold the shader
+ * discards on. Anti-aliased edges keep the ink colour and vary alpha, so they
+ * do not make an image look multi-coloured. */
+static bool image_is_mask(const std::vector<uint8_t> &px, uint8_t *out_max) {
+    bool seen = false;
+    uint8_t r0 = 0, g0 = 0, b0 = 0;
+    for (size_t i = 0; i + 3 < px.size(); i += 4) {
+        if (px[i + 3] == 0) continue;             /* hole: carries no colour */
+        if (!seen) { r0 = px[i]; g0 = px[i + 1]; b0 = px[i + 2]; seen = true; continue; }
+        if (px[i] != r0 || px[i + 1] != g0 || px[i + 2] != b0) return false;
+    }
+    if (!seen) return false;
+    /* The shader divides the pack pixel's intensity by this to recover the
+     * antialiasing ramp, so a black ink would divide by zero. expand_texel
+     * writes alpha 127 for an STP-set texel BEFORE testing for black, so a
+     * black semi-transparent ink really can reach here. */
+    uint8_t mx = r0 > g0 ? r0 : g0;
+    if (b0 > mx) mx = b0;
+    if (mx == 0) return false;
+    *out_max = mx;
+    return true;
+}
+
+/* The palette index this image inks, taken from the source texels rather than
+ * assumed to be 1. Majority vote over texels whose image centre is inked, so a
+ * stray hand-drawn pixel cannot swing it. -1 when nothing qualifies. */
+static int mask_ink_index(const State::Repl &r, const Upload &up, int shift) {
+    if (r.src_w <= 0 || r.src_h <= 0) return -1;
+    const int k = r.w / (r.src_w > 0 ? r.src_w : 1);
+    if (k <= 0 || r.w != k * r.src_w || r.h != k * r.src_h) return -1;
+    const int per = 1 << shift, bpp = 16 >> shift, m = (1 << bpp) - 1;
+    uint32_t cnt[256] = {0};
+    for (int tv = 0; tv < r.src_h; tv++) {
+        for (int tu = 0; tu < r.src_w; tu++) {
+            const size_t si = (size_t)tv * up.w + (size_t)(tu >> shift);
+            if (si >= up.pixels.size()) continue;
+            const int idx = (up.pixels[si] >> ((tu & (per - 1)) * bpp)) & m;
+            const size_t c = (((size_t)(tv * k + k / 2) * r.w)
+                              + (size_t)(tu * k + k / 2)) * 4 + 3;
+            if (c < r.pixels.size() && r.pixels[c]) cnt[idx]++;
+        }
+    }
+    int best = -1;
+    uint32_t bestn = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i] > bestn) { bestn = cnt[i]; best = i; }
+    return bestn ? best : -1;
+}
+
+/* Decode a pack entry on first use. Caller holds g.mu. Returns null when there
+ * is no file for this key or it could not be decoded; the failure is cached so
+ * a broken entry is not reopened every frame. */
+State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
+                             int base_x, int base_y) {
+    for (State::Repl &r : g.repl) {
+        if (r.key == key)
+            return (r.tried && r.pixels.empty()) ? nullptr : &r;
+    }
+
+    State::Repl r;
+    r.key   = key;
+    r.tried = true;
+    r.src_w = up.w << shift;      /* upload width is halfwords; texels differ by depth */
+    r.src_h = up.h;
+    r.origin_u = (up.x - base_x) << shift;
+    r.origin_v = up.y - base_y;
+
+    char name[64];
+    std::snprintf(name, sizeof(name), "%x-%x.png",
+                  (unsigned)(key >> 32), (unsigned)(key & 0xFFFFFFFFu));
+    const std::filesystem::path path = g.pack_dir / name;
+
+    std::vector<uint8_t> file;
+    if (FILE *f = std::fopen(path.string().c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long len = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (len > 0) {
+            file.resize((size_t)len);
+            if (std::fread(file.data(), 1, file.size(), f) != file.size())
+                file.clear();
+        }
+        std::fclose(f);
+    }
+
+    int w = 0, h = 0, comp = 0;
+    stbi_uc *px = file.empty() ? nullptr
+                               : stbi_load_from_memory(file.data(), (int)file.size(),
+                                                       &w, &h, &comp, 4);
+    if (px && w > 0 && h > 0) {
+        r.w = w; r.h = h;
+        r.pixels.assign(px, px + (size_t)w * h * 4);
+        r.mask = image_is_mask(r.pixels, &r.img_max);
+        if (r.mask) {
+            r.ink_index = mask_ink_index(r, up, shift);
+            if (r.ink_index < 0) r.mask = false;
+        }
+        r.dec_shift = shift;
+        r.ana_src_w = r.src_w;
+        r.ana_src_h = r.src_h;
+        g.n_repl_decoded++;
+    } else {
+        g.n_repl_failed++;
+    }
+    if (px) stbi_image_free(px);
+
+    g.repl.push_back(std::move(r));
+    State::Repl &ins = g.repl.back();
+    return ins.pixels.empty() ? nullptr : &ins;
+}
+
+extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
+                                           uint16_t clut_y, uint16_t texpage,
+                                           TexPackRepl *out) {
+    if (!out) return 0;
+    if (!tex_pack_active() || !lim) return 0;
+
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.replace_on || !g.repl_apply || g.known.empty()) return 0;
+
+    int depth = (texpage >> 7) & 3;
+    if (depth > 2) depth = 2;
+    const int shift  = (depth == 0) ? 2 : (depth == 1) ? 1 : 0;
+    const int base_x = (texpage & 0xF) * 64;
+    const int base_y = ((texpage >> 4) & 1) * 256;
+
+    const int pal_n = (depth == 0) ? 16 : (depth == 1) ? 256 : 0;
+    const uint32_t pal = palette_hash(clut_x, clut_y, pal_n);
+
+    int rx, ry, rw, rh;
+    sampled_vram_rect(lim, base_x, base_y, shift, &rx, &ry, &rw, &rh);
+
+    /* Which upload actually BACKS this primitive, not merely which ones its
+     * sample rect brushes against.
+     *
+     * The matched-set bookkeeping in tex_pack_on_textured_prim intentionally
+     * uses overlap, because that is Beetle's rule for "this pack entry got
+     * asked for". Substituting pixels is a stricter question: the replacement
+     * image covers exactly one upload's rect, and UVs outside it address
+     * nothing. Taking the first OVERLAPPING upload that happened to have a pack
+     * entry substituted an unrelated texture under the primitive's own UVs --
+     * which is why every glyph vanished while the font's own key was still
+     * reported unmatched. It was sampling someone else's image.
+     *
+     * So: require CONTAINMENT, and scan newest-first, since a later upload to
+     * the same VRAM region is the live one. */
+    g.n_repl_calls++;
+    bool contained = false;
+    for (size_t i = g.uploads.size(); i-- > 0; ) {
+        const Upload &up = g.uploads[i];
+        if (rx < up.x || ry < up.y ||
+            rx + rw > up.x + up.w || ry + rh > up.y + up.h) continue;
+        contained = true;
+        uint64_t key = pack_key(up.hash, pal);
+        int recolour = 0;
+        if (!key_set_contains(g.known, key)) {
+            /* No file for this exact CLUT. We still know WHICH image this is --
+             * the texture hash identifies it -- we just do not know its colour.
+             * So borrow the texture's lowest-keyed variant for its SHAPE and
+             * resolve the colour from the live CLUT in the shader.
+             *
+             * A pack entry is keyed (texture, palette), but a game that
+             * recolours by swapping the CLUT -- fading text, flashing a
+             * selection, drawing a glyph once per outline offset -- walks
+             * through far more palettes than any pack ships, and every one of
+             * those draws would otherwise fall back to the original low-res
+             * texture. Gated on the borrowed image being a single-colour mask,
+             * where there is no colour structure to destroy. */
+            /* Palettised draws only. A 15bpp primitive has pal_n == 0 and hence
+             * pal == 0, so its exact key never matches and it would otherwise
+             * fall through to a 4bpp-dumped image whose src_w is four times
+             * wrong. There is also no CLUT to recolour from. */
+            if (pal_n == 0) continue;
+            const uint64_t donor = key_set_first_tex(g.known, up.hash);
+            if (!donor) { g.n_repl_notex++; continue; }
+            key = donor;
+            recolour = 1;
+        }
+        bool skip = false;
+        for (uint32_t ex : g.excluded) { if (ex == up.hash) { skip = true; break; } }
+        if (skip) continue;
+
+        State::Repl *r = repl_get_locked(key, up, shift, base_x, base_y);
+        if (!r) { g.n_repl_miss++; return 0; }
+        if (recolour) {
+            /* continue, not return: the neighbouring key and exclude tests both
+             * fall through to the next upload, and a newer non-mask upload must
+             * not block an older one that matches on its exact key. */
+            const int sw = up.w << shift;
+            if (!r->mask || r->ink_index < 0 ||
+                r->dec_shift != shift ||                    /* same texel depth */
+                r->ana_src_w != sw || r->ana_src_h != up.h  /* same texel grid  */) {
+                g.n_repl_multicol++;
+                continue;
+            }
+            g.n_repl_recolour++;
+        }
+
+        out->pixels   = r->pixels.data();
+        out->width    = r->w;
+        out->height   = r->h;
+        /* Cached from this entry's first decode. Recomputing them from the
+         * live draw is more correct in principle -- origin is relative to the
+         * CURRENT texture page -- but doing so visibly reintroduced the glyph
+         * seams the texel-centre fix removed, so the two are coupled and the
+         * live version needs the sampling reworked with it, not on its own. */
+        out->src_w    = r->src_w;
+        out->src_h    = r->src_h;
+        out->origin_u = r->origin_u;
+        out->origin_v = r->origin_v;
+        out->id       = r->key;
+        out->gl_handle = &r->gl_handle;
+        out->recolour  = recolour;
+        /* Written on EVERY success path: TexPackRepl is uninitialised stack
+         * in tex_pack_arm and glb_set_replacement reads it directly. */
+        out->ink_index = recolour ? r->ink_index : 0;
+        out->ref_max   = recolour ? (float)r->img_max / 255.0f : 1.0f;
+        g.n_repl_hit++;
+        return 1;
+    }
+    if (!contained) g.n_repl_nocontain++;
+    g.n_repl_miss++;
+    return 0;
+}
+
+extern "C" int tex_pack_replace_enabled(int set) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (set >= 0) g.repl_apply = set != 0;
+    return g.repl_apply ? 1 : 0;
+}
+
+extern "C" void tex_pack_note_armed(unsigned long long id,
+                                    int x0, int y0, int x1, int y1) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    for (State::Armed &a : g.armed) {
+        if (a.id == id) {
+            if (x0 < a.x0) a.x0 = (int16_t)x0;
+            if (y0 < a.y0) a.y0 = (int16_t)y0;
+            if (x1 > a.x1) a.x1 = (int16_t)x1;
+            if (y1 > a.y1) a.y1 = (int16_t)y1;
+            a.hits++;
+            return;
+        }
+    }
+    if (g.armed.size() >= 256) return;
+    State::Armed a;
+    a.id = id;
+    a.x0 = (int16_t)x0; a.y0 = (int16_t)y0;
+    a.x1 = (int16_t)x1; a.y1 = (int16_t)y1;
+    a.hits = 1;
+    g.armed.push_back(a);
+}
+
 extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
                                           uint16_t clut_y, uint16_t texpage) {
     if (!tex_pack_active() || !lim) return;
@@ -461,7 +840,56 @@ extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
         if (g.replace_on && key_set_contains(g.known, key)) key_set_insert(g.matched, key);
         if (g.dump_on && key_set_insert(g.dumped, key))
             dump_upload(up, depth, clut_x, clut_y, pal);
+
+        /* Census of distinct cells, only while dumping — this is an authoring
+         * tool and the linear scan below is not something a play session
+         * should carry. Capped; a font atlas needs a couple of hundred. */
+        if (g.dump_on && g.uv_rects.size() < 4096) {
+            const int ou = (up.x - base_x) << shift;
+            const int ov = up.y - base_y;
+            bool seen = false;
+            for (State::UvRect &r : g.uv_rects) {
+                if (r.key == key && r.u0 == lim[0] && r.v0 == lim[1] &&
+                    r.u1 == lim[2] && r.v1 == lim[3]) { r.hits++; seen = true; break; }
+            }
+            if (!seen) {
+                State::UvRect r;
+                r.key = key;
+                r.u0 = (uint16_t)lim[0]; r.v0 = (uint16_t)lim[1];
+                r.u1 = (uint16_t)lim[2]; r.v1 = (uint16_t)lim[3];
+                r.origin_u = (int16_t)ou; r.origin_v = (int16_t)ov;
+                r.hits = 1;
+                g.uv_rects.push_back(r);
+            }
+        }
     }
+}
+
+/* A filesystem path is not a JSON string. On Windows every separator in
+ * "C:\Users\..." reads as an escape, and "\U" is not a legal one, so a raw %s
+ * of a path produced a response no JSON parser would accept -- which is why
+ * this whole surface silently could not be read from the wire. */
+static std::string json_escape(const std::string &s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\\': o += "\\\\"; break;
+            case '"':  o += "\\\""; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", (unsigned)(unsigned char)c);
+                    o += b;
+                } else {
+                    o += c;
+                }
+        }
+    }
+    return o;
 }
 
 extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
@@ -470,20 +898,35 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
     int n = 0;
 
     if (!subcmd || !std::strcmp(subcmd, "stats")) {
+        const std::string pack_dir = json_escape(g.pack_dir.string());
+        const std::string dump_dir = json_escape(g.dump_dir.string());
         n = std::snprintf(out, (size_t)cap,
             "{\"replace\":%d,\"dump\":%d,\"pack_dir\":\"%s\",\"dump_dir\":\"%s\","
             "\"pack_entries\":%zu,\"pack_matched\":%zu,\"live_uploads\":%zu,"
             "\"uploads\":%llu,\"upload_dedup\":%llu,\"kills\":%llu,\"prims\":%llu,"
             "\"pal_hash\":%llu,\"pal_memo_hit\":%llu,\"dumped\":%zu,"
-            "\"dump_written\":%llu,\"dump_failed\":%llu}",
+            "\"dump_written\":%llu,\"dump_failed\":%llu,"
+            "\"repl_images\":%zu,\"repl_decoded\":%llu,\"repl_failed\":%llu,"
+            "\"repl_hit\":%llu,\"repl_miss\":%llu,"
+            "\"repl_recolour\":%llu,\"repl_multicol\":%llu,"
+            "\"repl_calls\":%llu,\"repl_nocontain\":%llu,"
+            "\"repl_notex\":%llu}",
             (int)g.replace_on, (int)g.dump_on,
-            g.pack_dir.string().c_str(), g.dump_dir.string().c_str(),
+            pack_dir.c_str(), dump_dir.c_str(),
             g.known.size(), g.matched.size(), g.uploads.size(),
             (unsigned long long)g.n_uploads, (unsigned long long)g.n_upload_dedup,
             (unsigned long long)g.n_kills, (unsigned long long)g.n_prims,
             (unsigned long long)g.n_pal_hash, (unsigned long long)g.n_pal_memo_hit,
             g.dumped.size(),
-            (unsigned long long)g.n_dump_written, (unsigned long long)g.n_dump_failed);
+            (unsigned long long)g.n_dump_written, (unsigned long long)g.n_dump_failed,
+            g.repl.size(),
+            (unsigned long long)g.n_repl_decoded, (unsigned long long)g.n_repl_failed,
+            (unsigned long long)g.n_repl_hit, (unsigned long long)g.n_repl_miss,
+            (unsigned long long)g.n_repl_recolour,
+            (unsigned long long)g.n_repl_multicol,
+            (unsigned long long)g.n_repl_calls,
+            (unsigned long long)g.n_repl_nocontain,
+            (unsigned long long)g.n_repl_notex);
     } else if (!std::strcmp(subcmd, "uploads")) {
         n = std::snprintf(out, (size_t)cap, "[");
         for (size_t i = 0; i < g.uploads.size() && n < cap - 64; i++) {
@@ -491,6 +934,53 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             n += std::snprintf(out + n, (size_t)(cap - n),
                                "%s{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hash\":\"%x\"}",
                                i ? "," : "", u.x, u.y, u.w, u.h, (unsigned)u.hash);
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "repl")) {
+        /* Each decoded replacement with the numbers that address it. If a
+         * texture draws blank, this is where to look first: src_w/src_h are
+         * the SOURCE size in texels and origin_u/v its offset within the
+         * texture page, and the shader maps (u - origin) / src into the image.
+         * Wrong values there sample outside the image and discard. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.repl.size() && n < cap - 160; i++) {
+            const State::Repl &r = g.repl[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"img_w\":%d,\"img_h\":%d,"
+                "\"src_w\":%d,\"src_h\":%d,\"origin_u\":%d,\"origin_v\":%d,"
+                "\"decoded\":%s}",
+                i ? "," : "",
+                (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
+                r.w, r.h, r.src_w, r.src_h, r.origin_u, r.origin_v,
+                r.pixels.empty() ? "false" : "true");
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "armed")) {
+        /* Every texture that actually got substituted, with the screen box its
+         * primitives covered. Cross-reference against where the HUD draws. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.armed.size() && n < cap - 128; i++) {
+            const State::Armed &a = g.armed[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"hits\":%u}",
+                i ? "," : "",
+                (unsigned)(a.id >> 32), (unsigned)(a.id & 0xFFFFFFFFu),
+                a.x0, a.y0, a.x1, a.y1, a.hits);
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "uvs")) {
+        /* Every distinct cell a draw addressed, per texture. For an atlas this
+         * IS the cell layout, stated by the game rather than inferred from the
+         * bitmap. Only populated while dumping. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.uv_rects.size() && n < cap - 128; i++) {
+            const State::UvRect &r = g.uv_rects[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"u0\":%u,\"v0\":%u,\"u1\":%u,\"v1\":%u,"
+                "\"ou\":%d,\"ov\":%d,\"hits\":%u}",
+                i ? "," : "",
+                (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
+                r.u0, r.v0, r.u1, r.v1, r.origin_u, r.origin_v, r.hits);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "dumped") || !std::strcmp(subcmd, "missing")) {

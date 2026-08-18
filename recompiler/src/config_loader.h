@@ -110,6 +110,31 @@ struct WidescreenCullKeepSite {
     uint32_t result = 0;   // forced comparison result (0 or 1)
 };
 
+// Screen-edge compare whose BOUND follows the live reveal margin, rather than
+// having its verdict pinned like a keep site.
+//
+// `keep` is right only for a separately proven binary decision. At a clip-code
+// packer it is wrong: pinning the classifier tells the clipper that nothing
+// crosses the screen edge, so crossing polygons are never subdivided, are
+// submitted with coordinates outside the GPU's legal primitive range, and the
+// hardware discards them whole. Moving the bound keeps the classification
+// honest and simply clips at the revealed edge.
+//
+// `mode` names which operand carries the bound and which way it travels. Every
+// mode is identity at margin 0, so 4:3 output stays bit-for-bit unchanged.
+enum class WsCullWidenMode {
+    ImmUpper,  // SLTI/SLTIU: coord < imm + m   (right/bottom edge)
+    ImmLower,  // SLTI/SLTIU: coord < imm - m   (left/top edge)
+    BoundRt,   // SLT/SLTU:   rs    < rt  + m   (coord in rs, bound in rt)
+    BoundRs,   // SLT/SLTU:   rs + m <  rt      (bound in rs, coord in rt)
+};
+
+struct WidescreenCullWidenSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded SLT/SLTU/SLTI/SLTIU instruction
+    WsCullWidenMode mode = WsCullWidenMode::ImmUpper;
+};
+
 // Aspect-scaled 12-bit angular half-extent. These sites load a positive angle
 // constant with `addi[u] rt,zero,imm`; the runtime widens tan(angle) by the
 // live horizontal reveal factor. Full-word guards prevent overlay-address
@@ -455,6 +480,28 @@ struct RuntimeConfig {
     // geometry_correction, which has no control at all); per-game with
     // [video] perspective_texturing = true.
     bool                  video_perspective_texturing = false;
+
+    // pgxp_depth: depth-test polygons using PGXP's recovered per-vertex W
+    // instead of relying solely on the ordering table.
+    //
+    // The PS1 has no depth buffer. Primitives are linked into an ordering table
+    // indexed by ONE averaged depth per primitive (AVSZ3/AVSZ4), quantised into
+    // a fixed number of buckets, and drawn back to front. Two polygons that
+    // interpenetrate — or sit near-coplanar in the same bucket — therefore
+    // resolve by submission order. The hardware cannot express the right
+    // answer, so no amount of faithful emulation produces one; WipEout 3's
+    // trackside scenery shows it as pipes sorting through walls.
+    //
+    // PGXP already recovers a precise per-vertex W, and the textured path
+    // already carries it to the shader as a_q, so this writes a real depth
+    // buffer from data that is present rather than deriving anything new.
+    //
+    // Default OFF, and for a stronger reason than perspective_texturing: this
+    // one CHANGES WHICH PIXELS SURVIVE. A primitive without valid W (2D, UI,
+    // anything the provenance test rejects) must not participate at all, or it
+    // depth-tests against garbage and disappears. Opt-in per game with
+    // [video] pgxp_depth = true.
+    bool                  video_pgxp_depth = false;
 
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
@@ -930,6 +977,7 @@ struct GameConfig {
     // where maximal overdraw is preferable to range guessing. Each entry is
     // guarded by the complete MIPS word; 4:3 executes the vanilla comparison.
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<WidescreenCullWidenSite> ws_cull_widen_sites;
     // Exact 12-bit angular half-extents used by terrain-cell frusta.
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     // Full-word-guarded model-participation cosine compares widened only in

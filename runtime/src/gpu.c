@@ -107,6 +107,34 @@ static WsUiPrepassItem ws_ui_prepass[WS_UI_PREPASS_MAX];
 static uint32_t ws_ui_prepass_count;
 static uint16_t ws_ui_prepass_rank = 0xFFFFu;
 
+/* Why a UI-looking primitive did NOT reach the squash partition.
+ *
+ * Every rejection here leaves a primitive at its raw 4:3 X while the cluster
+ * around it is squashed toward an anchor -- which is precisely how a HUD mark
+ * ends up stranded in open screen at a wide aspect. The gates are silent
+ * `return`s, so a stranded primitive is indistinguishable from one that was
+ * never drawn at all. These counters let ws_ui_groups name the responsible gate
+ * from a capture instead of it being guessed at. Diagnostic only; nothing in
+ * the transform path reads them. */
+static struct {
+    uint32_t opcode;      /* not in the textured quad / rect families      */
+    uint32_t not_axis;    /* textured quad, but not axis-aligned           */
+    uint32_t degenerate;  /* zero or negative extent                       */
+    uint32_t too_big;     /* full-screen or large-primitive reject         */
+    uint32_t cap;         /* WS_UI_PREPASS_MAX reached                     */
+    uint32_t rank;        /* admitted, then dropped by the max_rank filter */
+} ws_ui_reject;
+
+/* Geometry of the primitives the max_rank filter discarded. A count alone
+ * cannot say whether those are stray world geometry (fine to drop) or HUD
+ * marks belonging to a cluster that IS being squashed (not fine -- they are
+ * left behind at their 4:3 X). Small fixed ring; the filter typically drops a
+ * handful. */
+#define WS_UI_RANKDROP_MAX 8
+static struct { int32_t x, y, w, h; uint16_t rank; uint8_t op; }
+    ws_ui_rankdrop[WS_UI_RANKDROP_MAX];
+static uint32_t ws_ui_rankdrop_count;
+
 /* Wide-aspect mode: 0 = off (4:3 identity), 1 = squash (legacy hack — compress
  * a wider FOV into the 320 frame, present stretched), 2 = native-wide (render
  * the wider FOV into an actually wider frame and present 1:1; the GTE is NOT
@@ -625,6 +653,58 @@ int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
         const WsCullKeepSite *site = &ws_cull_keep_sites[i];
         if (site->address != phys || site->expected != instr) continue;
         if (out) *out = psx_ws_cull_keep_result(vanilla, site->result);
+        return 1;
+    }
+    return 0;
+}
+
+/* [[widescreen.cull.widen]] site registry — the interpreter's half.
+ *
+ * The recompiler emits the widened helper directly into native code, but the
+ * same PC can also execute under the dirty-RAM interpreter, or inside an
+ * overlay shard built without this config. Without a runtime lookup those
+ * paths would evaluate the VANILLA compare while the AOT image evaluates the
+ * widened one, so the same site would cull differently depending on which
+ * backend happened to run it. Registering the sites here keeps both paths on
+ * the same verdict, exactly as the keep registry above does. */
+typedef struct {
+    uint32_t address;
+    uint32_t expected;
+    uint32_t mode;   /* WsCullWidenMode: 0 imm_upper, 1 imm_lower,
+                      *                  2 bound_rt,  3 bound_rs */
+} WsCullWidenSite;
+static WsCullWidenSite ws_cull_widen_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_cull_widen_n = 0;
+
+void gpu_ws_set_cull_widen_sites(const uint32_t *addresses,
+                                 const uint32_t *expected,
+                                 const uint32_t *modes, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_cull_widen_n = nsites;
+    for (int i = 0; i < nsites; i++) {
+        ws_cull_widen_sites[i].address = addresses[i] & 0x1FFFFFFFu;
+        ws_cull_widen_sites[i].expected = expected[i];
+        ws_cull_widen_sites[i].mode = modes[i];
+    }
+}
+
+/* Returns 1 and writes the widened verdict when `pc`/`instr` is a registered
+ * widen site. `rs`/`rt` are the live operand values; `imm` the sign-extendable
+ * immediate for the SLTI forms. Identity at margin 0 in every mode. */
+int psx_ws_cull_widen_site(uint32_t pc, uint32_t instr, uint32_t rs,
+                           uint32_t rt, uint32_t imm, uint32_t *out) {
+    const uint32_t phys = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < ws_cull_widen_n; i++) {
+        const WsCullWidenSite *site = &ws_cull_widen_sites[i];
+        if (site->address != phys || site->expected != instr) continue;
+        if (!out) return 1;
+        switch (site->mode) {
+            case 0:  *out = (uint32_t)psx_ws_cull_slti(rs, imm);        break;
+            case 1:  *out = (uint32_t)psx_ws_cull_slti_lower(rs, imm);  break;
+            case 2:  *out = (uint32_t)psx_ws_cull_slt_widen(rs, rt, 1); break;
+            default: *out = (uint32_t)psx_ws_cull_slt_widen(rs, rt, 0); break;
+        }
         return 1;
     }
     return 0;
@@ -1387,6 +1467,29 @@ int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
     return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
 }
 
+/* Register-bound widen for `SLT rd, rs, rt` ([[widescreen.cull.widen]]).
+ *
+ * The keep-site helper above PINS a verdict, which is correct only for a
+ * separately proven binary decision. At a clip-code packer it is actively
+ * wrong: pinning the classifier tells the clipper nothing crosses the screen
+ * edge, so polygons that do are never subdivided, are submitted with
+ * coordinates outside the GPU's legal primitive range, and the hardware drops
+ * the whole primitive. Widening moves the BOUND instead, so the clipper still
+ * classifies correctly and simply clips at the revealed edge.
+ *
+ * `bound_is_rt` selects which operand carries the bound, which is the only
+ * thing that differs between the two idioms:
+ *   bound_is_rt : coord in rs, bound in rt -> rs <  rt + m   (upper edge)
+ *   otherwise   : bound in rs, coord in rt -> rs + m <  rt   (lower edge)
+ * Both reduce to the vanilla `(int32_t)rs < (int32_t)rt` at margin 0, so 4:3
+ * stays bit-for-bit identical. */
+int psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt) {
+    const int32_t m = psx_ws_x_margin();
+    const int32_t a = (int32_t)rs, b = (int32_t)rt;
+    return bound_is_rt ? ((a < b + m) ? 1 : 0)
+                       : ((a + m < b) ? 1 : 0);
+}
+
 /* Signed left-edge widen for the funnel's `bltz maxSX, reject`: reject only
  * when the prim ends left of the REVEALED edge (maxSX < -margin). Returns the
  * branch predicate. Identity at margin 0 (4:3). */
@@ -1603,10 +1706,25 @@ int psx_ws_backdrop_ring_json(char *buf, int cap) {
 int psx_ws_ui_groups_json(char *buf, int cap) {
     int off = snprintf(buf, (size_t)cap,
         "\"active\":%d,\"squash\":%d,\"dense\":%d,\"rank\":%d,"
-        "\"disp_x\":%d,\"disp_w\":%d,\"join_gap\":%d,\"n\":%u,\"items\":[",
+        "\"disp_x\":%d,\"disp_w\":%d,\"join_gap\":%d,"
+        "\"rejected\":{\"opcode\":%u,\"not_axis\":%u,\"degenerate\":%u,"
+        "\"too_big\":%u,\"cap\":%u,\"rank\":%u},"
+        "\"n\":%u,",
         ws_active(), ws_auto_ui_squash, ws_auto_ui_dense,
         ws_ui_prepass_rank != 0xFFFFu ? (int)ws_ui_prepass_rank : -1,
-        ws_disp_x(), ws_disp_w(), WS_UI_GROUP_JOIN_GAP, ws_ui_prepass_count);
+        ws_disp_x(), ws_disp_w(), WS_UI_GROUP_JOIN_GAP,
+        ws_ui_reject.opcode, ws_ui_reject.not_axis, ws_ui_reject.degenerate,
+        ws_ui_reject.too_big, ws_ui_reject.cap, ws_ui_reject.rank,
+        ws_ui_prepass_count);
+    off += snprintf(buf + off, (size_t)(cap - off), "\"rank_dropped\":[");
+    for (uint32_t i = 0; i < ws_ui_rankdrop_count && off < cap - 120; i++) {
+        off += snprintf(buf + off, (size_t)(cap - off),
+            "%s{\"op\":\"%02x\",\"rank\":%u,\"x\":%d,\"w\":%d,\"y\":%d,\"h\":%d}",
+            i ? "," : "", ws_ui_rankdrop[i].op, ws_ui_rankdrop[i].rank,
+            ws_ui_rankdrop[i].x, ws_ui_rankdrop[i].w,
+            ws_ui_rankdrop[i].y, ws_ui_rankdrop[i].h);
+    }
+    off += snprintf(buf + off, (size_t)(cap - off), "],\"items\":[");
     for (uint32_t i = 0; i < ws_ui_prepass_count && off < cap - 220; i++) {
         const WsUiPrepassItem *it = &ws_ui_prepass[i];
         /* Recover the key components so a split is attributable. Mirrors
@@ -3325,27 +3443,65 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
 }
 
+/* Arming rate for perspective-correct UVs, per condition.
+ *
+ * perspective_triangles alone cannot answer "how much texture warp is left",
+ * because it has no denominator: comparing it to gp0_draw mixes in untextured
+ * mono and gouraud primitives that are correctly never armed, and comparing it
+ * to a vertex-lookup count divided by three is the same error. `attempts`
+ * counts exactly the textured triangles that reach this predicate, so
+ * armed/attempts IS the perspective coverage, and the three reject counters
+ * say which condition is spending it. Diagnostic only. */
+static struct {
+    uint64_t attempts;      /* textured triangles submitted                 */
+    uint64_t armed;         /* got perspective-correct UVs                  */
+    uint64_t no_correction; /* texture correction off                       */
+    uint64_t no_source;     /* CPU-built primitive, no packet address       */
+    uint64_t no_depth;      /* a vertex had no recorded Z, or Z == 0        */
+} s_texcorr;
+
+void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
+                                  uint64_t *no_correction,
+                                  uint64_t *no_source, uint64_t *no_depth) {
+    if (attempts)      *attempts      = s_texcorr.attempts;
+    if (armed)         *armed         = s_texcorr.armed;
+    if (no_correction) *no_correction = s_texcorr.no_correction;
+    if (no_source)     *no_source     = s_texcorr.no_source;
+    if (no_depth)      *no_depth      = s_texcorr.no_depth;
+}
+
 /* Enable perspective UVs only when every position word came from an exact
  * SWC2 projection store at that same DMA packet address. This preserves the
  * association through ordering-table reordering and rejects CPU-built UI. */
 static void prepare_texture_triangle(int i0, int i1, int i2) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
-    if (!s_texture_correction_enabled || gp0_cmd_source_addr == 0xFFFFFFFFu)
-        return;
+    gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
+    s_texcorr.attempts++;
+    if (!s_texture_correction_enabled) { s_texcorr.no_correction++; return; }
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) { s_texcorr.no_source++; return; }
     int indices[3] = { i0, i1, i2 };
     uint16_t z[3];
     for (int i = 0; i < 3; i++) {
         uint32_t addr = psx_ram_map_read((gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFFFFu) & ~3u;
         if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
-            z[i] == 0)
+            z[i] == 0) {
+            s_texcorr.no_depth++;
             return;
+        }
     }
     float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
     float qmax = q[0];
     if (q[1] > qmax) qmax = q[1];
     if (q[2] > qmax) qmax = q[2];
-    if (qmax <= 0.0f) return;
+    if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
+    s_texcorr.armed++;
     gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
+    /* The magnitude the line above normalises away. q/qmax is a per-triangle
+     * relative weight -- correct for UV correction, and meaningless as a depth,
+     * because it cannot say where this triangle sits against any other. The
+     * real GTE screen Z is right here, so hand it over unscaled and let the
+     * backend map it to NDC. */
+    gr_set_depth_triangle(1, (float)z[0], (float)z[1], (float)z[2]);
 }
 
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
@@ -4014,6 +4170,16 @@ static void gp0_exec_mono_rect(void) {
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
     ws_expand_fullscreen_rect(&x0, y0, &w, h);
+    /* Same auto_ui squash the textured rect path gets. Without it a flat
+     * -coloured HUD mark keeps its 4:3 X while the textured primitives of the
+     * same widget move toward their anchor, so at a wide aspect it is left
+     * behind in open screen. Untouched when the prepass did not admit this
+     * primitive, and rects never carry GTE output. */
+    if (ws_active() && w > 0) {
+        int corrected_w = w;
+        if (ws_auto_ui_transform_rect(&x0, y0, &corrected_w, h))
+            w = corrected_w;
+    }
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     if (draw_area_out_rect(x0, y0, w, h)) return;
@@ -4078,6 +4244,7 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
+    ws_sprt_fixed_transform(&x, y, 1);   /* auto_ui squash; no-op when unadmitted */
     x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
     if (draw_area_out_point(x, y)) return;
@@ -4119,11 +4286,15 @@ static void gp0_exec_mono_8x8(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    int ws_w = ws_sprt_fixed_transform(&x0, y0, 8);
     x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    if (draw_area_out_rect(x0, y0, 8, 8)) return;
-    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_rect(x0, y0, 8, 8, color);
+    {
+        int dw = (ws_w && ws_w != 8) ? ws_w : 8;
+        if (draw_area_out_rect(x0, y0, dw, 8)) return;
+        gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+        gr_draw_flat_rect(x0, y0, dw, 8, color);
+    }
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
@@ -4534,8 +4705,8 @@ static int gp0_command_word_count(uint8_t opcode) {
 
 static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
                               uint16_t rank) {
-    if (ws_ui_prepass_count >= WS_UI_PREPASS_MAX || rank == 0xFFFFu)
-        return;
+    if (rank == 0xFFFFu) return;
+    if (ws_ui_prepass_count >= WS_UI_PREPASS_MAX) { ws_ui_reject.cap++; return; }
     uint32_t op = words[0] >> 24;
     int32_t min_x, max_x, min_y, max_y;
 
@@ -4552,7 +4723,7 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
         int32_t vx[4], vy[4];
         for (int i = 0; i < 4; i++)
             parse_vertex(words[indices[i]], &vx[i], &vy[i]);
-        if (!ws_axis_aligned_quad(vx, vy)) return;
+        if (!ws_axis_aligned_quad(vx, vy)) { ws_ui_reject.not_axis++; return; }
         min_x = max_x = vx[0]; min_y = max_y = vy[0];
         for (int i = 1; i < 4; i++) {
             if (vx[i] < min_x) min_x = vx[i];
@@ -4560,35 +4731,59 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
             if (vy[i] < min_y) min_y = vy[i];
             if (vy[i] > max_y) max_y = vy[i];
         }
-    } else if ((op >= 0x64u && op <= 0x67u) ||
-               (op >= 0x74u && op <= 0x77u) ||
-               (op >= 0x7Cu && op <= 0x7Fu)) {
+    } else if (op >= 0x60u && op <= 0x7Fu) {
+        /* GP0 rectangle / sprite. Bits 4-3 select the size (00 variable,
+         * 01 1x1, 10 8x8, 11 16x16) and bit 2 whether it is textured.
+         *
+         * Only the TEXTURED families used to be admitted here, which silently
+         * dropped every flat-coloured HUD mark. Those then kept their raw 4:3
+         * X while the textured primitives beside them were squashed toward an
+         * anchor -- so at a wide aspect they were left stranded in open screen,
+         * to the left of the cluster they belong to. A GP0 rectangle is always
+         * screen-space and never carries GTE output, so admitting the whole
+         * range cannot reach world geometry. */
+        const unsigned size_sel = (op >> 3) & 3u;
+        const int textured = (op >> 2) & 1;
         parse_vertex(words[1], &min_x, &min_y);
         int32_t width, height;
-        if (op >= 0x64u && op <= 0x67u) {
-            width = (int32_t)(words[3] & 0x3FFu);
-            height = (int32_t)((words[3] >> 16) & 0x1FFu);
+        if (size_sel == 0u) {
+            if (textured) {
+                width  = (int32_t)(words[3] & 0x3FFu);
+                height = (int32_t)((words[3] >> 16) & 0x1FFu);
+            } else {
+                /* Mirrors gp0_exec_mono_rect: the full 16-bit field, then
+                 * clamped to the hardware maximum. */
+                width  = (int32_t)(words[2] & 0xFFFFu);
+                height = (int32_t)((words[2] >> 16) & 0xFFFFu);
+                if (width > 1023) width = 1023;
+                if (height > 511)  height = 511;
+            }
         } else {
-            width = height = op >= 0x7Cu ? 16 : 8;
+            width = height = size_sel == 1u ? 1 : (size_sel == 2u ? 8 : 16);
         }
-        if (width <= 0 || height <= 0) return;
+        if (width <= 0 || height <= 0) { ws_ui_reject.degenerate++; return; }
         max_x = min_x + width;
         max_y = min_y + height;
     } else {
+        ws_ui_reject.opcode++;
         return;
     }
 
     int32_t width = max_x - min_x, height = max_y - min_y;
     int32_t X = ws_disp_x(), W = ws_disp_w(), H = ws_disp_h();
     if ((min_x <= X && max_x >= X + W && min_y <= 0 && max_y >= H) ||
-        (width > W / 2 && height > H / 4))
+        (width > W / 2 && height > H / 4)) {
+        ws_ui_reject.too_big++;
         return;
+    }
 
     WsUiPrepassItem *item = &ws_ui_prepass[ws_ui_prepass_count++];
     item->group.key =
         ws_auto_ui_group_key_words(words, op, min_y, height);
     item->group.x = min_x - X;
     item->group.width = width;
+    item->group.y = min_y;
+    item->group.height = height;
     item->group.anchor = 0;
     item->group.root = ws_ui_prepass_count - 1u;
     item->src_addr = psx_ram_map_read(source_addr & 0x1FFFFFFFu) & ~3u;
@@ -4602,6 +4797,9 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
     ws_ui_prepass_count = 0;
     ws_ui_prepass_rank = 0xFFFFu;
     ws_auto_ui_dense = 0;
+    ws_ui_reject.opcode = ws_ui_reject.not_axis = ws_ui_reject.degenerate =
+        ws_ui_reject.too_big = ws_ui_reject.cap = ws_ui_reject.rank = 0;
+    ws_ui_rankdrop_count = 0;
     if (!ws_auto_ui_squash || !ws_active()) return;
 
     uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
@@ -4668,9 +4866,20 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
 
     uint32_t out = 0;
     for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
-        if (ws_ui_prepass[i].ot_rank == max_rank)
+        if (ws_ui_prepass[i].ot_rank == max_rank) {
             ws_ui_prepass[out++] = ws_ui_prepass[i];
+        } else if (ws_ui_rankdrop_count < WS_UI_RANKDROP_MAX) {
+            const WsUiPrepassItem *it = &ws_ui_prepass[i];
+            ws_ui_rankdrop[ws_ui_rankdrop_count].x    = it->group.x;
+            ws_ui_rankdrop[ws_ui_rankdrop_count].w    = it->group.width;
+            ws_ui_rankdrop[ws_ui_rankdrop_count].y    = it->y;
+            ws_ui_rankdrop[ws_ui_rankdrop_count].h    = it->h;
+            ws_ui_rankdrop[ws_ui_rankdrop_count].rank = it->ot_rank;
+            ws_ui_rankdrop[ws_ui_rankdrop_count].op   = it->op;
+            ws_ui_rankdrop_count++;
+        }
     }
+    ws_ui_reject.rank = ws_ui_prepass_count - out;
     ws_ui_prepass_count = out;
     /*
      * A high final-layer primitive count is a good "dense 2D menu" signal for
@@ -4690,8 +4899,13 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
         groups[i] = ws_ui_prepass[i].group;
     ws_ui_group_assign(groups, ws_ui_prepass_count, ws_disp_w(),
                        ws_auto_ui_dense);
-    for (uint32_t i = 0; i < ws_ui_prepass_count; i++)
+    for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
         ws_ui_prepass[i].group.anchor = group_origin + groups[i].anchor;
+        /* Copy the union-find root back too. Without this ws_ui_groups reports
+         * the stale insert-time index, which reads as "nothing merged" even
+         * when runs formed -- the exact question the command exists to answer. */
+        ws_ui_prepass[i].group.root = groups[i].root;
+    }
 }
 
 /* Per-opcode execution counters (exposed via gpu_get_opcode_stats) */
@@ -5080,9 +5294,12 @@ static void gp0_execute_command(void) {
             uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+            int ws_w = ws_sprt_fixed_transform(&x0, y0, 16);
+            x0 += ws_nw_hud_shift(x0, 16);
             x0 += draw_offset_x; y0 += draw_offset_y;
             gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-            gr_draw_flat_rect(x0, y0, 16, 16, color);
+            gr_draw_flat_rect(x0, y0, (ws_w && ws_w != 16) ? ws_w : 16, 16,
+                              color);
             break;
         }
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:

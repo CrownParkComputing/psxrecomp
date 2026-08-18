@@ -1132,6 +1132,9 @@ static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
  * SXY readback are untouched. Default off = the faithful floor. */
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
+/* [video] pgxp_depth — depth-test using PGXP's recovered W instead of relying
+ * solely on the ordering table. See gl_renderer_set_pgxp_depth. */
+static int           g_video_pgxp_depth = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -1540,6 +1543,11 @@ extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
 static bool          g_ws_engaged = true;
+/* Fill the pillarbox margins of a 4:3-pinned present with the frame's own edge
+ * columns instead of black (gl_renderer_set_pillarbox_edge_fill). Game-facing
+ * look for 2D screens on a very wide display; live-toggled by the
+ * ws_menu_edge_fill debug command for A/B. */
+extern "C" { int g_ws_menu_edge_fill_flag = 1; }   /* ws_menu_edge_fill command */
 /* Wide-aspect strategy: native-wide (render the wider FOV into a wider frame,
  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
@@ -6932,6 +6940,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * locked: we squash IFF we stretch. depth24 always classifies as FMV
          * even if the ws layer is not engaged yet (4:3 titles). */
         fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* 2D screens (title, menus, loading) are deliberately kept at 4:3 by the
+         * 3D-gated widescreen layer, which on a 32:9 display leaves them as a
+         * small island in a mostly black window. Extend their own edge columns
+         * across the margins instead. Never for MDEC video: those edge pixels
+         * are real picture content and smear.
+         *
+         * Deliberately NOT gated on g_ws_engaged. Engagement means "the GTE
+         * squash is running on gameplay frames", and it is false during boot,
+         * the memory-card load and the title screen -- precisely the screens
+         * this is for. gl_renderer_present only fills when the present is
+         * actually pillarboxed, so a 4:3 window has no margins to fill and this
+         * costs nothing there. */
+        if (g_gl_active)
+            gl_renderer_set_pillarbox_edge_fill(
+                g_ws_menu_edge_fill_flag && !di.depth24);
         /* MDEC movies are already decoded at their authored cadence and are
          * CPU/upload heavy. High-refresh crossfades only contend with decoding
          * and can starve audio, so present native-4:3/MDEC phases directly.
@@ -11331,6 +11354,7 @@ int main(int argc, char** argv) {
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
+            g_video_pgxp_depth = gc.runtime.video_pgxp_depth ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
@@ -11439,6 +11463,20 @@ int main(int argc, char** argv) {
                 }
                 gpu_ws_set_cull_keep_sites(
                     addresses.data(), expected.data(), results.data(),
+                    (int)addresses.size());
+            }
+            {
+                std::vector<uint32_t> addresses, expected, modes;
+                addresses.reserve(gc.ws_cull_widen_sites.size());
+                expected.reserve(gc.ws_cull_widen_sites.size());
+                modes.reserve(gc.ws_cull_widen_sites.size());
+                for (const auto& site : gc.ws_cull_widen_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                    modes.push_back((uint32_t)site.mode);
+                }
+                gpu_ws_set_cull_widen_sites(
+                    addresses.data(), expected.data(), modes.data(),
                     (int)addresses.size());
             }
             {
@@ -13123,7 +13161,19 @@ session_reboot:
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
     if (g_video_scale < 1) g_video_scale = 1;
-    if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
+    /* The ceiling is per-backend, not global. SW_MAX_INTERNAL_SCALE exists
+     * because the software path allocates a VRAM-sized hi-res MIRROR that costs
+     * 1 MB * scale^2; under GL that mirror stays at 1x (glb_set_scale) and the
+     * cost is an FBO instead, so GL can go considerably higher. Applying the
+     * software limit to every backend capped GL at 4x -- about 2048x960
+     * internal -- which is well short of 1440p/4K/8K on hardware that can
+     * trivially do it. The GL backend clamps again to the driver's real texture
+     * limit once the context exists. */
+    {
+        const int max_scale = (g_video_renderer == 1) ? GL_MAX_INTERNAL_SCALE
+                                                      : SW_MAX_INTERNAL_SCALE;
+        if (g_video_scale > max_scale) g_video_scale = max_scale;
+    }
     if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
         gr_set_scale(g_video_scale);
         if (g_video_scale > 1) {
@@ -13179,6 +13229,10 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
+    if (g_video_pgxp_depth)
+        std::fprintf(stdout, "psxrecomp: PGXP depth buffer on (ordering-table "
+                             "sort augmented by recovered per-vertex W)\n");
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */

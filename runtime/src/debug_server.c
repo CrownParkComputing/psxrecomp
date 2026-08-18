@@ -28,6 +28,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "tex_pack.h"     /* HD texture replacement state (tex_pack command) */
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
@@ -5205,10 +5206,19 @@ static void handle_geom_correction(int id, const char *json)
      * but described a different word (stale = provenance hole to hunt). */
     PGXPStats ps;
     pgxp_get_stats(&ps);
+    /* Perspective arming, with its real denominator. perspective_triangles on
+     * its own could only be compared against gp0_draw, which counts untextured
+     * primitives that are correctly never armed — so it read as a coverage
+     * figure without being one. texcorr.attempts counts exactly the textured
+     * triangles that reach the predicate. */
+    uint64_t tc_att = 0, tc_arm = 0, tc_off = 0, tc_nosrc = 0, tc_noz = 0;
+    gpu_texture_correction_stats(&tc_att, &tc_arm, &tc_off, &tc_nosrc, &tc_noz);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"geometry_correction\":%d,"
              "\"geometry_vertex_hits\":%u,"
              "\"perspective_triangles\":%u,"
+             "\"texcorr\":{\"attempts\":%llu,\"armed\":%llu,"
+             "\"no_correction\":%llu,\"no_source\":%llu,\"no_depth\":%llu},"
              "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
              "\"pgxp\":{\"enabled\":%d,\"cpu_mode\":%d,\"tolerance\":%.3f,"
              "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
@@ -5219,6 +5229,9 @@ static void handle_geom_correction(int id, const char *json)
              gte_geometry_correction_enabled(),
              (unsigned)hits,
              (unsigned)gpu_texture_correction_hits(),
+             (unsigned long long)tc_att, (unsigned long long)tc_arm,
+             (unsigned long long)tc_off, (unsigned long long)tc_nosrc,
+             (unsigned long long)tc_noz,
              (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
              pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
              (unsigned long long)ps.lookups,
@@ -7863,6 +7876,87 @@ static void handle_ws_ui_groups(int id, const char *json)
     int hdr  = snprintf(buf, cap, "{\"id\":%d,\"ok\":true,", id);
     int body = psx_ws_ui_groups_json(buf + hdr, (int)cap - hdr - 4);
     snprintf(buf + hdr + body, cap - (size_t)(hdr + body), "}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+/* pgxp_depth [on=0/1]: depth-test using PGXP's recovered per-vertex W.
+ *
+ * Live, because this one changes WHICH PIXELS SURVIVE and the only honest test
+ * is flipping it on the same scene. No args = report. */
+static void handle_pgxp_depth(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", -1);
+    extern void  gl_renderer_set_pgxp_zscale(float s);
+    extern float gl_renderer_pgxp_zscale(void);
+    const int zs = json_get_int(json, "zscale", -1);
+    if (zs > 0) gl_renderer_set_pgxp_zscale((float)zs);
+    extern void gl_renderer_set_zdebug(int on);
+    const int zdbg = json_get_int(json, "zdebug", -1);
+    if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
+    if (on >= 0) gl_renderer_set_pgxp_depth(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_pgxp_depth());
+}
+
+/* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
+ *
+ * The 3D-gated widescreen layer keeps 2D screens (title, menus, loading) at
+ * 4:3, which on a very wide display leaves them as an island in a black
+ * window. With this on, the frame's own edge columns are extended across the
+ * margins instead. It is a look, not a correctness fix — it smears where the
+ * edge pixels are busy — so it needs a live A/B rather than a rebuild.
+ * No args = report. */
+static void handle_ws_menu_edge_fill(int id, const char *json)
+{
+    extern int g_ws_menu_edge_fill_flag;
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) g_ws_menu_edge_fill_flag = on ? 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, g_ws_menu_edge_fill_flag);
+}
+
+/* tex_pack [sub=stats|uploads|dumped|missing]: HD texture replacement state.
+ *
+ * tex_pack.cpp has carried tex_pack_debug_json since it was written, but it was
+ * never reachable from the wire -- so "is the pack actually matching?" could
+ * only be answered by looking at the screen and guessing. That is precisely the
+ * question that decides whether a Beetle-authored pack is compatible at all,
+ * and "missing" (pack entries no draw has claimed yet) is the authoring aid for
+ * building a new one. Defaults to stats. */
+static void handle_tex_pack(int id, const char *json)
+{
+    /* repl=0/1 toggles substitution live. An A/B that needs a rebuild is an
+     * A/B that does not get run. */
+    const int dbg = json_get_int(json, "repl_debug", -1);
+    if (dbg >= 0) {
+        extern int g_repl_debug;
+        g_repl_debug = dbg ? 1 : 0;
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl_debug\":%d}", id, g_repl_debug);
+        return;
+    }
+    const int repl = json_get_int(json, "repl", -1);
+    if (repl >= 0) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl\":%d}",
+                 id, tex_pack_replace_enabled(repl));
+        return;
+    }
+
+    char sub[32];
+    if (!json_get_str(json, "sub", sub, sizeof(sub)))
+        strncpy(sub, "stats", sizeof(sub) - 1);
+    sub[sizeof(sub) - 1] = '\0';
+
+    const int cap = 1 << 16;
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    /* tex_pack_debug_json emits a complete JSON VALUE — an object for "stats",
+     * an array for the others — so it has to be given a key, not spliced in as
+     * bare fields. */
+    int hdr = snprintf(buf, (size_t)cap,
+                       "{\"id\":%d,\"ok\":true,\"active\":%d,\"%s\":",
+                       id, tex_pack_active(), sub);
+    int body = tex_pack_debug_json(sub, buf + hdr, cap - hdr - 4);
+    if (body <= 0) { free(buf); send_err(id, "unknown sub"); return; }
+    snprintf(buf + hdr + body, 4, "}");
     debug_server_send_line(buf);
     free(buf);
 }
@@ -13332,6 +13426,9 @@ static const CmdEntry s_commands[] = {
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_ui_groups",      handle_ws_ui_groups },
+    { "tex_pack",          handle_tex_pack },
+    { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
+    { "pgxp_depth",        handle_pgxp_depth },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },

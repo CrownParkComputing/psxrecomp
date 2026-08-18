@@ -212,6 +212,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
     std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
+    std::vector<PSXRecompV4::WidescreenCullWidenSite> ws_cull_widen;
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
     PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
     int                   ws_cull_activation_guard_pixels = 0;
@@ -275,6 +276,7 @@ int main(int argc, char** argv) {
         ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
         ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
         ws_cull_keep = cfg.ws_cull_keep_sites;
+        ws_cull_widen = cfg.ws_cull_widen_sites;
         ws_cull_angle = cfg.ws_cull_angle_sites;
         ws_aspect_cone = cfg.ws_aspect_cone;
         ws_cull_activation_guard_pixels =
@@ -370,6 +372,7 @@ int main(int argc, char** argv) {
         ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
         ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
         if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
+        if (ws_cull_widen.empty()) ws_cull_widen = wscfg.ws_cull_widen_sites;
         if (ws_cull_angle.empty()) ws_cull_angle = wscfg.ws_cull_angle_sites;
         if (ws_aspect_cone.sites.empty())
             ws_aspect_cone = wscfg.ws_aspect_cone;
@@ -1234,6 +1237,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
     codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
     codegen_config.ws_cull_keep_sites = ws_cull_keep;
+    codegen_config.ws_cull_widen_sites = ws_cull_widen;
     codegen_config.ws_cull_angle_sites = ws_cull_angle;
     codegen_config.ws_aspect_cone = ws_aspect_cone;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;

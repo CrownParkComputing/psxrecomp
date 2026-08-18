@@ -67,6 +67,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "tex_pack.h"     /* TexPackRepl — HD replacement handed to the draw */
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
 #include "host_time.h"
@@ -113,6 +114,8 @@
 #define PSXGL_DEPTH24_STENCIL8      0x88F0
 #define PSXGL_R16UI                 0x8234
 #define PSXGL_RED_INTEGER           0x8D94
+#define PSXGL_BGRA                  0x80E1  /* host-order ARGB readback */
+#define PSXGL_PACK_ROW_LENGTH       0x0D02  /* glReadPixels dest pitch, in PIXELS */
 #define PSXGL_FUNC_ADD              0x8006
 #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
 #define PSXGL_CONSTANT_ALPHA        0x8003
@@ -127,7 +130,8 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
-#define GL_MAX_INTERNAL_SCALE 4
+/* GL_MAX_INTERNAL_SCALE lives in gpu_render.h — main.cpp needs it to pick the
+ * per-backend ceiling before the GL context exists. */
 
 /* ---- Loaded modern-GL entry points ------------------------------------- */
 typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
@@ -146,6 +150,7 @@ typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
+typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
@@ -155,6 +160,7 @@ typedef void   (APIENTRY *PFN_glBlendEquationSeparate)(GLenum, GLenum);
 typedef void   (APIENTRY *PFN_glGenVertexArrays)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindVertexArray)(GLuint);
 typedef void   (APIENTRY *PFN_glActiveTexture)(GLenum);
+typedef void   (APIENTRY *PFN_glGenerateMipmap)(GLenum);
 typedef void   (APIENTRY *PFN_glGenBuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindBuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glBufferData)(GLenum, ptrdiff_t, const void *, GLenum);
@@ -212,6 +218,7 @@ static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
 static PFN_glUniform2i         p_glUniform2i;
+static PFN_glUniform2f         p_glUniform2f;
 static PFN_glUniform4i         p_glUniform4i;
 static PFN_glUniform2f         p_glUniform2f;
 static PFN_glUniform4f         p_glUniform4f;
@@ -221,6 +228,7 @@ static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
 static PFN_glBindVertexArray   p_glBindVertexArray;
 static PFN_glActiveTexture     p_glActiveTexture;
+static PFN_glGenerateMipmap    p_glGenerateMipmap;
 static PFN_glGenBuffers        p_glGenBuffers;
 static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
@@ -283,6 +291,7 @@ static int load_modern_gl(void) {
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
+    LOAD(p_glGenerateMipmap, "glGenerateMipmap");
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
@@ -336,6 +345,10 @@ static int           s_osd_tw = 0, s_osd_th = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static void          gl_swap_with_osd(void);
 static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+/* Extend the frame's edge columns into the pillarbox margins of a 4:3-pinned
+ * present instead of leaving them black. Off unless a game asks for it: it is
+ * a deliberate look, and it is wrong for content whose edge pixels are busy. */
+static int           s_pillarbox_edge_fill = 0;
 static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
 static GLint         s_present_uSharp = -1;
 static GLuint        s_interp_prog = 0, s_interp_tex[3];
@@ -380,6 +393,59 @@ static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 /* Programs. */
 static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+/* HD texture replacement. Deliberately a SEPARATE program and a separate draw
+ * (draw_repl_prim) rather than a mode inside the batch: a replaced prim binds a
+ * different texture through different uniforms, so folding it into
+ * flush_tex_batch meant routing that function's uniform writes through
+ * indirection — and getting that subtly wrong silently broke every UI draw,
+ * including with replacement disabled. Keeping the batch path byte-identical to
+ * the version without this feature makes that class of bug impossible. */
+static GLuint s_repl_prog = 0;
+static GLint  s_uReplTex = -1, s_uReplOrigin = -1, s_uReplSrc = -1;
+static GLint  s_uReplMaskset = -1, s_uReplSemipass = -1, s_uReplSemimode = -1;
+static GLint  s_uReplDebug = -1;
+static GLint  s_uReplVram = -1, s_uReplRecolour = -1;
+static GLint  s_uReplInk = -1, s_uReplRefMax = -1;
+static int    s_repl_recolour = 0, s_repl_ink = 0;   /* armed alongside s_repl_tex */
+static float  s_repl_ref_max = 1.0f;
+int g_repl_debug = 0;               /* tex_pack repl_debug=1 */
+/* TEX_VS's projection uniforms, for the REPLACEMENT program's own copy.
+ *
+ * Uniforms are per-program. s_geo_prog and s_tex_prog get these initialised at
+ * startup precisely because, as the comment there says, GLSL zeroes them and
+ * that collapses every x to u_xcenter — and u_xhalf = 0 divides by zero on top.
+ * s_repl_prog sharing the vertex SOURCE does not share its uniform state, so
+ * without this every replaced primitive was a degenerate off-screen triangle
+ * and rasterized nothing at all. That, not sampling or masking, is why the 2D
+ * layer vanished whenever a pack was enabled. */
+static GLint s_repl_uXoff = -1, s_repl_uXhalf = -1;
+static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
+
+/* PGXP depth ([video] pgxp_depth). Off is the shipped default and must be
+ * bit-identical to a build without the feature: the shader's z term is 0, the
+ * depth test stays disabled, and the buffer is never cleared. */
+static int   s_pgxp_depth = 0;         /* configured */
+static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
+static int   s_zdebug = 0;             /* paint depth as greyscale       */
+static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
+/* Near plane in GTE Z units for the reciprocal depth map.
+ *
+ * MUST sit at or below the smallest Z the scene produces, because the map
+ * clamps with max(a_z, zn): anything nearer collapses onto the near plane and
+ * then occludes everything drawn after it. At 128 that swallowed the track
+ * under the camera, which in turn hid the ship completely.
+ *
+ * A sweep that scored 'distinct depth levels used' picked 128 and was
+ * exactly backwards -- clamping the near field concentrates the remainder
+ * into more visible levels, so the broken value scored best. 1 clamps
+ * nothing (Z is at least 1) and only costs far-field precision, which a
+ * 24-bit buffer still resolves. */
+static float s_pgxp_zscale = 1.0f;
+static GLint s_tex_uZscale = -1, s_repl_uZscale = -1;
+static GLint s_tex_uZdebug = -1, s_repl_uZdebug = -1;
+static GLint s_tex_uDepthOn = -1, s_repl_uDepthOn = -1;
+static GLuint s_repl_tex = 0;                       /* armed for the next prim */
+static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
 /* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
  * semi(1) q(1)
  * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch).
@@ -387,7 +453,7 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
  * fragment shader read the noperspective varying — i.e. bit-identical to the
  * pre-feature pipeline. */
-#define TEXV 20
+#define TEXV 21
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
@@ -399,6 +465,8 @@ static int     s_pc_valid = 0;                  /* sub-pixel positions present *
 static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  */
 static int     s_pq_valid = 0;                  /* perspective weights present */
 static float   s_pq[3];
+static int     s_pz_valid = 0;
+static float   s_pz[3];      /* absolute GTE screen Z, 0..65535 */
 
 /* TEX program uniforms. */
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
@@ -434,6 +502,10 @@ int g_ws_bd_phase_mode   = 1;   /* (retained for the debug command; unused since
  * batch's gate (batch flushes when a prim's gate differs, so a batch is uniform). */
 static int s_bd_gate = 0;
 static int s_tb_gate = 0;
+/* Whether the open batch's prims carry recovered W, so depth may apply. It is
+ * a batch KEY below, because a batch mixing prims with and without provenance
+ * could not be given one depth state. */
+static int s_tb_depth = 0;
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
@@ -1044,11 +1116,14 @@ static const char *TEX_VS =
     "layout(location=7) in vec4 a_limits;\n"
     "layout(location=8) in float a_semi;\n"
     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
+    "layout(location=10) in float a_z;  /* absolute GTE screen Z; 0 = none    */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+    "uniform int   u_depth_on;/* PGXP depth: write z from a_q; 0 = flat */\n"
+    "uniform float u_zscale; /* GTE screen-Z full scale; see gl_renderer_set_pgxp_zscale */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
     "flat out int v_persp;\n"
@@ -1074,7 +1149,171 @@ static const char *TEX_VS =
     "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
     "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
-    "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
+    /* PGXP depth (u_depth_on). a_q is the normalised 1/z the projection
+     * recovered, so 1 - a_q rises with distance and gives a depth that sorts
+     * correctly where the ordering table's one-bucket-per-primitive cannot.
+     * Multiplied by w because the pipeline divides by it, leaving exactly
+     * 1 - a_q in NDC. Zero when off, which is the original expression. */
+    /* Depth from the ABSOLUTE screen Z, not from a_q. a_q is q/qmax, normalised
+     * within one triangle, so it says nothing about where this triangle sits
+     * against any other -- deriving depth from it gave every triangle its own
+     * private 0..1 range and shattered the scene. The GTE's 16-bit screen Z is
+     * a single global scale, so map it straight to NDC. Multiplied by w because
+     * the pipeline divides by it. */
+    /* Reciprocal (perspective) depth, not linear. A linear map has to pick a
+     * far value and CLAMP past it, and everything beyond collapses onto the far
+     * plane with no ordering left among it -- which is most of a race track.
+     * 1 - 2*zn/z is monotonic over the whole 1..65535 range with no clamp, and
+     * spends its precision near the camera where overlaps actually happen,
+     * exactly as a hardware perspective depth buffer does. u_zscale is the near
+     * plane in GTE Z units. */
+    "  float zn = 1.0 - 2.0 * u_zscale / max(a_z, u_zscale);\n"
+    "  float zc = (u_depth_on == 0) ? 0.0\n"
+    "           : ((a_z > 0.0) ? zn * w : -w);\n"
+    "  gl_Position = vec4(ndc * w, zc, w); }\n";
+/* HD replacement fragment program. Shares TEX_VS, so position handling — the
+ * u_shift grid alignment, the native-wide x transforms, the perspective w
+ * divide — is bit-identical to the normal textured path; only the texel fetch
+ * differs. Instead of indexing VRAM through a CLUT it samples an RGBA image,
+ * addressed with the page-relative mapping tex_pack supplies:
+ *
+ *     s = (u - origin.x) / src.x     t = (v - origin.y) / src.y
+ *
+ * so the replacement's own resolution never appears here; a 16x atlas and a 1:1
+ * image are addressed the same way.
+ *
+ * The tail from u_semipass onward is TEX_FS verbatim, and must stay that way.
+ * frag.a is the PS1 MASK BIT, not opacity, and blend_factor's alpha is the
+ * dual-source destination factor — writing either as coverage sets the mask bit
+ * on every replaced pixel and makes later masked draws vanish. */
+static const char *REPL_FS =
+    "#version 330\n"
+    "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+    "smooth in vec2 v_uv_p; flat in int v_persp;\n"
+    "out vec4 frag; out vec4 blend_factor;\n"
+    "flat in ivec2 v_tpage; flat in ivec2 v_clut; flat in int v_depth;\n"
+    "flat in int v_raw; flat in ivec4 v_limits; flat in int v_semi;\n"
+    "uniform sampler2D u_repl;\n"
+    "uniform vec2 u_origin;   /* source origin within the page, texels */\n"
+    "uniform vec2 u_src;      /* source size, texels                   */\n"
+    "uniform int u_semipass;\n"
+    "uniform int u_semimode;\n"
+    "uniform int u_maskset;\n"
+    "uniform int u_zdebug;    /* 1 = paint depth as greyscale */\n"
+    "uniform usampler2D u_vram;\n"
+    "uniform int u_recolour;  /* 1 = take colour from the live CLUT */\n"
+    "uniform int u_ink;       /* dominant ink index; valid iff u_recolour */\n"
+    "uniform float u_ref_max; /* image's own full-ink max channel, 0..1  */\n"
+    "int vram_at(int x, int y){\n"
+    "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+    "}\n"
+    "vec3 col5(int raw){\n"
+    "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+    "}\n"
+    "int clut_at(int i){ return vram_at(v_clut.x + i, v_clut.y); }\n"
+    /* This fragment's PALETTE INDEX, read out of the game's own texel plane.
+     *
+     * Arithmetic identical to TEX_FS's fetch_texel, but with the index and the
+     * CLUT lookup SPLIT, because an HD ink pixel sitting over a hole texel has
+     * to resolve a different entry than the one directly under it.
+     *
+     * This replaces a first cut that scanned the CLUT for "the first non-zero
+     * entry after index 0" and called it the ink. That guessed: it assumed the
+     * hole is always index 0, applied one colour to the whole primitive, and at
+     * 8bpp could run 255 dependent texelFetches per fragment. Reading the index
+     * the hardware would have read costs one fetch and needs no assumption
+     * about which entry a given font inks. */
+    "int index_at(int u, int v){\n"
+    "  u &= 255; v &= 255;\n"
+    "  if (v_depth == 0) {\n"
+    "    int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);\n"
+    "    return (px >> ((u & 3) * 4)) & 0xF;\n"
+    "  }\n"
+    "  int px = vram_at(v_tpage.x + (u >> 1), v_tpage.y + v);\n"
+    "  return (px >> ((u & 1) * 8)) & 0xFF;\n"
+    "}\n"
+    /* Diagnostic: paint every replaced fragment solid magenta with no discard.
+     * Splits "the draw never reaches the framebuffer" from "it reaches it and
+     * samples nothing", which no amount of reading the code settles. */
+    "uniform int u_debug;\n"
+    "void main(){\n"
+    "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
+    /* +0.5 is texel CENTRE, and it is load-bearing here in a way it never was
+     * on the PS1 path. An integer u addresses texel u, whose span in the
+     * replacement is [u, u+1); sampling at u alone lands on its left EDGE. With
+     * NEAREST that still resolves to the right texel, so the omission was
+     * invisible — but this path is LINEAR (a pack image carries detail the
+     * texel grid does not), and there a half-texel shift blends in whatever
+     * sits one texel over. On a font atlas that neighbour is the adjacent
+     * glyph's cell, so every glyph quad drew a hairline of its neighbour along
+     * its own edge: background-coloured slivers cutting through letters and
+     * ink-coloured ones in the gaps. Clamp to v_limits.zw (not +0.999) so the
+     * far edge lands on the last texel's centre rather than past it. */
+    "  vec4 t = texture(u_repl, (uv - u_origin + vec2(0.5)) / u_src);\n"
+    /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
+     * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
+     * STP clear. It is not coverage. */
+    "  if (u_debug == 0 && t.a < 0.5/255.0) discard;\n"
+    "  int stp = (u_debug != 0) ? 0 : ((t.a > 0.75) ? 0 : 1);\n"
+    "  vec3 rgb = (u_debug != 0) ? vec3(1.0, 0.0, 1.0) : t.rgb;\n"
+    /* Palette-agnostic substitution: SHAPE from the pack, COLOUR from the game.
+     *
+     * The image was matched on the texture hash alone, so its RGB is whichever
+     * palette variant happened to be on disk and is discarded. The colour is
+     * re-derived the way the hardware derives it: read this fragment's palette
+     * INDEX out of the game's own texel plane and resolve it through THIS
+     * draw's CLUT. Nothing here guesses which entry is the ink, so a font that
+     * inks index 7, or one using two ink indices, works with no configuration.
+     *
+     * Three tiers, worst case = vanilla:
+     *   live entry     -- the exact texel the unreplaced draw would use;
+     *   clut_at(u_ink) -- HD ink overhanging a hole texel, which happens along
+     *                     EVERY glyph edge, because the whole point is that the
+     *                     pack shape is finer than the texel grid. Without it
+     *                     those pixels would be black; with a discard the shape
+     *                     would re-quantise back to the texel grid;
+     *   discard        -- the ink itself has been blanked (a CLUT fade).
+     *                     Vanilla draws nothing there either, so this
+     *                     reproduces it rather than leaving stale-coloured text.
+     *
+     * k rescales by the pack pixel's own intensity against the image's full-ink
+     * maximum. Under the mono gate that is exactly 1.0 in the interior, so it is
+     * a no-op there; at an edge LINEAR has blended the pack RGB toward the
+     * hole, and k carries that ramp onto the live colour -- so the fallback
+     * antialiases like the exact-key path instead of hardening into a dilated
+     * silhouette. STP comes from the live entry: bit 15 belongs to the CLUT, and
+     * the borrowed image's 0/127/255 tier was baked from a different one. */
+    "  if (u_debug == 0 && u_recolour != 0 && v_depth <= 1) {\n"
+    "    int e = clut_at(index_at(int(floor(uv.x)), int(floor(uv.y))));\n"
+    "    if (e == 0) e = clut_at(u_ink);\n"
+    "    if (e == 0) discard;\n"
+    "    rgb = col5(e) * clamp(max(max(t.r, t.g), t.b) / u_ref_max, 0.0, 1.0);\n"
+    "    stp = (e >> 15) & 1;\n"
+    "  }\n"
+    /* u_debug is kept, not removed: painting replaced fragments solid magenta
+     * with no discard is what finally separated "the draw never lands" from
+     * "it lands and samples nothing", after four wrong guesses that each cost
+     * a build. Reach for it first next time (tex_pack repl_debug=1). */
+    "  if (u_semipass == 1 && stp == 1) discard;\n"
+    "  if (u_semipass == 2 && stp == 0) discard;\n"
+    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  float dst_factor = 0.0;\n"
+    "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+    "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+    "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
+    "  }\n"
+    /* Depth readout (pgxp_depth zdebug=1). Paints window-space depth as
+     * greyscale -- near black, far white -- so the PGXP z distribution can be
+     * SEEN rather than inferred from which geometry went missing. Lives in the
+     * FRAGMENT shader deliberately: TEX_VS is shared by several programs, and a
+     * uniform added there is unset for whichever program forgets it, which
+     * silently divides by zero. gl_FragCoord.z needs no new varying. */
+    "  if (u_zdebug != 0) { frag = vec4(vec3(gl_FragCoord.z), 1.0);\n"
+    "                       blend_factor = vec4(0.0); return; }\n"
+    "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
+    "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
+    "}\n";
 static const char *TEX_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
@@ -1091,6 +1330,7 @@ static const char *TEX_FS =
     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
+    "uniform int u_zdebug;    /* 1 = paint depth as greyscale */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
     "uniform float u_shift;\n"
     "int vram_at(int x, int y){\n"
@@ -1164,6 +1404,14 @@ static const char *TEX_FS =
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
     "  }\n"
+    /* Depth readout (pgxp_depth zdebug=1). Paints window-space depth as
+     * greyscale -- near black, far white -- so the PGXP z distribution can be
+     * SEEN rather than inferred from which geometry went missing. Lives in the
+     * FRAGMENT shader deliberately: TEX_VS is shared by several programs, and a
+     * uniform added there is unset for whichever program forgets it, which
+     * silently divides by zero. gl_FragCoord.z needs no new varying. */
+    "  if (u_zdebug != 0) { frag = vec4(vec3(gl_FragCoord.z), 1.0);\n"
+    "                       blend_factor = vec4(0.0); return; }\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
@@ -1317,6 +1565,30 @@ static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
+    /* PGXP depth needs a per-frame clear; the PS1 has no depth buffer and so
+     * the game never clears one. Done on the first draw of each frame rather
+     * than from a new hook, so nothing outside this file has to know the
+     * feature exists. Scissor is enabled but not yet set for the draw area, so
+     * the clear covers the whole surface. */
+    if (s_pgxp_depth) {
+        /* Armed at Swap by this file, NOT keyed on the debug server's
+         * s_frame_count. That counter is incremented from two different places
+         * depending on whether PSX_DEBUG_TOOLS is compiled in, so a Release
+         * build could clear the depth buffer once and never again -- depth then
+         * accumulates across every frame until nearly all geometry is rejected,
+         * which on a race track reads as the ground vanishing and the ship
+         * flying through the floor. Worse, a savestate A/B cannot see it: that
+         * only ever compares single frames. Swap is the real frame boundary and
+         * it is right here in this file. */
+        if (s_depth_needs_clear) {
+            s_depth_needs_clear = 0;
+            glDisable(GL_SCISSOR_TEST);
+            glDepthMask(GL_TRUE);
+            glClearDepth(1.0);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+        }
+    }
     if (clip_to_draw_area) {
         int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
@@ -1325,6 +1597,7 @@ static void hr_begin(int clip_to_draw_area) {
     }
 }
 static void hr_end(void) {
+    if (s_pgxp_depth) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
      * host draws (OSD) that re-enable blend do not inherit B-F math. */
@@ -1801,20 +2074,47 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
  * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
  * whose two passes do not self-overlap. */
-static void tex_batch_draw_passes(int nverts, int semi) {
-    p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+/* Parameterised on the fragment program's uniform locations and the mask flag
+ * so the HD-replacement draw can use this EXACT logic instead of a second copy.
+ *
+ * That second copy is not hypothetical: writing one by hand dropped the
+ * s_mask_check stencil-only fixup, the semi == 4 dual-source case, and used
+ * mask_stencil(mask) where pass 2 needs mask_stencil(1) — and the resulting
+ * mask-bit corruption took out the whole HUD, including with replacement
+ * disabled. The mask/stencil protocol lives here, once. */
+/* Arm or disarm depth for the draw about to happen.
+ *
+ * `armed` is the batch's provenance verdict, not a preference: a primitive
+ * whose W was never recovered has no meaningful depth, so it must neither test
+ * nor write, or it compares against whatever the last 3D polygon left there and
+ * disappears. That is every 2D element in the game, which is why this is gated
+ * on the same signal the perspective path uses rather than on the config flag
+ * alone. Semi-transparent prims test but do not WRITE, the usual rule, so a
+ * translucent surface cannot occlude what is behind it. */
+static void depth_state(int armed, int semi) {
+    if (!s_pgxp_depth) return;
+    if (!armed) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); return; }
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(semi >= 0 ? GL_FALSE : GL_TRUE);
+}
+
+static void tex_batch_draw_passes_ex(int nverts, int semi,
+                                     GLint uSemipass, GLint uSemimode, int mask) {
+    p_glUniform1i(uSemimode, semi < 0 ? 0 : semi);
+    depth_state(s_depth_armed, semi);
     if (semi < 0) {
         glDisable(GL_BLEND);
-        mask_stencil(s_tb_mask);
-        p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
+        mask_stencil(mask);
+        p_glUniform1i(uSemipass, 0);                   /* all texels, one ordered colour pass */
         glDrawArrays(GL_TRIANGLES, 0, nverts);
         if (s_mask_check) {
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
             mask_stencil(1);
-            p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
+            p_glUniform1i(uSemipass, 2);               /* STP=1 texels set the mask bit */
             glDrawArrays(GL_TRIANGLES, 0, nverts);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        } else if (!s_tb_mask) {
+        } else if (!mask) {
             /* Alpha is already exact; defer its duplicate stencil encoding
              * until a later GP0(E6h) actually enables destination masking. */
             s_stencil_valid = 0;
@@ -1827,20 +2127,25 @@ static void tex_batch_draw_passes(int nverts, int semi) {
         glEnable(GL_BLEND);
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
         p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
-        if (s_tb_mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
-        p_glUniform1i(s_uSemipass, 0);
+        if (mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
+        p_glUniform1i(uSemipass, 0);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
-        if (!s_tb_mask) s_stencil_valid = 0;
+        if (!mask) s_stencil_valid = 0;
     } else {
         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
-        mask_stencil(s_tb_mask);
-        p_glUniform1i(s_uSemipass, 1);
+        mask_stencil(mask);
+        p_glUniform1i(uSemipass, 1);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
         apply_psx_blend(semi);                         /* Pass 2: STP=1 texels (blended) */
         mask_stencil(1);
-        p_glUniform1i(s_uSemipass, 2);
+        p_glUniform1i(uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
     }
+}
+
+/* The batch's call: byte-for-byte the previous behaviour. */
+static void tex_batch_draw_passes(int nverts, int semi) {
+    tex_batch_draw_passes_ex(nverts, semi, s_uSemipass, s_uSemimode, s_tb_mask);
 }
 
 /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
@@ -1892,6 +2197,10 @@ static void flush_tex_batch(void) {
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glUniform1i(s_tex_uDepthOn, s_tb_depth);
+    p_glUniform1i(s_tex_uZdebug, s_zdebug);
+    p_glUniform1f(s_tex_uZscale, s_pgxp_zscale);
+    s_depth_armed = s_tb_depth;
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1968,6 +2277,86 @@ static void flush_flat_batch(void) {
     }
     hr_end();
 }
+
+/* Draw ONE HD-replaced triangle, immediately and on its own.
+ *
+ * Deliberately standalone rather than a mode inside flush_tex_batch. A replaced
+ * prim needs a different program, texture and uniforms; teaching the batch to
+ * carry that meant indirecting flush_tex_batch's uniform writes, and a mistake
+ * there took out every UI draw even with replacement switched off. This way the
+ * batch path is untouched — byte-identical to a build without this feature —
+ * and the cost is one draw call per replaced prim, which is what isolating them
+ * would have cost anyway.
+ *
+ * `verts` is 3 vertices in the standard TEXV layout, so TEX_VS reads them
+ * exactly as it does from the batch. Caller has already flushed for ordering. */
+static void draw_repl_prim(const float *verts, int semi) {
+    hr_begin(1);
+    p_glUseProgram(s_repl_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_repl_tex);
+    p_glUniform1i(s_uReplTex, 0);
+    p_glUniform2f(s_uReplOrigin, s_repl_origin[0], s_repl_origin[1]);
+    p_glUniform2f(s_uReplSrc, s_repl_src[0], s_repl_src[1]);
+    p_glUniform1i(s_uReplMaskset, s_mask_set);
+    p_glUniform1i(s_uReplDebug, g_repl_debug);
+    /* Unit 1, because unit 0 already holds the replacement image. s_tex_prog
+     * puts VRAM on unit 0 since it has nothing else to bind; sharing that here
+     * would have the sampler read the pack PNG as if it were VRAM. Uniforms are
+     * per-PROGRAM, so this has to be set against s_repl_prog specifically --
+     * the same trap that once left every replaced primitive degenerate. */
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    p_glUniform1i(s_uReplVram, 1);
+    p_glUniform1i(s_uReplRecolour, s_repl_recolour);
+    p_glUniform1i(s_uReplInk, s_repl_ink);
+    p_glUniform1f(s_uReplRefMax, s_repl_ref_max);
+    s_depth_armed = s_pgxp_depth && s_pz_valid;
+    p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
+    p_glUniform1i(s_repl_uZdebug, s_zdebug);
+    p_glUniform1f(s_repl_uZscale, s_pgxp_zscale);
+
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(3 * TEXV * sizeof(float)),
+                   verts, PSXGL_STREAM_DRAW);
+
+    /* The SAME pass logic the batch uses, with this program's uniforms. Not a
+     * second implementation — that is what broke the HUD. */
+    tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
+                             s_mask_set);
+
+    /* Native-wide mirror, matching flush_tex_batch's treatment — but with THIS
+     * program's uniform locations. Passing s_tex_* here would write the wide
+     * transform into the other program while this one kept its defaults. */
+    if (g_wide_cur && s_ws_ablate != 1) {
+        int dx = wide_dx();
+        s_bd_gate = 0;
+        gl_perf_mirror_begin();
+        wide_target_begin(dx, s_repl_uXoff, s_repl_uXhalf);
+        wide_set_bd_scale(s_repl_uXscale, s_repl_uXcenter);
+        if (s_ws_ablate != 2)
+            tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
+                                     s_mask_set);
+        wide_clear_bd_scale(s_repl_uXscale, s_repl_uXcenter);
+        wide_target_end(s_repl_uXoff, s_repl_uXhalf);
+        gl_perf_mirror_end();
+    }
+    /* Do not leave the VRAM mirror bound to a sampler: pack_flush renders INTO
+     * s_raw_fbo, whose colour attachment is this same texture, and a texture
+     * bound for reading while it is the draw target is undefined. */
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    hr_end();
+}
+
+/* Defined below, next to the batch vertex writer it mirrors. */
+static int repl_take_tri(const int *xs, const int *ys, const int *us, const int *vs,
+                         const float *col, uint16_t clut_x, uint16_t clut_y,
+                         int base_x, int base_y, int depth, int rawtex,
+                         const int *lim, int semi);
 
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
  * or GL_LINES; verts are (x, y, r, g, b, a) tuples with colors as 1555. */
@@ -2092,6 +2481,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
      * state goes in the vertex; only these keys force a new draw. */
     {
         flush_flat_batch();   /* painter order: flat GEO before textured */
+        /* HD replacement takes the prim before any batch state is touched, so
+         * everything below is reached only by prims the batch actually draws. */
+        if (repl_take_tri(xs, ys, us, vs, col, clut_x, clut_y,
+                          base_x, base_y, depth, rawtex, lim, semi))
+            return;
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
         int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
         /* Batch key: keep opaque as -1. Dual-source (4) is only for semi modes
@@ -2118,6 +2512,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * prim alone (composited fully before the next), let opaque prims
          * keep batching. Cost is one draw per semi prim. */
         int isolate = (semi >= 0);
+        /* Recovered W is what makes this prim's depth meaningful; s_pq_valid is
+         * the same provenance verdict the perspective path uses. */
+        const int depth_ok = s_pgxp_depth && s_pz_valid;
         int reason = -1;
         if (s_tb_n > 0) {
             if (isolate) reason = 0;
@@ -2127,6 +2524,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (gate != s_tb_gate) reason = 4;
             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+            else if (depth_ok != s_tb_depth) reason = 4;   /* depth is a key too */
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -2136,6 +2534,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+            s_tb_depth = depth_ok;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
@@ -2150,10 +2549,45 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
+            vp[20] = s_pz_valid ? s_pz[i] : 0.0f;                   /* a_z; 0 = none   */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
+}
+
+/* Divert a prim with an armed HD replacement out of the batch entirely: drain
+ * what is queued so submission order holds, then draw it through the
+ * replacement program. Returns 1 when it handled the prim.
+ *
+ * Building the vertices here (rather than reusing the batch's writer) is what
+ * keeps the batch path untouched. The layout must stay in step with the writer
+ * above — same TEXV stride, same attribute order — because both feed TEX_VS. */
+static int repl_take_tri(const int *xs, const int *ys, const int *us, const int *vs,
+                         const float *col, uint16_t clut_x, uint16_t clut_y,
+                         int base_x, int base_y, int depth, int rawtex,
+                         const int *lim, int semi) {
+    if (!s_repl_tex) return 0;
+    flush_tex_batch();
+
+    float verts[3 * TEXV];
+    for (int i = 0; i < 3; i++) {
+        float *vp = &verts[i * TEXV];
+        vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+        vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+        vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
+        vp[8]  = (float)base_x;  vp[9]  = (float)base_y;
+        vp[10] = (float)clut_x;  vp[11] = (float)clut_y;
+        vp[12] = (float)depth;   vp[13] = (float)rawtex;
+        vp[14] = (float)lim[0];  vp[15] = (float)lim[1];
+        vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+        vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;
+        vp[19] = s_pq_valid ? s_pq[i] : 0.0f;
+        vp[20] = s_pz_valid ? s_pz[i] : 0.0f;
+    }
+    draw_repl_prim(verts, semi);
+    return 1;
 }
 
 /* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
@@ -2405,6 +2839,78 @@ static void glb_set_precise_triangle(int enabled,
     }
     sw_set_precise_triangle(enabled, x0,y0, x1,y1, x2,y2);
 }
+/* Arm the HD replacement for the next textured prim, uploading its image the
+ * first time it is seen. tex_pack owns the decoded pixels and hands us a slot
+ * to cache the GL name in, so each image uploads once and the pack's total size
+ * never has to be resident.
+ *
+ * CLAMP_TO_EDGE, not repeat: the shader clamps UVs to the prim's own sample
+ * bounds first, and wrapping would fetch a neighbouring atlas cell at the
+ * seams. LINEAR even when the PS1 path is nearest — the whole point is that the
+ * image carries detail the texel grid does not.
+ *
+ * Mipmapped, and that is not optional. A pack image is an integer upscale (16x
+ * for the font atlases) of a source the game draws at or near its native texel
+ * size, so on screen it is MINIFIED several times over. Unmipmapped LINEAR then
+ * samples roughly one texel in N and drops the rest, which shreds any thin
+ * hard-edged stroke — the F500 font garbles into noise at small sizes while
+ * fatter art survives. The deepest mip a font draw can select sits around the
+ * original texel grid, where a level is the box-average of one source pixel,
+ * i.e. the original bitmap; so this is never worse than vanilla and gets
+ * sharper as the internal resolution goes up. */
+/* A cleared slot must clear the recolour state with it. Leaving it armed lets
+ * the next primitive that DOES get a replacement inherit the previous one's
+ * palette treatment -- the same one-shot contract the tex slot already has. */
+static void repl_flags_reset(void) {
+    s_repl_recolour = 0;
+    s_repl_ink = 0;
+    s_repl_ref_max = 1.0f;
+}
+
+static void glb_set_replacement(const void *repl) {
+    if (!repl) { s_repl_tex = 0; repl_flags_reset(); return; }
+    const TexPackRepl *r = (const TexPackRepl *)repl;
+    if (!r->pixels || r->width <= 0 || r->height <= 0 ||
+        r->src_w <= 0 || r->src_h <= 0) {
+        s_repl_tex = 0;
+        repl_flags_reset();
+        return;
+    }
+
+    GLuint tex = r->gl_handle ? (GLuint)*r->gl_handle : 0;
+    if (!tex) {
+        glGenTextures(1, &tex);
+        if (!tex) { s_repl_tex = 0; repl_flags_reset(); return; }
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->width, r->height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, r->pixels);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (r->gl_handle) *r->gl_handle = (unsigned)tex;
+    }
+
+    s_repl_tex = tex;
+    s_repl_recolour = r->recolour ? 1 : 0;
+    s_repl_ink      = r->ink_index;
+    s_repl_ref_max  = (r->ref_max > 0.0f) ? r->ref_max : 1.0f;
+    s_repl_origin[0] = (float)r->origin_u;
+    s_repl_origin[1] = (float)r->origin_v;
+    s_repl_src[0]    = (float)r->src_w;
+    s_repl_src[1]    = (float)r->src_h;
+}
+
+/* Absolute GTE screen Z for PGXP depth. Kept apart from the perspective
+ * weights because those are normalised per triangle and carry no
+ * cross-triangle ordering; see gr_set_depth_triangle. */
+static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
+    s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
+    s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
+}
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
@@ -2499,7 +3005,44 @@ static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
     gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1);
 }
 static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
-static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
+/* Read the SUPERSAMPLED display rect straight out of the hr FBO.
+ *
+ * This used to be ensure_cpu() + sw_render_display_hires(), which is a
+ * contradiction: ensure_cpu() packs the FBO back down to the 1x 15-bit CPU
+ * mirror, so every supersampled pixel — the SSAA edges, the perspective UVs,
+ * the HD replacement texels — was averaged away BEFORE the "hires" resolve ran.
+ * sw_render_display_hires then found no CPU hi-res mirror, filled dw*dh of a
+ * (dw*S)*(dh*S) buffer, and the caller honestly downgraded to "scale 1". Net
+ * effect: on the GL backend, screenshot_hires silently could not see anything
+ * that only exists at high internal resolution — i.e. exactly the class of work
+ * it was written to verify. Diagnosing HD artifacts from its output means
+ * diagnosing them at 508x256.
+ *
+ * BGRA because the caller wants host-order 0xAARRGGBB; GL_RGBA would land
+ * byte-reversed. Alpha in the FBO is the PS1 mask bit, not opacity, so it is
+ * replaced with opaque rather than written into the PNG as transparency. */
+static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){
+    const int S = s_scale;
+    if (!s_ctx || !s_raster_ok || !s_hr_fbo || S <= 1 || !o || dw <= 0 || dh <= 0) {
+        ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh);
+    }
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    const int ow = dw * S, oh = dh * S;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, p / (int)sizeof(uint32_t));
+    glReadPixels(dx * S, dy * S, ow, oh, PSXGL_BGRA, GL_UNSIGNED_BYTE, o);
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    for (int y = 0; y < oh; y++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)o + (size_t)y * (size_t)p);
+        for (int x = 0; x < ow; x++) row[x] |= 0xFF000000u;
+    }
+    return ow * oh;
+}
 /* While GP1 depth24 is on, packed RGB888 lives in the CPU mirror and is
  * presented via gl_renderer_present — never as 1555 FBO texels. Queuing those
  * MDEC A0 rects hits UP_RECTS_MAX (16) and force-flushes mid-movie (MotK intro
@@ -2835,6 +3378,31 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
 }
 
 static int init_gpu_raster(void) {
+    /* Clamp the requested SSAA scale to what this driver can actually back.
+     * The hi-res target is VRAM_W x VRAM_H at `scale`, so the limiting factor
+     * is GL_MAX_TEXTURE_SIZE (and the renderbuffer limit for the depth/stencil
+     * attachment). Without this a too-large scale reaches glTexImage2D, fails
+     * silently, and surfaces only as "GL FBO incomplete" with no indication
+     * that the scale was the cause. */
+    {
+        GLint max_tex = 0, max_rb = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+        int lim = max_tex;
+        if (max_rb > 0 && max_rb < lim) lim = max_rb;
+        if (lim > 0) {
+            /* Width is the binding dimension: VRAM_W (1024) > VRAM_H (512). */
+            int max_scale = lim / VRAM_W;
+            if (max_scale < 1) max_scale = 1;
+            if (s_req_scale > max_scale) {
+                fprintf(stdout,
+                        "psxrecomp: GL supersampling %dx exceeds this driver's "
+                        "%dx%d texture limit; clamping to %dx\n",
+                        s_req_scale, lim, lim, max_scale);
+                s_req_scale = max_scale;
+            }
+        }
+    }
     s_scale = s_req_scale;
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
@@ -2842,7 +3410,30 @@ static int init_gpu_raster(void) {
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
     s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
-    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog || !s_stencil_prog) return 0;
+    /* Dual-source (the "1") matches s_tex_prog: REPL_FS writes the same
+     * frag/blend_factor pair, so a replaced prim uses identical blend plumbing. */
+    s_repl_prog = build_program_ex(TEX_VS, REPL_FS, 1);
+    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog ||
+        !s_stencil_prog || !s_repl_prog) return 0;
+    s_uReplTex      = p_glGetUniformLocation(s_repl_prog, "u_repl");
+    s_uReplOrigin   = p_glGetUniformLocation(s_repl_prog, "u_origin");
+    s_uReplSrc      = p_glGetUniformLocation(s_repl_prog, "u_src");
+    s_uReplMaskset  = p_glGetUniformLocation(s_repl_prog, "u_maskset");
+    s_uReplSemipass = p_glGetUniformLocation(s_repl_prog, "u_semipass");
+    s_uReplSemimode = p_glGetUniformLocation(s_repl_prog, "u_semimode");
+    s_uReplDebug    = p_glGetUniformLocation(s_repl_prog, "u_debug");
+    s_uReplVram     = p_glGetUniformLocation(s_repl_prog, "u_vram");
+    s_uReplRecolour = p_glGetUniformLocation(s_repl_prog, "u_recolour");
+    s_uReplInk      = p_glGetUniformLocation(s_repl_prog, "u_ink");
+    s_uReplRefMax   = p_glGetUniformLocation(s_repl_prog, "u_ref_max");
+    s_repl_uXoff    = p_glGetUniformLocation(s_repl_prog, "u_xoff");
+    s_repl_uXhalf   = p_glGetUniformLocation(s_repl_prog, "u_xhalf");
+    s_repl_uXscale  = p_glGetUniformLocation(s_repl_prog, "u_xscale");
+    s_repl_uXcenter = p_glGetUniformLocation(s_repl_prog, "u_xcenter");
+    s_repl_uShift   = p_glGetUniformLocation(s_repl_prog, "u_shift");
+    s_repl_uDepthOn = p_glGetUniformLocation(s_repl_prog, "u_depth_on");
+    s_repl_uZdebug  = p_glGetUniformLocation(s_repl_prog, "u_zdebug");
+    s_repl_uZscale  = p_glGetUniformLocation(s_repl_prog, "u_zscale");
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -2903,6 +3494,9 @@ static int init_gpu_raster(void) {
     s_geo_uXcenter = p_glGetUniformLocation(s_geo_prog, "u_xcenter");
     s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
     s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+    s_tex_uDepthOn = p_glGetUniformLocation(s_tex_prog, "u_depth_on");
+    s_tex_uZdebug  = p_glGetUniformLocation(s_tex_prog, "u_zdebug");
+    s_tex_uZscale  = p_glGetUniformLocation(s_tex_prog, "u_zscale");
     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
@@ -2931,6 +3525,14 @@ static int init_gpu_raster(void) {
         p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"), shift);
         p_glUniform1f(s_tex_uXoff, 0.0f);
         p_glUniform1f(s_tex_uXhalf, 512.0f);
+        /* Same defaults for the replacement program's own copy of TEX_VS's
+         * uniforms — see the note beside their declarations. */
+        p_glUseProgram(s_repl_prog);
+        p_glUniform1f(s_repl_uShift, shift);
+        p_glUniform1f(s_repl_uXoff, 0.0f);
+        p_glUniform1f(s_repl_uXhalf, 512.0f);
+        p_glUniform1f(s_repl_uXscale, 1.0f);
+        p_glUniform1f(s_repl_uXcenter, 0.0f);
         p_glUseProgram(s_blit_prog);
         p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
         p_glUseProgram(0);
@@ -2961,6 +3563,7 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
+        p_glVertexAttribPointer(10, 1, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* z    */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);
@@ -3237,6 +3840,40 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
         p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
     }
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    /* Pillarbox edge fill. A 4:3-pinned frame on a wide window leaves black
+     * bars either side; on a 32:9 display that is most of the screen, and a
+     * menu whose backdrop is a flat gradient reads as a small floating island.
+     *
+     * Extend the frame's own edge columns outward instead. The present vertex
+     * shader interpolates v_uv.x as mix(u_uv_rect.x, u_uv_rect.z, p.x), so
+     * passing the SAME u for both makes the quad sample one texture column
+     * across its whole width -- clamp-to-edge, which is what the present
+     * texture is already set to. The 4:3 content is untouched and undistorted;
+     * only the margins change.
+     *
+     * Deliberately not applied when cropping (content_w): that path leaves
+     * black on the right on purpose, and smearing a known-garbage trailing
+     * column across the margin is the opposite of what it is for. */
+    if (s_pillarbox_edge_fill && force_4_3 && !crop &&
+        src_w > 0 && src_h > 0 && lh > 0) {
+        const float v0 = 0.5f / (float)src_h, v1 = 1.f - v0;
+        const float ul = 0.5f / (float)src_w;    /* leftmost texel centre  */
+        const float ur = 1.f - ul;               /* rightmost texel centre */
+        if (lx > 0) {
+            glViewport(0, ly, lx, lh);
+            p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        const int right_w = ww - (lx + lw);
+        if (right_w > 0) {
+            glViewport(lx + lw, ly, right_w, lh);
+            p_glUniform4f(s_present_uUvRect, ur, v0, ur, v1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glViewport(lx, ly, lw, lh);
+    }
+
     p_glBindVertexArray(0); p_glUseProgram(0);
     /* PSX_PRESENT_DUMP_OUT=1: dump the drawn RESULT (post-filter) as well as
      * the source above, so a present-filter change can be judged on the pixels
@@ -3251,6 +3888,22 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
 }
+
+void gl_renderer_set_pgxp_zscale(float s) { if (s > 0.0f) s_pgxp_zscale = s; }
+float gl_renderer_pgxp_zscale(void) { return s_pgxp_zscale; }
+void gl_renderer_set_zdebug(int on) { s_zdebug = on ? 1 : 0; }
+int  gl_renderer_zdebug(void) { return s_zdebug; }
+void gl_renderer_set_pgxp_depth(int enabled) {
+    s_pgxp_depth = enabled ? 1 : 0;
+    if (!s_pgxp_depth) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
+}
+int gl_renderer_pgxp_depth(void) { return s_pgxp_depth; }
+
+void gl_renderer_set_pillarbox_edge_fill(int enabled) {
+    s_pillarbox_edge_fill = enabled ? 1 : 0;
+}
+
+int gl_renderer_pillarbox_edge_fill(void) { return s_pillarbox_edge_fill; }
 
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
@@ -4270,6 +4923,10 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
+    /* A frame is ending, so the next draw must start from a cleared depth
+     * buffer. Set here rather than inferred from a counter another
+     * translation unit owns -- see hr_begin. */
+    s_depth_needs_clear = 1;
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4384,6 +5041,50 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
     p_glUseProgram(0);
 }
 
+/* Pillarbox edge fill for the FBO present path — the same look as in
+ * gl_renderer_present, but this is the path that actually runs at internal
+ * scale > 1, where the renderer presents from its own high-resolution FBO
+ * instead of a CPU readback. Call AFTER present_target_quad; restores the
+ * viewport it found. See gl_renderer_set_pillarbox_edge_fill. */
+static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
+                              int x, int y, int w, int h, int linear,
+                              int lx, int ly, int lw, int lh, int v_flip,
+                              int ww) {
+    if (!s_pillarbox_edge_fill || lh <= 0 || w <= 0 || h <= 0) return;
+    const int right_w = ww - (lx + lw);
+    if (lx <= 0 && right_w <= 0) return;   /* no margins to fill */
+
+    float v0 = ((float)y + 0.5f) / (float)tex_h;
+    float v1 = ((float)(y + h) - 0.5f) / (float)tex_h;
+    if (!v_flip) { float t = v0; v0 = v1; v1 = t; }
+    /* Equal u for both ends makes PRESENT_VS's mix() constant across the quad,
+     * so it samples one texture column: clamp-to-edge by construction. */
+    const float ul = ((float)x + 0.5f) / (float)tex_w;
+    const float ur = ((float)(x + w) - 0.5f) / (float)tex_w;
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glBindVertexArray(s_present_vao);
+    if (lx > 0) {
+        glViewport(0, ly, lx, lh);
+        p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (right_w > 0) {
+        glViewport(lx + lw, ly, right_w, lh);
+        p_glUniform4f(s_present_uUvRect, ur, v0, ur, v1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    glViewport(lx, ly, lw, lh);
+}
+
 int gl_renderer_present_hold_last(void) {
     int ww = 0, wh = 0;
     int lx, ly, lw, lh;
@@ -4491,6 +5192,9 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
+    if (force_4_3)
+        present_edge_fill(s_hr_tex, VRAM_W, VRAM_H, disp_x, disp_y, w, h,
+                          linear, lx, ly, lw, lh, 1, ww);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -4615,6 +5319,8 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
     .set_precise_triangle = glb_set_precise_triangle,
     .set_perspective_triangle = glb_set_perspective_triangle,
+    .set_depth_triangle = glb_set_depth_triangle,
+    .set_replacement          = glb_set_replacement,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
     .draw_textured_triangle = glb_draw_textured_triangle,
