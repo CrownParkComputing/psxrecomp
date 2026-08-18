@@ -1109,6 +1109,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
+/* FMV present reconstruction (VIDEO_FMV_FILTER_*), pushed to the GL renderer
+ * once the config is resolved. Only consulted while g_video_aa is on. */
+static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+
+/* recomp-ui stores this 1-based so a zero-initialized (older) host reads as
+ * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
+ * the boundary, and treat anything out of range as the default. */
+static inline int launcher_fmv_filter_to_cfg(int ls_value) {
+    if (ls_value < 1 || ls_value > RECOMP_LAUNCHER_FMV_FILTER_COUNT)
+        return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+    return ls_value - 1;
+}
+static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+    if (cfg_value < 0 || cfg_value >= PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
+        cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+    return cfg_value + 1;
+}
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
@@ -1126,7 +1143,8 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
  * newly-seen texture. */
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
-static std::string   g_hd_texture_dir;
+static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
@@ -1169,7 +1187,9 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * Driver vsync and the wall-clock pacer are XOR. Waiting on both (pacer then
  * FIFO SwapBuffers) double-blocks on Linux compositors: ~16.7 ms + ~16.7 ms
  * = 30 Hz / 0.50x with the CPU idle. ~60 Hz panels may use vsync as the clock;
- * otherwise the pacer holds 59.94 Hz and present must not wait on the swap. */
+ * otherwise the pacer holds 59.94 Hz and present must not wait on the swap.
+ * Wayland: never let driver vsync own cadence by default (same effective
+ * policy as PSX_VSYNC=0); opt in with PSX_WAYLAND_ALLOW_VSYNC=1. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
@@ -2649,6 +2669,16 @@ static void shutdown_runtime(void);
  * there instead of killing the process. */
 static int g_netplay_from_lobby = 0;
 static int g_netplay_vsync_forced_off = 0;
+/* Manual fast-forward drops the swap interval to 0 for its duration. With
+ * driver vsync on, every present blocks ~one refresh, so turbo was capped at
+ * (present_every x refresh) regardless of CPU headroom — present_every is 2 at
+ * the default 4x multiplier, i.e. a hard 2x ceiling, and even
+ * PSX_FAST_FORWARD_SPEED=max could not exceed 4x. Deliberately consulted only
+ * by present_effective_swap_interval(), NOT by present_vsync_owns_cadence():
+ * vsync must keep "owning cadence" so present_should_wall_pace() stays false
+ * and the 60 Hz wall pacer does not replace the ceiling it just removed. The
+ * turbo block's own frame_pacer_wait(period / mult) remains the limiter. */
+static int g_turbo_vsync_forced_off = 0;
 
 static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
     if (!netplay_enabled ||
@@ -2679,6 +2709,56 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
  * wall-clock pacer double-blocks the vblank callback (present is before the
  * guest resumes), which shows up as MotK FMV ~30–40 FPS in netplay vs ~50+
  * offline. Force immediate swaps for the session; restore on soft-exit. */
+static int g_present_half_rate_healed = 0; /* 1 once 0.50x heal tripped */
+/* Wayland: driver vsync + wall pacer (or compositor-forced FIFO with pacer)
+ * lands at ~0.50x. Empirically PSX_VSYNC=0 (pacer + immediate swap) holds
+ * 60 fps; so never let driver vsync own cadence on Wayland unless opted in. */
+static int g_wayland_allow_vsync = 0;
+
+static int host_video_is_wayland(void) {
+    const char *driver = SDL_GetCurrentVideoDriver();
+    return driver && std::strcmp(driver, "wayland") == 0;
+}
+
+/* Plausible panel rates only. SDL/Wayland has stuffed pixel width (e.g. 3840
+ * for 4K) into refresh_rate; treating that as Hz selects the wrong cadence
+ * path and pairs badly with compositor present sync. */
+static double sanitize_host_refresh_hz(double hz, int mode_w, int mode_h,
+                                       double raw_hz, const char **reject_why) {
+    if (reject_why) *reject_why = nullptr;
+    if (!(hz > 0.0))
+        return 0.0;
+    if (hz < 20.0 || hz > 500.0) {
+        if (reject_why) *reject_why = "out of range";
+        return 0.0;
+    }
+    if (mode_w > 0 && std::fabs(hz - (double)mode_w) < 0.5) {
+        if (reject_why) *reject_why = "matches mode width";
+        return 0.0;
+    }
+    if (mode_h > 0 && std::fabs(hz - (double)mode_h) < 0.5) {
+        if (reject_why) *reject_why = "matches mode height";
+        return 0.0;
+    }
+    (void)raw_hz;
+    return hz;
+}
+
+static double display_mode_refresh_hz(const SDL_DisplayMode &dm,
+                                      const char **reject_why) {
+    double hz = 0.0;
+#if defined(PSX_SDL3)
+    /* Prefer rational rate: float refresh_rate is what Wayland has corrupted. */
+    if (dm.refresh_rate_numerator > 0 && dm.refresh_rate_denominator > 0)
+        hz = (double)dm.refresh_rate_numerator /
+             (double)dm.refresh_rate_denominator;
+#endif
+    if (!(hz >= 20.0 && hz <= 500.0) && dm.refresh_rate > 0)
+        hz = (double)dm.refresh_rate;
+    return sanitize_host_refresh_hz(hz, dm.w, dm.h, (double)dm.refresh_rate,
+                                    reject_why);
+}
+
 static int host_refresh_matches_crtc(void) {
     const double psx_hz = psx_crtc_frame_hz();
     return g_host_refresh_hz >= psx_hz * 0.98 &&
@@ -2694,11 +2774,16 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
+    /* Wayland default: wall-clock pacer + swap interval 0 (same as PSX_VSYNC=0). */
+    if (host_video_is_wayland() && !g_wayland_allow_vsync)
+        return 0;
     return host_refresh_matches_crtc();
 }
 
 static int present_effective_swap_interval(void) {
     if (g_netplay_vsync_forced_off || psx_netplay_active())
+        return 0;
+    if (g_turbo_vsync_forced_off)
         return 0;
     if (g_frame_interpolation)
         return 0;
@@ -2732,8 +2817,15 @@ static void log_present_cadence(void) {
                     "wall-clock pacer skipped)\n",
                     g_host_refresh_hz);
     } else if (g_frame_period_ms > 0.0) {
-        if (g_video_vsync != 0 && !g_frame_interpolation &&
+        if (host_video_is_wayland() && !g_wayland_allow_vsync &&
+            g_video_vsync != 0 && !g_frame_interpolation &&
             !g_netplay_vsync_forced_off) {
+            std::printf("psxrecomp: present cadence: wall-clock pacer "
+                        "(%.4f ms/frame); Wayland forces swap interval 0 "
+                        "(set PSX_WAYLAND_ALLOW_VSYNC=1 to opt into driver vsync)\n",
+                        g_frame_period_ms);
+        } else if (g_video_vsync != 0 && !g_frame_interpolation &&
+                   !g_netplay_vsync_forced_off) {
             if (g_host_refresh_hz > 0.0) {
                 std::printf("psxrecomp: present cadence: wall-clock pacer "
                             "(%.4f ms/frame); driver vsync off on %.0f Hz panel\n",
@@ -6079,6 +6171,61 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     RuntimePerfFrameScope runtime_perf_frame_scope;
     runtime_perf_diag_tick();
 
+    /* PSX_HITCH_DIAG=<ms>: per-frame hitch tracer. The 1 s FPS average hides
+     * single-frame spikes ("fps is fine but weapon impacts stutter"), so log
+     * one line whenever the wall time between vblanks exceeds the threshold,
+     * with the emu/pacer split and deltas of the usual burst suspects. The
+     * wall - guest - pacer remainder is host-side work (present, GL, audio). */
+    {
+        static double hitch_thresh_ms = -1.0;
+        if (hitch_thresh_ms < 0.0) {
+            const char *e = std::getenv("PSX_HITCH_DIAG");
+            hitch_thresh_ms = (e && *e) ? atof(e) : 0.0;
+        }
+        if (hitch_thresh_ms > 0.0) {
+            extern uint64_t g_dirty_ram_insns_run;
+            extern uint32_t g_dirty_ram_code_gen;
+            extern uint64_t s_frame_count;
+            static Uint64 h_last_pc = 0;
+            static uint64_t h_guest = 0, h_pace = 0, h_dirty = 0, h_ldus = 0;
+            static uint32_t h_cg = 0;
+            uint64_t ld_tot = 0, ld_max = 0, ld_last = 0;
+            overlay_loader_get_load_timing(&ld_tot, &ld_max, &ld_last);
+            Uint64 pc_now = SDL_GetPerformanceCounter();
+            if (h_last_pc) {
+                /* g_runtime_perf.frequency is only initialized under
+                 * PSX_RUNTIME_PERF_DIAG; fall back to the SDL clock so the
+                 * split never prints NaN when the tracer runs alone. */
+                double tick_freq = (double)g_runtime_perf.frequency;
+                if (tick_freq <= 0.0)
+                    tick_freq = (double)SDL_GetPerformanceFrequency();
+                double wall = (double)(pc_now - h_last_pc) * 1000.0 /
+                              (double)SDL_GetPerformanceFrequency();
+                double guest = (double)(g_runtime_perf.guest_work_ticks -
+                                        h_guest) * 1000.0 / tick_freq;
+                double pace = (double)(g_runtime_perf.pacer_ticks -
+                                       h_pace) * 1000.0 / tick_freq;
+                if (wall > hitch_thresh_ms) {
+                    std::fprintf(stderr,
+                        "[HITCH] f=%llu wall=%.1fms guest=%.1f pacer=%.1f "
+                        "host=%.1f | dirty_insns=+%llu ovl_load=+%.2fms "
+                        "code_gen=+%u\n",
+                        (unsigned long long)s_frame_count, wall, guest, pace,
+                        wall - guest - pace,
+                        (unsigned long long)(g_dirty_ram_insns_run - h_dirty),
+                        (double)(ld_tot - h_ldus) / 1000.0,
+                        g_dirty_ram_code_gen - h_cg);
+                }
+            }
+            h_last_pc = pc_now;
+            h_guest = g_runtime_perf.guest_work_ticks;
+            h_pace  = g_runtime_perf.pacer_ticks;
+            h_dirty = g_dirty_ram_insns_run;
+            h_ldus  = ld_tot;
+            h_cg    = g_dirty_ram_code_gen;
+        }
+    }
+
     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
      * than presents so turbo and skipped-frame modes still report game speed.
      * Skip during netplay post-load barrier — admit is stalled and the window
@@ -6162,6 +6309,37 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              fps, speed, (unsigned long long)s_frame_count);
             }
             std::fflush(stderr);
+
+            /* Half-rate (~0.50x) with driver vsync still requested: force the
+             * proven Wayland-safe policy (PSX_VSYNC=0) — wall-clock pacer +
+             * immediate swap. Do NOT hand cadence to driver vsync. */
+            {
+                static int s_half_rate_windows = 0;
+                const int half = (speed >= 0.45 && speed <= 0.55) ? 1 : 0;
+                if (!g_present_half_rate_healed &&
+                    !g_frame_interpolation &&
+                    !psx_netplay_active() &&
+                    g_video_vsync != 0 &&
+                    half) {
+                    s_half_rate_windows++;
+                    if (s_half_rate_windows >= 2) {
+                        g_present_half_rate_healed = 1;
+                        g_video_vsync = 0;
+                        g_wayland_allow_vsync = 0;
+                        apply_present_cadence();
+                        std::printf("psxrecomp: present half-rate self-heal: "
+                                    "forcing PSX_VSYNC=0 (wall-clock pacer + "
+                                    "immediate swap); driver vsync was "
+                                    "halving the frame rate\n");
+                        log_present_cadence();
+                        std::fflush(stdout);
+                        s_half_rate_windows = 0;
+                    }
+                } else if (!half) {
+                    s_half_rate_windows = 0;
+                }
+            }
+
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
         }
@@ -6483,7 +6661,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         static int turbo_skip = 0;
         static int turbo_was_down = 0;
-        if (host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
+        /* PSX_TURBO_HOLD=1: benchmarking override — behave as if the turbo key
+         * were held for the whole session. Headless fixtures (PSX_LOAD_SLOT)
+         * have no keyboard, and measuring the fast-forward ceiling / profiling
+         * under turbo requires the exact production code path, not a synthetic
+         * unpaced mode. */
+        static int turbo_hold_env = -1;
+        if (turbo_hold_env < 0) {
+            const char *th = std::getenv("PSX_TURBO_HOLD");
+            turbo_hold_env = (th && th[0] == '1') ? 1 : 0;
+        }
+        if (turbo_hold_env ||
+            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
@@ -6494,6 +6683,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 else
                     snprintf(msg, sizeof(msg), "Fast forward: %dx", mult);
                 host_osd_push(msg, 900);
+                /* Release the vsync ceiling for the duration of the hold. */
+                g_turbo_vsync_forced_off = 1;
+                apply_present_cadence();
             }
             turbo_was_down = 1;
             if (mult >= 2 && g_frame_period_ms > 0.0) {
@@ -6511,6 +6703,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
         } else {
             turbo_skip = 0;
+            if (turbo_was_down && g_turbo_vsync_forced_off) {
+                /* Restore the configured present cadence on release. */
+                g_turbo_vsync_forced_off = 0;
+                apply_present_cadence();
+            }
             turbo_was_down = 0;
         }
     }
@@ -7013,10 +7210,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. Either SwapWindow vsync OR the wall-clock pacer owns timing,
          * never both. 24-bit (FMV) frames pin to native 4:3. */
-        /* FMV: nearest present — linear filtering fringes the right edge of
-         * low-res 24-bit scanouts into adjacent (often garbage) texels. */
+        /* FMV follows the same AA setting as everything else. It used to be
+         * pinned to nearest because plain GL_LINEAR fringed the right edge of
+         * low-res 24-bit scanouts into adjacent (often garbage) texels — but
+         * gl_renderer_present now half-texel-insets its UV rect (and crops the
+         * depth24 margin via content_w), which is exactly that bleed, and it
+         * reconstructs a filtered low-res source properly (PSX_FMV_FILTER,
+         * default bicubic) instead of smearing whole texels. Measured: the
+         * right-edge jump the old comment describes is 0 with filtering on.
+         * Set video AA off to get nearest back. */
+        gl_renderer_set_fmv_filter(g_video_fmv_filter);
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
-                            (g_video_aa && !depth24_frame) ? 1 : 0,
+                            g_video_aa ? 1 : 0,
                             pin_43 ? 1 : 0, 0 /* full width */);
         netplay_note_present();
     } else {
@@ -10777,6 +10982,13 @@ namespace {
         gi->memcard_inspect = ae_memcard_inspect;
         gi->mods = PSXRecompV4::mod_runtime_launcher_provider();
         gi->bios_verify = ae_bios_verify;
+        /* HD texture pack. The in-exe UI is deliberately just an on/off switch
+         * plus the active pack's folder — installing, listing and comparing
+         * packs is retcomm-launcher's per-title job, and duplicating that
+         * surface here would mean two implementations of the same thing.
+         * Offered only once a pack is actually selected, so a title with no
+         * packs shows no dead control. */
+        gi->hdpack_supported = g_hd_texture_pack.empty() ? 0 : 1;
 #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
         g_lnch_game_players = game_players_n;
         /* ae_disc_verify only fills netplay_ok/disc_fp when this is true. */
@@ -10963,6 +11175,10 @@ int main(int argc, char** argv) {
     g_active_config_path = game_config_path;
 
     std::filesystem::path memcard_dir;
+    /* [savestate] dir — slot .pst root. Empty => use memcard_dir (historical
+     * layout). Set independently so sibling builds of one game can share
+     * memory cards while keeping their savestates apart. */
+    std::filesystem::path savestate_dir;
     std::filesystem::path memcard1_path;   /* explicit slot-1 .mcd (empty => dir/card1.mcd) */
     std::filesystem::path memcard2_path;   /* explicit slot-2 .mcd (empty => dir/card2.mcd) */
     bool memcard1_enabled = true;
@@ -11133,6 +11349,7 @@ int main(int argc, char** argv) {
             g_video_scale      = gc.runtime.video_supersampling;
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_texfilter  = gc.runtime.video_texture_filter;
+            g_video_fmv_filter = gc.runtime.video_fmv_filter;
             g_video_geometry_correction   =
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
@@ -11523,6 +11740,9 @@ int main(int argc, char** argv) {
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+        if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+        if (us.has_hd_textures)     g_hd_textures     = us.hd_textures ? 1 : 0;
+        if (us.has_hd_texture_pack) g_hd_texture_pack = us.hd_texture_pack.string();
         if (us.has_geometry_correction)
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
@@ -11574,6 +11794,7 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
         if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
+        if (us.has_savestate_dir)    savestate_dir    = us.savestate_dir;
         if (us.has_multitap_enabled) multitap_enabled = us.multitap_enabled;
         if (us.has_multitap_analog) {
             multitap_analog = us.multitap_analog;
@@ -11682,10 +11903,14 @@ int main(int argc, char** argv) {
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive)
-     * (vsync XOR wall-clock pacer — vsync clocks only ~60 Hz panels);
+     * (vsync XOR wall-clock pacer — vsync clocks only ~60 Hz panels;
+     * on Wayland driver vsync is disabled for cadence unless
+     * PSX_WAYLAND_ALLOW_VSYNC=1);
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_WAYLAND_ALLOW_VSYNC"))
+        g_wayland_allow_vsync = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
@@ -11705,6 +11930,10 @@ int main(int argc, char** argv) {
         memcard_dir = memcard_dir.lexically_normal();
         memcard1_path.clear();
         memcard2_path.clear();
+        /* Same rationale as the card paths: this flag exists to isolate ALL
+         * writable state, so a settings.toml [savestate] dir pointing outside
+         * the isolated directory must not survive it. */
+        savestate_dir.clear();
         std::error_code memcard_ec;
         std::filesystem::create_directories(memcard_dir, memcard_ec);
         if (memcard_ec) {
@@ -11721,6 +11950,25 @@ int main(int argc, char** argv) {
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+
+    /* Savestate root. Unset => the memcard dir, i.e. exactly the historical
+     * <memcard_dir>/<bios_token>/state_*.pst layout. A relative setting is
+     * resolved against the executable directory, matching --memcard-dir. */
+    if (!savestate_dir.empty()) {
+        if (savestate_dir.is_relative())
+            savestate_dir = exe_dir_from_argv(argv[0]) / savestate_dir;
+        savestate_dir = savestate_dir.lexically_normal();
+        std::error_code ss_ec;
+        std::filesystem::create_directories(savestate_dir, ss_ec);
+        if (ss_ec) {
+            std::fprintf(stderr,
+                "psxrecomp: cannot create [savestate] dir %s: %s — "
+                "falling back to the memory-card directory\n",
+                savestate_dir.string().c_str(), ss_ec.message().c_str());
+            savestate_dir.clear();
+        }
+    }
+    if (savestate_dir.empty()) savestate_dir = memcard_dir;
 
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml
@@ -11948,6 +12196,7 @@ int main(int argc, char** argv) {
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
+            seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
             /* Seeded (and marked present) so a launcher save round-trips the
              * player's hand-edited value instead of dropping the key. */
             seed.geometry_correction = (g_video_geometry_correction != 0);
@@ -12122,6 +12371,12 @@ int main(int argc, char** argv) {
             ls.supersampling      = seed.supersampling;
             ls.antialiasing       = seed.antialiasing ? 1 : 0;
             ls.texture_filter     = seed.texture_filter;
+            /* HD textures: on/off plus the active pack folder, which the UI
+             * shows read-only. Selection itself belongs to the launcher. */
+            ls.hdpack_enabled     = g_hd_textures ? 1 : 0;
+            std::snprintf(ls.hdpack_dir, sizeof(ls.hdpack_dir), "%s",
+                          g_hd_texture_pack.c_str());
+            ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.screen_kind        = seed.screen_kind;
@@ -12314,6 +12569,8 @@ int main(int argc, char** argv) {
                  * is the legacy fallback field for consoles without the cap and is
                  * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
+                seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                seed.has_fmv_filter = true;
                 {
                     const int n = std::min(PSX_MAX_PLAYERS, RECOMP_LAUNCHER_MAX_PLAYERS);
                     const int un = std::min(n, PSXRecompV4::UserSettings::kMaxControllerPlayers);
@@ -12359,6 +12616,8 @@ int main(int argc, char** argv) {
                 seed.has_geometry_correction = true;
                 seed.perspective_texturing = ls.perspective_texturing != 0;
                 seed.has_perspective_texturing = true;
+                seed.fmv_filter            = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                seed.has_fmv_filter        = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
                 seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
@@ -12561,6 +12820,7 @@ int main(int argc, char** argv) {
                 g_video_scale     = seed.supersampling;
                 g_video_aa        = seed.antialiasing;
                 g_video_texfilter = seed.texture_filter;
+                g_video_fmv_filter = seed.fmv_filter;
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
                 g_video_screen    = seed.screen_kind;
@@ -12768,6 +13028,10 @@ int main(int argc, char** argv) {
     /* HD texture pack. Keyed off the STOCK disc, not mod_disc: the pack folder
      * belongs next to the user's own image (where a RetroArch-authored pack
      * already sits) and must not move when a disc-patching mod is toggled. */
+    /* Precedence: game.toml < settings.toml (applied above with the other
+     * [video] keys) < environment. settings.toml is the layer both the
+     * launcher's pack manager and recomp-ui's toggle write, so a pack selected
+     * in either survives the other; env stays a developer override. */
     {
         const char *hd_env = std::getenv("PSX_HD_TEXTURE_DUMP");
         if (hd_env && hd_env[0] && std::strcmp(hd_env, "0") != 0) g_hd_texture_dump = 1;
@@ -12775,9 +13039,14 @@ int main(int argc, char** argv) {
         if (hd_env && hd_env[0]) g_hd_textures = (std::strcmp(hd_env, "0") != 0) ? 1 : 0;
         hd_env = std::getenv("PSX_HD_TEXTURE_DIR");
         if (hd_env && hd_env[0]) g_hd_texture_dir = hd_env;
+        hd_env = std::getenv("PSX_HD_TEXTURE_PACK");
+        if (hd_env && hd_env[0]) g_hd_texture_pack = hd_env;
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
-                  g_hd_texture_dir.c_str());
+                  g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
+    /* Coverage report for the launcher's per-pack stats. atexit alongside the
+     * other end-of-session flushes; a no-op when no pack is active. */
+    std::atexit(tex_pack_write_coverage);
 
 session_reboot:
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
@@ -13253,12 +13522,32 @@ session_reboot:
     /* Host refresh: if the panel is within ~2% of the live CRTC rate (NTSC
      * 59.94 / PAL 50), record it so driver vsync can own cadence. Otherwise
      * keep the PSX CRTC period and force swap interval 0. Mods that own
-     * native VBlank keep their cadence. */
+     * native VBlank keep their cadence.
+     *
+     * Sanitize aggressively: Wayland/SDL has reported pixel width (3840) as
+     * refresh_rate, which selects wall-pacer+swap0 while the compositor still
+     * blocks → 30 Hz / 0.50x. Prefer SDL3 numerator/denominator when present. */
     {
-        SDL_DisplayMode dm;
+        SDL_DisplayMode dm{};
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
-        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0)
-            g_host_refresh_hz = (double)dm.refresh_rate;
+        const char *reject_why = nullptr;
+        double raw_hz = 0.0;
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0) {
+            const double float_hz = (double)dm.refresh_rate;
+            raw_hz = float_hz;
+#if defined(PSX_SDL3)
+            if (dm.refresh_rate_numerator > 0 && dm.refresh_rate_denominator > 0) {
+                raw_hz = (double)dm.refresh_rate_numerator /
+                         (double)dm.refresh_rate_denominator;
+            }
+#endif
+            g_host_refresh_hz = display_mode_refresh_hz(dm, &reject_why);
+            if (reject_why) {
+                std::printf("psxrecomp: ignoring bogus host refresh %.0f Hz "
+                            "(%s; mode %dx%d, sdl float %.0f); treating as unknown\n",
+                            raw_hz, reject_why, dm.w, dm.h, float_hz);
+            }
+        }
         refresh_frame_pacer_period();
         if (!g_mod_native_vblank_rate) {
             const double psx_hz = psx_crtc_frame_hz();
@@ -13267,9 +13556,14 @@ session_reboot:
                             "(%.4f ms/frame, %s CRTC)\n",
                             (int)(g_host_refresh_hz + 0.5), g_frame_period_ms,
                             gpu_display_is_pal() ? "PAL" : "NTSC");
-            } else {
+            } else if (g_host_refresh_hz > 0.0) {
                 std::printf("psxrecomp: host panel %.0f Hz; keeping %s %.2f Hz pacing\n",
                             g_host_refresh_hz,
+                            gpu_display_is_pal() ? "PAL" : "NTSC",
+                            psx_hz);
+            } else {
+                std::printf("psxrecomp: host refresh unknown; keeping %s %.2f Hz "
+                            "pacing (wall-clock; swap interval 0)\n",
                             gpu_display_is_pal() ? "PAL" : "NTSC",
                             psx_hz);
             }
@@ -13619,7 +13913,10 @@ session_reboot:
             if (bundled->image)
                 openbios_ws = bundled->image->image_wordsum;
         }
-        savestate_configure(memcard_dir.string().c_str(),
+        /* savestate_dir, not memcard_dir: sibling builds of one game may share
+         * memory cards while keeping slot .pst files apart (see [savestate]
+         * dir). Defaults to memcard_dir when unset. */
+        savestate_configure(savestate_dir.string().c_str(),
                             memory_get_bios_checksum(), game_entry_pc,
                             bios_token, openbios_ws);
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
@@ -13964,6 +14261,10 @@ soft_return_lobby:
         ls.supersampling = g_video_scale;
         ls.antialiasing = g_video_aa ? 1 : 0;
         ls.texture_filter = g_video_texfilter;
+        ls.hdpack_enabled = g_hd_textures ? 1 : 0;
+        std::snprintf(ls.hdpack_dir, sizeof(ls.hdpack_dir), "%s",
+                      g_hd_texture_pack.c_str());
+        ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.screen_kind = g_video_screen;
@@ -14216,6 +14517,13 @@ soft_return_lobby:
                 us.has_antialiasing = true;
                 us.texture_filter = ls.texture_filter;
                 us.has_texture_filter = true;
+                /* Only the toggle is user-editable here; hdpack_dir is shown
+                 * read-only, so the launcher's pack choice is never clobbered. */
+                g_hd_textures = ls.hdpack_enabled ? 1 : 0;
+                us.hd_textures = ls.hdpack_enabled != 0;
+                us.has_hd_textures = true;
+                us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                us.has_fmv_filter = true;
                 us.geometry_correction = ls.geometry_correction != 0;
                 us.has_geometry_correction = true;
                 us.perspective_texturing = ls.perspective_texturing != 0;
@@ -14271,6 +14579,7 @@ soft_return_lobby:
             g_video_scale = ls.supersampling;
             g_video_aa = ls.antialiasing;
             g_video_texfilter = ls.texture_filter;
+            g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
             g_video_screen = ls.screen_kind;

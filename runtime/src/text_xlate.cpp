@@ -419,7 +419,24 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
-std::atomic<bool>     g_capture_on{true};     // always-on inventory (default)
+/* The capture inventory is an AUTHORING tool: it ingests every source string the
+ * game draws so a translator can enumerate them. It is not needed to APPLY a
+ * shipped translation (that is g_apply_armed, decided by the loaded tables).
+ *
+ * It is not free. text_xlate_on_dispatch runs at every dispatch, and with
+ * capture on it scans a0..a3, classifies each as text-ish, reads the record and
+ * hashes it. On the WipEout 3 ntscfull8 mod (~33k dispatches/frame) that was the
+ * single largest CPU consumer in the intro FMV — gprofng put it at 18.6% of
+ * samples, and disabling it measured +22% fps over guest frames 800-2200.
+ *
+ * So: on by default only where the rest of the authoring/debug tooling lives,
+ * off in a release build. PSX_XLATE_CAPTURE=1 turns it back on for authoring;
+ * PSX_XLATE_CAPTURE=0 turns it off in a debug-tools build. */
+#ifdef PSX_NO_DEBUG_TOOLS
+std::atomic<bool>     g_capture_on{false};    // release: authoring inventory off
+#else
+std::atomic<bool>     g_capture_on{true};     // debug-tools build: always-on
+#endif
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
@@ -914,8 +931,9 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
     else if (language && *language) g_lang = language;
     if (project_root && *project_root)
         g_dir = (fs::path(project_root) / "translations").string();
+    /* Explicit env wins in both directions over the build-flavour default. */
     const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
-    if (capenv && capenv[0] == '0') g_capture_on.store(false);
+    if (capenv && capenv[0]) g_capture_on.store(capenv[0] != '0');
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
 }
