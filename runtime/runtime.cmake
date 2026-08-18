@@ -1282,8 +1282,15 @@ function(psxrecomp_add_runtime_target target)
             # appearing on the Mods page (and inflate the release packagers'
             # catalog assertions). This runs before the game's own staging, so
             # both catalogs land on a clean slate.
+            #
+            # Scoped to mods/packages, NOT mods/: both catalogs own only a
+            # packages/ subtree, while mods/state.toml is USER STATE written at
+            # runtime (which mods are enabled, with which options). Wiping the
+            # whole tree silently disabled every enabled mod on every rebuild --
+            # 8 MB, widescreen, framerate all reverting off, repeatedly misread
+            # as the mods themselves regressing.
             COMMAND ${CMAKE_COMMAND} -E rm -rf
-                "$<TARGET_FILE_DIR:${target}>/mods"
+                "$<TARGET_FILE_DIR:${target}>/mods/packages"
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${PSXRECOMP_ROOT}/mods/builtin"
                 "$<TARGET_FILE_DIR:${target}>/mods"
