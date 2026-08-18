@@ -5144,6 +5144,9 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
  * same in a race and in a menu, which is the whole point of a bezel. */
 static GLuint s_bezel_tex = 0;
 static int    s_bezel_w = 0, s_bezel_h = 0;
+/* Backdrop behind the tiled mark, derived from the art itself so each team
+ * brings its own colour. Black read as a hole in the screen. */
+static float  s_bezel_bg[3] = { 0.0f, 0.0f, 0.0f };
 
 int gl_renderer_set_bezel(const void *rgba, int w, int h) {
     if (s_bezel_tex) { glDeleteTextures(1, &s_bezel_tex); s_bezel_tex = 0; }
@@ -5163,6 +5166,29 @@ int gl_renderer_set_bezel(const void *rgba, int w, int h) {
                  GL_UNSIGNED_BYTE, rgba);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     s_bezel_w = w; s_bezel_h = h;
+    /* Backdrop from the art: mean of the opaque pixels, darkened. Each team
+     * then brings its own colour instead of sitting on black, which read as a
+     * hole punched in the screen rather than as part of the design. Weighted by
+     * alpha so soft edges do not drag it toward whatever the file pads with. */
+    {
+        const unsigned char *p8 = (const unsigned char *)rgba;
+        double acc[3] = { 0, 0, 0 }, wsum = 0;
+        const size_t n = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < n; i++) {
+            const double al = p8[i * 4 + 3] / 255.0;
+            if (al <= 0.0) continue;
+            acc[0] += p8[i * 4 + 0] * al;
+            acc[1] += p8[i * 4 + 1] * al;
+            acc[2] += p8[i * 4 + 2] * al;
+            wsum += al;
+        }
+        if (wsum > 0.0) {
+            for (int c = 0; c < 3; c++)
+                s_bezel_bg[c] = (float)(acc[c] / wsum / 255.0) * 0.28f;
+        } else {
+            s_bezel_bg[0] = s_bezel_bg[1] = s_bezel_bg[2] = 0.06f;
+        }
+    }
     return 1;
 }
 
@@ -5186,8 +5212,12 @@ static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
     const float img = (float)s_bezel_w / (float)s_bezel_h;
     /* One logo spans the margin width, with a little air either side. */
     const float tile_w = 1.0f / 0.78f;
-    /* Same on-screen scale vertically: how many logo-heights fit the margin. */
-    const float tile_h = ((float)vh / ((float)vw * 0.78f)) / img;
+    /* Repeats needed vertically for each tile to keep the logo's own aspect:
+     * a tile is (vw/tile_w) wide on screen, so it must be (vw/tile_w)/img tall,
+     * and vh divided by that is the count. Previously this DIVIDED by img
+     * instead of multiplying, squashing every mark by img^2 -- 1.7x on the
+     * 1024x778 marks, which is the stretched look. */
+    const float tile_h = img * tile_w * (float)vh / (float)vw;
     glViewport(vx, vy, vw, vh);
     p_glUniform4f(s_present_uUvRect,
                   -(tile_w - 1.0f) * 0.5f, 0.0f,
@@ -5213,8 +5243,21 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
     p_glBindVertexArray(s_present_vao);
+    /* Backdrop first, then the mark blended over it. The art is RGBA with a
+     * transparent field, so without this the gaps between tiles show whatever
+     * the drawable was cleared to -- black. */
+    glEnable(GL_SCISSOR_TEST);
+    glClearColor(s_bezel_bg[0], s_bezel_bg[1], s_bezel_bg[2], 1.0f);
+    if (lx > 0)      { glScissor(0, 0, lx, wh);            glClear(GL_COLOR_BUFFER_BIT); }
+    if (right_w > 0) { glScissor(right_x, 0, right_w, wh); glClear(GL_COLOR_BUFFER_BIT); }
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                          GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     if (lx > 0)      bezel_draw_rect(0, 0, lx, wh);
     if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
+    glDisable(GL_BLEND);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
 }
