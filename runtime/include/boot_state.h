@@ -145,6 +145,10 @@ int  boot_state_load_buffer(const uint8_t* file, size_t file_len,
                             uint32_t bios_checksum, uint32_t entry_pc,
                             CPUState* cpu);
 
+/* Suppress the per-load "savestate: load_timing" stderr line (dual-console
+ * machine switching loads at ~100 Hz). Default off. */
+void boot_state_set_quiet_load(int on);
+
 /* Header-only integrity check (no section inflate/apply). Returns 1 if this
  * build can load the image; 0 and fills reason (when non-NULL) on reject. */
 int  boot_state_check_buffer(const uint8_t* file, size_t file_len,

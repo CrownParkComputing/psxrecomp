@@ -144,6 +144,13 @@ const char *sio1_get_backend(void);
 /* Debug-server peeks into the live singleton. */
 Sio1Device *sio1_get_device(void);
 
+/* Dual-console support (dual_machine.c): swap which per-machine device the
+ * singleton wrapper drives, and suppress BS_SEC_SIO1 snapshot APPLY while
+ * dual mode is active (the crossover wire is host-owned and must survive
+ * machine switches byte-exact; writes still serialize normally). */
+void sio1_dual_install(Sio1Device *d);
+void sio1_dual_suppress_snapshot_apply(int on);
+
 #ifdef __cplusplus
 }
 #endif

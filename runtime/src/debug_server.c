@@ -34,6 +34,7 @@
 #include "cdrom.h"
 #include "sio.h"
 #include "sio1.h"
+#include "dual_machine.h"
 #include "memcard.h"
 #include "spu.h"
 #include "audio_trace.h"
@@ -6310,6 +6311,28 @@ static void handle_gte_latch_dump(int id, const char *json)
     snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
              id, gte_latch_total(), emitted, body);
     debug_server_send_line(reply); free(body); free(reply);
+}
+
+static void handle_dual_state(int id, const char *json)
+{
+    (void)json;
+    uint64_t cyc[2] = { 0, 0 };
+    int live = psx_dual_machine_live();
+    psx_dual_machine_cycles(cyc);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"active\":%d,"
+             "\"live\":%d,"
+             "\"swaps\":%llu,"
+             "\"cycles_a\":%llu,"
+             "\"cycles_b\":%llu,"
+             "\"skew\":%lld}",
+             id,
+             live >= 0,
+             live,
+             (unsigned long long)psx_dual_machine_swaps(),
+             (unsigned long long)cyc[0],
+             (unsigned long long)cyc[1],
+             (long long)(cyc[0] - cyc[1]));
 }
 
 static void handle_sio1_state(int id, const char *json)
@@ -13505,6 +13528,7 @@ static const CmdEntry s_commands[] = {
     { "dma_cdrom_history", handle_dma_cdrom_history },
     { "sio_state",         handle_sio_state },
     { "sio1_state",        handle_sio1_state },
+    { "dual_state",        handle_dual_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },

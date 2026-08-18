@@ -88,6 +88,9 @@ extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
 /* Timer wire: 3*u16 + 3*u32 + 3*u16 + 3*i32 + 3*u32 = 48 bytes (no pad holes). */
 #define TIMER_REGS_WIRE_BYTES (48u)
 
+static int s_quiet_load;
+void boot_state_set_quiet_load(int on) { s_quiet_load = on ? 1 : 0; }
+
 /* ---- deferred capture state (armed before first boot, fired at handoff) ---- */
 static char     s_capture_path[512];
 static uint32_t s_capture_checksum;
@@ -919,7 +922,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
 
-    {
+    if (!s_quiet_load) {
         const double total_ms = boot_state_mono_ms() - t0;
         fprintf(stderr,
                 "savestate: load_timing read=0.0 inflate=%.1f "

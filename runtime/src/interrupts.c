@@ -972,6 +972,16 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 
 void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
+    /* Dual-console cooperative switcher (dual_machine.c). One load+branch
+     * when inactive; on a slice-deadline switch the poll does not return
+     * (longjmps into the other machine via psx_scheduler_resume_at). */
+    {
+        extern int g_psx_dual_active;
+        if (g_psx_dual_active) {
+            extern void psx_dual_machine_poll(CPUState *cpu, uint32_t resume_pc);
+            psx_dual_machine_poll(cpu, s_compiled_interrupt_resume_pc);
+        }
+    }
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);
     const int np_active = psx_netplay_active();

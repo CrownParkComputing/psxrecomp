@@ -1282,7 +1282,7 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     /* Decline when the target page no longer matches the static game image.
      * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
      * of the live RAM bytes instead of running stale compiled code. */
-    if (!psx_game_text_native_ok(target)) return 0;
+    if (!psx_game_text_native_ok_memo(target)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -2704,7 +2704,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     /* Run the statically-compiled game function only while the target is still
      * native-safe. Dirty overlay pages and pages whose text bytes diverged from
      * the original EXE image fall through to interpret the live RAM bytes. */
-    if (psx_game_text_native_ok(addr)) {
+    if (psx_game_text_native_ok_memo(addr)) {
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);

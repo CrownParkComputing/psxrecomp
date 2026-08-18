@@ -46,6 +46,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "latency_ring.h"
 #include "sio.h"
 #include "sio1.h"
+#include "dual_machine.h"
 #ifndef PSX_MAX_PLAYERS
 #define PSX_MAX_PLAYERS 2
 #endif
@@ -5392,6 +5393,13 @@ static void sample_pad_into_sio(int override) {
     }
 }
 
+/* dual_machine.c: fresh host pads for the machine that just resumed
+ * (its blob restored a stale pad snapshot; the per-frame push in the
+ * present body only runs for the local machine). */
+extern "C" void psx_dual_repush_host_pads(void) {
+    sample_pad_into_sio(-1);
+}
+
 static void sample_headless_pad_into_sio(int override) {
     if (override < 0) {
         uint16_t mash = 0xFFFFu;
@@ -7389,6 +7397,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 }
 
 static void sdl_vblank_present(void) {
+    /* Dual-console: the non-local machine runs headless -- no present,
+     * no pacing wait, no audio, no input sampling (dual_machine repushes
+     * pads after each switch). Keep the debug socket responsive. */
+    if (!psx_dual_present_gate()) {
+#ifndef PSX_NO_DEBUG_TOOLS
+        debug_server_poll();
+#endif
+        return;
+    }
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
@@ -11616,6 +11633,12 @@ int main(int argc, char** argv) {
              * peer only; the register file always responds (see
              * accuracy/axis4_sio1_serial.md). Env PSX_SIO1_BACKEND /
              * PSX_SIO1_LATENCY override at sio1_init() time for A/B. */
+            if (gc.runtime.has_link && gc.runtime.link_enabled &&
+                gc.runtime.link_backend == "crossover") {
+                /* Stage B dual-console: two in-process machines cross-
+                 * wired on SIO1. Activation is lazy (first safe poll). */
+                psx_dual_machine_request(0);
+            }
             if (gc.runtime.has_link && gc.runtime.link_enabled) {
                 if (!sio1_set_backend(gc.runtime.link_backend.c_str()))
                     std::fprintf(stderr, "psxrecomp: [runtime.link] unknown "
@@ -13286,6 +13309,12 @@ session_reboot:
     interrupts_init();
     sio_init();
     sio1_init();
+    {   /* Env A/B for dual-console without touching game.toml:
+         * PSX_DUAL_CONSOLE=1 requests it, =0 vetoes a config request. */
+        const char *e = std::getenv("PSX_DUAL_CONSOLE");
+        if (e && e[0] == '1') psx_dual_machine_request(0);
+        else if (e && e[0] == '0') g_psx_dual_active = 0;
+    }
     psx_event_step_conservative_env_init();
     /* Seed per-player device routing from the resolved [controller] config.
      * SDL controller handles are opened later (after SDL_Init); here we only

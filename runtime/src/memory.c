@@ -791,6 +791,45 @@ done:
     return ok;
 }
 
+/* ---- Address-level text-guard memo --------------------------------------
+ *
+ * The generated psx_game_text_native_ok() has to binary-search the game
+ * dispatch table (21k+ entries on WipEout 3 — ~15 random cache lines, plus
+ * psx_ram_canon_code_addr) before it can even form the range key the verdict
+ * memo above is keyed on. The dirty interpreter asks that question on EVERY
+ * control transfer into game text, and on a mod-patched title the answer is a
+ * permanent "no" for hundreds of pages — so the search is re-run forever to
+ * re-derive a verdict that never changes.
+ *
+ * addr -> (ranges, count) is a static map and exec_pc IS addr, so a verdict
+ * keyed on (addr, g_text_guard_gen) is by construction the same verdict the
+ * range memo returns; it just skips the lookup that produces the key. Shares
+ * the PSX_TEXT_GUARD_MEMO=0 bisect switch with the range memo. */
+#define TEXT_ADDR_MEMO_SLOTS 8192u        /* power of two */
+typedef struct {
+    uint32_t addr;
+    uint32_t gen;
+    int      ok;
+} TextAddrMemo;
+static TextAddrMemo s_text_addr_memo[TEXT_ADDR_MEMO_SLOTS];
+
+int psx_game_text_native_ok_memo(uint32_t addr) {
+    extern int psx_game_text_native_ok(uint32_t addr);
+    TextAddrMemo *e;
+    int ok;
+
+    if (!text_ok_memo_enabled()) return psx_game_text_native_ok(addr);
+
+    e = &s_text_addr_memo[((addr * 2654435761u) >> 9) & (TEXT_ADDR_MEMO_SLOTS - 1u)];
+    if (e->addr == addr && e->gen == g_text_guard_gen) return e->ok;
+
+    ok = psx_game_text_native_ok(addr);
+    e->addr = addr;
+    e->gen  = g_text_guard_gen;
+    e->ok   = ok;
+    return ok;
+}
+
 /* Preserve the generated-code ABI used by existing game projects. */
 int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
                                     uint32_t count) {

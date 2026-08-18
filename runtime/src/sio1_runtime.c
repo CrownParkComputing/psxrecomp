@@ -38,6 +38,19 @@ static void sio1_irq_cb(void *user, uint32_t detail) {
 }
 
 Sio1Device *sio1_get_device(void) { return g_dev; }
+
+/* ===== dual-console hooks (dual_machine.c) ============================== */
+
+static int g_snapshot_apply_suppressed;
+
+void sio1_dual_install(Sio1Device *d) {
+    if (d) g_dev = d;
+    sio1_update_active();
+}
+
+void sio1_dual_suppress_snapshot_apply(int on) {
+    g_snapshot_apply_suppressed = on ? 1 : 0;
+}
 const char *sio1_get_backend(void) { return g_backend; }
 
 int sio1_set_backend(const char *name) {
@@ -142,6 +155,10 @@ void sio1_snapshot_write(uint8_t *p) {
 
 int sio1_snapshot_read(const uint8_t *p, uint32_t len) {
     int ok;
+    /* Dual-console: the device + crossover wire persist per machine in host
+     * memory; applying the blob's (stale) copy would erase chars the peer
+     * pushed since it was written. Accept and ignore the section. */
+    if (g_snapshot_apply_suppressed) return 1;
     if (!g_dev) return len == 0;
     ok = sio1_device_snap_read(g_dev, p, len, psx_get_cycle_count());
     sio1_update_active();

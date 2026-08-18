@@ -173,6 +173,9 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
 int      dirty_ram_text_native_ok(uint32_t phys);
+/* (addr, text-guard generation) memo over the generated psx_game_text_native_ok
+ * — same verdict, without the dispatch-table binary search on every dispatch. */
+int      psx_game_text_native_ok_memo(uint32_t addr);
 /* Exact CFG ranges; exec_pc clips ranges that end before the resume PC. */
 int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                              uint32_t count,
