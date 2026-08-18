@@ -402,6 +402,7 @@ std::vector<GlyphLabel>                  g_glyph_labels;// per-glyph RAM patches
 std::atomic<int>                         g_glyph_pending{0}; // unpatched count (0 => idle)
 std::vector<VramPatch>                   g_vram_patches; // pre-rendered strip patches
 std::atomic<int>                         g_vram_patch_n{0};  // count (0 => upload hook idle)
+std::atomic<int>                         g_table_n{0};       // string entries (0 => dispatch scan idle)
 std::vector<MsgInplace>                  g_msg_inplace; // table-driven message RAM patches
 std::atomic<int>                         g_msg_inplace_pending{0}; // unpatched count (0 => idle)
 // Card-manager messages are packed into NUL-terminated *chunks*; within a chunk,
@@ -493,6 +494,7 @@ void load_tables_locked() {
     g_glyph_pending.store(0, std::memory_order_relaxed);
     g_vram_patches.clear();
     g_vram_patch_n.store(0, std::memory_order_relaxed);
+    g_table_n.store(0, std::memory_order_relaxed);
     g_msg_inplace.clear();
     g_msg_inplace_pending.store(0, std::memory_order_relaxed);
     g_msg_seps.clear();
@@ -599,6 +601,7 @@ void load_tables_locked() {
             }
         }
     }
+    g_table_n.store((int)g_table.size(), std::memory_order_relaxed);
     g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
     g_vram_patch_n.store((int)g_vram_patches.size(), std::memory_order_relaxed);
     g_msg_inplace_pending.store((int)g_msg_inplace.size(), std::memory_order_relaxed);
@@ -836,6 +839,20 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
     const bool cap = g_capture_on.load(std::memory_order_relaxed);
     const bool app = g_apply_armed.load(std::memory_order_relaxed);
     if (!cap && !app) return;
+    /* g_apply_armed covers EVERY apply mechanism, but the only apply work this
+     * DISPATCH hook performs is string-arg swapping plus the throttled
+     * in-place RAM patches; vram_patch blocks apply through the VRAM upload
+     * hook instead. A fixes-only translation set (WipEout 3 ships one for the
+     * track palette gap) used to leave this armed with an EMPTY string table,
+     * and the a0..a3 record scan below then hashed four registers on every
+     * dispatch against a table that could never hit -- 20% of a stock FMV run.
+     * No dispatch-relevant work => stay out of the hot path entirely. */
+    if (!cap &&
+        g_table_n.load(std::memory_order_relaxed) == 0 &&
+        g_glyph_pending.load(std::memory_order_relaxed) <= 0 &&
+        g_msg_inplace_pending.load(std::memory_order_relaxed) <= 0 &&
+        g_msg_sep_pending.load(std::memory_order_relaxed) <= 0)
+        return;
     uint8_t* ram = memory_get_ram_ptr();
     if (!ram) return;
     uint64_t call_n = g_calls.fetch_add(1, std::memory_order_relaxed);
