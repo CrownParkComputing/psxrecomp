@@ -1128,6 +1128,26 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
     return cfg_value + 1;
 }
+
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+/* Driver vsync crosses the launcher ABI 1-based (ON/OFF/ADAPTIVE) for the same
+ * reason fmv_filter does: our own encoding uses 0 for "off", which a
+ * zero-initialized host could not be told apart from "no opinion". The runtime
+ * side stays 1 = vsync / 0 = immediate / -1 = adaptive (g_video_vsync, the
+ * [video] vsync key, and the GL swap interval all speak that). */
+static inline int launcher_vsync_to_cfg(int ls_value) {
+    switch (ls_value) {
+        case RECOMP_LAUNCHER_VSYNC_OFF:      return 0;
+        case RECOMP_LAUNCHER_VSYNC_ADAPTIVE: return -1;
+        default:                             return 1;
+    }
+}
+static inline int cfg_vsync_to_launcher(int cfg_value) {
+    if (cfg_value == 0)  return RECOMP_LAUNCHER_VSYNC_OFF;
+    if (cfg_value < 0)   return RECOMP_LAUNCHER_VSYNC_ADAPTIVE;
+    return RECOMP_LAUNCHER_VSYNC_ON;
+}
+#endif /* RECOMP_LAUNCHER_HAS_VSYNC */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
@@ -12372,6 +12392,7 @@ int main(int argc, char** argv) {
             seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
             seed.frame_interpolation = (g_frame_interpolation != 0);
             seed.has_frame_interpolation = true;
+            seed.vsync = g_video_vsync;                   seed.has_vsync = true;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
             seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
@@ -12540,6 +12561,9 @@ int main(int argc, char** argv) {
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.screen_kind        = seed.screen_kind;
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+            ls.vsync              = cfg_vsync_to_launcher(seed.vsync);
+#endif
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.rewind_depth      = seed.rewind_depth > 0 ? seed.rewind_depth : 50;
@@ -12779,6 +12803,10 @@ int main(int argc, char** argv) {
                 seed.has_fmv_filter        = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
                 seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+                seed.vsync                 = launcher_vsync_to_cfg(ls.vsync);
+                seed.has_vsync             = true;
+#endif
                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
                 seed.audio_freq            = ls.audio_freq;            seed.has_audio_freq            = true;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
@@ -12990,6 +13018,9 @@ int main(int argc, char** argv) {
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+                g_video_vsync = seed.vsync;
+#endif
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
@@ -14447,6 +14478,9 @@ soft_return_lobby:
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.screen_kind = g_video_screen;
         ls.frame_interp = g_frame_interpolation ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+        ls.vsync = cfg_vsync_to_launcher(g_video_vsync);
+#endif
         ls.frame_interp_fps = g_frame_interpolation_fps;
         ls.spu_hq = g_audio_spu_hq ? 1 : 0;
         ls.auto_skip_fmv = (skip_fmv_offered && g_auto_skip_fmv) ? 1 : 0;
@@ -14708,6 +14742,10 @@ soft_return_lobby:
                 us.has_perspective_texturing = true;
                 us.screen_kind = ls.screen_kind;
                 us.has_screen_kind = true;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+                us.vsync = launcher_vsync_to_cfg(ls.vsync);
+                us.has_vsync = true;
+#endif
                 us.frame_interpolation = ls.frame_interp != 0;
                 us.has_frame_interpolation = true;
                 us.frame_interpolation_fps = ls.frame_interp_fps;
@@ -14772,6 +14810,9 @@ soft_return_lobby:
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
             g_fullscreen = ls.fullscreen != 0;
             g_frame_interpolation = ls.frame_interp ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_VSYNC)
+            g_video_vsync = launcher_vsync_to_cfg(ls.vsync);
+#endif
             g_frame_interpolation_fps = ls.frame_interp_fps;
             g_audio_freq = ls.audio_freq;
             g_audio_spu_hq = ls.spu_hq != 0;
