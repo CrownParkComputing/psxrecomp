@@ -11,6 +11,8 @@
  */
 
 #include "gpu.h"
+
+static void gpu_vblank_period_refresh(void);
 #include "pgxp.h"
 #include "mod_memory.h"
 #include "gpu_primitive_reject.h"
@@ -2738,6 +2740,7 @@ static void gpu_reset_state(int clear_vram) {
     hres1 = 0;
     vres = 0;
     video_mode = 0;
+    gpu_vblank_period_refresh();
     display_depth = 0;
     vertical_interlace = 0;
 
@@ -3265,6 +3268,22 @@ int gpu_display_is_pal(void) {
 static uint32_t s_crtc_refresh_multiplier = 1u;
 /* 0 = derive from GP1 video_mode; else absolute period before Nx divide. */
 static uint32_t s_crtc_period_override = 0u;
+/* Cached gpu_vblank_period_cycles() result. The period is consulted on EVERY
+ * interrupt check (interrupts_service_scheduled_events / cycles_to_vblank run
+ * per basic-block edge), and recomputing it there put a should-be-constant
+ * lookup at ~3% exclusive in the whole-run profile. Inputs change only at the
+ * three cold writers below (GP1 display-mode write, CRTC multiplier, period
+ * override) plus reset, each of which refreshes the cache. */
+static uint32_t s_vblank_period_cached =
+    PSX_VBLANK_CYCLES_NTSC;  /* video_mode starts 0 (NTSC), mult 1 */
+
+static void gpu_vblank_period_refresh(void) {
+    const uint32_t base = s_crtc_period_override
+        ? s_crtc_period_override
+        : (video_mode ? PSX_VBLANK_CYCLES_PAL : PSX_VBLANK_CYCLES_NTSC);
+    const uint32_t mult = s_crtc_refresh_multiplier ? s_crtc_refresh_multiplier : 1u;
+    s_vblank_period_cached = base / mult;
+}
 
 void gpu_set_crtc_refresh_multiplier(uint32_t multiplier) {
     if (multiplier < 1u)
@@ -3272,6 +3291,7 @@ void gpu_set_crtc_refresh_multiplier(uint32_t multiplier) {
     if (multiplier > 8u)
         multiplier = 8u;
     s_crtc_refresh_multiplier = multiplier;
+    gpu_vblank_period_refresh();
 }
 
 uint32_t gpu_get_crtc_refresh_multiplier(void) {
@@ -3280,6 +3300,7 @@ uint32_t gpu_get_crtc_refresh_multiplier(void) {
 
 void gpu_set_crtc_vblank_period_override(uint32_t cycles) {
     s_crtc_period_override = cycles;
+    gpu_vblank_period_refresh();
 }
 
 uint32_t gpu_get_crtc_vblank_period_override(void) {
@@ -3287,11 +3308,7 @@ uint32_t gpu_get_crtc_vblank_period_override(void) {
 }
 
 uint32_t gpu_vblank_period_cycles(void) {
-    const uint32_t base = s_crtc_period_override
-        ? s_crtc_period_override
-        : (video_mode ? PSX_VBLANK_CYCLES_PAL : PSX_VBLANK_CYCLES_NTSC);
-    const uint32_t mult = gpu_get_crtc_refresh_multiplier();
-    return base / mult;
+    return s_vblank_period_cached;
 }
 
 void gpu_get_display_info(GpuDisplayInfo* out) {
@@ -5816,6 +5833,7 @@ static void gp1_display_mode(uint32_t val) {
     hres1 = val & 3;
     vres = (val >> 2) & 1;
     video_mode = (val >> 3) & 1;
+    gpu_vblank_period_refresh();
     if (new_depth != display_depth)
         s_d24_upload_x1 = 0; /* rising/falling: drop stale coverage */
     display_depth = new_depth;
@@ -5978,6 +5996,7 @@ static int gpu_snap_parse(PstR *r) {
     RU(draw_area_left); RU(draw_area_top); RU(draw_area_right); RU(draw_area_bottom);
     RI(draw_offset_x); RI(draw_offset_y);
     RU(hres1); RU(hres2); RU(vres); RU(video_mode); RU(display_depth); RU(vertical_interlace);
+    gpu_vblank_period_refresh();  /* video_mode just changed under the cache */
     RU(display_disabled); RU(irq1_flag); RU(dma_direction); RU(lcf);
     RU(display_area_x); RU(display_area_y);
     RU(h_display_x1); RU(h_display_x2); RU(v_display_y1); RU(v_display_y2);

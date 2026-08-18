@@ -1225,6 +1225,8 @@ static int           g_fmv_skip_no_xa_hold  = 4;
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
+/* 1 = the user chose (settings.toml); 0 = engine default may auto-pick. */
+static int           g_frame_interpolation_explicit = 0;
 static int           g_frame_interpolation_fps = 0;
 static int           g_frame_interpolation_blend =
     PSX_MOD_FRAME_INTERPOLATION_LINEAR;
@@ -7116,9 +7118,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * and can starve audio, so present native-4:3/MDEC phases directly.
          * The classification catches the transition frame before the first
          * decode; the activity stamp also covers authentic 4:3 configurations. */
-        if (g_gl_active)
+        /* PSX_FMV_INTERP=1 keeps interpolation running through FMV/MDEC
+         * phases instead of presenting them raw. The suspension exists
+         * because high-refresh crossfades contend with decode and can starve
+         * audio; on a 60 Hz host smoothing 25 fps PAL video is exactly what
+         * the viewer wants, so let it be A/B'd without a rebuild. */
+        if (g_gl_active) {
+            static const int fmv_interp = psx_env_tristate("PSX_FMV_INTERP");
             gl_renderer_set_interpolation_suspended(
-                fmv_frame || mdec_recently_active(2));
+                fmv_interp == 1 ? 0 : (fmv_frame || mdec_recently_active(2)));
+        }
         const int local_viewport_slot = netplay_local_viewport_slot();
         const bool local_viewport_crop = local_viewport_slot >= 0;
         bool local_viewport_wide =
@@ -12022,8 +12031,10 @@ int main(int argc, char** argv) {
         apply_offline_pad_count(game_players, multitap_enabled);
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
-        if (us.has_frame_interpolation)
+        if (us.has_frame_interpolation) {
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+            g_frame_interpolation_explicit = 1;
+        }
         if (us.has_frame_interpolation_fps)
             g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
@@ -13963,9 +13974,33 @@ session_reboot:
          * the settings preference (equals gr_scale() under dual-raster). */
         if (!netplay_cpu_auth_gpu())
             g_video_scale = gr_scale();
-        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
-                                      (double)g_frame_interpolation_fps,
-                                      /*blend_mode*/ 0);
+        {
+            /* PAL 50 Hz content presented through 60 Hz driver vsync must
+             * duplicate ten frames every second -- a rhythmic judder that
+             * reads as "not smooth" even when the emulator holds full speed
+             * (stock WipEout 3 SE menus measured 50-55 fps at 1.0-1.1x and
+             * still stuttered). The interp thread exists precisely to smooth
+             * a cadence mismatch, so when the user has NOT chosen, default it
+             * ON for PAL content on a ~60 Hz panel. PSX_FRAME_INTERP=0|1
+             * overrides everything for A/B. */
+            int fi = g_frame_interpolation;
+            const char *e = std::getenv("PSX_FRAME_INTERP");
+            if (e && e[0]) {
+                fi = (e[0] != '0');
+            } else if (!fi && !g_frame_interpolation_explicit &&
+                       gpu_display_is_pal() &&
+                       g_host_refresh_hz >= 55.0 && g_host_refresh_hz <= 65.0) {
+                fi = 1;
+                std::fprintf(stdout,
+                    "psxrecomp: frame interpolation auto-enabled "
+                    "(PAL content on %.0f Hz panel; settings.toml "
+                    "frame_interpolation or PSX_FRAME_INTERP override)\n",
+                    g_host_refresh_hz);
+            }
+            gl_renderer_set_interpolation(fi, g_host_refresh_hz,
+                                          (double)g_frame_interpolation_fps,
+                                          /*blend_mode*/ 0);
+        }
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
