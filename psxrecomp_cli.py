@@ -309,15 +309,17 @@ def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> P
             return p.resolve()
     names = [basename, f"{basename}.exe"]
     search_dirs = [
+        # The dedicated analyzer tree comes FIRST. ensure_analyzer() builds and
+        # source-stamps that one, and an older psxrecomp-analyze left behind in
+        # the shared emitters tree would otherwise shadow every rebuild — the
+        # tool would be rebuilt correctly and then never used.
+        project_root / "psxrecomp" / "recompiler" / "build-analyze",
+        ROOT / "recompiler" / "build-analyze",
         project_root / "psxrecomp" / "recompiler" / "build",
         project_root / "psxrecomp" / "recompiler" / "build" / "Release",
         project_root / "build-recompiler",
         ROOT / "recompiler" / "build",
         ROOT / "recompiler" / "build" / "Release",
-        # Dedicated minimal tree used by ensure_analyzer(); see there for why
-        # the analyzer does not share the emitters' build directory.
-        project_root / "psxrecomp" / "recompiler" / "build-analyze",
-        ROOT / "recompiler" / "build-analyze",
     ]
     for d in search_dirs:
         for name in names:
@@ -411,6 +413,50 @@ def ensure_emitters(
     return game, bios
 
 
+# Source files that make up psxrecomp-analyze. Kept in step with the target's
+# source list in recompiler/CMakeLists.txt.
+ANALYZER_SOURCES = (
+    "recompiler/src/ps1_exe_parser.cpp",
+    "recompiler/src/mips_decoder.cpp",
+    "recompiler/src/function_analysis.cpp",
+    "recompiler/src/analysis_db.cpp",
+    "recompiler/src/bios_call_names.cpp",
+    "recompiler/src/analysis_export.cpp",
+    "recompiler/src/widescreen_scan.cpp",
+    "recompiler/src/main_analyze.cpp",
+    "recompiler/include/analysis_db.h",
+    "recompiler/src/analysis_export.h",
+    "recompiler/include/widescreen_scan.h",
+    "runtime/include/ws_cull_detect.h",
+)
+
+
+def _analyzer_source_hash(project_root: Path) -> str:
+    """Digest of the analyzer's sources, or "" if they cannot be read.
+
+    The toolchain stamp notices a changed COMPILER; nothing noticed changed
+    CODE, so a psxrecomp-analyze built before a feature landed kept being reused
+    and rejected the very options the caller had just learned to pass. This is
+    the same guard `psxrecomp-game --codegen-hash` provides for the emitters,
+    computed here rather than baked in so it needs no CMake support.
+    """
+    import hashlib
+
+    fw = framework_root(project_root)
+    h = hashlib.sha256()
+    for rel in ANALYZER_SOURCES:
+        p = fw / rel
+        if not p.is_file():
+            return ""
+        h.update(rel.encode("utf-8"))
+        h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def _analyzer_stamp_path(tool: Path) -> Path:
+    return tool.parent / (tool.name + ".srcstamp")
+
+
 def ensure_analyzer(
     project_root: Path,
     progress: ProgressReporter,
@@ -428,19 +474,37 @@ def ensure_analyzer(
     do with analysis. Building the one target that is actually missing avoids
     dragging that failure into an unrelated command.
     """
+    src = recompiler_source_dir(project_root)
+    dedicated = src / "build-analyze"
+
+    # If this project already has the dedicated tree, always run the build step
+    # rather than trusting the binary's presence. Ninja is a no-op when nothing
+    # changed (tens of milliseconds), and it is the only thing that notices an
+    # analyzer SOURCE edit — the toolchain stamp catches a changed compiler, not
+    # changed code, so a stale binary would otherwise keep producing old-format
+    # reports indefinitely.
+    want = _analyzer_source_hash(project_root)
     try:
-        return find_psxrecomp_analyze(project_root)
+        existing = find_psxrecomp_analyze(project_root)
+        stamp = _analyzer_stamp_path(existing)
+        have = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+        if want and have == want:
+            return existing
+        progress.log(
+            "psxrecomp-analyze is stale for the current sources — rebuilding"
+            if have
+            else "psxrecomp-analyze has no source stamp — rebuilding once"
+        )
     except FileNotFoundError:
         pass
 
     progress.phase("emitters", pct=0.12, message="Building psxrecomp-analyze…")
-    src = recompiler_source_dir(project_root)
     _build_recompiler_targets(
         project_root,
         progress,
         ("psxrecomp-analyze",),
         download_toolchain=download_toolchain,
-        build_dir_override=src / "build-analyze",
+        build_dir_override=dedicated,
         # The analyzer needs fmt and nothing else. Configuring its own tree with
         # libchdr and the test suite off keeps `analyze` independent of whatever
         # state the emitters' build directory is in — a half-configured cache, a
@@ -455,6 +519,11 @@ def ensure_analyzer(
         raise RuntimeError(
             f"psxrecomp-analyze build finished but the binary was not found: {exc}"
         ) from exc
+    if want:
+        try:
+            _analyzer_stamp_path(tool).write_text(want, encoding="utf-8")
+        except OSError:
+            pass
     progress.log(f"Analyzer built: {tool}")
     return tool
 
@@ -1669,15 +1738,15 @@ def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
         return EXIT_USAGE
 
     activate_embedded_toolchain(project_root, progress)
+    # Always go through ensure_analyzer: it owns both the "is it there" and the
+    # "is it current" questions. Calling find_psxrecomp_analyze() here first
+    # made the source-stamp check unreachable whenever a binary already existed,
+    # which is exactly the case it was written for.
     try:
-        tool = find_psxrecomp_analyze(project_root)
-    except FileNotFoundError:
-        progress.phase("emitters", pct=0.1, message="Building psxrecomp-analyze…")
-        try:
-            tool = ensure_analyzer(project_root, progress)
-        except Exception as exc:  # noqa: BLE001
-            progress.error(str(exc), code=EXIT_ERROR)
-            return EXIT_ERROR
+        tool = ensure_analyzer(project_root, progress)
+    except Exception as exc:  # noqa: BLE001
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
 
     out_dir = Path(args.out).expanduser() if args.out else (project_root / "analysis")
     if not out_dir.is_absolute():
@@ -1724,6 +1793,12 @@ def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
         cmd += ["--emit-ghidra", str(out_dir / "psxrecomp_import.py")]
     if getattr(args, "emit_symbol_addrs", False):
         cmd += ["--emit-symbol-addrs", str(out_dir / "symbol_addrs.txt")]
+    if getattr(args, "scan_widescreen", False):
+        cmd += [
+            "--scan-widescreen",
+            "--emit-ws-sites",
+            str(out_dir / "widescreen_sites.toml"),
+        ]
     prev = out_dir / "functions.prev.tsv"
     if getattr(args, "diff", False) and prev.is_file():
         cmd += ["--diff", str(prev)]
@@ -1936,6 +2011,11 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--emit-ghidra", action="store_true", help="write a Ghidra import script")
     an.add_argument(
         "--emit-symbol-addrs", action="store_true", help="write a decomp symbol map"
+    )
+    an.add_argument(
+        "--scan-widescreen",
+        action="store_true",
+        help="also scan for [widescreen.cull] site candidates",
     )
     an.add_argument("--json-progress", action="store_true")
     an.set_defaults(handler=cmd_analyze)

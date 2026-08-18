@@ -230,58 +230,69 @@ bool write_json_bundle(const AnalysisDb& db, const std::filesystem::path& dir,
 bool write_symbols_toml(const AnalysisDb& db, const std::filesystem::path& path,
                         Confidence min_conf, bool include_unnamed,
                         std::string& error) {
-    // Existing entries are authoritative: a name a human typed outranks
-    // anything the analyzer inferred, and an entry whose address this run did
-    // not rediscover is still carried through rather than dropped.
+    // APPEND-ONLY. An earlier version regenerated the file from the [[func]]
+    // entries it had parsed, which silently deleted everything else in it —
+    // and symbols.toml carries more than functions: Ape Escape has 11
+    // [[object]] entries and a top-level `game` key, Crash Team Racing has 33
+    // [[site]] entries, all hand-researched. Existing bytes are now never
+    // rewritten; newly discovered functions are appended and nothing else is
+    // touched.
     std::vector<SymbolEntry> existing;
     if (!load_symbols(path, existing, error)) return false;
 
     std::set<uint32_t> have;
     for (const auto& s : existing) have.insert(s.pc);
 
-    struct Row { uint32_t pc; std::string name, status, note; bool emit; };
-    std::vector<Row> rows;
-    for (const auto& s : existing)
-        rows.push_back({s.pc, s.name, s.status, s.note, s.emit});
+    std::string original;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in)
+            original.assign(std::istreambuf_iterator<char>(in),
+                            std::istreambuf_iterator<char>());
+    }
 
+    std::string added_text;
     uint32_t added = 0;
     if (include_unnamed) {
         for (const auto& f : db.functions) {
             if (f.is_data) continue;
             if (static_cast<int>(f.confidence) > static_cast<int>(min_conf)) continue;
             if (have.count(f.addr)) continue;
-            std::string note =
+            const std::string note =
                 f.bios_call.empty()
                     ? fmt::format("{} — {} arg(s), {} caller(s), {}",
-                                  confidence_name(f.confidence),
-                                  f.sig.arg_count, f.in_degree,
-                                  f.sig.is_leaf ? "leaf" : "non-leaf")
+                                  confidence_name(f.confidence), f.sig.arg_count,
+                                  f.in_degree, f.sig.is_leaf ? "leaf" : "non-leaf")
                     : fmt::format("kernel dispatch thunk {} — {} caller(s)",
                                   f.bios_call, f.in_degree);
-            rows.push_back({f.addr, f.name, "guessed", note, false});
+            added_text += fmt::format(
+                "\n[[func]]\npc = 0x{:08X}\nname = \"{}\"\nemit = false\n"
+                "status = \"guessed\"\nnote = \"{}\"\n",
+                f.addr, f.name, note);
             added++;
         }
     }
 
-    std::sort(rows.begin(), rows.end(),
-              [](const Row& a, const Row& b) { return a.pc < b.pc; });
+    if (added == 0) {
+        fmt::print("  symbols.toml: {} entries, none new\n", existing.size());
+        return true;
+    }
 
     std::ofstream f;
     if (!open_out(path, f, error)) return false;
-    f << "# " << db.image_name << " — progressive symbol map\n";
-    f << "# Discover → label here → manipulate via PSX_FN_* (sync_symbols.py).\n";
-    f << "# Written by `psxrecomp-analyze --emit-symbols`. Existing names,\n";
-    f << "# statuses and notes are preserved verbatim on every rewrite.\n";
-    f << "# See psxrecomp/docs/SYMBOLS.md and docs/FUNCTION_DISCOVERY.md.\n";
-    for (const auto& r : rows) {
-        f << "\n[[func]]\n";
-        f << fmt::format("pc = 0x{:08X}\n", r.pc);
-        f << "name = \"" << r.name << "\"\n";
-        f << "emit = " << (r.emit ? "true" : "false") << "\n";
-        f << "status = \"" << (r.status.empty() ? "guessed" : r.status) << "\"\n";
-        if (!r.note.empty()) f << "note = \"" << r.note << "\"\n";
+    if (original.empty()) {
+        f << "# " << db.image_name << " — progressive symbol map\n";
+        f << "# Discover → label here → manipulate via PSX_FN_* (sync_symbols.py).\n";
+        f << "# See psxrecomp/docs/SYMBOLS.md and docs/FUNCTION_DISCOVERY.md.\n";
+    } else {
+        f << original;
+        if (original.back() != '\n') f << "\n";
     }
-    fmt::print("  symbols.toml: {} entries ({} new)\n", rows.size(), added);
+    f << "\n# --- appended by `psxrecomp-analyze --emit-symbols` ("
+      << confidence_name(min_conf) << " or better) ---\n";
+    f << added_text;
+    fmt::print("  symbols.toml: {} existing entries kept, {} appended\n",
+               existing.size(), added);
     return true;
 }
 

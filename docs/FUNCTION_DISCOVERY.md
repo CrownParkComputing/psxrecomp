@@ -161,8 +161,12 @@ silently merged.
 
 ## Naming loop
 
-`symbols.toml` (see [SYMBOLS.md](SYMBOLS.md)) is the persistence layer, and both
-writers preserve existing entries verbatim:
+`symbols.toml` (see [SYMBOLS.md](SYMBOLS.md)) is the persistence layer. Both
+writers are **append/edit-only and never regenerate the file**: it holds more
+than functions — Ape Escape has 11 `[[object]]` entries and a top-level `game`
+key, Crash Team Racing has 33 `[[site]]` entries, all hand-researched — and an
+earlier version that rebuilt the file from parsed `[[func]]` entries silently
+deleted every one of them.
 
 ```bash
 psxrecomp-analyze <EXE> --symbols symbols.toml --emit-symbols \
@@ -201,3 +205,85 @@ this?"* and can afford a labelled hypothesis, because a wrong answer is a wrong
 report that a human will notice. They share the boundary detection and the
 strict table resolver; they differ in what they are allowed to guess, and the
 labels exist so a consumer can tell which is which.
+
+---
+
+## Widescreen site scanning (`--scan-widescreen`)
+
+Widescreen bring-up on a new title means finding a handful of exact instruction
+addresses for `[widescreen.cull]`. Tomba's `game.toml` carries four bias/range
+pairs and three `a1` nops, each located by hand from disassembly or by mining
+the runtime's capture set with `tools/overlay_xref.py`. Every one of them has a
+crisp syntactic signature, so for a main-EXE title that search is static.
+
+```bash
+psxrecomp-analyze <EXE> --scan-widescreen --emit-ws-sites ws.toml
+python3 psxrecomp/psxrecomp_cli.py analyze --project-root . --scan-widescreen
+# or: RetComM Studio → Functions → tick "Widescreen sites" → Analyze
+```
+
+### What it finds
+
+**The per-game screen extents.** These are not fixed — Tomba tests `0x140/0x141`
+on a 320 display, Ape Escape `0x181` on 368, Wipeout 3 `0x200/0x240` on 512.
+Frequency alone picks the wrong values (Wipeout 3's real immediates appear in
+only three funnels, drowned by ordinary bounds checks in 83 GTE functions), so
+the scan scores **co-occurrence**: the screen-extent signature is a width
+compare and a height compare in the *same* function. Pairs are weighted toward
+GTE code and toward the console's actual display modes, then completed with the
+inclusive-bound sibling when the image contains a compare against it. That last
+step is load-bearing — Tomba's pairing keys on `sltiu_imm - 2*bias == W`, and
+`449 - 128` is `0x141`, so without it three of its four pairs vanish.
+
+When neither chosen set lands on a real console mode, the report and the emitted
+TOML say so rather than presenting a guess with a confident face.
+
+**`auto_screen_x` coverage.** Functions carrying the screen-extent signature are
+listed using `ws_cull_detect.h` — the same detector the recompiler and the
+runtime interpreter use, so the verdict cannot drift. Knowing that 22 of Tomba's
+functions are already handled without any per-address list is the most useful
+thing to learn before hand-listing anything.
+
+**bias/range pairs**, the masked-u16 X window:
+
+```
+80022E78  addiu $v0, $v0, 64        <- bias_sites   (+halfwidth)
+80022E7C  andi  $v0, $v0, 0xFFFF
+80022E80  sltiu $v0, $v0, 449       <- range_sites  (W + 2*halfwidth)
+80022E84  beq   $v0, $zero, reject
+```
+
+The arithmetic tie between the two immediates is what makes this safe to
+propose. Without it, any neighbouring `addiu`/`sltiu` would qualify.
+
+**`a1` margin sites** — a repurposable `nop` before a caller-supplied margin
+joins an X term. These classifiers are *callees* of the render funnel, not
+funnels themselves (Tomba's uses no GTE op and has no static caller at all), so
+the signature is local: the function takes `$a1`, folds it in with `addu`, and
+has a nop just before that is not already a branch delay slot.
+
+**`screen_x` sites** — width compares in functions `auto_screen_x` cannot reach,
+which are exactly the addresses that still need listing by hand.
+
+### Measured against hand-found ground truth
+
+Tomba's `game.toml` sites were found by hand over the course of the widescreen
+work. Scanning `SCUS_942.36` with everything auto-discovered:
+
+| key | recall | candidates proposed |
+|---|---|---|
+| `bias_sites` | **4/4** | 4 (no false positives) |
+| `range_sites` | **4/4** | 4 (no false positives) |
+| `a1_sites` | **3/3** | 17 |
+
+Independently, the scan recovers Ape Escape's documented `0x181` and both of
+Wipeout 3's configured `0x200`/`0x240`.
+
+### Safety
+
+Every proposal already satisfies the instruction form `code_generator.cpp`
+requires — `addi`/`addiu` for bias, `sltiu` for range and screen_x, a bare `nop`
+for a1 — because the emitter hard-errors on a mismatch in main-EXE mode. A
+suggestion that would break the build is not a suggestion. What the scanner
+cannot tell you is whether widening a given site *helps*; that is still
+playtesting.

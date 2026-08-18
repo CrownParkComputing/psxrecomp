@@ -166,11 +166,13 @@ add_executable(psxrecomp-analyze
     src/analysis_db.cpp
     src/bios_call_names.cpp
     src/analysis_export.cpp
+    src/widescreen_scan.cpp
     src/main_analyze.cpp
 )
 target_include_directories(psxrecomp-analyze PRIVATE
     include
     src
+    ../runtime/include   # ws_cull_detect.h — the shared auto_screen_x detector
     lib/fmt/include
     lib/toml11
 )
