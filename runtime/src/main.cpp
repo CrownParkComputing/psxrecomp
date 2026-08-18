@@ -1545,15 +1545,50 @@ extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
 static bool          g_ws_engaged = true;
+/* Widescreen/present bisect gates. Every knob below is UNSET by default, so a
+ * normal run behaves exactly as before; each one pins a single decision of the
+ * widescreen present layer so an on-screen artifact can be attributed to one
+ * stage instead of the whole pipeline:
+ *
+ *   PSX_WS_EDGE_FILL=0|1   pillarbox margins: black vs the frame's edge columns
+ *   PSX_WS_FORCE_43=0|1    the per-frame "pin this frame to native 4:3" verdict
+ *   PSX_WS_NATIVE_WIDE=0|1 native-wide render vs the legacy GTE squash
+ *   PSX_WS_ASPECT=<n>:<d>  the configured display aspect (e.g. 4:3, 16:9)
+ *
+ * -1 = unset (keep the configured/computed value), 0/1 = pin. */
+static int psx_env_tristate(const char *name) {
+    const char *e = std::getenv(name);
+    if (!e || !e[0]) return -1;
+    return (e[0] == '0') ? 0 : 1;
+}
+static int psx_ws_gate(const char *name) {
+    /* Resolved once: these are bisect pins, not live toggles. */
+    return psx_env_tristate(name);
+}
 /* Fill the pillarbox margins of a 4:3-pinned present with the frame's own edge
  * columns instead of black (gl_renderer_set_pillarbox_edge_fill). Game-facing
  * look for 2D screens on a very wide display; live-toggled by the
- * ws_menu_edge_fill debug command for A/B. */
-extern "C" { int g_ws_menu_edge_fill_flag = 1; }   /* ws_menu_edge_fill command */
+ * ws_menu_edge_fill debug command for A/B.
+ *
+ * OFF unless the title opts in via [widescreen] menu_edge_fill, matching the
+ * renderer's own contract ("wrong for content whose edge pixels are busy").
+ * It used to default ON for every title, so any 2D screen smeared its edge
+ * columns across the side bars the moment a pillarbox existed — i.e. on every
+ * fullscreen 16:9 display, where it reads as the picture bleeding off-screen
+ * instead of letterboxing (SFA3 character select). PSX_WS_EDGE_FILL overrides
+ * the config either way. */
+extern "C" { int g_ws_menu_edge_fill_flag = 0; }   /* ws_menu_edge_fill command */
 /* Wide-aspect strategy: native-wide (render the wider FOV into a wider frame,
  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
 static int           g_ws_native_wide = 1;
+/* PSX_WS_NATIVE_WIDE=0|1 pins native-wide vs the legacy squash (bisect gate,
+ * resolved at first use — see psx_ws_gate). */
+static int psx_ws_native_wide_effective(void) {
+    static int gate = -2;
+    if (gate == -2) gate = psx_env_tristate("PSX_WS_NATIVE_WIDE");
+    return gate >= 0 ? gate : g_ws_native_wide;
+}
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -1636,7 +1671,7 @@ static void refresh_widescreen_projection() {
         gpu_last_frame_vertical_split_screen();
     const bool native_wide = (g_netplay_local_viewport == 1)
         ? local_native_wide
-        : (g_ws_native_wide != 0);
+        : (psx_ws_native_wide_effective() != 0);
     const int mode = wide ? (native_wide ? 2 : 1) : 0;
     int proj_num = g_video_aspect_num;
     int proj_den = g_video_aspect_den;
@@ -6959,6 +6994,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * locked: we squash IFF we stretch. depth24 always classifies as FMV
          * even if the ws layer is not engaged yet (4:3 titles). */
         fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* PSX_WS_FORCE_43 pins this verdict for bisecting (see psx_ws_gate). */
+        {
+            static const int g_force43 = psx_ws_gate("PSX_WS_FORCE_43");
+            if (g_force43 >= 0) fmv_frame = g_force43 != 0;
+        }
         /* 2D screens (title, menus, loading) are deliberately kept at 4:3 by the
          * 3D-gated widescreen layer, which on a 32:9 display leaves them as a
          * small island in a mostly black window. Extend their own edge columns
@@ -6971,9 +7011,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * this is for. gl_renderer_present only fills when the present is
          * actually pillarboxed, so a 4:3 window has no margins to fill and this
          * costs nothing there. */
-        if (g_gl_active)
+        if (g_gl_active) {
+            static const int fill_gate = psx_ws_gate("PSX_WS_EDGE_FILL");
             gl_renderer_set_pillarbox_edge_fill(
-                g_ws_menu_edge_fill_flag && !di.depth24);
+                fill_gate >= 0 ? fill_gate
+                               : (g_ws_menu_edge_fill_flag && !di.depth24));
+        }
         /* MDEC movies are already decoded at their authored cadence and are
          * CPU/upload heavy. High-refresh crossfades only contend with decoding
          * and can starve audio, so present native-4:3/MDEC phases directly.
@@ -7010,7 +7053,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * wide (compositor unsupported, or the surface fallback below)
          * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
          * stretch: its canonical content is pre-squashed FOR the stretch. */
-        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+        const bool nw_pin = g_ws_engaged && psx_ws_native_wide_effective();
 
         /* Ring the classification now that it's final (only the software/CPU
          * wide path below can still fall back — it amends this entry). A
@@ -11429,6 +11472,7 @@ int main(int argc, char** argv) {
             /* Keep titles with known native-wide regressions on the original
              * projection-squash + stretched-present widescreen path. */
             g_ws_native_wide = gc.ws_native_wide ? 1 : 0;
+            g_ws_menu_edge_fill_flag = gc.ws_menu_edge_fill ? 1 : 0;
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
             /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
@@ -13274,6 +13318,18 @@ session_reboot:
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
+    /* PSX_WS_ASPECT=<n>:<d> pins the display aspect for bisecting a stretch
+     * (the letterbox rect is derived from it) without touching settings.toml. */
+    if (const char *asp = std::getenv("PSX_WS_ASPECT")) {
+        int an = 0, ad = 0;
+        if (std::sscanf(asp, "%d:%d", &an, &ad) == 2 && an > 0 && ad > 0) {
+            g_video_aspect_num = an;
+            g_video_aspect_den = ad;
+            std::fprintf(stdout, "psxrecomp: PSX_WS_ASPECT pinned display aspect %d:%d\n", an, ad);
+        } else {
+            std::fprintf(stderr, "psxrecomp: ignoring invalid PSX_WS_ASPECT='%s'\n", asp);
+        }
+    }
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
     if (g_video_pgxp_depth)

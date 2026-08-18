@@ -349,6 +349,13 @@ static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
  * present instead of leaving them black. Off unless a game asks for it: it is
  * a deliberate look, and it is wrong for content whose edge pixels are busy. */
 static int           s_pillarbox_edge_fill = 0;
+/* Present letterbox aspect (4:3 native unless a wide aspect is configured). */
+static int           s_aspect_num = 4, s_aspect_den = 3;
+/* Last present's margin verdict, for PSX_PRESENT_DIAG: whether the frame was
+ * pinned to native 4:3, and whether the edge fill actually drew into a margin.
+ * A smeared bar is one of these two turning on — the diag says which. */
+static int           s_pres_force_43 = 0;
+static int           s_pres_fill_drew = 0;
 static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
 static GLint         s_present_uSharp = -1;
 static GLuint        s_interp_prog = 0, s_interp_tex[3];
@@ -908,15 +915,22 @@ static void pres_record(int path, int dx, int dy, int w, int h,
         }
         if (diag) {
             static int last_path = -1, last_d24 = -1, last_h = -1, last_dy = -1;
+            static int last_f43 = -1, last_fill = -1, last_lw = -1;
             int d24 = gpu_display_is_depth24();
             if (path != last_path || d24 != last_d24 || h != last_h ||
-                dy != last_dy) {
+                dy != last_dy || s_pres_force_43 != last_f43 ||
+                s_pillarbox_edge_fill != last_fill || lw != last_lw) {
                 fprintf(stderr,
                         "[PRES] f=%llu path=%d depth24=%d disp=(%d,%d %dx%d) "
-                        "letterbox=(%d,%d %dx%d)\n",
+                        "letterbox=(%d,%d %dx%d) aspect=%d:%d force43=%d "
+                        "edge_fill=%d filled=%d\n",
                         (unsigned long long)s_frame_count, path, d24,
-                        dx, dy, w, h, lx, ly, lw, lh);
+                        dx, dy, w, h, lx, ly, lw, lh,
+                        s_aspect_num, s_aspect_den, s_pres_force_43,
+                        s_pillarbox_edge_fill, s_pres_fill_drew);
                 last_path = path; last_d24 = d24; last_h = h; last_dy = dy;
+                last_f43 = s_pres_force_43; last_fill = s_pillarbox_edge_fill;
+                last_lw = lw;
             }
         }
     }
@@ -3339,7 +3353,6 @@ static void present_set_sharp(int mode, int tex_w, int tex_h,
 /* Display aspect for the present letterbox. Default 4:3 (native). When a wide
  * aspect is configured the 4:3 frame is stretched into it — paired with the
  * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
-static int s_aspect_num = 4, s_aspect_den = 3;
 
 void gl_renderer_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { num = 4; den = 3; }
@@ -3761,6 +3774,8 @@ void gl_renderer_shutdown(void) {
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
     if (!s_ctx) return;
+    s_pres_force_43 = force_4_3 ? 1 : 0;
+    s_pres_fill_drew = 0;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
@@ -5103,6 +5118,7 @@ static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
     if (!s_pillarbox_edge_fill || lh <= 0 || w <= 0 || h <= 0) return;
     const int right_w = ww - (lx + lw);
     if (lx <= 0 && right_w <= 0) return;   /* no margins to fill */
+    s_pres_fill_drew = 1;                  /* reported by PSX_PRESENT_DIAG */
 
     float v0 = ((float)y + 0.5f) / (float)tex_h;
     float v1 = ((float)(y + h) - 0.5f) / (float)tex_h;
@@ -5227,6 +5243,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
+    s_pres_force_43 = force_4_3 ? 1 : 0;
+    s_pres_fill_drew = 0;
     int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
                                      linear, force_4_3, GL_PRES_VRAM);
     if (interp_pair) {

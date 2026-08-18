@@ -1446,6 +1446,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_offered = true;
     bool vulkan_offered = false;
     bool ws_adaptive_view = false;
+    bool ws_menu_edge_fill = false;
     bool ws_ultrawide_offered = false;
     if (cfg.contains("video")) {
         const toml::value& video = toml::find(cfg, "video");
@@ -1667,6 +1668,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_ultrawide_offered = toml::find<bool>(ws, "offer_ultrawide");
         if (ws.contains("adaptive_view"))
             ws_adaptive_view = toml::find<bool>(ws, "adaptive_view");
+        if (ws.contains("menu_edge_fill"))
+            ws_menu_edge_fill = toml::find<bool>(ws, "menu_edge_fill");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
@@ -2230,6 +2233,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_offered*/            ws_offered,
         /*vulkan_offered*/        vulkan_offered,
         /*ws_adaptive_view*/      ws_adaptive_view,
+        /*ws_menu_edge_fill*/     ws_menu_edge_fill,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,

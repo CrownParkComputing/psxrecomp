@@ -1163,6 +1163,13 @@ struct GameConfig {
     // widest aspect this title offers.
     bool ws_adaptive_view = false;
 
+    // [widescreen] menu_edge_fill — fill the pillarbox margins of a 4:3-pinned
+    // present with the frame's own edge columns instead of black. A deliberate
+    // look for 2D screens on a very wide display, and WRONG whenever the edge
+    // columns carry picture (it smears them across the bars), so it is opt-in
+    // per title. Runtime-only (read at startup; no codegen impact).
+    bool ws_menu_edge_fill = false;
+
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;
     // ordinary widescreen offer remains the independent 16:9 choice.
