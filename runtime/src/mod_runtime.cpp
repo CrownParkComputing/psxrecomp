@@ -1301,6 +1301,10 @@ const std::string& mod_runtime_fingerprint() {
     return state().plan.fingerprint;
 }
 
+extern "C" const char* psx_mod_runtime_fingerprint_cstr(void) {
+    return state().plan.fingerprint.c_str();
+}
+
 const std::filesystem::path& mod_runtime_effective_disc_path() {
     return state().effective_disc_path;
 }

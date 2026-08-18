@@ -41,6 +41,13 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+
+/* Declarations only -- STB_IMAGE_IMPLEMENTATION lives in
+ * psx_window_icon.cpp, whose STBI_NO_STDIO must be matched here or the
+ * declarations disagree with the definitions that exist. */
+#include <random>
+#define STBI_NO_STDIO
+#include "../third_party/stb_image.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
 #include "latency_ring.h"
@@ -1157,6 +1164,7 @@ static int           g_video_perspective_texturing = 0;
 /* [video] pgxp_depth — depth-test using PGXP's recovered W instead of relying
  * solely on the ordering table. See gl_renderer_set_pgxp_depth. */
 static int           g_video_pgxp_depth = 0;
+extern "C" void gl_renderer_set_depth_always(int on);
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -1166,11 +1174,13 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
 static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::string   g_bezel_path;      /* [video] bezel -- margin artwork */
 static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
-static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
+static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
+static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_audio_freq     = 44100; /* host device request */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
@@ -1619,9 +1629,18 @@ static int           g_logical_w = 640;
  * the given aspect: height = width*den/num. */
 static void clamp_window_aspect(int* w, int* h, int num, int den) {
     int width = *w;
-    if (width < 640) width = 640;
     SDL_Rect bounds;
-    if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0 && bounds.h > 0) {
+    const int have_bounds =
+        (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0 && bounds.h > 0);
+    /* 0 = "fit the display". The old default was a hardcoded 1280, which on a
+     * 4K or 8K panel opens a small window in the corner and, worse, makes the
+     * image far smaller than the internal render resolution the user chose --
+     * supersampling 16 rendering into a 1280-wide window throws almost all of
+     * it away. Fitting the usable bounds keeps the window proportional to the
+     * display it is actually on. An explicit width still wins. */
+    if (width <= 0) width = have_bounds ? bounds.w : 1280;
+    if (width < 640) width = 640;
+    if (have_bounds) {
         if (width > bounds.w)             width = bounds.w;
         if (width * den / num > bounds.h) width = bounds.h * num / den;
     }
@@ -11514,6 +11533,12 @@ int main(int argc, char** argv) {
             g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
+            g_bezel_path       = gc.runtime.video_bezel;
+            if (gc.runtime.runtime_cpu_overclock != 100u) {
+                psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
+                std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
+                             psx_get_cpu_overclock());
+            }
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -11917,6 +11942,7 @@ int main(int argc, char** argv) {
 #endif
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
+        if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
@@ -12361,6 +12387,24 @@ int main(int argc, char** argv) {
         (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
     if (want_launcher) {
         launcher_boot_timing_mark("host:before_sdl_init");
+    /* Per-monitor DPI awareness, BEFORE any SDL_Init.
+     *
+     * Without it Windows virtualises everything this process sees: on a
+     * 7680x4320 panel at 400% scaling SDL_GetDisplayUsableBounds reports
+     * 1920x1032, so the window is clamped to roughly 1376 LOGICAL pixels and
+     * opens as a small box, while the desktop compositor then upscales it.
+     * The internal render resolution is unaffected -- which is the trap: the
+     * game renders at supersampling 16 and the result is thrown away scaling
+     * a 1376-wide window up to an 8K display.
+     *
+     * permonitorv2 makes SDL report physical pixels, so the window sizes
+     * against the real panel and the drawable matches it 1:1. */
+#ifdef SDL_HINT_WINDOWS_DPI_AWARENESS
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+#ifdef SDL_HINT_WINDOWS_DPI_SCALING
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+#endif
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             launcher_boot_timing_mark("host:after_sdl_init");
             recomp_launcher_set_preserve_sdl(1);
@@ -13432,6 +13476,13 @@ session_reboot:
     }
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
+    if (g_video_pgxp_depth) {
+        /* Unarmed prims (no recovered depth: ship model, HUD, CPU-built
+         * effects) must ALWAYS PASS, or the depth test culls them against
+         * world Z they never took part in — measured live: the player ship
+         * and trackside monitors vanish without this. */
+        gl_renderer_set_depth_always(1);
+    }
     if (g_video_pgxp_depth)
         std::fprintf(stdout, "psxrecomp: PGXP depth buffer on (ordering-table "
                              "sort augmented by recovered per-vertex W)\n");
@@ -13647,6 +13698,24 @@ session_reboot:
      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
+    /* Per-monitor DPI awareness, BEFORE any SDL_Init.
+     *
+     * Without it Windows virtualises everything this process sees: on a
+     * 7680x4320 panel at 400% scaling SDL_GetDisplayUsableBounds reports
+     * 1920x1032, so the window is clamped to roughly 1376 LOGICAL pixels and
+     * opens as a small box, while the desktop compositor then upscales it.
+     * The internal render resolution is unaffected -- which is the trap: the
+     * game renders at supersampling 16 and the result is thrown away scaling
+     * a 1376-wide window up to an 8K display.
+     *
+     * permonitorv2 makes SDL report physical pixels, so the window sizes
+     * against the real panel and the drawable matches it 1:1. */
+#ifdef SDL_HINT_WINDOWS_DPI_AWARENESS
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+#ifdef SDL_HINT_WINDOWS_DPI_SCALING
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+#endif
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
             return 1;
@@ -13731,6 +13800,22 @@ session_reboot:
     }
     psx_apply_window_icon(sdl_window, argv[0]);
 
+    /* Maximise instead of computing the frame size ourselves.
+     *
+     * clamp_window_aspect fits the CLIENT area to the usable bounds, but a
+     * window is client plus title bar and borders, so fitting the client to a
+     * full-height display produced a window taller than the screen that hung
+     * off the top. Deriving the decoration size first does not work either:
+     * SDL_GetWindowBordersSize reports nothing useful before the window is
+     * shown, so the correction silently did not apply.
+     *
+     * The window manager already solves this exactly. Maximise and let it fit
+     * the work area, decorations and taskbar included. Only when the request
+     * was "fit the display" (window_width unset) -- an explicit width is a
+     * deliberate choice and is left alone. */
+    if (!g_fullscreen && !g_video_win_w_explicit)
+        SDL_MaximizeWindow(sdl_window);
+
     /* Host refresh: if the panel is within ~2% of the live CRTC rate (NTSC
      * 59.94 / PAL 50), record it so driver vsync can own cadence. Otherwise
      * keep the PSX CRTC period and force swap interval 0. Mods that own
@@ -13788,6 +13873,73 @@ session_reboot:
     if (g_video_renderer == 1) {
         gl_renderer_set_swap_interval(present_effective_swap_interval()); /* applied at context init */
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+
+    /* Bezel artwork ([video] bezel): a still image behind the frame that fills
+     * the letterbox/pillarbox margins. Loaded here because the GL context now
+     * exists and stb_image is already linked for the HD texture pack. A
+     * relative path resolves against the disc directory, so a pack of team
+     * wallpapers can sit beside the disc like the texture pack does. */
+    if (!g_bezel_path.empty() && g_bezel_path != "off" && g_gl_active) {
+        /* Resolve the setting to a file.
+         *
+         *   "random"      one of the bundled team logos, chosen ONCE per
+         *                 launch and kept for the whole session -- a mark that
+         *                 changed mid-run would read as a glitch;
+         *   "qirex" etc.  that team;
+         *   anything else a path, relative to the disc directory.
+         *
+         * Bundled art lives next to the executable so a stock install has it
+         * without touching the disc folder. */
+        std::filesystem::path bp;
+        const std::filesystem::path bez_dir =
+            exe_dir_from_argv(argv[0]) / "bezels";
+        if (g_bezel_path == "random") {
+            std::vector<std::filesystem::path> pool;
+            std::error_code bec;
+            for (const auto &e : std::filesystem::directory_iterator(bez_dir, bec)) {
+                if (bec) break;
+                if (e.is_regular_file(bec) && e.path().extension() == ".png")
+                    pool.push_back(e.path());
+            }
+            std::sort(pool.begin(), pool.end());   /* directory order is not defined */
+            if (!pool.empty()) {
+                std::random_device rd;
+                bp = pool[rd() % pool.size()];
+            }
+        } else {
+            bp = std::filesystem::path(g_bezel_path);
+            if (!bp.has_extension()) {             /* a team name */
+                std::filesystem::path named = bez_dir / (g_bezel_path + ".png");
+                std::error_code nec;
+                if (std::filesystem::exists(named, nec)) bp = named;
+            }
+            if (bp.is_relative()) bp = resolved_disc.parent_path() / bp;
+        }
+        std::vector<unsigned char> file;
+        if (FILE *bf = std::fopen(bp.string().c_str(), "rb")) {
+            std::fseek(bf, 0, SEEK_END);
+            const long len = std::ftell(bf);
+            std::fseek(bf, 0, SEEK_SET);
+            if (len > 0) {
+                file.resize((size_t)len);
+                if (std::fread(file.data(), 1, file.size(), bf) != file.size())
+                    file.clear();
+            }
+            std::fclose(bf);
+        }
+        int bw = 0, bh = 0, bc = 0;
+        unsigned char *px = file.empty() ? nullptr
+            : stbi_load_from_memory(file.data(), (int)file.size(), &bw, &bh, &bc, 4);
+        if (px) {
+            gl_renderer_set_bezel(px, bw, bh);
+            stbi_image_free(px);
+            std::fprintf(stdout, "psxrecomp: bezel artwork %dx%d from %s\n",
+                         bw, bh, bp.string().c_str());
+        } else {
+            std::fprintf(stdout, "psxrecomp: bezel artwork not loaded: %s\n",
+                         bp.string().c_str());
+        }
+    }
         if (!g_gl_active) {
             gr_set_backend(GR_BACKEND_SOFTWARE);
             gl_renderer_set_cpu_auth_dual(0);

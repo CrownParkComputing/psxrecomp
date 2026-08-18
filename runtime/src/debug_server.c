@@ -7961,6 +7961,38 @@ static void handle_ws_ui_groups(int id, const char *json)
  *
  * Live, because this one changes WHICH PIXELS SURVIVE and the only honest test
  * is flipping it on the same scene. No args = report. */
+/* zbuf <path>: dump the real depth buffer over the display rect as a 16-bit
+ * greyscale PNG. Distinct from pgxp_depth zdebug, which paints every fragment
+ * its own depth including semi-transparent ones that never write. */
+static void handle_zbuf(int id, const char *json)
+{
+    extern int gl_renderer_read_depth(float *, int, int, int, int);
+    extern int gr_scale(void);
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    if (di.disabled || !di.width || !di.height) { send_err(id, "display disabled"); return; }
+    if (di.depth24) { send_err(id, "24bpp scanout"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    int S = gr_scale(); if (S < 1) S = 1;
+    uint32_t w = di.width > 640 ? 640 : di.width;
+    uint32_t h = di.height > 512 ? 512 : di.height;
+    uint32_t ow = w * (uint32_t)S, oh = h * (uint32_t)S;
+    float *f = (float *)malloc((size_t)ow * oh * sizeof(float));
+    if (!f) { send_err(id, "alloc failed"); return; }
+    int got = gl_renderer_read_depth(f, (int)di.display_x, (int)di.display_y, (int)w, (int)h);
+    if (got <= 0) { free(f); send_err(id, "no depth surface"); return; }
+    /* Raw float32, row-major, bottom-up as GL returns it. No PNG: the consumer
+     * is a histogram, and quantising to 8 or 16 bits would throw away exactly
+     * the resolution this is being read to measure. */
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(f); send_err(id, "open failed"); return; }
+    const size_t wrote = fwrite(f, sizeof(float), (size_t)ow * oh, fp);
+    fclose(fp); free(f);
+    if (wrote != (size_t)ow * oh) { send_err(id, "short write"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"w\":%u,\"h\":%u,\"scale\":%d}",
+             id, path, ow, oh, S);
+}
+
 static void handle_pgxp_depth(int id, const char *json)
 {
     const int on = json_get_int(json, "on", -1);
@@ -7971,8 +8003,25 @@ static void handle_pgxp_depth(int id, const char *json)
     extern void gl_renderer_set_zdebug(int on);
     const int zdbg = json_get_int(json, "zdebug", -1);
     if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
+    extern void gl_renderer_set_depth_always(int on);
+    const int always = json_get_int(json, "always", -1);
+    if (always >= 0) gl_renderer_set_depth_always(always);
     if (on >= 0) gl_renderer_set_pgxp_depth(on);
-    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_pgxp_depth());
+    /* Report the Z distribution alongside the flag: choosing znear without it
+     * is guesswork, and guessing it wrong is what broke this twice. */
+    extern void gl_renderer_pgxp_zstats(float *, float *, double *,
+                                        unsigned long long *,
+                                        unsigned long long *, int);
+    float zmn = 0.0f, zmx = 0.0f; double zmean = 0.0;
+    unsigned long long zn = 0, hist[20] = {0};
+    gl_renderer_pgxp_zstats(&zmn, &zmx, &zmean, &zn, hist, 20);
+    char hb[256]; int ho = 0;
+    for (int i = 0; i < 20 && ho < (int)sizeof(hb) - 24; i++)
+        ho += snprintf(hb + ho, sizeof(hb) - (size_t)ho, "%s%llu",
+                       i ? "," : "", hist[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"zmin\":%.1f,\"zmax\":%.1f,"
+             "\"zmean\":%.1f,\"zn\":%llu,\"zhist\":[%s]}",
+             id, gl_renderer_pgxp_depth(), zmn, zmx, zmean, zn, hb);
 }
 
 /* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
@@ -8239,6 +8288,67 @@ static void handle_savestate(int id, const char *json)
         return;
     }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
+}
+
+/* Live CPU overclock for anchored A/B: animation-rate artifacts cannot be
+ * attributed to the overclock without flipping it on the exact same scene. */
+/* Census of imperfect PGXP triangles for the last complete frame: which
+ * screen prims are NOT fully dataflow-corrected, and why, per vertex. */
+static void handle_pgxp_census(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0, tris = 0, clean = 0;
+    int n = gpu_pgxp_census_dump(&frame, &tris, &clean, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"tris\":%u,\"clean\":%u,"
+        "\"imperfect\":%d,\"entries\":[", id, frame, tris, clean, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"cls\":[%u,%u,%u],\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_pgxp_texcensus(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0;
+    int n = gpu_pgxp_texcensus_dump(&frame, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"misses\":%d,\"entries\":[",
+        id, frame, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"reason\":%u,\"vtx\":%u,\"why\":%u,\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_overclock(int id, const char *json)
+{
+    int pct = json_get_int(json, "percent", -1);
+    if (pct > 0)
+        psx_set_cpu_overclock((uint32_t)pct);
+    send_fmt("{\"id\":%d,\"ok\":true,\"percent\":%u}",
+             id, psx_get_cpu_overclock());
 }
 
 static void handle_turbo(int id, const char *json)
@@ -13506,6 +13616,7 @@ static const CmdEntry s_commands[] = {
     { "tex_pack",          handle_tex_pack },
     { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
     { "pgxp_depth",        handle_pgxp_depth },
+    { "zbuf",              handle_zbuf },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
@@ -13675,6 +13786,9 @@ static const CmdEntry s_commands[] = {
     { "input_route_stop",  handle_input_route_stop },
     { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
+    { "pgxp_census",       handle_pgxp_census },
+    { "pgxp_texcensus",    handle_pgxp_texcensus },
+    { "overclock",         handle_overclock },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },

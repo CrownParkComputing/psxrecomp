@@ -452,7 +452,16 @@ static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
 static int   s_pgxp_depth = 0;         /* configured */
 static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
 static int   s_zdebug = 0;             /* paint depth as greyscale       */
+#define ZC_BUCKETS 20
+static float  s_zc_min = 1e30f, s_zc_max = 0.0f;
+static double s_zc_sum = 0.0;
+static uint64_t s_zc_n = 0, s_zc_hist[ZC_BUCKETS];
 static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
+static int   s_wide_depth_clear = 1;   /* same, for the native-wide mirror */
+/* Diagnostic: GL_ALWAYS keeps depth WRITES but never rejects. Separates "the
+ * test is discarding this geometry" from "this geometry never got drawn",
+ * which no amount of staring at a depth readout settles. */
+static int   s_depth_always = 0;
 /* Near plane in GTE Z units for the reciprocal depth map.
  *
  * MUST sit at or below the smallest Z the scene produces, because the map
@@ -830,6 +839,21 @@ static void hold_ensure_tex(int w, int h) {
 
 /* Snapshot the just-drawn default backbuffer (letterbox + content) before Swap.
  * Hold-last can then redraw this exact image without touching guest VRAM. */
+/* MEASURED: this costs nothing. Disabling the capture entirely moves present
+ * by less than noise (18.86ms off vs 18.49ms on, 8K/7680-wide), so the
+ * earlier claim that throttling it cut present 18.2ms -> 3.9ms was wrong --
+ * that comparison was between two different screens, not two settings.
+ * Capture every frame; the held frame is only ever shown while the
+ * emulator is STALLED or PAUSED (see gl_renderer_present_hold_last callers:
+ * the stall tick and the rewind pause), where it is a still image. Capturing
+ * it every frame meant a full-drawable glCopyTexSubImage2D on the present
+ * path -- at 7680x4039 that is ~31M pixels, about 124 MB of copy per frame,
+ * and it measured as ~18ms of the ~23ms present cost at 8K.
+ *
+ * Every Nth frame instead: worst case the held image is N frames stale, which
+ * at 60-100 fps is tens of milliseconds and imperceptible on a frozen frame,
+ * and the cost drops by N. */
+
 static void hold_capture_drawable(void) {
     int ww = 0, wh = 0;
     if (!s_ctx || !s_win)
@@ -1270,19 +1294,26 @@ static const char *REPL_FS =
     "uniform int u_debug;\n"
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
-    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
-    /* +0.5 is texel CENTRE, and it is load-bearing here in a way it never was
-     * on the PS1 path. An integer u addresses texel u, whose span in the
-     * replacement is [u, u+1); sampling at u alone lands on its left EDGE. With
-     * NEAREST that still resolves to the right texel, so the omission was
-     * invisible — but this path is LINEAR (a pack image carries detail the
-     * texel grid does not), and there a half-texel shift blends in whatever
-     * sits one texel over. On a font atlas that neighbour is the adjacent
-     * glyph's cell, so every glyph quad drew a hairline of its neighbour along
-     * its own edge: background-coloured slivers cutting through letters and
-     * ink-coloured ones in the gaps. Clamp to v_limits.zw (not +0.999) so the
-     * far edge lands on the last texel's centre rather than past it. */
-    "  vec4 t = texture(u_repl, (uv - u_origin + vec2(0.5)) / u_src);\n"
+    /* Continuous source-space sampling with a half-IMAGE-pixel interior clamp.
+     *
+     * The interpolated uv is already a CONTINUOUS texel-space position (a
+     * fragment in the middle of texel u carries uv ~ u+0.5), so adding a
+     * blanket +0.5 texel here double-shifted every sample by half a source
+     * texel. Invisible on big art; fatal on the segment-atlas strips, whose
+     * source rows are ONE texel tall: half a texel is half the image, so the
+     * strip drew with its top half cut off and the wrapped top row appended
+     * at the bottom (the press-start/further-information offset). At glyph
+     * edges the same shift pushed LINEAR samples into the neighbouring atlas
+     * cell (the stray marks below G / right of O and E on loading text).
+     *
+     * The sliver bug the +0.5 originally fixed is handled the right way: the
+     * clamp keeps samples half an IMAGE pixel inside the prim UV cell
+     * ([lo, hi] inclusive texels => continuous cell edge at hi+1), so LINEAR
+     * can never blend across the cell boundary no matter the pack scale. */
+    "  vec2 halfimg = 0.5 * u_src / vec2(textureSize(u_repl, 0));\n"
+    "  uv = clamp(uv, vec2(v_limits.xy) + halfimg,\n"
+    "             vec2(v_limits.zw) + vec2(1.0) - halfimg);\n"
+    "  vec4 t = texture(u_repl, (uv - u_origin) / u_src);\n"
     /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
      * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
      * STP clear. It is not coverage. */
@@ -1960,6 +1991,17 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    /* Per-frame depth clear for THIS surface. The allocation-time clear only
+     * covers the first frame, and hr_begin clears the hr FBO only -- so with
+     * PGXP depth on, the wide margins would accumulate depth forever and
+     * progressively reject their own geometry. Armed at Swap, like hr_begin. */
+    if (s_pgxp_depth && s_wide_depth_clear) {
+        s_wide_depth_clear = 0;
+        glDisable(GL_SCISSOR_TEST);
+        glDepthMask(GL_TRUE);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+    }
     glEnable(GL_SCISSOR_TEST);
     {
         int sy = s_area_y1, sh = s_area_y2 - s_area_y1 + 1;
@@ -2129,7 +2171,7 @@ static void depth_state(int armed, int semi) {
     if (!s_pgxp_depth) return;
     if (!armed) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); return; }
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
+    glDepthFunc(s_depth_always ? GL_ALWAYS : GL_LEQUAL);
     glDepthMask(semi >= 0 ? GL_FALSE : GL_TRUE);
 }
 
@@ -2952,6 +2994,62 @@ static void glb_set_replacement(const void *repl) {
 static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
     s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
     s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
+    /* Census of the Z this title actually emits. znear must sit just under the
+     * scene minimum: too high and the near field clamps onto one plane and
+     * occludes everything behind it; too low and the reciprocal crushes the
+     * whole scene into the last percent of the range, where the test between
+     * two objects is decided by float noise. Both failures were shipped before
+     * this counter existed, because both were guessed at, not measured. */
+    if (s_pz_valid) {
+        for (int i = 0; i < 3; i++) {
+            const float z = s_pz[i];
+            if (z < s_zc_min) s_zc_min = z;
+            if (z > s_zc_max) s_zc_max = z;
+            s_zc_sum += (double)z; s_zc_n++;
+            unsigned b = 0; float t = z;   /* log2 buckets: shape, not mean */
+            while (t >= 2.0f && b < ZC_BUCKETS - 1) { t *= 0.5f; b++; }
+            s_zc_hist[b]++;
+        }
+    }
+}
+
+/* Z census readout (pgxp_depth). Resets on read so a sweep measures one scene
+ * at a time. */
+void gl_renderer_set_depth_always(int on) { s_depth_always = on ? 1 : 0; }
+int  gl_renderer_depth_always(void) { return s_depth_always; }
+
+/* Read back the real DEPTH BUFFER over the display rect.
+ *
+ * Not the same thing as the zdebug colour view, and the difference is the
+ * whole point: zdebug paints every fragment its own computed depth, including
+ * semi-transparent ones that set glDepthMask(GL_FALSE) and therefore never
+ * contribute. Sampling that view by colour cannot tell a mis-projected hull
+ * triangle from the craft's own glow sitting over empty sky. The buffer holds
+ * only what was actually WRITTEN, so it answers the question the colour view
+ * cannot. Returns pixels written, or 0. */
+int gl_renderer_read_depth(float *out, int dx, int dy, int dw, int dh) {
+    const int S = s_scale;
+    if (!s_ctx || !s_raster_ok || !s_hr_fbo || !out || dw <= 0 || dh <= 0) return 0;
+    flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+    const int ow = dw * S, oh = dh * S;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(dx * S, dy * S, ow, oh, GL_DEPTH_COMPONENT, GL_FLOAT, out);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    return ow * oh;
+}
+
+void gl_renderer_pgxp_zstats(float *mn, float *mx, double *mean,
+                             unsigned long long *n, unsigned long long *hist,
+                             int hist_len) {
+    if (mn) *mn = (s_zc_n ? s_zc_min : 0.0f);
+    if (mx) *mx = s_zc_max;
+    if (mean) *mean = (s_zc_n ? s_zc_sum / (double)s_zc_n : 0.0);
+    if (n) *n = s_zc_n;
+    for (int i = 0; i < hist_len && i < ZC_BUCKETS; i++) hist[i] = s_zc_hist[i];
+    s_zc_min = 1e30f; s_zc_max = 0.0f; s_zc_sum = 0.0; s_zc_n = 0;
+    for (int i = 0; i < ZC_BUCKETS; i++) s_zc_hist[i] = 0;
 }
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
@@ -4183,7 +4281,13 @@ static GLuint wide_fbo_for(int base_x) {
             glClearColor(0, 0, 0, 0);
             glClearStencil(0);
             glStencilMask(0xFF);
-            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            glClearDepth(1.0);
+            glDepthMask(GL_TRUE);
+            /* Depth as well as colour and stencil. This surface carries its own
+             * depth attachment, and hr_begin only ever clears the hr FBO -- so with
+             * PGXP depth on, the wide margins would test against depth written
+             * before this allocation and never cleared again. */
+            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
             s_wide_base[i] = base_x;
             return s_wide_fbo[i];
@@ -5016,6 +5120,7 @@ static void gl_swap_with_osd(void) {
      * buffer. Set here rather than inferred from a counter another
      * translation unit owns -- see hr_begin. */
     s_depth_needs_clear = 1;
+    s_wide_depth_clear = 1;
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -5135,6 +5240,163 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
  * scale > 1, where the renderer presents from its own high-resolution FBO
  * instead of a CPU readback. Call AFTER present_target_quad; restores the
  * viewport it found. See gl_renderer_set_pillarbox_edge_fill. */
+/* Bezel art: a still image behind the frame, filling whatever the letterbox or
+ * pillarbox leaves over -- the trick vertical shmups use on horizontal
+ * displays, so the dead space reads as designed rather than as a limitation.
+ *
+ * Drawn across the WHOLE window before the game image: simpler and safer than
+ * filling two margin strips, since it needs no margin arithmetic, covers
+ * pillarbox and letterbox alike, and the game quad paints over the middle.
+ *
+ * Crucially it never samples the frame. present_edge_fill stretches one edge
+ * COLUMN across the margin, which suits a flat menu backdrop and turns track
+ * geometry into horizontal smears, so it has to know whether the frame is a
+ * menu -- and gets it wrong. A still image has no such question: it looks the
+ * same in a race and in a menu, which is the whole point of a bezel. */
+static GLuint s_bezel_tex = 0;
+static int    s_bezel_w = 0, s_bezel_h = 0;
+/* Backdrop behind the tiled mark, derived from the art itself so each team
+ * brings its own colour. Black read as a hole in the screen. */
+static float  s_bezel_bg[3] = { 0.0f, 0.0f, 0.0f };
+
+int gl_renderer_set_bezel(const void *rgba, int w, int h) {
+    if (s_bezel_tex) { glDeleteTextures(1, &s_bezel_tex); s_bezel_tex = 0; }
+    if (!rgba || w <= 0 || h <= 0) return 1;          /* clearing is success */
+    if (!s_ctx || !s_raster_ok) return 0;
+    glGenTextures(1, &s_bezel_tex);
+    if (!s_bezel_tex) return 0;
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    /* REPEAT so a single logo can tile down a tall margin. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    /* Pad the image with transparent margin before upload, so tiles do not
+     * butt against each other. GL_REPEAT tiles edge to edge with no notion of
+     * spacing, so the gap has to exist in the texture: 10% of the image width
+     * added on each side leaves 20% between neighbours. The logo itself is
+     * never distorted -- it is centred in a larger transparent cell, and the
+     * tiling maths uses the padded cell's aspect. */
+    /* Both axes padded by the same fraction of the WIDTH, not each axis by
+     * its own. Tiles are scaled so one spans a fixed share of the margin
+     * width, so a pad measured in width units lands as the same on-screen gap
+     * horizontally and vertically -- and, more importantly, the same gap for
+     * every mark. These logos run from 1024x479 to 1024x997, so padding each
+     * axis by its own 10% gave a visibly different vertical gap per team. */
+    const int px_pad = (w * 10) / 100, py_pad = px_pad;
+    const int pw = w + px_pad * 2, ph = h + py_pad * 2;
+    unsigned char *padded =
+        (unsigned char *)calloc((size_t)pw * (size_t)ph, 4);
+    if (padded) {
+        const unsigned char *src8 = (const unsigned char *)rgba;
+        for (int y = 0; y < h; y++)
+            memcpy(padded + (((size_t)(y + py_pad) * pw) + px_pad) * 4,
+                   src8 + (size_t)y * w * 4, (size_t)w * 4);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                 padded ? pw : w, padded ? ph : h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, padded ? padded : rgba);
+    free(padded);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    s_bezel_w = padded ? pw : w; s_bezel_h = padded ? ph : h;
+    /* Backdrop from the art: mean of the opaque pixels, darkened. Each team
+     * then brings its own colour instead of sitting on black, which read as a
+     * hole punched in the screen rather than as part of the design. Weighted by
+     * alpha so soft edges do not drag it toward whatever the file pads with. */
+    {
+        const unsigned char *p8 = (const unsigned char *)rgba;
+        double acc[3] = { 0, 0, 0 }, wsum = 0;
+        const size_t n = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < n; i++) {
+            const double al = p8[i * 4 + 3] / 255.0;
+            if (al <= 0.0) continue;
+            acc[0] += p8[i * 4 + 0] * al;
+            acc[1] += p8[i * 4 + 1] * al;
+            acc[2] += p8[i * 4 + 2] * al;
+            wsum += al;
+        }
+        if (wsum > 0.0) {
+            for (int c = 0; c < 3; c++)
+                s_bezel_bg[c] = (float)(acc[c] / wsum / 255.0) * 0.28f;
+        } else {
+            s_bezel_bg[0] = s_bezel_bg[1] = s_bezel_bg[2] = 0.06f;
+        }
+    }
+    return 1;
+}
+
+int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
+
+/* Draw the bezel into ONE viewport, cover-cropped to that viewport's aspect.
+ *
+ * Cover, not stretch: scale to fill and crop the overflow, centred. Stretching
+ * distorts any artwork whose aspect does not match, and a margin rarely does --
+ * a portrait poster squeezed across a 7680-wide window is unrecognisable, while
+ * the same poster cover-cropped into a tall narrow margin fits it naturally. */
+/* Tile the bezel down one margin, preserving the logo's aspect.
+ *
+ * A margin is tall and narrow; a single logo stretched to fill it would be
+ * grotesque and cover-cropping one would show a sliver. Tiling keeps every
+ * copy at its authored proportions and fills any margin size, which is what a
+ * repeating mark is for. The count is derived from the margin width so the
+ * logo reads at a consistent size regardless of resolution or window shape. */
+static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
+    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
+    const float img = (float)s_bezel_w / (float)s_bezel_h;
+    /* One logo spans the margin width, with a little air either side. */
+    const float tile_w = 1.0f / 0.78f;
+    /* Repeats needed vertically for each tile to keep the logo's own aspect:
+     * a tile is (vw/tile_w) wide on screen, so it must be (vw/tile_w)/img tall,
+     * and vh divided by that is the count. Previously this DIVIDED by img
+     * instead of multiplying, squashing every mark by img^2 -- 1.7x on the
+     * 1024x778 marks, which is the stretched look. */
+    const float tile_h = img * tile_w * (float)vh / (float)vw;
+    glViewport(vx, vy, vw, vh);
+    p_glUniform4f(s_present_uUvRect,
+                  -(tile_w - 1.0f) * 0.5f, 0.0f,
+                   (tile_w + 1.0f) * 0.5f, tile_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* Bezel into the left and right margins, one copy each, before the game quad.
+ * Per-margin rather than one image behind everything: the margins are tall and
+ * narrow, so portrait artwork fills them naturally, and each side gets the
+ * whole picture instead of one picture cut in half by the frame. */
+static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
+    (void)ly; (void)lh;
+    if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
+    const int right_x = lx + lw;
+    const int right_w = ww - right_x;
+    if (lx <= 0 && right_w <= 0) return;          /* no margins to fill */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glBindVertexArray(s_present_vao);
+    /* Backdrop first, then the mark blended over it. The art is RGBA with a
+     * transparent field, so without this the gaps between tiles show whatever
+     * the drawable was cleared to -- black. */
+    glEnable(GL_SCISSOR_TEST);
+    glClearColor(s_bezel_bg[0], s_bezel_bg[1], s_bezel_bg[2], 1.0f);
+    if (lx > 0)      { glScissor(0, 0, lx, wh);            glClear(GL_COLOR_BUFFER_BIT); }
+    if (right_w > 0) { glScissor(right_x, 0, right_w, wh); glClear(GL_COLOR_BUFFER_BIT); }
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                          GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    if (lx > 0)      bezel_draw_rect(0, 0, lx, wh);
+    if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
+    glDisable(GL_BLEND);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+}
+
 static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
                               int x, int y, int w, int h, int linear,
                               int lx, int ly, int lw, int lh, int v_flip,
@@ -5369,6 +5631,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
         return;
     }
+    present_bezel(ww, wh, lx, ly, lw, lh);   /* behind the frame */
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
     if (force_4_3)

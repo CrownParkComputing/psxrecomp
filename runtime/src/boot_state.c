@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include "tex_pack.h"
+#include "mod_plugins.h"
 #if defined(_WIN32)
 #  include <windows.h>
 #else
@@ -54,12 +56,6 @@ static uint32_t s_section_exclude;
 /* Only these may be excluded — each has a matching guard at its write site. */
 #define BS_SEC_EXCLUDABLE ((1u << BS_SEC_RAM) | (1u << BS_SEC_VRAM) | \
                            (1u << BS_SEC_SPURAM) | (1u << BS_SEC_CPU))
-
-static unsigned bs_popcount(uint32_t v) {
-    unsigned n = 0;
-    for (; v; v &= v - 1u) n++;
-    return n;
-}
 
 void boot_state_set_section_exclude(uint32_t mask) { s_section_exclude = mask; }
 uint32_t boot_state_section_exclude(void) { return s_section_exclude; }
@@ -219,6 +215,10 @@ typedef struct BsOut {
     size_t   len;
     size_t   cap;
     int      no_zlib; /* 1 => always raw sections (netplay snap ring) */
+    uint32_t sections;/* sections actually written; backpatched into the header.
+                       * The old hardcoded section_count=16 made every appended
+                       * section a poison pill: the loader stopped at 16 and a
+                       * LATER section's bytes read as garbage (the TEXPACK trap). */
 } BsOut;
 
 static int bs_write(BsOut* o, const void* p, size_t n) {
@@ -269,6 +269,7 @@ static int write_section_raw(BsOut* o, uint32_t tag, uint32_t flags,
         return 0;
     if (!bs_write(o, hdr, sizeof hdr)) return 0;
     if (len && !bs_write(o, data, (size_t)len)) return 0;
+    o->sections++;
     return 1;
 }
 
@@ -410,12 +411,21 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    /* Sections actually emitted. Excluded ones are not written, so the count
-     * must drop with them or the loader walks past the end of the buffer
-     * looking for a record that was never serialized. */
-    h.section_count = 17u - bs_popcount(s_section_exclude & BS_SEC_EXCLUDABLE);
+    /* Backpatched after the last section lands (see below). The counter also
+     * subsumes the exclude-mask arithmetic: excluded sections simply never
+     * reach write_section, so the count is right by construction. */
+    h.section_count = 0;
 
+    size_t hdr_off = o->f ? (size_t)ftell(o->f) : o->len;
+    o->sections = 0;
     ok = write_header_le(o, &h);
+
+    /* Mod-plan guard rides FIRST: applying it is a pure compare, so a
+     * mismatched load rejects before any machine state is touched. */
+    if (ok) {
+        const char* fp = psx_mod_runtime_fingerprint_cstr();
+        ok = write_section(o, BS_SEC_MODSET, fp, (uint64_t)strlen(fp));
+    }
 
     if (ok && !(s_section_exclude & (1u << BS_SEC_CPU)))
         ok = write_cpu_section(o, cpu);
@@ -507,6 +517,42 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
                 ok = pst_w_u32(&w, dirty_ram_get_bitmap_word(i));
             if (ok) ok = write_section(o, BS_SEC_DIRTY, db, nbytes);
             free(db);
+        }
+    }
+    /* HD texture pack tracker: rects+hashes only; pixels rebuild from the
+     * restored VRAM at apply (see tex_pack_state_apply). Zero bytes when the
+     * pack is inactive — the section is simply absent. */
+    if (ok) {
+        uint32_t tb = tex_pack_state_bytes();
+        if (tb) {
+            uint8_t* buf = (uint8_t*)malloc(tb);
+            if (!buf) ok = 0;
+            else {
+                tex_pack_state_write(buf);
+                ok = write_section(o, BS_SEC_TEXPACK, buf, tb);
+                free(buf);
+            }
+        }
+    }
+    /* Backpatch the real section count over the header's placeholder. */
+    if (ok) {
+        uint8_t le[4];
+        le[0] = (uint8_t)(o->sections & 0xFF);
+        le[1] = (uint8_t)((o->sections >> 8) & 0xFF);
+        le[2] = (uint8_t)((o->sections >> 16) & 0xFF);
+        le[3] = (uint8_t)((o->sections >> 24) & 0xFF);
+        if (o->f) {
+            long end_pos = ftell(o->f);
+            if (end_pos < 0 ||
+                fseek(o->f, (long)hdr_off + 28, SEEK_SET) != 0 ||
+                fwrite(le, 1, 4, o->f) != 4 ||
+                fseek(o->f, end_pos, SEEK_SET) != 0)
+                ok = 0;
+        } else {
+            if (hdr_off + 32 <= o->len)
+                memcpy(o->data + hdr_off + 28, le, 4);
+            else
+                ok = 0;
         }
     }
     return ok;
@@ -730,8 +776,39 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &g_psx_icache_tv[i])) return 0;
         return 1;
     }
+    case BS_SEC_MODSET: {
+        /* Pure compare — no state touched. A state saved under a different
+         * enabled mod set must not apply: RAM layout / patched code paths
+         * differ and the machine resumes into garbage (observed as a null-PC
+         * recovery spin). Section order puts this first, so the reject lands
+         * before any mutation. */
+        const char* live = psx_mod_runtime_fingerprint_cstr();
+        size_t live_len = strlen(live);
+        if (live_len != (size_t)len || (len && memcmp(live, p, (size_t)len) != 0)) {
+            fprintf(stderr,
+                    "savestate: REFUSED - state's mod set differs from this "
+                    "session's (state %.*s... vs live %.8s...). Relaunch with "
+                    "the matching mods enabled to load it.\n",
+                    (int)(len < 8 ? len : 8), (const char*)p, live);
+            return 0;
+        }
+        return 1;
+    }
+    case BS_SEC_TEXPACK: {
+        /* Applies AFTER BS_SEC_VRAM in stream order; pixels rebuild from the
+         * freshly restored CPU VRAM mirror and are hash-verified inside. */
+        tex_pack_state_apply(p, len, NULL);
+        return 1;
+    }
     default:
-        return 0;
+        /* Unknown section: SKIP, never fail. This was `return 0`, which made
+         * every state written by a build with one extra section a poison pill
+         * for every build without it -- and worse than unloadable: the apply
+         * loop had already restored RAM/VRAM/CPU by the time it hit the
+         * unknown tag, so the refusal left a HALF-RESTORED machine that
+         * wedged or died at PC=0. A sectioned state format exists precisely
+         * so readers can step over what they do not know. */
+        return 1;
     }
 }
 

@@ -106,6 +106,18 @@ enum {
                               on load for pre-SIO1 blobs: absent section
                               leaves the device at power-on (sio1_init),
                               same rule as BS_SEC_ICACHE.                   */
+    /* MERGE NOTE (PR6): the widescreen branch allocated 0x11/0x12 for the two
+     * sections below while master had already shipped 0x11 = BS_SEC_SIO1 (all
+     * master v5 states and every dual-console switch blob carry it), so the
+     * branch's tags are renumbered +1 here. States written by the PR BRANCH
+     * builds are the only casualties: their 0x11 payload parses as SIO1 and
+     * is refused -- dev-only states, accepted loss. */
+    BS_SEC_TEXPACK = 0x12, /* HD texture pack upload tracker (rects+hashes)      */
+    BS_SEC_MODSET  = 0x13, /* resolved mod-plan fingerprint (load guard):
+                            * loading a state into a session whose enabled mod
+                            * set differs poisons the machine (null-PC spin was
+                            * observed live) -- refuse BEFORE any apply instead.
+                            * Written FIRST so the reject precedes mutation.    */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

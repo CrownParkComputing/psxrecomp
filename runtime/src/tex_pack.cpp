@@ -164,7 +164,23 @@ struct State {
      * has no image for this texture" from "no upload backs this primitive",
      * and those want opposite fixes. */
     uint64_t n_repl_calls = 0, n_repl_nocontain = 0, n_repl_notex = 0;
+    /* Why containment fails, not just how often. Records the sample rect and
+     * the upload that overlapped it MOST, so the two candidate causes can be
+     * told apart: a rect spanning several uploads (best overlap is a strict
+     * subset on one axis) versus a stale or re-uploaded record (best overlap
+     * tiny or absent). Diagnostic only -- nothing in the replace path reads
+     * it, and it is capped so a race cannot grow it without bound. */
+    struct NoContain {
+        int32_t  rx, ry, rw, rh;   /* the primitive's sample rect     */
+        int32_t  ux, uy, uw, uh;   /* best-overlapping upload, or 0s  */
+        uint32_t hash;             /* that upload's texture hash      */
+        int32_t  ov;               /* overlap area, texels            */
+        uint32_t hits;
+    };
+    std::vector<NoContain> nocontain;
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
+    uint64_t n_restore_kept = 0;   /* uploads surviving savestate-restore revalidation */
+    uint64_t n_state_calls = 0, n_state_dropped = 0; /* TEXPACK section apply telemetry */
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
     uint64_t n_dump_written = 0, n_dump_failed = 0;
 };
@@ -513,6 +529,82 @@ void invalidate_locked(int x, int y, int w, int h) {
 
 }  // namespace
 
+/* Savestate integration. The upload tracker is what makes HD substitution
+ * possible -- a draw substitutes only when it lands inside a tracked upload --
+ * and a savestate restore repopulates VRAM without uploads. Anything the game
+ * uploads once (boot-time text strips, font atlases) therefore lost its HD
+ * replacement after every load, until the game happened to re-upload it.
+ *
+ * The snapshot stores rects + hashes only (20 bytes/entry): pixels are
+ * reconstructed from the RESTORED VRAM at apply time and verified against the
+ * stored hash, so a kept entry is byte-exact by construction and the section
+ * stays a few KB. Old states without the section simply skip this. */
+extern "C" uint32_t tex_pack_state_bytes(void) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    return (uint32_t)(4u + g.uploads.size() * 20u);
+}
+
+extern "C" void tex_pack_state_write(uint8_t *p) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    const uint32_t n = (uint32_t)g.uploads.size();
+    uint32_t off = 0;
+    auto put32 = [&](uint32_t v) {
+        p[off++] = (uint8_t)(v); p[off++] = (uint8_t)(v >> 8);
+        p[off++] = (uint8_t)(v >> 16); p[off++] = (uint8_t)(v >> 24);
+    };
+    put32(n);
+    for (const Upload &u : g.uploads) {
+        put32((uint32_t)u.x); put32((uint32_t)u.y);
+        put32((uint32_t)u.w); put32((uint32_t)u.h);
+        put32(u.hash);
+    }
+}
+
+extern "C" void tex_pack_state_apply(const uint8_t *p, uint64_t len,
+                                     const uint16_t *vram) {
+    if (!tex_pack_active() || !p || len < 4) return;
+    /* The caller passes the savestate's OWN VRAM section. gpu_get_vram() is
+     * the CPU mirror, which under the GL-authoritative pipeline is only kept
+     * coherent where something forces it (CLUT rows) -- hashing tracked rects
+     * against a stale mirror would silently drop every entry. */
+    if (!vram) vram = gpu_get_vram();
+    if (!vram) return;
+    std::lock_guard<std::mutex> lk(g.mu);
+    uint32_t off = 0;
+    auto get32 = [&]() {
+        uint32_t v = (uint32_t)p[off] | ((uint32_t)p[off+1] << 8) |
+                     ((uint32_t)p[off+2] << 16) | ((uint32_t)p[off+3] << 24);
+        off += 4; return v;
+    };
+    g.n_state_calls++;
+    const uint32_t n = get32();
+    if (len < 4ull + (uint64_t)n * 20ull) return;
+    g.uploads.clear();
+    g.pal_memo.clear();
+    size_t kept = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const int x = (int)get32(), y = (int)get32();
+        const int w = (int)get32(), h = (int)get32();
+        const uint32_t hash = get32();
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 ||
+            x + w > FB_WIDTH || y + h > FB_HEIGHT) continue;
+        Upload up;
+        up.x = x; up.y = y; up.w = w; up.h = h; up.hash = hash;
+        up.pixels.resize((size_t)w * (size_t)h);
+        for (int row = 0; row < h; row++)
+            std::memcpy(up.pixels.data() + (size_t)row * w,
+                        vram + ((size_t)(y + row) * FB_WIDTH + x),
+                        (size_t)w * sizeof(uint16_t));
+        if (crc32_compute((const uint8_t *)up.pixels.data(),
+                          up.pixels.size() * sizeof(uint16_t)) != hash)
+            continue;   /* VRAM diverged from this rect since it was saved */
+        g.uploads.push_back(std::move(up));
+        if (++kept >= MAX_UPLOADS) break;
+    }
+    g.n_restore_kept += kept;
+    g.n_state_dropped += (uint64_t)n - kept;
+}
+
 extern "C" void tex_pack_invalidate(int x, int y, int w, int h) {
     if (!tex_pack_active()) return;
     std::lock_guard<std::mutex> lk(g.mu);
@@ -525,10 +617,40 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
 
     std::lock_guard<std::mutex> lk(g.mu);
 
-    /* A full-VRAM transfer is a savestate restore, not a texture; Beetle drops
-     * these too, and tracking one would alias every subsequent lookup. */
+    /* A full-VRAM transfer is a savestate restore, not a texture. Beetle drops
+     * these from tracking too -- but DROPPING EVERY TRACKED UPLOAD is what
+     * made HD replacements (including the fonts, which are pack entries) fall
+     * back to low-res after loading a state: substitution requires a draw to
+     * land inside a tracked upload, the restore repopulates VRAM without any
+     * uploads, and textures the game only uploads once (boot-time text strips)
+     * never track again for the rest of the session.
+     *
+     * We can do better than dropping, exactly: each Upload carries its pixel
+     * preimage, and this transfer carries the complete incoming VRAM. Keep an
+     * entry iff its rect in the incoming image is byte-identical to the
+     * preimage -- then its hash is still true of what VRAM now holds, which is
+     * the precise condition substitution relies on. Anything the state differs
+     * on is dropped as before. Palette memos stay dropped: they are keyed on
+     * position and re-hash lazily from live VRAM, so correctness is unaffected.
+     */
     if (w == FB_WIDTH && h == FB_HEIGHT) {
-        invalidate_locked(0, 0, FB_WIDTH, FB_HEIGHT);
+        size_t kept = 0;
+        for (size_t i = 0; i < g.uploads.size(); ) {
+            const Upload &u = g.uploads[i];
+            bool same = (u.x >= 0 && u.y >= 0 &&
+                         u.x + u.w <= FB_WIDTH && u.y + u.h <= FB_HEIGHT &&
+                         u.pixels.size() == (size_t)u.w * (size_t)u.h);
+            for (int row = 0; same && row < u.h; row++) {
+                const uint16_t *inc = pixels + ((size_t)(u.y + row) * FB_WIDTH + u.x);
+                if (std::memcmp(inc, u.pixels.data() + (size_t)row * u.w,
+                                (size_t)u.w * sizeof(uint16_t)) != 0)
+                    same = false;
+            }
+            if (same) { kept++; i++; }
+            else      { g.n_kills++; g.uploads.erase(g.uploads.begin() + (ptrdiff_t)i); }
+        }
+        g.n_restore_kept += kept;
+        g.pal_memo.clear();
         return;
     }
 
@@ -540,7 +662,15 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
     const uint32_t hash = crc32_compute((const uint8_t *)pixels, n * sizeof(uint16_t));
 
     for (const Upload &u : g.uploads) {
-        if (u.hash == hash && u.w == w && u.h == h) { g.n_upload_dedup++; return; }
+        /* Dedup only when the POSITION matches too. The game re-uploads some
+         * textures (the UI text strips) at a rect one scanline off from the
+         * first upload; deduping by content alone kept the STALE rect, so the
+         * draw's origin was computed one texel high -- glyph tops cut off,
+         * bottoms duplicated, and under LINEAR sampling that same one-texel
+         * error is the neighbour-bleed seam. Same content at a new position is
+         * a new upload; invalidate_locked above already retired any overlap. */
+        if (u.hash == hash && u.w == w && u.h == h &&
+            u.x == x && u.y == y) { g.n_upload_dedup++; return; }
     }
 
     Upload up;
@@ -762,15 +892,20 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         out->pixels   = r->pixels.data();
         out->width    = r->w;
         out->height   = r->h;
-        /* Cached from this entry's first decode. Recomputing them from the
-         * live draw is more correct in principle -- origin is relative to the
-         * CURRENT texture page -- but doing so visibly reintroduced the glyph
-         * seams the texel-centre fix removed, so the two are coupled and the
-         * live version needs the sampling reworked with it, not on its own. */
-        out->src_w    = r->src_w;
-        out->src_h    = r->src_h;
-        out->origin_u = r->origin_u;
-        out->origin_v = r->origin_v;
+        /* From the LIVE containing upload, not the entry's first decode. The
+         * Repl caches the origin of whichever upload triggered its decode, but
+         * origin is a property of THIS draw's upload and texture page. With
+         * position-exact dedup above, `up` is the rect the draw actually
+         * samples, so this is now correct where the first attempt (which read
+         * the stale deduped rect) was not.
+         *
+         * src stays derived from the upload too: same texture content always
+         * has the same dimensions, so this only ever differs from the cache by
+         * the drifted position. */
+        out->src_w    = up.w << shift;
+        out->src_h    = up.h;
+        out->origin_u = (up.x - base_x) << shift;
+        out->origin_v = up.y - base_y;
         out->id       = r->key;
         out->gl_handle = &r->gl_handle;
         out->recolour  = recolour;
@@ -781,7 +916,39 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         g.n_repl_hit++;
         return 1;
     }
-    if (!contained) g.n_repl_nocontain++;
+    if (!contained) {
+        g.n_repl_nocontain++;
+        /* Record WHY, capped. Find the upload that overlapped this sample
+         * rect most; its shape against the rect distinguishes "the rect spans
+         * several uploads" from "no live record covers it any more". */
+        if (g.nocontain.size() < 64) {
+            int best = -1, best_ov = 0;
+            for (size_t k = 0; k < g.uploads.size(); k++) {
+                const Upload &u = g.uploads[k];
+                const int ox = std::min(rx + rw, u.x + u.w) - std::max(rx, u.x);
+                const int oy = std::min(ry + rh, u.y + u.h) - std::max(ry, u.y);
+                if (ox <= 0 || oy <= 0) continue;
+                if (ox * oy > best_ov) { best_ov = ox * oy; best = (int)k; }
+            }
+            bool seen = false;
+            for (State::NoContain &nc : g.nocontain) {
+                if (nc.rx == rx && nc.ry == ry && nc.rw == rw && nc.rh == rh) {
+                    nc.hits++; seen = true; break;
+                }
+            }
+            if (!seen) {
+                State::NoContain nc {};
+                nc.rx = rx; nc.ry = ry; nc.rw = rw; nc.rh = rh;
+                if (best >= 0) {
+                    const Upload &u = g.uploads[(size_t)best];
+                    nc.ux = u.x; nc.uy = u.y; nc.uw = u.w; nc.uh = u.h;
+                    nc.hash = u.hash; nc.ov = best_ov;
+                }
+                nc.hits = 1;
+                g.nocontain.push_back(nc);
+            }
+        }
+    }
     g.n_repl_miss++;
     return 0;
 }
@@ -910,6 +1077,7 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             "\"repl_hit\":%llu,\"repl_miss\":%llu,"
             "\"repl_recolour\":%llu,\"repl_multicol\":%llu,"
             "\"repl_calls\":%llu,\"repl_nocontain\":%llu,"
+            "\"restore_kept\":%llu,\"state_calls\":%llu,\"state_dropped\":%llu,"
             "\"repl_notex\":%llu}",
             (int)g.replace_on, (int)g.dump_on,
             pack_dir.c_str(), dump_dir.c_str(),
@@ -926,6 +1094,9 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             (unsigned long long)g.n_repl_multicol,
             (unsigned long long)g.n_repl_calls,
             (unsigned long long)g.n_repl_nocontain,
+            (unsigned long long)g.n_restore_kept,
+            (unsigned long long)g.n_state_calls,
+            (unsigned long long)g.n_state_dropped,
             (unsigned long long)g.n_repl_notex);
     } else if (!std::strcmp(subcmd, "uploads")) {
         n = std::snprintf(out, (size_t)cap, "[");
@@ -953,6 +1124,21 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
                 (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
                 r.w, r.h, r.src_w, r.src_h, r.origin_u, r.origin_v,
                 r.pixels.empty() ? "false" : "true");
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "nocontain")) {
+        /* Sample rects that no tracked upload contained, with the upload that
+         * overlapped each one most. If ov is a large fraction of the rect and
+         * the upload is short on one axis, the rect spans several uploads; if
+         * ov is 0 or tiny, no live record covers it at all. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.nocontain.size() && n < cap - 200; i++) {
+            const State::NoContain &c = g.nocontain[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"rect\":[%d,%d,%d,%d],\"best\":[%d,%d,%d,%d],"
+                "\"hash\":\"%x\",\"ov\":%d,\"hits\":%u}",
+                i ? "," : "", c.rx, c.ry, c.rw, c.rh,
+                c.ux, c.uy, c.uw, c.uh, c.hash, c.ov, c.hits);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "armed")) {

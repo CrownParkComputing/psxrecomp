@@ -181,6 +181,11 @@ int psx_mod_set_disc_speed(uint32_t divisor,
  */
 int psx_mod_set_main_ram_8mb(int enabled);
 
+/* Fingerprint of the resolved mod plan for this session ("" when no mods
+ * runtime is active). Savestates embed it (BS_SEC_MODSET) so a load into a
+ * session with a different enabled mod set refuses cleanly. */
+const char* psx_mod_runtime_fingerprint_cstr(void);
+
 /* Mark a guest main-RAM range unique under 8 MB mode (optional narrowing). */
 void psx_ram_register_unique(uint32_t addr, uint32_t len);
 

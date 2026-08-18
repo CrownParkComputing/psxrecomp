@@ -439,6 +439,22 @@ struct RuntimeConfig {
     // PNG write per newly-seen texture, so it is a tool, not a play setting.
     bool                  video_hd_texture_dump = false;
 
+    // [runtime] cpu_overclock — percent of stock CPU speed. 100 = stock.
+    // The guest runs as native code, so this scales the per-instruction cycle
+    // CHARGE down: the CPU completes more work inside the same CRTC period
+    // while timers, SPU, CDROM and refresh keep their real rates.
+    // hueponik's pal100full8 patch requires >900%.
+    uint32_t              runtime_cpu_overclock = 100;
+
+    // [video] bezel — a still image drawn behind the frame, filling whatever
+    // the letterbox or pillarbox leaves over, the way vertical shmups fill the
+    // dead space on a horizontal display. Never samples the frame, so unlike
+    // the edge fill it cannot smear moving content and needs no menu-vs-
+    // gameplay test. Relative paths resolve against the disc directory.
+    // Empty = none. For WipEout 3, the team wallpapers by MotorcycleEmptiness
+    // (awesome-wipeout.github.io) suit this exactly.
+    std::string           video_bezel;
+
     // hd_texture_dir: parent directory for both folders above. Empty (default)
     // means the directory the disc image lives in, which is where a pack
     // authored for RetroArch already expects to sit.
