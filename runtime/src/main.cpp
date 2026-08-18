@@ -11395,7 +11395,12 @@ int main(int argc, char** argv) {
     constexpr bool ws_offered = false;
     constexpr bool ws_ultrawide_offered = false;
     constexpr bool frame_interpolation_offered = false;
-    constexpr bool skip_fmv_offered = false;
+    /* Skip FMVs is SETTINGS-owned: [video] auto_skip_fmv in settings.toml,
+     * surfaced as a row in recomp-ui and a checkbox in retcomm-launcher (both
+     * of which already read/write the key). It was briefly mod-owned via the
+     * builtin psx.skip_fmv activation plugin; that mod is removed -- one
+     * feature, one control. */
+    constexpr bool skip_fmv_offered = true;
     /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
      * former game.toml `offer_turbo_loads` opt-out is deprecated and ignored:
      * offering the generic switch is no longer possible for any title, so a
@@ -12067,13 +12072,12 @@ int main(int argc, char** argv) {
 #endif
         }
     }
-    /* Skip FMVs is mod-owned on PSX. Clamp stale generic settings before
-     * seeding recomp-ui; an enabled activation plugin applies the feature
-     * after the final mod-plan commit. */
+    /* Skip FMVs: settings-owned ([video] auto_skip_fmv); the clamp guards the
+     * offered=false configuration should a console profile ever revert it. */
     if (!skip_fmv_offered && g_auto_skip_fmv) {
         std::fprintf(stdout,
-            "psxrecomp: Skip FMVs is mod-owned on PSX; "
-            "ignoring the legacy Settings value\n");
+            "psxrecomp: Skip FMVs is not offered for this title; "
+            "ignoring the Settings value\n");
         g_auto_skip_fmv = 0;
     }
     /* Load acceleration is mod-owned on PSX, unconditionally. Nothing upstream
