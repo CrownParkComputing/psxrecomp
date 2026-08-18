@@ -690,6 +690,16 @@ struct RuntimeConfig {
     bool                  has_anti_deadzone = false;
     int                   anti_deadzone     = 0;
 
+    // [runtime.link]: SIO1 serial-link peer (docs/config_schema.md).
+    // `link_enabled` gates the PEER, not the register file -- the SIO1
+    // registers respond whether or not a cable is plugged in (see
+    // accuracy/axis4_sio1_serial.md). Default off => "null" endpoint
+    // (no cable: DSR/CTS low, TX discarded).
+    bool                  has_link            = false;
+    bool                  link_enabled        = false;
+    std::string           link_backend        = "null";
+    int                   link_latency_cycles = 0;
+    bool                  link_trace          = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].

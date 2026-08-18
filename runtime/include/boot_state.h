@@ -101,6 +101,11 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    BS_SEC_SIO1   = 0x11,  /* SIO1 serial link: regs + RX FIFO + shifter +
+                              endpoint wire queue (timeline deltas). Optional
+                              on load for pre-SIO1 blobs: absent section
+                              leaves the device at power-on (sio1_init),
+                              same rule as BS_SEC_ICACHE.                   */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

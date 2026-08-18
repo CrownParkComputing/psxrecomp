@@ -11,6 +11,7 @@
 #include "dma.h"
 #include "interrupts.h"
 #include "sio.h"
+#include "sio1.h"
 #include "starvation_ring.h"
 #include "timers.h"
 #if defined(PSX_HAS_RECOMP_NET)
@@ -76,6 +77,7 @@ void psx_event_step_conservative_env_init(void) {
 static void advance_devices(uint32_t c) {
     psx_cycle_count += (uint64_t)c;
     sio_advance(c);
+    sio1_advance(c);
     cdrom_advance(c);
     dma_advance(c);
     timers_advance(c);
@@ -139,6 +141,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(0xFFFFFFFFu);   if (s1 < best) best = s1;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
 }
@@ -156,6 +159,7 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
     uint32_t c = cdrom_cycles_to_irq(i_mask);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_deliverable_irq(i_mask); if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);     if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);   if (s1 < best) best = s1;
     if (best == 0) best = 1;
     return best;
 }

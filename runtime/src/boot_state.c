@@ -75,6 +75,10 @@ extern int      dma_snapshot_read(const uint8_t* p, uint32_t len);
 extern uint32_t sio_snapshot_bytes(void);
 extern void     sio_snapshot_write(uint8_t* p);
 extern int      sio_snapshot_read(const uint8_t* p, uint32_t len);
+extern uint32_t sio1_snapshot_bytes(void);
+extern void     sio1_snapshot_write(uint8_t* p);
+extern int      sio1_snapshot_read(const uint8_t* p, uint32_t len);
+extern void     sio1_init(void);
 extern uint32_t mdec_snapshot_bytes(void);
 extern void     mdec_snapshot_write(uint8_t* p);
 extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
@@ -384,7 +388,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 16;
+    h.section_count = 17;
 
     ok = write_header_le(o, &h);
 
@@ -444,6 +448,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_module_section(o, BS_SEC_CDROM, cdrom_snapshot_bytes, cdrom_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
+    if (ok) ok = write_module_section(o, BS_SEC_SIO1,  sio1_snapshot_bytes,  sio1_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_MDEC,  mdec_snapshot_bytes,  mdec_snapshot_write);
     if (ok) {
         /* I-cache tags: warm loads must replay with the fetch-cost state the
@@ -662,6 +667,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return dma_snapshot_read(p, len);
     case BS_SEC_SIO:
         return sio_snapshot_read(p, len);
+    case BS_SEC_SIO1:
+        return sio1_snapshot_read(p, len);
     case BS_SEC_MDEC:
         return mdec_snapshot_read(p, len);
     case BS_SEC_DIRTY: {
@@ -904,6 +911,10 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     if (!ok || (seen & required) != required)
         return 0;
+
+    /* Pre-SIO1 blob (v5 written before BS_SEC_SIO1 existed): power-on. */
+    if (!(seen & (1u << BS_SEC_SIO1)))
+        sio1_init();
 
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();

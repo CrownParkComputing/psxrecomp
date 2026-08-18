@@ -45,6 +45,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "frame_pacing.h"
 #include "latency_ring.h"
 #include "sio.h"
+#include "sio1.h"
 #ifndef PSX_MAX_PLAYERS
 #define PSX_MAX_PLAYERS 2
 #endif
@@ -11611,6 +11612,18 @@ int main(int argc, char** argv) {
              * touch this flag, so applying it here (config-load time) is stable.
              * Full history + removal plan: psxrecomp sio.c g_pad_legacy_cfg. */
             sio_set_legacy_cfg(gc.runtime.legacy_pad_config ? 1 : 0);
+            /* [runtime.link] — SIO1 serial-link peer. `enabled` gates the
+             * peer only; the register file always responds (see
+             * accuracy/axis4_sio1_serial.md). Env PSX_SIO1_BACKEND /
+             * PSX_SIO1_LATENCY override at sio1_init() time for A/B. */
+            if (gc.runtime.has_link && gc.runtime.link_enabled) {
+                if (!sio1_set_backend(gc.runtime.link_backend.c_str()))
+                    std::fprintf(stderr, "psxrecomp: [runtime.link] unknown "
+                                 "backend '%s' — link disabled\n",
+                                 gc.runtime.link_backend.c_str());
+                sio1_set_latency_cycles(
+                    (uint32_t)gc.runtime.link_latency_cycles);
+            }
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -13272,6 +13285,7 @@ session_reboot:
     timers_init();
     interrupts_init();
     sio_init();
+    sio1_init();
     psx_event_step_conservative_env_init();
     /* Seed per-player device routing from the resolved [controller] config.
      * SDL controller handles are opened later (after SDL_Init); here we only

@@ -33,6 +33,7 @@
 #include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
+#include "sio1.h"
 #include "memcard.h"
 #include "spu.h"
 #include "audio_trace.h"
@@ -5440,11 +5441,13 @@ static void handle_cycles_to_next_event(int id, const char *json)
     uint32_t c = cdrom_cycles_to_irq(i_mask);
     uint32_t d = dma_cycles_to_irq(i_mask);
     uint32_t s = sio_cycles_to_irq(i_mask);
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
              "\"cycles_to_next_event\":%u,"
-             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u}",
-             id, i_stat, i_mask, agg, t, c, d, s);
+             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u,"
+             "\"sio1\":%u}",
+             id, i_stat, i_mask, agg, t, c, d, s, s1);
 }
 
 static void handle_irq_state(int id, const char *json)
@@ -6307,6 +6310,41 @@ static void handle_gte_latch_dump(int id, const char *json)
     snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
              id, gte_latch_total(), emitted, body);
     debug_server_send_line(reply); free(body); free(reply);
+}
+
+static void handle_sio1_state(int id, const char *json)
+{
+    (void)json;
+    Sio1Device *d = sio1_get_device();
+    uint32_t txc = 0, rxc = 0, ovr = 0, irqs = 0;
+    if (!d) { send_err(id, "sio1 not initialized"); return; }
+    sio1_device_get_counters(d, &txc, &rxc, &ovr, &irqs);
+    /* Side-effect-free peeks only (a real STAT/RXDATA read pops/perturbs). */
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"regs_enabled\":%d,"
+             "\"backend\":\"%s\","
+             "\"stat\":\"0x%08X\","
+             "\"mode\":\"0x%04X\","
+             "\"ctrl\":\"0x%04X\","
+             "\"baud\":\"0x%04X\","
+             "\"bit_cycles\":%u,"
+             "\"char_cycles\":%u,"
+             "\"active\":%d,"
+             "\"tx_chars\":%u,"
+             "\"rx_chars\":%u,"
+             "\"overruns\":%u,"
+             "\"irqs\":%u}",
+             id,
+             g_sio1_regs_enabled,
+             sio1_get_backend(),
+             sio1_device_peek_stat(d, psx_get_cycle_count()),
+             sio1_device_peek_mode(d),
+             sio1_device_peek_ctrl(d),
+             sio1_device_peek_baud(d),
+             sio1_device_bit_cycles(d),
+             sio1_device_char_cycles(d),
+             sio1_device_active(d),
+             txc, rxc, ovr, irqs);
 }
 
 static void handle_sio_state(int id, const char *json)
@@ -13466,6 +13504,7 @@ static const CmdEntry s_commands[] = {
     { "dma_trace_clear",   handle_dma_trace_clear },
     { "dma_cdrom_history", handle_dma_cdrom_history },
     { "sio_state",         handle_sio_state },
+    { "sio1_state",        handle_sio1_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },

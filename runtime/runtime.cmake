@@ -270,6 +270,9 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/host_time.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
+    ${PSXRECOMP_ROOT}/runtime/src/sio1.c
+    ${PSXRECOMP_ROOT}/runtime/src/sio1_runtime.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_link.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_trace_ranges.c

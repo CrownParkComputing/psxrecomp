@@ -17,6 +17,7 @@
 #include "mdec.h"
 #include "mod_memory.h"
 #include "sio.h"
+#include "sio1.h"
 #include "spu.h"
 #include "timers.h"
 #include "lockstep.h"
@@ -1368,8 +1369,15 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
         return mem_ctrl[(addr - 0x1F801000u) >> 2];
     }
-    /* SIO: 0x1F801040..0x1F80105F */
-    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        return sio_read(addr);
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F. Own register file +
+     * lane decode (accuracy/axis4_sio1_serial.md); PSX_SIO1_REGS=0 keeps
+     * the legacy fold into the SIO0 handler (reads 0 / writes dropped). */
+    if (addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        if (g_sio1_regs_enabled) return sio1_read(addr, 4);
         return sio_read(addr);
     }
     /* RAM size: 0x1F801060 */
@@ -1427,8 +1435,14 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
         mem_ctrl[(addr - 0x1F801000u) >> 2] = val;
         return;
     }
-    /* SIO: 0x1F801040..0x1F80105F */
-    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        sio_write(addr, val);
+        return;
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F */
+    if (addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        if (g_sio1_regs_enabled) { sio1_write(addr, 4, val); return; }
         sio_write(addr, val);
         return;
     }
@@ -1492,8 +1506,13 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
     if (addr >= 0x1F801060u && addr <= 0x1F801063u) {
         return (uint16_t)(ram_size_reg >> (8u * (addr & 2u)));
     }
-    /* SIO: 0x1F801040..0x1F80105F */
-    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        return (uint16_t)sio_read(addr);
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F */
+    if (addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        if (g_sio1_regs_enabled) return (uint16_t)sio1_read(addr, 2);
         return (uint16_t)sio_read(addr);
     }
     /* Interrupts */
@@ -1554,8 +1573,14 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
                      | ((uint32_t)val << shift);
         return;
     }
-    /* SIO: 0x1F801040..0x1F80105F */
-    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        sio_write(addr, val);
+        return;
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F */
+    if (addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        if (g_sio1_regs_enabled) { sio1_write(addr, 2, val); return; }
         sio_write(addr, val);
         return;
     }
@@ -1618,9 +1643,15 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
         uint32_t val = (addr < 0x1F801074u) ? i_stat : i_mask;
         return (uint8_t)(val >> (8 * (addr & 3)));
     }
-    /* SIO: 0x1F801040..0x1F80104F */
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
     if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
         return (uint8_t)sio_read(addr & ~3u);
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F. Real lane decode -- a
+     * byte read of 0x1F801055 must see STAT bits 8..15 (DSR/CTS/IRQ).
+     * Legacy behavior (PSX_SIO1_REGS=0) was open-bus fallthrough. */
+    if (g_sio1_regs_enabled && addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        return (uint8_t)sio1_read(addr, 1);
     }
     /* DMA: 0x1F801080..0x1F8010FF — byte reads return the corresponding
      * byte of the 32-bit register.  The BIOS shell reads DICR (0x1F8010F4)
@@ -1686,8 +1717,14 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
         interrupt_write_mask_masked((uint32_t)val << shift, 0xFFu << shift, 8);
         return;
     }
-    /* SIO: 0x1F801040..0x1F80105F */
-    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+    /* SIO0 (pads/memcards): 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        sio_write(addr & ~3u, (uint32_t)val);
+        return;
+    }
+    /* SIO1 (serial link): 0x1F801050..0x1F80105F -- real lane decode. */
+    if (addr >= 0x1F801050u && addr <= 0x1F80105Fu) {
+        if (g_sio1_regs_enabled) { sio1_write(addr, 1, (uint32_t)val); return; }
         sio_write(addr & ~3u, (uint32_t)val);
         return;
     }
@@ -2257,7 +2294,7 @@ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
         if (phys >= 0x1F801820u && phys <= 0x1F801827u) return 1u; /* MDEC (1007) */
         if (phys >= 0x1F801000u && phys <= 0x1F801023u) return 1u; /* SysControl (1020) */
         if (phys >= 0x1F801040u && phys <= 0x1F80104Fu) return 1u; /* FrontIO/pad (1043) */
-        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO (1055) */
+        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO1 serial link (1055) */
         if (phys >= 0x1F801070u && phys <= 0x1F801077u) return 1u; /* IRQ (1094) */
         if (phys >= 0x1F801080u && phys <= 0x1F8010FFu) return 1u; /* DMA (1106) */
         if (phys >= 0x1F801100u && phys <= 0x1F80113Fu) return 1u; /* Timers (1119) */

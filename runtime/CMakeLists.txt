@@ -426,6 +426,30 @@ if(BUILD_TESTING)
                  ${CMAKE_CURRENT_BINARY_DIR}/sio_card_protocol_scratch)
     set_tests_properties(sio_card_protocol_test PROPERTIES DISABLED TRUE)
 
+    # SIO1 serial link (accuracy/axis4_sio1_serial.md): the device core is a
+    # pure instance with injected clock + IRQ callback, so these link only
+    # sio1.c + psx_link.c -- no runtime stub wall (contrast sio_card_protocol).
+    add_executable(sio1_registers_test
+        tests/test_sio1_registers.c
+        src/sio1.c
+        src/psx_link.c)
+    target_include_directories(sio1_registers_test PRIVATE include)
+    add_test(NAME sio1_registers_test COMMAND sio1_registers_test)
+
+    add_executable(sio1_link_loopback_test
+        tests/test_sio1_link_loopback.c
+        src/sio1.c
+        src/psx_link.c)
+    target_include_directories(sio1_link_loopback_test PRIVATE include)
+    add_test(NAME sio1_link_loopback_test COMMAND sio1_link_loopback_test)
+
+    add_executable(sio1_snapshot_test
+        tests/test_sio1_snapshot.c
+        src/sio1.c
+        src/psx_link.c)
+    target_include_directories(sio1_snapshot_test PRIVATE include)
+    add_test(NAME sio1_snapshot_test COMMAND sio1_snapshot_test)
+
     # POSIX-only: dlopen()s a fixture .so out of a synthetic cache tree, so it
     # cannot link under MinGW/MSVC (-ldl). run_overlay_posix_test.sh already
     # stages the cache tree, builds the fixture and the test, and runs it — so

@@ -509,6 +509,33 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("idle_skip")) {
         rt.idle_skip = toml::find<bool>(runtime, "idle_skip");
     }
+    if (runtime.contains("link")) {
+        const toml::value& lk = toml::find(runtime, "link");
+        rt.has_link = true;
+        if (lk.contains("enabled"))
+            rt.link_enabled = toml::find<bool>(lk, "enabled");
+        if (lk.contains("backend")) {
+            rt.link_backend = toml::find<std::string>(lk, "backend");
+            for (char& c : rt.link_backend)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (rt.link_backend != "null" && rt.link_backend != "loopback" &&
+                rt.link_backend != "crossover") {
+                throw std::runtime_error(fmt::format(
+                    "[runtime.link] backend must be 'null', 'loopback' or "
+                    "'crossover', got '{}'", rt.link_backend));
+            }
+        }
+        if (lk.contains("latency_cycles")) {
+            const auto n = toml::find<int64_t>(lk, "latency_cycles");
+            if (n < 0 || n > 1000000) {
+                throw std::runtime_error(fmt::format(
+                    "[runtime.link] latency_cycles out of range (0..1000000): {}", n));
+            }
+            rt.link_latency_cycles = static_cast<int>(n);
+        }
+        if (lk.contains("trace"))
+            rt.link_trace = toml::find<bool>(lk, "trace");
+    }
     if (runtime.contains("overlay_autocompile_cmd")) {
         rt.overlay_autocompile_cmd =
             toml::find<std::string>(runtime, "overlay_autocompile_cmd");

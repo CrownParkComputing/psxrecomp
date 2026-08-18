@@ -27,6 +27,7 @@
 
 #include "interrupts.h"
 #include "sio.h"
+#include "sio1.h"
 #include "timers.h"
 #include "gpu.h"
 #include "cdrom.h"
@@ -910,6 +911,7 @@ uint32_t cycles_to_next_event(void) {
     uint32_t c = cdrom_cycles_to_irq(i_mask);  if (c < best) best = c;
     uint32_t d = dma_cycles_to_irq(i_mask);    if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);    if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);  if (s1 < best) best = s1;
     return best;
 }
 

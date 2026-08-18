@@ -32,6 +32,9 @@ extern void     dma_snapshot_write(uint8_t *p);
 extern uint32_t sio_snapshot_bytes(void);
 extern void     sio_snapshot_write(uint8_t *p);
 extern void     sio_snapshot_section_ends(uint32_t out[5]);
+extern uint32_t sio1_snapshot_bytes(void);
+extern void     sio1_snapshot_write(uint8_t *p);
+extern void     sio1_snapshot_section_ends(uint32_t out[3]);
 
 #define NP_SPAD_SIZE 1024u
 
@@ -327,6 +330,32 @@ void netplay_sio_digest_parts(NetplaySioParts *out)
     out->meta = crc ^ 0xFFFFFFFFu;
 }
 
+uint32_t netplay_sio1_digest(void)
+{
+    /* Fold only through the fsm+wire (pace) section -- exclude telemetry
+     * meta, same rationale as netplay_sio_digest above. */
+    static uint8_t *buf;
+    static uint32_t cap;
+    uint32_t n = sio1_snapshot_bytes();
+    uint32_t ends[3];
+    uint32_t crc;
+
+    if (!n) return 0;
+    if (n > cap) {
+        uint8_t *nb = (uint8_t *)realloc(buf, n);
+        if (!nb) return 0;
+        buf = nb;
+        cap = n;
+    }
+    sio1_snapshot_write(buf);
+    sio1_snapshot_section_ends(ends);
+    if (ends[2] != n || ends[1] > ends[2])
+        return digest_module(sio1_snapshot_bytes, sio1_snapshot_write);
+    crc = 0xFFFFFFFFu;
+    crc = crc32_update(crc, buf, ends[1]);
+    return crc ^ 0xFFFFFFFFu;
+}
+
 uint32_t netplay_baseline_ext_digest(void)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -335,11 +364,13 @@ uint32_t netplay_baseline_ext_digest(void)
     uint32_t spad = netplay_spad_digest();
     uint32_t dma = netplay_dma_digest();
     uint32_t sio = netplay_sio_digest();
+    uint32_t sio1 = netplay_sio1_digest();
     crc = crc32_update(crc, (const uint8_t *)&aux, sizeof(aux));
     crc = crc32_update(crc, (const uint8_t *)&cd, sizeof(cd));
     crc = crc32_update(crc, (const uint8_t *)&spad, sizeof(spad));
     crc = crc32_update(crc, (const uint8_t *)&dma, sizeof(dma));
     crc = crc32_update(crc, (const uint8_t *)&sio, sizeof(sio));
+    crc = crc32_update(crc, (const uint8_t *)&sio1, sizeof(sio1));
     return crc ^ 0xFFFFFFFFu;
 }
 
