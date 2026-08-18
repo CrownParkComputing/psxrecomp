@@ -5275,7 +5275,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
-    if (force_4_3)
+    /* Any pillarboxed present, not just a widescreen game pinning a frame
+     * to 4:3. present_edge_fill already self-gates on margins existing and
+     * on the feature flag, so force_4_3 only narrowed it to one case: a
+     * plain 4:3 game in a wide window got black bars with the fill armed
+     * and never invoked. */
         present_edge_fill(s_hr_tex, VRAM_W, VRAM_H, disp_x, disp_y, w, h,
                           linear, lx, ly, lw, lh, 1, ww);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
