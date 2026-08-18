@@ -493,7 +493,14 @@ extern "C" void tex_pack_shutdown(void) {
 }
 
 extern "C" int tex_pack_active(void) {
-    return (g.replace_on || g.dump_on) ? 1 : 0;
+    /* Replacement with an EMPTY pack can never substitute anything, yet an
+     * armed hook still pays per upload: mutex, overlap invalidation, a CRC32
+     * of the whole rect, and a stored pixel copy. FMV is a stream of MDEC
+     * macroblock uploads, dozens per movie frame, so hd_textures=true with no
+     * pack installed showed up as tex_pack_on_upload -> invalidate_locked ->
+     * free in the stock FMV profile (frame-time dips to 40 fps). Track only
+     * when the work can pay off: a pack with entries, or dumping. */
+    return ((g.replace_on && !g.known.empty()) || g.dump_on) ? 1 : 0;
 }
 
 extern "C" void tex_pack_set_texture_window(uint32_t raw) {
