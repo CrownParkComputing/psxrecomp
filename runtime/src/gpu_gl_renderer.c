@@ -5163,11 +5163,17 @@ int gl_renderer_set_bezel(const void *rgba, int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     /* Pad the image with transparent margin before upload, so tiles do not
      * butt against each other. GL_REPEAT tiles edge to edge with no notion of
-     * spacing, so the gap has to exist in the texture: 5% added on each side
-     * leaves 10% between neighbours, horizontally and vertically. Padding both
-     * axes by the same fraction preserves the aspect, so the tiling maths
-     * downstream is unchanged. */
-    const int px_pad = (w * 5) / 100, py_pad = (h * 5) / 100;
+     * spacing, so the gap has to exist in the texture: 10% of the image width
+     * added on each side leaves 20% between neighbours. The logo itself is
+     * never distorted -- it is centred in a larger transparent cell, and the
+     * tiling maths uses the padded cell's aspect. */
+    /* Both axes padded by the same fraction of the WIDTH, not each axis by
+     * its own. Tiles are scaled so one spans a fixed share of the margin
+     * width, so a pad measured in width units lands as the same on-screen gap
+     * horizontally and vertically -- and, more importantly, the same gap for
+     * every mark. These logos run from 1024x479 to 1024x997, so padding each
+     * axis by its own 10% gave a visibly different vertical gap per team. */
+    const int px_pad = (w * 10) / 100, py_pad = px_pad;
     const int pw = w + px_pad * 2, ph = h + py_pad * 2;
     unsigned char *padded =
         (unsigned char *)calloc((size_t)pw * (size_t)ph, 4);
