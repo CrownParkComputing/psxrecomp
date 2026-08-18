@@ -11380,6 +11380,11 @@ int main(int argc, char** argv) {
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
             g_bezel_path       = gc.runtime.video_bezel;
+            if (gc.runtime.runtime_cpu_overclock != 100u) {
+                psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
+                std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
+                             psx_get_cpu_overclock());
+            }
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
