@@ -45,6 +45,7 @@
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
 #include "lockstep.h"
+#include "psx_ram.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,7 +161,7 @@ uint64_t s_frame_count = 0;
  * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
  * classifies the fork: pc differs but wr matches => same writes via a different
  * control path; wr differs => actual state divergence. Reusable for any title.
- * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
+ * Hashed over main RAM (phys < live size) only — game state lives there; MMIO/
  * scratchpad churn (device polling) would add benign cross-backend noise. */
 uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
 uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
@@ -177,7 +178,7 @@ static PSX_BSS FpEntry  s_fp_ring[FP_RING_CAP];
 static uint32_t s_fp_head  = 0;
 static uint64_t s_fp_total = 0;
 
-/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
+/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys < live size)
  * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
  * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
  * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
@@ -194,7 +195,7 @@ static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
         g_fp_sp_count++;
         return;
     }
-    if (phys >= 0x200000u) return;                  /* main RAM only */
+    if (phys >= g_psx_ram_size) return;                  /* main RAM only */
     uint64_t h = g_fp_wr_hash;
     h = (h ^ (uint64_t)phys) * 1099511628211ULL;
     h = (h ^ (uint64_t)val)  * 1099511628211ULL;
@@ -5127,9 +5128,9 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+    /* Effectively the entire live main RAM in one shot.  Response uses a heap-
      * sized envelope so we don't truncate. */
-    if (len > 0x200000) len = 0x200000;
+    if ((uint32_t)len > g_psx_ram_size) len = (int)g_psx_ram_size;
 
     /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
     size_t env = 256;
@@ -8707,17 +8708,37 @@ static void handle_screenshot_hires(int id, const char *json)
         strncpy(path, "psx_screenshot_hires.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
-    uint32_t *argb = (uint32_t *)malloc((size_t)ow * oh * sizeof(uint32_t));
+    /* calloc, not malloc: any pixel a resolve declines to touch must be a
+     * deterministic black, never whatever the allocator handed back. */
+    uint32_t *argb = (uint32_t *)calloc((size_t)ow * oh, sizeof(uint32_t));
     if (!argb) { send_err(id, "alloc failed"); return; }
-    int got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
+    /* Pitch is BYTES, not pixels: the resolves step rows with
+     * (uint8_t *)out + row * out_pitch (gpu_sw_renderer.c sw_render_display /
+     * sw_render_display_hires), and the present path passes it that way
+     * (main.cpp gr_render_display_hires(sdl_pixel_buf, sw * sizeof(uint32_t))).
+     * Passing the pixel width here stepped 1/4 of a row per row, which tiled
+     * the frame 4x across and left the bottom three quarters black. */
+    int got = gr_render_display_hires(argb, (int)(ow * sizeof(uint32_t)),
+                                      (int)di.display_x,
                                       (int)di.display_y, (int)w, (int)h);
-    if (!got) {
-        /* No hi-res surface (scale 1, or a backend without one): resolve the
-         * native display instead and say so, rather than emitting a blank. */
+    /* The resolves return the pixel COUNT they wrote, and a partial cover is a
+     * real case: gr_scale() reports the GL backend's internal scale, but
+     * sw_render_display_hires falls back to the native resolve when the CPU
+     * hi-res mirror does not exist (gpu_sw_renderer.c: !g_hr || g_scale <= 1).
+     * That fills w*h of an ow*oh buffer and still returns non-zero, so testing
+     * `!got` alone would emit a PNG that is mostly untouched allocation. Demand
+     * full cover, else redo it honestly at native size. */
+    if (got < (int)((size_t)ow * oh)) {
+        /* No hi-res surface (scale 1, a backend without one, or a partial
+         * cover): resolve the native display instead and say so, rather than
+         * emitting a blank. */
         scale = 1; ow = w; oh = h;
-        got = gr_render_display(argb, (int)ow, (int)di.display_x,
+        got = gr_render_display(argb, (int)(ow * sizeof(uint32_t)),
+                                (int)di.display_x,
                                 (int)di.display_y, (int)w, (int)h);
-        if (!got) { free(argb); send_err(id, "no display surface"); return; }
+        if (got < (int)((size_t)ow * oh)) {
+            free(argb); send_err(id, "no display surface"); return;
+        }
     }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
@@ -8739,6 +8760,56 @@ static void handle_screenshot_hires(int id, const char *json)
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,"
              "\"height\":%u,\"scale\":%d}", id, path, ow, oh, scale);
+}
+
+/* present_shot — PNG of the COMPOSED renderer output: the frame after SDL fits
+ * the display buffer into the logical surface, i.e. at the aspect the player is
+ * actually looking at.
+ *
+ * The three buffer-level captures above (screenshot / screenshot_file /
+ * screenshot_hires) all resolve the display buffer BEFORE that fit. On a 508x256
+ * display in a 4:3 window they answer 508x256 while the window shows 640x480 —
+ * the same pixels at a different shape. That is correct for faithfulness work
+ * and WRONG for anything aspect-shaped: a widescreen change alters the GTE
+ * squash and the present fit, so validating it against a pre-fit buffer measures
+ * the one stage the change does not touch.
+ *
+ * Staged and fulfilled in the present path (see present_shot_request in
+ * main.cpp), so the ack means "queued", not "written" — the PNG lands on the
+ * next present. Sample `present_shot_seq` before staging and poll it until the
+ * counter moves; `wrote` in that reply says whether a file actually landed.
+ *
+ * Refused up front on headless (no present surface) and on the Vulkan backend,
+ * which presents through its own swapchain and has no readback hook — accepting
+ * there would leave a request nothing can ever fulfil. */
+static void handle_present_shot(int id, const char *json)
+{
+    extern int present_shot_request(const char *path);
+    extern int present_shot_seq(void);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_present_shot.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    if (!present_shot_request(path)) {
+        send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
+                     "which has no present readback)");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"staged\":true,\"seq\":%d}",
+             id, path, present_shot_seq());
+}
+
+/* present_shot_seq — completion counter for the staged capture above. Sample it
+ * before present_shot and poll until it changes; the counter advances on every
+ * completion, success or not, so the poll always terminates. `wrote` reports
+ * whether that completion actually produced a PNG. */
+static void handle_present_shot_seq(int id, const char *json)
+{
+    extern int present_shot_seq(void);
+    extern int present_shot_ok(void);
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"seq\":%d,\"wrote\":%d}",
+             id, present_shot_seq(), present_shot_ok());
 }
 
 /* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
@@ -9357,7 +9428,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
-        if (phys < 0x200000u)
+        if (phys < g_psx_ram_size)
             rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
         else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
             rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
@@ -13447,6 +13518,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_present_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "screenshot_hires",  handle_screenshot_hires },
+    { "present_shot",      handle_present_shot },
+    { "present_shot_seq",  handle_present_shot_seq },
     { "display_ring_get",  handle_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },

@@ -1470,7 +1470,8 @@ int main(int argc, char** argv) {
         uint32_t game_text_start = exe->load_address() & 0x1FFFFFFFu;
         uint32_t game_text_end = game_text_start + exe->code_size();
         ds << "int psx_game_address_in_text(uint32_t addr) {\n";
-        ds << "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
+        ds << "    extern uint32_t psx_ram_canon_code_addr(uint32_t);\n";
+        ds << "    uint32_t phys = psx_ram_canon_code_addr(addr) & 0x1FFFFFFFu;\n";
         ds << fmt::format("    return phys >= 0x{:08X}u && phys < 0x{:08X}u;\n",
                           game_text_start, game_text_end);
         ds << "}\n\n";
@@ -1587,6 +1588,8 @@ int main(int argc, char** argv) {
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
         ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
+        ds << "    extern uint32_t psx_ram_canon_code_addr(uint32_t);\n";
+        ds << "    addr = psx_ram_canon_code_addr(addr);\n";
         ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
         ds << "    while (lo < hi) {\n";
         ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";

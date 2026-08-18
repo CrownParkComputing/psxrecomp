@@ -277,6 +277,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
     ${PSXRECOMP_ROOT}/runtime/src/text_xlate.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/tex_pack.cpp
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
@@ -332,6 +333,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_speed.c
+    ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_ram.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_pgxp.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_packages.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_runtime.cpp
@@ -902,8 +904,9 @@ function(psxrecomp_add_runtime_target target)
     target_link_libraries(${target} PRIVATE chdr-static)
     # audio_trace.c uses C11 atomics. Make the runtime's actual language
     # requirement explicit instead of relying on a parent project's global
-    # CMAKE_C_STANDARD setting.
-    target_compile_features(${target} PRIVATE c_std_11)
+    # CMAKE_C_STANDARD setting. cxx_std_17 likewise — game CMakeLists may omit
+    # CMAKE_CXX_STANDARD; mod_packages.cpp must not compile as a pre-17 dialect.
+    target_compile_features(${target} PRIVATE c_std_11 cxx_std_17)
 
     # Game-specific executable name. Every title instantiates this function with
     # the same CMake target name ("psx-runtime"), so without this they ALL produce
@@ -954,6 +957,7 @@ function(psxrecomp_add_runtime_target target)
                 find_program(CMAKE_RC_COMPILER
                     NAMES llvm-rc llvm-windres windres
                     HINTS
+                        "$ENV{RETCOMM_TOOLCHAIN_DIR}/bin"
                         "$ENV{RETCOMM_TOOLCHAIN}/bin"
                         "$ENV{CMAKE_CLANG_V1}/bin"
                     DOC "Windows resource compiler for APP_ICON .rc")
@@ -1250,7 +1254,7 @@ function(psxrecomp_add_runtime_target target)
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}")
         endif()
 
-    # Framework-owned mod catalog (loading speed). These target game_id "*" and
+    # Framework-owned mod catalog (loading speed, 8 MB RAM). These target game_id "*" and
     # are emulator features rather than per-disc content, so every game gets
     # them without carrying a copy of the manifests. Staged BEFORE the game's
     # own POST_BUILD copy so a title may still override an id if it ever needs
@@ -1267,7 +1271,7 @@ function(psxrecomp_add_runtime_target target)
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${PSXRECOMP_ROOT}/mods/builtin"
                 "$<TARGET_FILE_DIR:${target}>/mods"
-            COMMENT "Staging framework-owned mod catalog (loading speed)"
+            COMMENT "Staging framework-owned mod catalog"
             VERBATIM)
     endif()
     endif()
@@ -1446,20 +1450,49 @@ function(psxrecomp_add_runtime_target target)
     # can still use -DPSX_ENABLE_VULKAN=OFF to produce the inert stub explicitly.
     option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" ON)
     if(PSX_ENABLE_VULKAN)
-    # $VULKAN_SDK first; else find_path. Unset before find_path — an empty
-    # normal _vk_inc makes find_path a no-op on modern CMake (Homebrew miss).
+    # $VULKAN_SDK first; then headers inside CMAKE_SYSROOT (RetComM jammy pack);
+    # else host find_path only when not using a sysroot. Host /usr/include is
+    # invisible (and unsafe) under clang --sysroot=…/toolchains/…/sysroot —
+    # that combination made Hub Linux builds fail with:
+    #   vulkan/vulkan.h: file not found
+    # after configure claimed "headers /usr/include".
     set(_vk_inc "")
+    set(_vk_inc_from_sdk FALSE)
     if(DEFINED ENV{VULKAN_SDK})
         if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
             set(_vk_inc "$ENV{VULKAN_SDK}/Include")
+            set(_vk_inc_from_sdk TRUE)
         elseif(EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
             set(_vk_inc "$ENV{VULKAN_SDK}/include")
+            set(_vk_inc_from_sdk TRUE)
         endif()
     endif()
-    if(NOT _vk_inc)
+    if(NOT _vk_inc AND CMAKE_SYSROOT)
+        if(EXISTS "${CMAKE_SYSROOT}/usr/include/vulkan/vulkan.h")
+            set(_vk_inc "${CMAKE_SYSROOT}/usr/include")
+        elseif(EXISTS "${CMAKE_SYSROOT}/include/vulkan/vulkan.h")
+            set(_vk_inc "${CMAKE_SYSROOT}/include")
+        endif()
+    endif()
+    if(NOT _vk_inc AND NOT CMAKE_SYSROOT)
         unset(_vk_inc CACHE)
         unset(_vk_inc)
         find_path(_vk_inc vulkan/vulkan.h)
+    endif()
+    # Last-chance: find_path may still run under a sysroot build if callers
+    # cleared CMAKE_SYSROOT after option() — reject host paths that sit
+    # outside the active sysroot unless they came from VULKAN_SDK.
+    if(_vk_inc AND CMAKE_SYSROOT AND NOT _vk_inc_from_sdk)
+        file(TO_CMAKE_PATH "${CMAKE_SYSROOT}" _psx_vk_sysroot)
+        file(TO_CMAKE_PATH "${_vk_inc}" _psx_vk_inc_norm)
+        string(FIND "${_psx_vk_inc_norm}" "${_psx_vk_sysroot}" _psx_vk_under)
+        if(NOT _psx_vk_under EQUAL 0)
+            message(STATUS
+                "Vulkan backend: ignoring host headers ${_vk_inc} "
+                "(outside CMAKE_SYSROOT=${CMAKE_SYSROOT}); "
+                "install vulkan-headers into the sysroot or set VULKAN_SDK")
+            set(_vk_inc "")
+        endif()
     endif()
     find_program(GLSLC_EXE NAMES glslc
         HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")

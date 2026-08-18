@@ -555,6 +555,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
         }
+        if (video.contains("fmv_filter")) {
+            const auto mode = toml::find<std::string>(video, "fmv_filter");
+            if (!video_fmv_filter_parse(mode, &rt.video_fmv_filter))
+                throw std::runtime_error(fmt::format(
+                    "[video] fmv_filter must be \"nearest\", \"bilinear\", "
+                    "\"sharp\" or \"bicubic\": {}", mode));
+        }
         if (video.contains("renderer")) {
             const auto mode = toml::find<std::string>(video, "renderer");
             if (mode == "software")     rt.video_renderer = 0;
@@ -565,6 +572,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("offer_vulkan")) {
             rt.video_offer_vulkan = toml::find<bool>(video, "offer_vulkan");
+        }
+        if (video.contains("hd_textures")) {
+            rt.video_hd_textures = toml::find<bool>(video, "hd_textures");
+        }
+        if (video.contains("hd_texture_dump")) {
+            rt.video_hd_texture_dump = toml::find<bool>(video, "hd_texture_dump");
+        }
+        if (video.contains("hd_texture_dir")) {
+            rt.video_hd_texture_dir = toml::find<std::string>(video, "hd_texture_dir");
         }
         if (video.contains("geometry_correction")) {
             rt.video_geometry_correction =
@@ -2215,6 +2231,17 @@ UserSettings load_user_settings(const fs::path& path) {
             if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
             else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
         });
+        if (v.contains("fmv_filter")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "fmv_filter");
+            if (video_fmv_filter_parse(m, &s.fmv_filter)) s.has_fmv_filter = true;
+        });
+        if (v.contains("hd_textures")) try_get([&]{
+            s.hd_textures = toml::find<bool>(v, "hd_textures"); s.has_hd_textures = true;
+        });
+        if (v.contains("hd_texture_pack")) try_get([&]{
+            s.hd_texture_pack = fs::path(toml::find<std::string>(v, "hd_texture_pack"));
+            s.has_hd_texture_pack = true;
+        });
         if (v.contains("geometry_correction")) try_get([&]{
             s.geometry_correction = toml::find<bool>(v, "geometry_correction");
             s.has_geometry_correction = true;
@@ -2301,10 +2328,10 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("rewind_interval")) try_get([&]{
             int d = toml::find<int>(v, "rewind_interval");
-            static const int opts[5] = {1, 4, 8, 12, 15};
+            static const int opts[6] = {1, 4, 8, 12, 15, 30};
             int best = opts[0];
             int best_d = d > best ? d - best : best - d;
-            for (int i = 1; i < 5; ++i) {
+            for (int i = 1; i < 6; ++i) {
                 int dd = d > opts[i] ? d - opts[i] : opts[i] - d;
                 if (dd < best_d) { best_d = dd; best = opts[i]; }
             }
@@ -2329,14 +2356,14 @@ UserSettings load_user_settings(const fs::path& path) {
         const toml::value& h = toml::find(doc, "hotkeys");
         if (h.contains("rewind_pad")) try_get([&]{
             const auto n = toml::find<int64_t>(h, "rewind_pad");
-            if (n >= 0 && n < 256) {
+            if (pad_bind_value_ok(n)) {
                 s.hotkey_pad_rewind = (int)n;
                 s.has_hotkey_pad_rewind = true;
             }
         });
         if (h.contains("save_state_menu_pad")) try_get([&]{
             const auto n = toml::find<int64_t>(h, "save_state_menu_pad");
-            if (n >= 0 && n < 256) {
+            if (pad_bind_value_ok(n)) {
                 s.hotkey_pad_save_state_menu = (int)n;
                 s.has_hotkey_pad_save_state_menu = true;
             }
@@ -2392,6 +2419,13 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (m.contains("enable2")) try_get([&]{
             s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
+        });
+    }
+    if (doc.contains("savestate")) {
+        const toml::value& ss = toml::find(doc, "savestate");
+        if (ss.contains("dir")) try_get([&]{
+            const auto p = toml::find<std::string>(ss, "dir");
+            if (!p.empty()) { s.savestate_dir = fs::path(p); s.has_savestate_dir = true; }
         });
     }
     if (doc.contains("localization")) {
@@ -2522,6 +2556,12 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
     if (s.has_texture_filter)
         f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
+    if (s.has_fmv_filter)
+        f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+    if (s.has_hd_textures)
+        f << "hd_textures       = " << (s.hd_textures ? "true" : "false") << "\n";
+    if (s.has_hd_texture_pack)
+        f << "hd_texture_pack   = \"" << fwd(s.hd_texture_pack) << "\"\n";
     if (s.has_geometry_correction)
         f << "geometry_correction   = "
           << (s.geometry_correction ? "true" : "false") << "\n";
@@ -2603,6 +2643,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         if (s.has_memcard2_enabled)
             f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
     }
+    if (s.has_savestate_dir)
+        f << "\n[savestate]\ndir = \"" << fwd(s.savestate_dir) << "\"\n";
 
     {
         bool any_ctrl = s.has_deadzone || s.has_multitap_enabled ||

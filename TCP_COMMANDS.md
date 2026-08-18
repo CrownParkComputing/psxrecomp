@@ -50,7 +50,9 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `read_scratch` |   | ✓ | `addr`, `len` | Read PS1 scratchpad (0x1F800000 region) |
 | `read_vram` / `vram_peek` | ✓¹ | ✓ | `x`, `y`, `w`, `h` | Read 16-bit VRAM pixels (max 128×128) |
 | `gpu_state` | ✓ | ✓ | — | Display area, display depth, draw offset, GPUSTAT, clip rect, xfer state |
-| `screenshot_hires` |   | ✓ | `path` | PNG of the **supersampled** surface (the present path the window uses), at `display × gr_scale()`. ⚠ `screenshot`/`screenshot_file` capture native 15-bit VRAM and are **blind to anything that only exists in the hi-res mirror** — geometry correction, SSAA edges, perspective UVs — so they show a clean frame while the player sees a broken one. Use this one to verify those. Falls back to the native resolve (and reports `scale: 1`) when no hi-res surface exists |
+| `screenshot_hires` | ✓ | ✓ | `path` | PNG of the **supersampled** surface (the present path the window uses), at `display × gr_scale()`. ⚠ `screenshot`/`screenshot_file` capture native 15-bit VRAM and are **blind to anything that only exists in the hi-res mirror** — geometry correction, SSAA edges, perspective UVs — so they show a clean frame while the player sees a broken one. Use this one to verify those. Falls back to the native resolve (and reports `scale: 1`) when no hi-res surface exists |
+| `present_shot` | ✓ |   | `path` | PNG of the **composed present surface** — the frame after the backend fits the display buffer to the window, so it carries the presented aspect. ⚠ every other capture resolves the display buffer *before* that fit: on a 508×256 display in a 4:3 window they answer 508×256 while the player sees 640×480. Use this one for anything aspect-shaped (widescreen, letterbox), where a pre-fit buffer would hide the very stage the change touches. Staged and fulfilled on the next present, so the ack means *queued* — poll `present_shot_seq`. Unavailable headless and on the Vulkan backend (its swapchain has no readback hook) |
+| `present_shot_seq` | ✓ |   | — | Completion counter for `present_shot`, plus `wrote` (1 = that completion produced a PNG). Sample before staging, poll until `seq` moves. Advances on success *and* failure, so the poll always terminates |
 | `geom_correction` |   | ✓ | — | `[video] geometry_correction` / `perspective_texturing` engagement: enable flag plus free-running `geometry_vertex_hits` and `perspective_triangles` totals. Both enhancements silently fall back to the faithful path on anything they cannot prove is projected geometry, so a zero counter with the flag on means the title never qualifies — sample twice and diff for a rate |
 | `sio_state` | ✓ | ✓ | — | SIO registers + (native only) pad/memcard protocol + TX/RX history |
 | `irq_state` | ✓ | ✓ | — | `I_STAT`, `I_MASK` (both), plus chain state on native |
@@ -263,9 +265,9 @@ The TCP server is the canonical instrumentation surface. Rule 3 in `CLAUDE.md` i
 
 ## Complete command index (generated)
 
-**292 commands registered** — 279 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**306 commands registered** — 293 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-47 of 292 have prose above; **245 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+51 of 306 have prose above; **255 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -289,6 +291,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `card_buffer_dump` | ✓ |  |  |
 | `card_data_writes` | ✓ |  |  |
 | `card_data_writes_reset` | ✓ |  |  |
+| `card_handoff` | ✓ |  |  |
 | `card_mgr_clear` | ✓ |  |  |
 | `card_mgr_trace` | ✓ |  |  |
 | `card_read_summary` | ✓ |  |  |
@@ -379,6 +382,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `frame_timeseries` | ✓ | ✓ | ✓ |
 | `freeze_check` | ✓ |  |  |
 | `game_options` | ✓ |  |  |
+| `geom_correction` | ✓ |  | ✓ |
 | `get_frame` | ✓ | ✓ | ✓ |
 | `get_quads` | ✓ |  |  |
 | `get_registers` | ✓ | ✓ | ✓ |
@@ -404,6 +408,11 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `hle_dump` | ✓ |  | ✓ |
 | `idle_skip` | ✓ |  |  |
 | `imask_trace` | ✓ |  |  |
+| `input_route_append` | ✓ |  |  |
+| `input_route_clear` | ✓ |  |  |
+| `input_route_start` | ✓ |  |  |
+| `input_route_status` | ✓ |  |  |
+| `input_route_stop` | ✓ |  |  |
 | `insn_freeze` | ✓ |  |  |
 | `insn_freeze_snapshot` | ✓ |  |  |
 | `insn_freeze_status` | ✓ |  |  |
@@ -447,10 +456,16 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `parity_ctl` | ✓ | ✓ |  |
 | `parity_dump` | ✓ | ✓ |  |
 | `pause` | ✓ |  | ✓ |
+| `pc_probe_arm` | ✓ |  |  |
+| `pc_probe_clear` | ✓ |  |  |
+| `pc_probe_dump` | ✓ |  |  |
+| `pgxp` | ✓ |  |  |
 | `phase_hot` | ✓ |  |  |
 | `phase_profile` | ✓ |  |  |
 | `ping` | ✓ | ✓ | ✓ |
 | `present_ring` | ✓ |  |  |
+| `present_shot` | ✓ |  | ✓ |
+| `present_shot_seq` | ✓ |  | ✓ |
 | `press` | ✓ | ✓ |  |
 | `probe_clear` | ✓ |  |  |
 | `probe_trace` | ✓ |  |  |
@@ -477,6 +492,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `savestate` | ✓ |  |  |
 | `screenshot` | ✓ | ✓ | ✓ |
 | `screenshot_file` | ✓ | ✓ | ✓ |
+| `screenshot_hires` | ✓ |  | ✓ |
 | `set_input` | ✓ | ✓ | ✓ |
 | `set_snapshot` | ✓ | ✓ | ✓ |
 | `sio_arm_audit` | ✓ |  |  |

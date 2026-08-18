@@ -35,6 +35,7 @@
 #include "lockstep.h"
 #include "starvation_ring.h"
 #include "fntrace.h"  /* fntrace_is_game_started / fntrace_mark_game_started */
+#include "psx_ram.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -256,7 +257,9 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
  * cache-unfriendly open-addressed lookup on every guest instruction. */
 static inline void exec_pc_table_record(uint32_t pc) {
     uint32_t phys = pc & 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    /* Full 8 MiB capacity, matching DIRTY_RAM_EXEC_WORD_COUNT: high-bank
+     * enhancement code (8 MB mod) must leave coverage evidence too. */
+    if (phys < 8u * 1024u * 1024u && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         uint32_t mask = 1u << (word & 31u);
         uint32_t *slot = &g_dirty_ram_exec_pc_bitmap[word >> 5];
@@ -469,6 +472,11 @@ static void callret_end(uint32_t idx, CPUState *cpu, uint32_t path) {
  * load. See dirty_ram_interp.h for the per-game rationale. */
 uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
 
+/* Text-image base (phys) = the loaded game's main-EXE load address. Defaults to
+ * the kernel-window end so the below-text overlay clause is empty until a
+ * high-loading game pins it; main.cpp sets it at game load. See the header. */
+uint32_t g_text_image_lo = DIRTY_RAM_KERNEL_WINDOW_END;
+
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 extern int psx_game_address_in_text(uint32_t addr);
@@ -536,7 +544,7 @@ static int ws_cull_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;       /* 8 MB capacity */
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -562,7 +570,7 @@ static int ws_cull_bltz_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;       /* 8 MB capacity */
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -599,7 +607,7 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     }
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
-    if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;          /* 8 MB capacity */
     static uint32_t words[2 * WIN + 2];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 2); a += 4u)
@@ -2282,6 +2290,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
+    /* High-mirror code PCs fold to the low 2 MiB only while still aliased.
+     * Unique high pages (enhancement code) keep their real PC. */
+    addr = psx_ram_canon_code_addr(addr);
+    if (stop_addr != 0u)
+        stop_addr = psx_ram_canon_code_addr(stop_addr);
 #ifndef PSX_NO_DEBUG_TOOLS
     /* A0/B0/C0 kernel-vector stubs are runtime-written, so calls to them
      * land HERE, not in the static dispatcher — which meant the bioscall
@@ -2757,11 +2770,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) {
         /* Bulk host transfers can populate post-EXE executable RAM without
          * passing through the write hooks that mark dirty pages. A real
-         * control transfer to a decodable word above the configured boot-EXE
-         * text end is enough evidence to admit that word to the interpreter.
-         * Data and invalid targets still fail closed. */
-        if (phys < (2u * 1024u * 1024u) &&
-            phys >= g_overlay_region_floor &&
+         * control transfer to a decodable word OUTSIDE the configured boot-EXE
+         * text image is enough evidence to admit that word to the interpreter.
+         * "Outside" is both sides of the text: a boot EXE that loads high
+         * streams its gameplay overlays into the RAM below itself (Klonoa's
+         * text is 0x180000-0x18B000, its overlays run from 0x10000+), and
+         * gating on the floor alone rejected every one of those targets —
+         * a JALR into a CD-DMA'd overlay page then fell through to
+         * psx_unknown_dispatch and fail-fast exit(1). Data and invalid targets
+         * still fail closed via the decodability check. */
+        if (phys < (8u * 1024u * 1024u) &&
+            phys_is_overlay_region(phys) &&
             dirty_ram_word_looks_decodable(fetch_word(phys))) {
             dirty_ram_mark_executable_range(phys, 4u);
         } else {
