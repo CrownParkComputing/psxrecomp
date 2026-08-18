@@ -5129,6 +5129,62 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
  * scale > 1, where the renderer presents from its own high-resolution FBO
  * instead of a CPU readback. Call AFTER present_target_quad; restores the
  * viewport it found. See gl_renderer_set_pillarbox_edge_fill. */
+/* Bezel art: a still image behind the frame, filling whatever the letterbox or
+ * pillarbox leaves over -- the trick vertical shmups use on horizontal
+ * displays, so the dead space reads as designed rather than as a limitation.
+ *
+ * Drawn across the WHOLE window before the game image: simpler and safer than
+ * filling two margin strips, since it needs no margin arithmetic, covers
+ * pillarbox and letterbox alike, and the game quad paints over the middle.
+ *
+ * Crucially it never samples the frame. present_edge_fill stretches one edge
+ * COLUMN across the margin, which suits a flat menu backdrop and turns track
+ * geometry into horizontal smears, so it has to know whether the frame is a
+ * menu -- and gets it wrong. A still image has no such question: it looks the
+ * same in a race and in a menu, which is the whole point of a bezel. */
+static GLuint s_bezel_tex = 0;
+
+int gl_renderer_set_bezel(const void *rgba, int w, int h) {
+    if (s_bezel_tex) { glDeleteTextures(1, &s_bezel_tex); s_bezel_tex = 0; }
+    if (!rgba || w <= 0 || h <= 0) return 1;          /* clearing is success */
+    if (!s_ctx || !s_raster_ok) return 0;
+    glGenTextures(1, &s_bezel_tex);
+    if (!s_bezel_tex) return 0;
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    return 1;
+}
+
+int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
+
+/* Cover the drawable with the bezel, before the game quad, so the frame paints
+ * over the centre and only the margins keep the art. */
+static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
+    if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
+    if (lx <= 0 && ly <= 0 && lw >= ww && lh >= wh) return;  /* no margins */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glViewport(0, 0, ww, wh);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glUniform4f(s_present_uUvRect, 0.0f, 0.0f, 1.0f, 1.0f);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+}
+
 static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
                               int x, int y, int w, int h, int linear,
                               int lx, int ly, int lw, int lh, int v_flip,
@@ -5273,6 +5329,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
         return;
     }
+    present_bezel(ww, wh, lx, ly, lw, lh);   /* behind the frame */
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
     if (force_4_3)
