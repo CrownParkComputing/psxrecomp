@@ -339,6 +339,10 @@ def find_psxrecomp_bios(project_root: Path) -> Path:
     return _find_recompiler_tool(project_root, "psxrecomp-bios", "PSXRECOMP_BIOS")
 
 
+def find_psxrecomp_analyze(project_root: Path) -> Path:
+    return _find_recompiler_tool(project_root, "psxrecomp-analyze", "PSXRECOMP_ANALYZE")
+
+
 def find_emitters(project_root: Path) -> tuple[Path, Path]:
     """Return (psxrecomp-game, psxrecomp-bios); raises FileNotFoundError if either missing."""
     return find_psxrecomp_game(project_root), find_psxrecomp_bios(project_root)
@@ -475,6 +479,10 @@ def ensure_emitters(
         "psxrecomp-game",
         "--target",
         "psxrecomp-bios",
+        # Built alongside the emitters so `analyze` never has to configure a
+        # second build tree. It shares their sources and costs one extra link.
+        "--target",
+        "psxrecomp-analyze",
     ]
     progress.log(" ".join(build_cmd))
     proc = subprocess.run(build_cmd, capture_output=True, text=True)
@@ -1473,6 +1481,134 @@ def cmd_ensure_emitters(args: argparse.Namespace, progress: ProgressReporter) ->
     return EXIT_OK
 
 
+def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
+    """Static function discovery over the project's boot EXE.
+
+    Distinct from `generate`: this produces knowledge *about* the executable
+    (function boundaries, call graph, recovered jump tables, inferred
+    signatures) rather than C for the runtime, and it never consults the
+    runtime or any capture set to do it.
+    """
+    project_root = (
+        Path(args.project_root).expanduser().resolve()
+        if args.project_root
+        else Path.cwd().resolve()
+    )
+    config = Path(args.config).expanduser()
+    if not config.is_absolute():
+        config = (project_root / config).resolve()
+
+    exe = str(getattr(args, "exe", "") or "").strip()
+    seeds = ""
+    if not exe:
+        if not config.is_file():
+            progress.error(
+                f"no --exe given and config not found: {config}", code=EXIT_USAGE
+            )
+            return EXIT_USAGE
+        secs = load_sections(config)
+        exe = str((secs.get("game") or {}).get("exe") or "").strip()
+        seeds = str((secs.get("recompiler") or {}).get("seeds") or "").strip()
+        if not exe:
+            progress.error(f"[game].exe not set in {config}", code=EXIT_USAGE)
+            return EXIT_USAGE
+
+    exe_path = Path(exe).expanduser()
+    if not exe_path.is_absolute():
+        exe_path = (project_root / exe_path).resolve()
+    if not exe_path.is_file():
+        progress.error(
+            f"boot EXE not found: {exe_path} (run `prepare-disc` first?)",
+            code=EXIT_USAGE,
+        )
+        return EXIT_USAGE
+
+    activate_embedded_toolchain(project_root, progress)
+    try:
+        tool = find_psxrecomp_analyze(project_root)
+    except FileNotFoundError:
+        progress.phase("emitters", pct=0.1, message="Building psxrecomp-analyze…")
+        try:
+            ensure_emitters(project_root, progress)
+            tool = find_psxrecomp_analyze(project_root)
+        except Exception as exc:  # noqa: BLE001
+            progress.error(str(exc), code=EXIT_ERROR)
+            return EXIT_ERROR
+
+    out_dir = Path(args.out).expanduser() if args.out else (project_root / "analysis")
+    if not out_dir.is_absolute():
+        out_dir = (project_root / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    symbols = Path(args.symbols).expanduser() if args.symbols else (
+        project_root / "symbols.toml"
+    )
+    if not symbols.is_absolute():
+        symbols = (project_root / symbols).resolve()
+
+    cmd = [
+        str(tool),
+        str(exe_path),
+        "--out",
+        str(out_dir),
+        "--emit-tsv",
+        str(out_dir / "functions.tsv"),
+        "--top",
+        str(int(getattr(args, "top", 15) or 15)),
+    ]
+    if symbols.is_file():
+        cmd += ["--symbols", str(symbols)]
+    if getattr(args, "no_refs", False):
+        cmd.append("--no-refs")
+    if getattr(args, "exact", False):
+        cmd.append("--exact")
+    seeds_arg = str(getattr(args, "seeds", "") or "").strip() or seeds
+    if seeds_arg:
+        seeds_path = Path(seeds_arg).expanduser()
+        if not seeds_path.is_absolute():
+            seeds_path = (project_root / seeds_path).resolve()
+        if seeds_path.is_file():
+            cmd += ["--seeds", str(seeds_path)]
+    if getattr(args, "emit_symbols", False):
+        cmd += ["--symbols", str(symbols)] if not symbols.is_file() else []
+        cmd += [
+            "--emit-symbols",
+            "--min-confidence",
+            str(getattr(args, "min_confidence", "high") or "high"),
+        ]
+    if getattr(args, "emit_ghidra", False):
+        cmd += ["--emit-ghidra", str(out_dir / "psxrecomp_import.py")]
+    if getattr(args, "emit_symbol_addrs", False):
+        cmd += ["--emit-symbol-addrs", str(out_dir / "symbol_addrs.txt")]
+    prev = out_dir / "functions.prev.tsv"
+    if getattr(args, "diff", False) and prev.is_file():
+        cmd += ["--diff", str(prev)]
+
+    # Keep the last run so the next one can diff against it without the caller
+    # having to manage snapshots.
+    cur = out_dir / "functions.tsv"
+    if cur.is_file():
+        shutil.copy2(cur, prev)
+
+    progress.phase("analyze", pct=0.3, message=f"Analyzing {exe_path.name}…")
+    progress.log(" ".join(cmd))
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    for stream in (proc.stdout, proc.stderr):
+        if stream:
+            for line in stream.splitlines():
+                if line.strip():
+                    progress.log(line)
+    if proc.returncode != 0:
+        progress.error(
+            f"psxrecomp-analyze failed (exit {proc.returncode})", code=EXIT_ERROR
+        )
+        return EXIT_ERROR
+
+    progress.phase("done", pct=1.0, message=f"Analysis written to {out_dir}")
+    progress.result(ok=True, out_dir=str(out_dir), exe=str(exe_path))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="psxrecomp_cli", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1632,6 +1768,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not fetch cmake-clang-v1 when no local pack is found",
     )
     em.set_defaults(handler=cmd_ensure_emitters)
+
+    an = sub.add_parser(
+        "analyze",
+        help="static function discovery over the boot EXE (no runtime involved)",
+    )
+    an.add_argument("--project-root", default="", help="game project root")
+    an.add_argument("--config", default="game.toml", help="game.toml path")
+    an.add_argument("--exe", default="", help="override the boot EXE path")
+    an.add_argument("--out", default="", help="output dir (default: <root>/analysis)")
+    an.add_argument("--symbols", default="", help="symbols.toml (default: <root>/symbols.toml)")
+    an.add_argument("--seeds", default="", help="seed address file (default: [recompiler].seeds)")
+    an.add_argument("--top", default="15", help="rows in the stdout top lists")
+    an.add_argument("--exact", action="store_true", help="reachability-only partition")
+    an.add_argument("--no-refs", action="store_true", help="skip refs.json")
+    an.add_argument("--diff", action="store_true", help="diff against the previous run")
+    an.add_argument(
+        "--emit-symbols",
+        action="store_true",
+        help="merge discovered functions into symbols.toml (existing names win)",
+    )
+    an.add_argument("--min-confidence", default="high", help="gate for --emit-symbols")
+    an.add_argument("--emit-ghidra", action="store_true", help="write a Ghidra import script")
+    an.add_argument(
+        "--emit-symbol-addrs", action="store_true", help="write a decomp symbol map"
+    )
+    an.add_argument("--json-progress", action="store_true")
+    an.set_defaults(handler=cmd_analyze)
 
     p = sub.add_parser("pgo-train", help="force PGO rebuild+train+use")
     add_common(p)

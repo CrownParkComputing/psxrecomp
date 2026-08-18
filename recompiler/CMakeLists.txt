@@ -131,6 +131,38 @@ elseif(MSVC)
     target_link_options(psxrecomp PRIVATE /STACK:16777216)
 endif()
 
+# psxrecomp-analyze — developer-facing static function discovery.
+#
+# NOT part of the recompilation path. It turns the boundary/CFG/jump-table
+# knowledge the emitters already derive into a queryable artifact set for
+# modding and decomp work (see docs/FUNCTION_DISCOVERY.md).
+#
+# The source list is the guarantee: no runtime/ translation unit appears here
+# and none may be added. The tool's whole claim is that everything it reports
+# was proven from the executable image alone, with no trace, overlay-capture,
+# or executed-PC feedback. Linking the runtime would quietly make that false.
+add_executable(psxrecomp-analyze
+    src/ps1_exe_parser.cpp
+    src/mips_decoder.cpp
+    src/function_analysis.cpp
+    src/analysis_db.cpp
+    src/bios_call_names.cpp
+    src/analysis_export.cpp
+    src/main_analyze.cpp
+)
+target_include_directories(psxrecomp-analyze PRIVATE
+    include
+    src
+    lib/fmt/include
+    lib/toml11
+)
+target_link_libraries(psxrecomp-analyze PRIVATE fmt)
+if(MINGW)
+    target_link_options(psxrecomp-analyze PRIVATE -Wl,--stack,16777216)
+elseif(MSVC)
+    target_link_options(psxrecomp-analyze PRIVATE /STACK:16777216)
+endif()
+
 # ---- baked codegen hash (stale-binary guard) --------------------------------
 # Bake the SAME emitter-source hash the runtime folds into its overlay cache
 # tag (runtime/runtime.cmake -> hash_codegen.cmake, shared canonical list in
@@ -477,6 +509,7 @@ if(BUILD_TESTING)
                 fmv_quiet_guards
                 fps_telemetry_opt_in
                 frame_interpolation_display_rate
+                host_refresh_sanitize
                 hybrid_dev_any_input
                 launcher_vulkan_option
                 mod_controller_override
