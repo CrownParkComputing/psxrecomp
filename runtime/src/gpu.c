@@ -2375,6 +2375,16 @@ static uint32_t s_d24_upload_x1 = 0;
  * supposed to look like. Cleared at every depth24 ENTRY; a savestate restore
  * marks all rows (restored VRAM is authoritative). */
 static uint8_t  s_d24_row_written[512];
+/* Whether MDEC was streaming at the previous depth24 present. The pre-movie
+ * publisher/licence screens are 24-bit STILLS in the SAME depth24 session as
+ * the movie that follows, so the depth-transition clear never separates them:
+ * their rows stay marked and leak into the movie's letterbox bars (observed:
+ * the SCEA text strip alternating with black under the Psygnosis FMV). A
+ * still does not stream MDEC; a movie does. On the IDLE->STREAMING edge the
+ * bitmap is cleared, so everything a still left behind becomes bars while the
+ * movie re-marks its own rows with every decoded frame. The 10-vblank window
+ * rides out inter-frame gaps of low-fps movies without flapping. */
+static int      s_d24_mdec_was_streaming = 0;
 static uint32_t gpu_display_depth_bit(void);  /* display_depth declared below */
 static int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */
 static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
@@ -3249,6 +3259,12 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
 void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
                              uint32_t count) {
     uint32_t vy = (di->display_y + y) & 511u;
+    if (y == 0) {   /* once per presented frame (row 0 leads every loop) */
+        const int streaming = mdec_recently_active(10u);
+        if (streaming && !s_d24_mdec_was_streaming)
+            memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
+        s_d24_mdec_was_streaming = streaming;
+    }
     uint32_t base_byte_x = (di->display_x & 1023u) * 2u;
     const uint16_t* row = vram + (size_t)vy * 1024u;
     uint32_t valid = 0u;
