@@ -58,6 +58,12 @@ static int  rewind_pump_compress(size_t budget);
  * PSX_REWIND_FMV_INTERVAL still overrides for anyone who wants denser snaps. */
 #define RW_DEF_FMV_INTERVAL_8MB 30
 #define RW_FMV_MDEC_HYSTERESIS 8u
+/* Latch sources, for PSX_REWIND_DIAG attribution. */
+#define RW_FMV_SRC_DEPTH24 1
+#define RW_FMV_SRC_MDEC    2
+#define RW_FMV_SRC_XA      3
+/* Cap the streaming deflate at ~1/RW_FMV_DUTY of the emulation thread. */
+#define RW_FMV_DUTY 3u
 #define RW_PANEL_W     640
 #define RW_PANEL_H     176
 #define RW_SLIDE_MS    180u
@@ -182,6 +188,15 @@ static uint32_t s_depth = RW_DEF_DEPTH;
 static int s_depth_pref = -1; /* -1 = unset; else from settings.toml / launcher */
 static int s_interval_pref = -1;
 static uint32_t s_frame;
+/* Raw (pre-deflate) size of the last snapshot — sizes the pump-drain floor. */
+static size_t   s_last_raw_len;
+/* Completed captures, for the PSX_REWIND_DIAG rate line. */
+static uint32_t s_capture_count;
+/* Set when PSX_REWIND_FMV_INTERVAL was given explicitly — bypasses the floor. */
+static int      s_fmv_interval_explicit;
+/* Free-running vblank counter and the last value the deflate advanced on. */
+static uint32_t s_vblank_seq;
+static uint32_t s_pump_seq = 0xffffffffu;
 static uint32_t s_last_capture_frame = 0xffffffffu;
 static int s_capture_due;
 static int s_configured;
@@ -303,6 +318,9 @@ static int rewind_wanted(void)
                 fmv_def = RW_DEF_FMV_INTERVAL_8MB;
             s_fmv_interval =
                 env_u32("PSX_REWIND_FMV_INTERVAL", fmv_def, 1u, 60u);
+            /* An explicit env pick wins over the drain floor, the same way the
+             * 8 MB defaults above are floors on the DEFAULT only. */
+            s_fmv_interval_explicit = getenv("PSX_REWIND_FMV_INTERVAL") ? 1 : 0;
         }
         {
             uint32_t depth_def;
@@ -319,24 +337,54 @@ static int rewind_wanted(void)
     return s_enabled;
 }
 
-/* Same heuristic as netplay rb_fmv_media_active — denser snaps while media runs. */
+/* Same heuristic as netplay rb_fmv_media_active — denser snaps while media runs.
+ * Returns the latching source so PSX_REWIND_DIAG can name it: XA in particular
+ * stays asserted for a game that streams its BGM off the disc, which is NOT a
+ * movie and must not be treated as one (see rewind_capture_interval). */
 static int rewind_fmv_media_active(void)
 {
     if (gpu_display_is_depth24())
-        return 1;
+        return RW_FMV_SRC_DEPTH24;
     if (mdec_recently_active(RW_FMV_MDEC_HYSTERESIS))
-        return 1;
+        return RW_FMV_SRC_MDEC;
     if (cdrom_xa_stream_active())
-        return 1;
+        return RW_FMV_SRC_XA;
     return 0;
+}
+
+/* Vblanks the streaming pump needs to drain one snapshot through deflate, at
+ * RW_ZSLICE per frame. Capturing faster than this cannot work: do_capture
+ * refuses while s_zpend.active, so the only thing a shorter interval buys is a
+ * deflate that never stops running on the emulation thread. */
+static uint32_t rewind_drain_frames(void)
+{
+    size_t len = s_last_raw_len ? s_last_raw_len : (size_t)(2u << 20);
+    uint32_t frames = (uint32_t)((len + RW_ZSLICE - 1u) / RW_ZSLICE);
+    return frames ? frames : 1u;
 }
 
 static uint32_t rewind_capture_interval(void)
 {
+    uint32_t fmv;
     if (!rewind_fmv_media_active())
         return s_interval;
     /* FMV densifies toward s_fmv_interval but never sparser than the user pick. */
-    return s_interval < s_fmv_interval ? s_interval : s_fmv_interval;
+    fmv = s_fmv_interval;
+    /* ...and never denser than the pump can actually sustain. RW_DEF_FMV_INTERVAL
+     * is 4, but a 2 MB-mode snapshot is ~3.7 MB (RAM + VRAM + SPU RAM), which is
+     * ~4 vblanks of RW_ZSLICE on its own — so "every 4 frames" pinned deflate at
+     * 100% duty on the emulation thread for as long as the heuristic latched.
+     * Street Fighter Alpha 3 streams its BGM as XA, so cdrom_xa_stream_active()
+     * held it latched through ordinary gameplay and cost ~3.5 ms of every 16.7 ms
+     * frame. RW_DEF_FMV_INTERVAL_8MB=30 was the same realisation applied to 8 MB
+     * only; deriving the floor from the measured snapshot size covers every mode.
+     * RW_FMV_DUTY keeps the pump under ~1/3 duty. */
+    if (!s_fmv_interval_explicit) {
+        const uint32_t floor_iv = rewind_drain_frames() * RW_FMV_DUTY;
+        if (fmv < floor_iv)
+            fmv = floor_iv;
+    }
+    return s_interval < fmv ? s_interval : fmv;
 }
 
 static int resume_pc_ok(uint32_t pc)
@@ -504,10 +552,43 @@ static uint16_t *s_vram_async;   /* 1 MiB, lazily allocated */
 void psx_rewind_note_frame(void)
 {
     uint32_t iv;
-    if (!psx_rewind_enabled() || s_open || psx_netplay_active())
+    if (!psx_rewind_enabled())
+        return;
+    /* Paces the streaming deflate (psx_rewind_poll). Counted BEFORE the
+     * open/netplay bail: s_frame is the ring tick and must not advance while
+     * the filmstrip is up or netplay owns the state, but an already-in-flight
+     * compression still has to drain — throttling it on s_frame would strand
+     * s_zpend.active (and its ~7 MB of buffers) until the guest resumed. */
+    s_vblank_seq++;
+    if (s_open || psx_netplay_active())
         return;
     s_frame++;
     iv = rewind_capture_interval();
+    /* PSX_REWIND_DIAG=1: one line per second naming the densify latch and the
+     * interval it resolved to. This is how the SFA3 "XA BGM reads as FMV"
+     * case is identified — src=xa with a densified interval during a fight. */
+    {
+        static int diag = -1;
+        static uint32_t last_s, cap_at_last;
+        if (diag < 0) diag = getenv("PSX_REWIND_DIAG") ? 1 : 0;
+        if (diag) {
+            uint32_t now_s = (uint32_t)SDL_GetTicks() / 1000u;
+            if (now_s != last_s) {
+                static const char *src_name[4] = {
+                    "none", "depth24", "mdec", "xa"
+                };
+                int src = rewind_fmv_media_active();
+                fprintf(stderr,
+                    "[REWIND] f=%u src=%s interval=%u (user=%u fmv=%u "
+                    "drain=%u) raw=%zu captures/s=%u\n",
+                    s_frame, src_name[src & 3], iv, s_interval, s_fmv_interval,
+                    rewind_drain_frames(), s_last_raw_len,
+                    s_capture_count - cap_at_last);
+                last_s = now_s;
+                cap_at_last = s_capture_count;
+            }
+        }
+    }
     if (s_last_capture_frame == 0xffffffffu ||
         s_frame - s_last_capture_frame >= iv)
         s_capture_due = 1;
@@ -637,6 +718,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         }
         if (!ok || !blob || !len)
             return 0;
+        s_last_raw_len = len;
     }
     /* Stage the streaming deflate; the envelope header goes in up front. */
     uLong bound = compressBound((uLong)len);
@@ -665,6 +747,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
     list_push(tick, thumb);
     s_last_capture_frame = s_frame;
     s_capture_due = 0;
+    s_capture_count++;
     return 1;
 }
 
@@ -736,8 +819,21 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
         return;
     }
     /* Amortize the pending snapshot deflate: ~1 MiB (~2 ms) per vblank
-     * instead of the whole ~9.5 MiB (~20-30 ms) in the capture frame. */
-    (void)rewind_pump_compress(RW_ZSLICE);
+     * instead of the whole ~9.5 MiB (~20-30 ms) in the capture frame.
+     *
+     * "per vblank" was the intent but nothing enforced it: psx_rewind_poll is
+     * called from psx_check_interrupts, and while the fast paths there gate on
+     * (++s_fast_maintenance & 0x3FFF) the general slow path calls it at EVERY
+     * interrupt check. So the 1 MiB slice ran hundreds of times per frame and
+     * the whole snapshot drained in one or two frames — re-creating the very
+     * spike this streaming path exists to remove, only now charged to guest
+     * time instead of host (SFA3: [HITCH] guest=30-45 ms, gprofng put zlib at
+     * 31% of the emulation thread). Stamp the pump to one slice per guest
+     * frame so the deflate is actually spread across the capture interval. */
+    if (s_vblank_seq != s_pump_seq) {
+        s_pump_seq = s_vblank_seq;
+        (void)rewind_pump_compress(RW_ZSLICE);
+    }
     if (s_capture_due && !s_open && !psx_netplay_active())
         (void)do_capture(cpu, resume_pc);
 }

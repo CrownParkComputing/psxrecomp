@@ -6469,8 +6469,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         rewind_poll_toggle_buttons();
         psx_rewind_note_frame();
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
-        if (savestate_menu_open)
+        if (savestate_menu_open) {
             savestate_menu_host_pause_loop();
+            /* The menu is modal, so the button that dismissed it (Cross =
+             * load, Square = save, Circle = cancel) is still physically held
+             * when the guest resumes — and the pad sample directly below this
+             * loop would deliver it to the game as a real press. Loads already
+             * armed this guard inside savestate_submit_slot(); arm it on EVERY
+             * exit so save and cancel stop leaking too. The guard holds the pad
+             * neutral until the buttons are released (90 ms floor, 700 ms cap),
+             * which is exactly the "swallow the dismissing press" semantics. */
+            savestate_input_guard_arm();
+        }
         if (psx_rewind_is_open())
             rewind_host_pause_loop();
     }

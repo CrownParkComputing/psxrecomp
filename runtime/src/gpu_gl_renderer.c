@@ -2051,6 +2051,8 @@ static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
 static uint64_t s_batch_total = 0, s_batch_reason[7];
+/* Cached PSX_SEMI_BATCH (see the isolate site) — never getenv() per prim. */
+static int s_semi_batch = 0;
 
 void gl_renderer_batch_diag(uint64_t out[8]) {
     out[0] = s_batch_total;
@@ -2517,7 +2519,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const int depth_ok = s_pgxp_depth && s_pz_valid;
         int reason = -1;
         if (s_tb_n > 0) {
-            if (isolate) reason = 0;
+            if (isolate && !s_semi_batch) reason = 0;
             else if (batch_semi != s_tb_semi) reason = 1;
             else if (s_mask_set != s_tb_mask) reason = 2;
             else if (s_tex_filter != s_tb_filter) reason = 3;
@@ -2552,7 +2554,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[20] = s_pz_valid ? s_pz[i] : 0.0f;                   /* a_z; 0 = none   */
         }
         s_tb_n += 3;
-        if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
+        /* PSX_SEMI_BATCH=1 lets the semi prims batch with everything else.
+         * DIAGNOSTIC ONLY and off by default: the isolation above is a
+         * draw-ORDER correctness fix (Tomba AP-block, CTR intro flaps), so
+         * batching them can mis-composite overlapping semi geometry. It is
+         * exposed because on a sprite-heavy screen the isolation is one GL
+         * draw per semi prim — SFA3's post-character-select splash issues
+         * ~210/frame — and this is the way to see what that costs, and
+         * whether a given game even notices visually. */
+        if (isolate && !s_semi_batch) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
 }
 
@@ -3615,6 +3625,8 @@ static int init_gpu_raster(void) {
 }
 
 int gl_renderer_init_context(SDL_Window *win) {
+    /* Resolved once here, never per prim — see the isolate site. */
+    s_semi_batch = getenv("PSX_SEMI_BATCH") ? 1 : 0;
     s_win = win;
     s_present_w = 0;
     s_present_h = 0;
@@ -4470,6 +4482,44 @@ static void gl_perf_present_enter(void) {
     g_bdg_cur = (g_wide_cur != 0); g_bdg_base = g_wide_cur_base; g_bdg_w = g_wide_w; g_bdg_off = g_wide_off;
     s_bdg_applied = 0; s_bdg_prims = 0; s_bdg_clearx = -999999;
     { extern void psx_ws_dbg_gate_frame_snapshot(void); psx_ws_dbg_gate_frame_snapshot(); }
+    /* PSX_BATCH_DIAG=1: why the textured batch drains. One draw call per
+     * flush, so batches/s IS the draw-call rate — when prims/batch approaches
+     * 1 the batcher is doing nothing and the GL driver dominates the
+     * emulation thread. Reasons: semi=every semi-transparent prim drawn alone
+     * (deliberate draw-order isolation), smode/mask/filt/gate/twin=that batch
+     * key changed between prims, full=vertex buffer full. Free when unset, and
+     * deliberately outside the s_pf_on gate so it needs no debug build. */
+    {
+        static int bdiag = -1;
+        static uint32_t last_s;
+        static uint64_t l_tot, l_r[7], l_prims;
+        static double l_flush;
+        if (bdiag < 0) bdiag = getenv("PSX_BATCH_DIAG") ? 1 : 0;
+        if (bdiag) {
+            uint32_t now_s = (uint32_t)SDL_GetTicks() / 1000u;
+            if (now_s != last_s) {
+                uint64_t dp = s_scene_prims - l_prims;
+                uint64_t db = s_batch_total - l_tot;
+                fprintf(stderr,
+                    "[BATCH] prims/s=%llu batches/s=%llu (%.2f prims/batch) "
+                    "flush_cpu=%.1f ms/s | semi=%llu smode=%llu mask=%llu "
+                    "filt=%llu gate=%llu twin=%llu full=%llu\n",
+                    (unsigned long long)dp, (unsigned long long)db,
+                    db ? (double)dp / (double)db : 0.0,
+                    s_cw_flush_ms - l_flush,
+                    (unsigned long long)(s_batch_reason[0] - l_r[0]),
+                    (unsigned long long)(s_batch_reason[1] - l_r[1]),
+                    (unsigned long long)(s_batch_reason[2] - l_r[2]),
+                    (unsigned long long)(s_batch_reason[3] - l_r[3]),
+                    (unsigned long long)(s_batch_reason[4] - l_r[4]),
+                    (unsigned long long)(s_batch_reason[5] - l_r[5]),
+                    (unsigned long long)(s_batch_reason[6] - l_r[6]));
+                last_s = now_s; l_tot = s_batch_total; l_prims = s_scene_prims;
+                l_flush = s_cw_flush_ms;
+                for (int i = 0; i < 7; i++) l_r[i] = s_batch_reason[i];
+            }
+        }
+    }
     if (!s_pf_on) return;
     uint64_t now = SDL_GetPerformanceCounter();
     s_pf_enter = now;
