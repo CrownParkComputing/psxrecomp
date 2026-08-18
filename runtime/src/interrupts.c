@@ -749,6 +749,20 @@ void interrupts_init(void) {
     }
 }
 
+/* Dual-console: a machine switch may only happen where the host-static
+ * exception layer is quiescent -- outside exception dispatch, no deferred
+ * cooperative ChangeThread, no pending deferred exception longjmp, and not
+ * inside device service. At such points every field the switch does NOT
+ * carry across is zero on both machines by construction. */
+int psx_interrupts_switch_safe(void) {
+    extern int psx_in_device_service;
+    if (in_exception) return 0;
+    if (s_defer_switch_pending) return 0;
+    if (g_pending_exception_longjmp) return 0;
+    if (psx_in_device_service) return 0;
+    return 1;
+}
+
 void interrupts_resync_after_restore(void) {
     /* Absolute guest-cycle timestamps from the pre-load timeline are invalid
      * once psx_cycle_count rewinds (typical: save → play N seconds → load).

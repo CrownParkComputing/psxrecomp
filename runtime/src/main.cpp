@@ -5431,8 +5431,16 @@ static void sample_pad_into_sio(int override) {
 /* dual_machine.c: fresh host pads for the machine that just resumed
  * (its blob restored a stale pad snapshot; the per-frame push in the
  * present body only runs for the local machine). */
-extern "C" void psx_dual_repush_host_pads(void) {
-    sample_pad_into_sio(-1);
+extern "C" void psx_dual_repush_host_pads(int allow) {
+    if (allow) {
+        sample_pad_into_sio(-1);
+        return;
+    }
+    /* Route excludes this machine: neutral pads (active-low, none). */
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+        sio_set_pad_state_slot(s, 0xFFFFu);
+        sio_set_pad_sticks(s, 0x80, 0x80, 0x80, 0x80);
+    }
 }
 
 static void sample_headless_pad_into_sio(int override) {
@@ -6177,8 +6185,45 @@ struct NetplayVblankEpilogue {
 };
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
+/* PSX_DUAL_PRESENT_OWNER=<0|1|both>: which console may drive the window.
+ *
+ * Dual-console has NO display-ownership concept — both machines run the same
+ * frontend, so whichever is live when its guest hits vblank presents. The two
+ * guests are at unrelated points in their own timelines, so the window
+ * alternates between two independent frames at the switch rate (tens per
+ * second) and reads as flicker/tearing between out-of-sync gameplay. Pinning
+ * the owner proves that is the cause and makes the window usable meanwhile:
+ * the muted machine still runs, it just does not present. Default "both" =
+ * historical behaviour. */
+static int dual_present_owner(void) {
+    static int owner = -2;              /* -2 unread, -1 = both */
+    if (owner == -2) {
+        const char *e = std::getenv("PSX_DUAL_PRESENT_OWNER");
+        /* Default: the PRIMARY owns the window and the secondary runs headless.
+         * Letting both present is not just visually wrong (the window alternates
+         * between two consoles at unrelated points in their own timelines) --
+         * it also costs the primary its frame rate, because every present the
+         * secondary makes takes a turn at the swap/vsync the primary needed.
+         * Measured 26 -> 48 fps on the intro just by muting the secondary.
+         * PSX_DUAL_PRESENT_OWNER=both restores the old free-for-all. */
+        if (!e || !e[0]) owner = 0;
+        else if (e[0] == 'b') owner = -1;
+        else owner = (e[0] == '1') ? 1 : 0;
+    }
+    return owner;
+}
+
+static int dual_present_muted(void) {
+    int owner, live;
+    if ((owner = dual_present_owner()) < 0) return 0;
+    live = psx_dual_machine_live();
+    return live >= 0 && live != owner;
+}
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
+    /* Non-owner console: run the guest, skip the window entirely. */
+    if (dual_present_muted()) return ep;
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
      * next tick has a live native chain under its dispatch again. */
@@ -6568,7 +6613,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Solo resim self-check replay republishes the recorded rows itself —
          * live sampling must not touch SIO during the replay window. */
         if (!psx_selfcheck_replay_input()) {
-            if (g_headless)
+            if (!psx_dual_input_allowed())
+                psx_dual_repush_host_pads(0);   /* route excludes local */
+            else if (g_headless)
                 sample_headless_pad_into_sio(override);
             else
                 sample_pad_into_sio(override);
@@ -7444,6 +7491,13 @@ static void sdl_vblank_present(void) {
      * no pacing wait, no audio, no input sampling (dual_machine repushes
      * pads after each switch). Keep the debug socket responsive. */
     if (!psx_dual_present_gate()) {
+        /* NOTE: do NOT clear top-level-resume here. Post-switch execution
+         * legitimately bridges every call-return above the restored frame
+         * through the scheduler's null-pc recovery (no native chain exists
+         * under a resume_at), and the headless machine never runs the body
+         * that normally re-establishes one. Clearing mid-bridge turns the
+         * next pc=0 into a hard GUEST_EXIT (observed: instant exit at the
+         * first switch). The recovery path is silent while dual is active. */
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_poll();
 #endif

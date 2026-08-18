@@ -80,6 +80,14 @@ void gl_renderer_present_blank(void);
  * snapshot when interpolation owned the last present). Used during rollback
  * resim so the window keeps a wall-clock present cadence without reading
  * mid-resim VRAM. Returns 1 if a Swap happened, 0 if no hold is available. */
+/* VRAM banks — one GPU-side VRAM per emulated console. Dual-console switching
+ * activates the peer's bank instead of reading 1 MiB back through
+ * gr_vram_transfer_out and re-uploading it on every machine switch. */
+int gl_renderer_vram_bank_create(int slot);
+int gl_renderer_vram_bank_activate(int slot);
+int gl_renderer_vram_bank_live(void);
+int gl_renderer_vram_bank_seed(int dst, int src);
+
 int gl_renderer_present_hold_last(void);
 
 /* Sync the authoritative FBO down to CPU VRAM if the GPU side is ahead (else

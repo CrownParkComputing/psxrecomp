@@ -31,6 +31,15 @@ extern uint32_t g_psx_ram_size;
 extern uint32_t g_psx_ram_mask;
 
 uint32_t memory_get_ram_bytes(void);
+
+/* DRAM banks — one per emulated console. Bank 0 is the static array every
+ * single-console run uses; dual_machine.c creates bank 1 and swaps the live
+ * pointer at a machine switch instead of copying 8 MiB through a snapshot. */
+#define PSX_MEMORY_MAX_BANKS 2
+int      memory_ram_bank_create(int slot);
+int      memory_ram_bank_activate(int slot);
+int      memory_ram_bank_live(void);
+uint8_t *memory_ram_bank_ptr(int slot);
 int      psx_ram_8mb_active(void);
 /* Drop a previous launch's request before mod activation (rematch / launcher). */
 void     psx_ram_reset_size_request(void);

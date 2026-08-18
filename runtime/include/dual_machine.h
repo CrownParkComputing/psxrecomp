@@ -50,6 +50,15 @@ void psx_dual_machine_poll(struct CPUState *cpu, uint32_t resume_pc);
  * local one). Consulted by the vblank present path in main.cpp. */
 int psx_dual_present_gate(void);
 
+/* Input routing: which machine(s) receive the host pads. The excluded
+ * machine is fed neutral pads. 0 = both (default), 1 = machine 0 only,
+ * 2 = machine 1 only. Needed for asymmetric menu navigation (the link
+ * master/slave handshake) while Stage B mirrors one set of host pads. */
+void psx_dual_set_input_route(int route);
+int  psx_dual_get_input_route(void);
+/* 1 = host pads flow to the LIVE machine under the current route. */
+int  psx_dual_input_allowed(void);
+
 /* Diagnostics (debug server "dual_state"). */
 int      psx_dual_machine_live(void);      /* -1 when inactive */
 uint64_t psx_dual_machine_swaps(void);

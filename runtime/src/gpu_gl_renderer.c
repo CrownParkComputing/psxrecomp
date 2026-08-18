@@ -392,6 +392,24 @@ static int           s_raster_ok = 0;      /* full GPU pipeline available */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
 /* Native raw-1555 sampling mirror + readback source. */
 static GLuint        s_raw_tex = 0, s_raw_fbo = 0;
+
+/* ---- VRAM banks (dual console) -----------------------------------------
+ * The authoritative VRAM is GPU-side: the hi-res colour target plus the raw
+ * 1555 R16UI mirror everything samples. A second console therefore needs its
+ * OWN set, or every machine switch has to read 1 MiB back through
+ * gr_vram_transfer_out (a synchronous pipeline drain) and upload it again --
+ * measured as the dominant half of the switch cost. Activating a bank just
+ * re-points the live handles; all existing code reads these same statics.
+ * The CPU mirror is a lazily-synced cache, so it is NOT banked: activate
+ * marks it stale and the next reader re-reads from the bank that is now live. */
+typedef struct {
+    GLuint hr_tex, hr_rb, hr_fbo;
+    GLuint raw_tex, raw_fbo;
+    int    created;
+} VramBank;
+#define PSX_GL_VRAM_BANKS 2
+static VramBank s_vram_bank[PSX_GL_VRAM_BANKS];
+static int      s_vram_bank_live;
 /* CPU->VRAM upload staging (native RGBA8). */
 static GLuint        s_up_tex = 0;
 /* copy_rect staging (hr-sized RGBA8). */
@@ -3490,6 +3508,12 @@ static int init_gpu_raster(void) {
     if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
     if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
 
+    /* Bank 0 is what init just built; a single console never has another. */
+    s_vram_bank[0].hr_tex  = s_hr_tex;  s_vram_bank[0].hr_rb  = s_hr_rb;
+    s_vram_bank[0].hr_fbo  = s_hr_fbo;  s_vram_bank[0].raw_tex = s_raw_tex;
+    s_vram_bank[0].raw_fbo = s_raw_fbo; s_vram_bank[0].created = 1;
+    s_vram_bank_live = 0;
+
     s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
     s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
     s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
@@ -5149,6 +5173,93 @@ static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
     p_glBindVertexArray(0);
     p_glUseProgram(0);
     glViewport(lx, ly, lw, lh);
+}
+
+/* Build the GL objects for a second console's VRAM. Same shapes as init's, so
+ * the live handles stay interchangeable. Cleared to black like power-on VRAM. */
+int gl_renderer_vram_bank_create(int slot) {
+    VramBank *b;
+    int hw, hh;
+    if (slot < 0 || slot >= PSX_GL_VRAM_BANKS || !s_ctx || !s_raster_ok) return 0;
+    b = &s_vram_bank[slot];
+    if (b->created) return 1;
+    hw = VRAM_W * s_scale;
+    hh = VRAM_H * s_scale;
+    b->hr_tex  = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
+    b->raw_tex = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H,
+                          PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
+    p_glGenRenderbuffers(1, &b->hr_rb);
+    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, b->hr_rb);
+    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, hw, hh);
+    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
+    if (!make_fbo(&b->hr_fbo, b->hr_tex, b->hr_rb)) return 0;
+    if (!make_fbo(&b->raw_fbo, b->raw_tex, 0)) return 0;
+    {   /* Power-on state: both targets cleared, not whatever the driver left. */
+        const GLuint fbos[2] = { b->hr_fbo, b->raw_fbo };
+        int i;
+        for (i = 0; i < 2; i++) {
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbos[i]);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.f, 0.f, 0.f, 0.f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        }
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    }
+    b->created = 1;
+    return 1;
+}
+
+/* Point the renderer at `slot`'s VRAM. Queued draws are realised first: they
+ * target the OUTGOING bank's FBO and must not land in the incoming one. */
+int gl_renderer_vram_bank_activate(int slot) {
+    VramBank *b;
+    if (slot < 0 || slot >= PSX_GL_VRAM_BANKS) return 0;
+    b = &s_vram_bank[slot];
+    if (!b->created) return 0;
+    if (slot == s_vram_bank_live) return 1;
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    pack_flush();
+    s_hr_tex  = b->hr_tex;  s_hr_rb  = b->hr_rb;  s_hr_fbo = b->hr_fbo;
+    s_raw_tex = b->raw_tex; s_raw_fbo = b->raw_fbo;
+    s_vram_bank_live = slot;
+    /* The CPU mirror still holds the outgoing machine's pixels. */
+    s_gpu_dirty = 1;
+    present_force_consumed();
+    s_force_present_remaining = 1;
+    return 1;
+}
+
+int gl_renderer_vram_bank_live(void) { return s_vram_bank_live; }
+
+/* Copy one bank's VRAM into another, GPU-side. Forking a second console after
+ * boot means it inherits whatever the boot drew, so its bank cannot just start
+ * cleared. Two blits, no readback -- the whole point of banking. */
+int gl_renderer_vram_bank_seed(int dst, int src) {
+    VramBank *d, *s;
+    if (dst < 0 || dst >= PSX_GL_VRAM_BANKS ||
+        src < 0 || src >= PSX_GL_VRAM_BANKS || dst == src) return 0;
+    d = &s_vram_bank[dst];
+    s = &s_vram_bank[src];
+    if (!d->created || !s->created) return 0;
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    pack_flush();
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s->hr_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, d->hr_fbo);
+    p_glBlitFramebuffer(0, 0, VRAM_W * s_scale, VRAM_H * s_scale,
+                        0, 0, VRAM_W * s_scale, VRAM_H * s_scale,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s->raw_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, d->raw_fbo);
+    p_glBlitFramebuffer(0, 0, VRAM_W, VRAM_H, 0, 0, VRAM_W, VRAM_H,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    return 1;
 }
 
 int gl_renderer_present_hold_last(void) {

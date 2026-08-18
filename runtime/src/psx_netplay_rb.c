@@ -2377,11 +2377,19 @@ int psx_netplay_rb_recover_null_pc(struct CPUState *cpu_in, uint32_t *out_pc)
             cand = cands[i];
             if (!rb_resume_pc_ok(cand))
                 continue;
-            fprintf(stderr,
-                    "psxrecomp: rb recover null-pc → 0x%08x (ra=0x%08x sticky=0x%08x)\n",
-                    (unsigned)cand, (unsigned)cpu_in->gpr[31],
-                    (unsigned)g_last_good_bb_pc);
-            fflush(stderr);
+            {
+                /* Dual-console switches arm top-level-resume ~100x/s and this
+                 * bridge legitimately fires after each -- log only offline/
+                 * netplay resumes, not the dual steady state. */
+                extern int g_psx_dual_active;
+                if (!g_psx_dual_active) {
+                    fprintf(stderr,
+                            "psxrecomp: rb recover null-pc → 0x%08x (ra=0x%08x sticky=0x%08x)\n",
+                            (unsigned)cand, (unsigned)cpu_in->gpr[31],
+                            (unsigned)g_last_good_bb_pc);
+                    fflush(stderr);
+                }
+            }
             *out_pc = cand;
             note_good_bb_pc(cand);
             return 1;

@@ -149,6 +149,13 @@ int  boot_state_load_buffer(const uint8_t* file, size_t file_len,
  * machine switching loads at ~100 Hz). Default off. */
 void boot_state_set_quiet_load(int on);
 
+/* Sections the caller owns by other means and wants left out of the blob
+ * entirely — neither written on save nor required on load. Sticky; pass 0 to
+ * clear. Dual-console switching excludes BS_SEC_RAM because it hands DRAM over
+ * by swapping bank pointers (memory_ram_bank_activate) instead of copying it. */
+void     boot_state_set_section_exclude(uint32_t mask);
+uint32_t boot_state_section_exclude(void);
+
 /* Header-only integrity check (no section inflate/apply). Returns 1 if this
  * build can load the image; 0 and fills reason (when non-NULL) on reject. */
 int  boot_state_check_buffer(const uint8_t* file, size_t file_len,

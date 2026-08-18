@@ -503,10 +503,14 @@ static inline uint32_t target26    (uint32_t i) { return  i        & 0x03FFFFFFu
 /* Read a 32-bit instruction word from kernel RAM at the given physical addr.
  * Caller has already verified the address is in dirty kernel RAM. */
 static inline uint32_t fetch_word(uint32_t phys) {
-    /* Main RAM is a process-lifetime static allocation. Cache its address so
-     * instruction fetch does not cross translation units for every guest op. */
-    static const uint8_t *ram;
-    if (!ram) ram = memory_get_ram_ptr();
+    /* Read through the LIVE DRAM bank pointer. This used to cache the base in
+     * a function-static ("main RAM is a process-lifetime static allocation"),
+     * which dual-console bank swapping invalidates — memory_ram_bank_activate
+     * moves it, and a cached base would keep fetching the other machine's
+     * instructions forever. g_psx_ram is the same global psx_cyc.h's load fast
+     * path already dereferences per guest access, so this is not a new cost. */
+    extern uint8_t *g_psx_ram;
+    const uint8_t *ram = g_psx_ram;
     return  (uint32_t)ram[phys]
          | ((uint32_t)ram[phys + 1] <<  8)
          | ((uint32_t)ram[phys + 2] << 16)

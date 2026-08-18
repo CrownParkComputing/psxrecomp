@@ -399,6 +399,90 @@ typedef struct HostThreadFiber {
 static HostThreadFiber s_host_threads[32];
 static psx_fiber_t s_main_fiber;
 
+/* ===== dual-console machine context (dual_machine.c) ======================
+ * Everything scheduler/exception-layer that is per-MACHINE but lives in host
+ * statics. With each machine on its own fiber tree the jmp_bufs stay valid
+ * across a swap (they target that machine's preserved stacks); the TCB->fiber
+ * table must swap so two machines' identical guest TCB addresses do not
+ * collide on host fibers. Opaque to callers. */
+static int g_in_scheduler_run;   /* defined below (scheduler loop) */
+static psx_fiber_t psx_current_host_fiber(void);  /* defined below */
+
+typedef struct PsxSchedMachineCtx {
+    jmp_buf            sched_jmpbuf;
+    psx_sched_escape_t escape;
+    uint32_t           return_tcb;
+    int                top_level_resume;
+    int                in_scheduler_run;
+    HostThreadFiber    host_threads[32];
+    int                dispatch_depth;
+    int                call_bail;
+    int                call_unit_depth;
+    jmp_buf            exc_jmpbuf;
+    void              *exc_owner_fiber;
+    int                exc_pending_longjmp;
+} PsxSchedMachineCtx;
+
+size_t psx_sched_machine_ctx_size(void) { return sizeof(PsxSchedMachineCtx); }
+
+void psx_sched_machine_swap_out(void *out_v) {
+    PsxSchedMachineCtx *out = (PsxSchedMachineCtx *)out_v;
+    extern int g_psx_dispatch_depth;
+    extern int g_call_unit_depth;
+    extern void *g_exception_owner_fiber;
+    extern int g_pending_exception_longjmp;
+    extern jmp_buf exception_jmpbuf;
+    memcpy(out->sched_jmpbuf, g_scheduler_jmpbuf, sizeof(jmp_buf));
+    out->escape           = g_sched_escape;
+    out->return_tcb       = g_sched_return_tcb;
+    out->top_level_resume = psx_scheduler_top_level_resume_active();
+    out->in_scheduler_run = g_in_scheduler_run;
+    memcpy(out->host_threads, s_host_threads, sizeof(s_host_threads));
+    out->dispatch_depth   = g_psx_dispatch_depth;
+    out->call_bail        = g_psx_call_bail;
+    out->call_unit_depth  = g_call_unit_depth;
+    memcpy(out->exc_jmpbuf, exception_jmpbuf, sizeof(jmp_buf));
+    out->exc_owner_fiber      = g_exception_owner_fiber;
+    out->exc_pending_longjmp  = g_pending_exception_longjmp;
+}
+
+void psx_sched_machine_swap_in(const void *in_v) {
+    const PsxSchedMachineCtx *in = (const PsxSchedMachineCtx *)in_v;
+    extern int g_psx_dispatch_depth;
+    extern int g_call_unit_depth;
+    extern void *g_exception_owner_fiber;
+    extern int g_pending_exception_longjmp;
+    extern jmp_buf exception_jmpbuf;
+    extern void psx_scheduler_top_level_resume_clear(void);
+    memcpy(g_scheduler_jmpbuf, in->sched_jmpbuf, sizeof(jmp_buf));
+    g_sched_escape     = in->escape;
+    g_sched_return_tcb = in->return_tcb;
+    if (!in->top_level_resume) psx_scheduler_top_level_resume_clear();
+    g_in_scheduler_run = in->in_scheduler_run;
+    memcpy(s_host_threads, in->host_threads, sizeof(s_host_threads));
+    g_psx_dispatch_depth = in->dispatch_depth;
+    g_psx_call_bail      = in->call_bail;
+    g_call_unit_depth    = in->call_unit_depth;
+    memcpy(exception_jmpbuf, in->exc_jmpbuf, sizeof(jmp_buf));
+    g_exception_owner_fiber     = in->exc_owner_fiber;
+    g_pending_exception_longjmp = in->exc_pending_longjmp;
+}
+
+/* Clean context for a machine that has never run: empty TCB-fiber table,
+ * no escapes, zero depths. Its root fiber entry calls psx_scheduler_run,
+ * which setjmps before any longjmp can occur, so the jmp_bufs' contents
+ * are never consumed. */
+void psx_sched_machine_ctx_init(void *ctx_v) {
+    memset(ctx_v, 0, sizeof(PsxSchedMachineCtx));
+    ((PsxSchedMachineCtx *)ctx_v)->escape.reason = PSX_RUN_CONTINUE;
+    ((PsxSchedMachineCtx *)ctx_v)->in_scheduler_run = 1;
+}
+
+/* Root fiber for the calling thread (converting it on first use). */
+psx_fiber_t psx_sched_root_fiber(void) {
+    return psx_current_host_fiber();
+}
+
 static uint32_t psx_tcb_state(CPUState* cpu, uint32_t tcb)
 {
     return psx_is_valid_tcb(cpu, tcb) ? cpu->read_word(tcb) : 0;

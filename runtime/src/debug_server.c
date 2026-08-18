@@ -6313,6 +6313,20 @@ static void handle_gte_latch_dump(int id, const char *json)
     debug_server_send_line(reply); free(body); free(reply);
 }
 
+static void handle_dual_input(int id, const char *json)
+{
+    char route[16];
+    int r = -1;
+    if (json_get_str(json, "route", route, sizeof route)) {
+        if      (!strcmp(route, "both")) r = 0;
+        else if (!strcmp(route, "a"))    r = 1;
+        else if (!strcmp(route, "b"))    r = 2;
+    }
+    if (r < 0) { send_err(id, "route must be 'both'|'a'|'b'"); return; }
+    psx_dual_set_input_route(r);
+    send_fmt("{\"id\":%d,\"ok\":true,\"route\":%d}", id, r);
+}
+
 static void handle_dual_state(int id, const char *json)
 {
     (void)json;
@@ -6322,6 +6336,7 @@ static void handle_dual_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"active\":%d,"
              "\"live\":%d,"
+             "\"input_route\":%d,"
              "\"swaps\":%llu,"
              "\"cycles_a\":%llu,"
              "\"cycles_b\":%llu,"
@@ -6329,6 +6344,7 @@ static void handle_dual_state(int id, const char *json)
              id,
              live >= 0,
              live,
+             psx_dual_get_input_route(),
              (unsigned long long)psx_dual_machine_swaps(),
              (unsigned long long)cyc[0],
              (unsigned long long)cyc[1],
@@ -13529,6 +13545,7 @@ static const CmdEntry s_commands[] = {
     { "sio_state",         handle_sio_state },
     { "sio1_state",        handle_sio1_state },
     { "dual_state",        handle_dual_state },
+    { "dual_input",        handle_dual_input },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },

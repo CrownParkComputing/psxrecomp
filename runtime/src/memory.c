@@ -38,7 +38,17 @@
 #define MOD_MEMORY_BASE 0x1F000000u
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
-static uint8_t ram[RAM_SIZE];
+/* DRAM banks. `ram` is a POINTER at the live bank, not the array itself, so a
+ * dual-console machine switch can hand the other console its own 8 MiB by
+ * moving one pointer instead of memcpying the world (dual_machine.c measured
+ * 2.7 ms/switch copying it). Costs nothing at steady state: the hot inline load
+ * path in psx_cyc.h already dereferences g_psx_ram, so the indirection is one
+ * the generated code and overlay shards were paying already. Bank 0 is the
+ * only bank a single-console run ever has. */
+static uint8_t ram_bank0[RAM_SIZE];
+static uint8_t *ram = ram_bank0;
+static uint8_t *s_ram_banks[PSX_MEMORY_MAX_BANKS] = { ram_bank0 };
+static int s_ram_bank_live;
 static int s_ram_8mb_requested;
 
 uint32_t g_psx_ram_size = PSX_RAM_2MB;
@@ -172,7 +182,7 @@ uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address) {
 }
 
 /* Exposed for inlined main-RAM load helpers in psx_cyc.h (VLC/decode hot path). */
-uint8_t *g_psx_ram = ram;
+uint8_t *g_psx_ram = ram_bank0;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
@@ -201,6 +211,37 @@ static inline uint32_t psx_phys_addr_store(uint32_t addr, uint32_t width) {
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
+
+/* Allocate the backing store for a non-zero bank. Idempotent; bank 0 is the
+ * static array and always exists. Zeroed like power-on DRAM. */
+int memory_ram_bank_create(int slot) {
+    if (slot < 0 || slot >= PSX_MEMORY_MAX_BANKS) return 0;
+    if (s_ram_banks[slot]) return 1;
+    s_ram_banks[slot] = (uint8_t *)calloc(1, RAM_SIZE);
+    return s_ram_banks[slot] != NULL;
+}
+
+/* Point live DRAM at `slot`. Every consumer reads through `ram`/g_psx_ram, and
+ * the switch only happens where psx_interrupts_switch_safe(), so no caller can
+ * be holding a stale base across it (the poll is an opaque call, so the
+ * compiler must reload the global after it). */
+int memory_ram_bank_activate(int slot) {
+    if (slot < 0 || slot >= PSX_MEMORY_MAX_BANKS || !s_ram_banks[slot])
+        return 0;
+    ram = s_ram_banks[slot];
+    g_psx_ram = s_ram_banks[slot];
+    s_ram_bank_live = slot;
+    return 1;
+}
+
+int memory_ram_bank_live(void) { return s_ram_bank_live; }
+
+/* Backing store of a bank whether or not it is live — the fork seeds the new
+ * machine's DRAM through this before its first switch. */
+uint8_t *memory_ram_bank_ptr(int slot) {
+    if (slot < 0 || slot >= PSX_MEMORY_MAX_BANKS) return NULL;
+    return s_ram_banks[slot];
+}
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 uint32_t memory_get_ram_bytes(void) { return g_psx_ram_size; }
 int      psx_ram_8mb_active(void) { return g_psx_ram_size > PSX_RAM_2MB; }
@@ -813,12 +854,21 @@ typedef struct {
 } TextAddrMemo;
 static TextAddrMemo s_text_addr_memo[TEXT_ADDR_MEMO_SLOTS];
 
+static int text_addr_memo_enabled(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("PSX_TEXT_ADDR_MEMO");
+        s = (e && e[0] == '0') ? 0 : text_ok_memo_enabled();
+    }
+    return s;
+}
+
 int psx_game_text_native_ok_memo(uint32_t addr) {
     extern int psx_game_text_native_ok(uint32_t addr);
     TextAddrMemo *e;
     int ok;
 
-    if (!text_ok_memo_enabled()) return psx_game_text_native_ok(addr);
+    if (!text_addr_memo_enabled()) return psx_game_text_native_ok(addr);
 
     e = &s_text_addr_memo[((addr * 2654435761u) >> 9) & (TEXT_ADDR_MEMO_SLOTS - 1u)];
     if (e->addr == addr && e->gen == g_text_guard_gen) return e->ok;
@@ -1329,7 +1379,7 @@ void memory_init(const char* bios_path) {
         fprintf(stdout,
                 "psxrecomp: unique 8 MB main RAM "
                 "(full high window unique; aliased code PCs fold to 2 MiB)\n");
-    memset(ram, 0, sizeof(ram));
+    memset(ram, 0, RAM_SIZE);
     memset(scratchpad, 0, sizeof(scratchpad));
     psx_ram_apply_registered_bitmap();
     /* Rematch re-enters without process exit — wipe sticky I/O regs that

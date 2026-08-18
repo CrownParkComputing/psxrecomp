@@ -45,6 +45,25 @@ static double boot_state_mono_ms(void) {
 
 /* ---- core accessors (existing runtime modules) ---- */
 extern uint8_t*  memory_get_ram_ptr(void);
+
+/* Sections the caller owns by other means and does not want in the blob.
+ * Dual-console machine switching hands RAM over by swapping DRAM bank pointers
+ * (memory_ram_bank_activate), so carrying 8 MiB of it through every switch
+ * blob is pure copying. Excluded sections are neither written nor required. */
+static uint32_t s_section_exclude;
+/* Only these may be excluded — each has a matching guard at its write site. */
+#define BS_SEC_EXCLUDABLE ((1u << BS_SEC_RAM) | (1u << BS_SEC_VRAM) | \
+                           (1u << BS_SEC_SPURAM))
+
+static unsigned bs_popcount(uint32_t v) {
+    unsigned n = 0;
+    for (; v; v &= v - 1u) n++;
+    return n;
+}
+
+void boot_state_set_section_exclude(uint32_t mask) { s_section_exclude = mask; }
+uint32_t boot_state_section_exclude(void) { return s_section_exclude; }
+
 extern uint32_t  memory_get_ram_bytes(void);
 extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  i_stat;
@@ -391,12 +410,16 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 17;
+    /* Sections actually emitted. Excluded ones are not written, so the count
+     * must drop with them or the loader walks past the end of the buffer
+     * looking for a record that was never serialized. */
+    h.section_count = 17u - bs_popcount(s_section_exclude & BS_SEC_EXCLUDABLE);
 
     ok = write_header_le(o, &h);
 
     if (ok) ok = write_cpu_section(o, cpu);
-    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
+    if (ok && !(s_section_exclude & (1u << BS_SEC_RAM)))
+        ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
@@ -420,7 +443,11 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
              write_section(o, BS_SEC_CLOCK, cyc, 8);
     }
     if (ok) ok = write_module_section(o, BS_SEC_GPU, gpu_snapshot_bytes, gpu_snapshot_write);
-    if (ok) {
+    if (ok && (s_section_exclude & (1u << BS_SEC_VRAM))) {
+        /* Owned elsewhere (dual-console VRAM banks): skip the section AND the
+         * readback that would build it — gr_vram_transfer_out is a synchronous
+         * GL pipeline drain and was the dominant half of a machine switch. */
+    } else if (ok) {
         /* §96 incremental mirror only while RB dirty-tracking is on.
          * Offline / delay-sync / zlib disk: classic full transfer_out. */
         if (o->no_zlib && gpu_vram_dirty_tracking()) {
@@ -447,7 +474,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         }
     }
     if (ok) ok = write_module_section(o, BS_SEC_SPU, spu_snapshot_bytes, spu_snapshot_write);
-    if (ok) ok = write_section(o, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
+    if (ok && !(s_section_exclude & (1u << BS_SEC_SPURAM)))
+        ok = write_section(o, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
     if (ok) ok = write_module_section(o, BS_SEC_CDROM, cdrom_snapshot_bytes, cdrom_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
@@ -816,11 +844,11 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     const uint8_t* end;
     BootStateHeader h;
     char reject[256];
-    const uint32_t required =
+    const uint32_t required = ~s_section_exclude & (
         (1u<<BS_SEC_CPU)|(1u<<BS_SEC_RAM)|(1u<<BS_SEC_SPAD)|(1u<<BS_SEC_IRQ)|
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
-        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY);
+        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY));
     uint32_t seen = 0;
     int ok = 1;
     const double t0 = boot_state_mono_ms();
