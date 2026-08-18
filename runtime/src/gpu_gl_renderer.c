@@ -5345,14 +5345,28 @@ int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
 static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
     if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
     const float img = (float)s_bezel_w / (float)s_bezel_h;
-    /* One logo spans the margin width, with a little air either side. */
-    const float tile_w = 1.0f / 0.78f;
+    /* FIXED logo size, anchored to the WINDOW height rather than the margin
+     * width. Width-derived sizing made the mark grow with every extra pixel
+     * of pillarbox: enormous on an ultrawide, a sliver on a barely-wider-
+     * than-4:3 window. The height does not change as the pillarbox widens,
+     * so a height fraction reads as the same object at every window shape; a
+     * wider margin simply shows more breathing room around the same-size
+     * column of marks. Clamped to 78% of the margin so narrow margins keep
+     * the old a-little-air-either-side behaviour instead of cropping.
+     * PSX_BEZEL_SCALE overrides the height fraction (default 0.18). */
+    static float scale_frac = -1.0f;
+    if (scale_frac < 0.0f) {
+        const char *e = getenv("PSX_BEZEL_SCALE");
+        scale_frac = (e && e[0]) ? (float)atof(e) : 0.18f;
+        if (scale_frac <= 0.01f || scale_frac > 1.0f) scale_frac = 0.18f;
+    }
+    float want_px = scale_frac * (float)vh;
+    if (want_px > 0.78f * (float)vw) want_px = 0.78f * (float)vw;
+    const float tile_w = (float)vw / want_px;
     /* Repeats needed vertically for each tile to keep the logo's own aspect:
-     * a tile is (vw/tile_w) wide on screen, so it must be (vw/tile_w)/img tall,
-     * and vh divided by that is the count. Previously this DIVIDED by img
-     * instead of multiplying, squashing every mark by img^2 -- 1.7x on the
-     * 1024x778 marks, which is the stretched look. */
-    const float tile_h = img * tile_w * (float)vh / (float)vw;
+     * a tile is want_px wide on screen, so it must be want_px/img tall, and
+     * vh divided by that is the count. */
+    const float tile_h = img * (float)vh / want_px;
     glViewport(vx, vy, vw, vh);
     p_glUniform4f(s_present_uUvRect,
                   -(tile_w - 1.0f) * 0.5f, 0.0f,
