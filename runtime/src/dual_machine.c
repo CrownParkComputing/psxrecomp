@@ -84,6 +84,30 @@ static PsxLinkEndpoint *s_ep[2];
 static struct CPUState *s_cpu;          /* the shared CPUState object */
 static uint64_t  s_swaps;
 static int       s_fastswap;   /* RAM handed over by bank pointer, not blob */
+/* Machine 1's CPU registers. Machine 0 keeps main.cpp's stack CPUState (every
+ * frame of its fiber tree was created holding that pointer); machine 1's tree
+ * grows entirely from dual_machine1_entry, so rooting it at its OWN struct
+ * makes its whole call tree consistent -- and then the CPU section can leave
+ * the switch blob: each machine's registers simply persist in its own struct
+ * while the other runs. Under threads (Stage D) this is also the struct each
+ * thread owns outright. Only meaningful while s_fastswap. */
+static CPUState  s_cpu_bank1;
+
+
+/* PSX_DUAL_CPU_BANK=0 roots machine 1 at the SHARED struct (pre-banking
+ * behaviour, CPU section back in the blob) -- bisect gate. */
+static int cpu_bank_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PSX_DUAL_CPU_BANK");
+        v = !(e && e[0] == '0');
+    }
+    return v;
+}
+
+static CPUState *dual_cpu(int m) {
+    return (m == 1 && s_fastswap && cpu_bank_enabled()) ? &s_cpu_bank1 : s_cpu;
+}
 static uint32_t  s_last_pc[2];  /* PC each machine last yielded at */
 static uint32_t  s_slice_coarse = DUAL_SLICE_COARSE_DEFAULT;
 static uint32_t  s_bios_checksum;
@@ -119,6 +143,12 @@ void psx_dual_set_local_machine(int machine) {
     s_local = machine ? 1 : 0;
 }
 int psx_dual_get_local_machine(void) { return s_local; }
+
+/* Veto a config-file request before activation (PSX_DUAL_CONSOLE=0). */
+void psx_dual_machine_cancel(void) {
+    if (s_active) return;   /* too late -- already running two machines */
+    s_requested = 0;
+}
 
 int psx_dual_machine_live(void) { return s_active ? s_live : -1; }
 uint64_t psx_dual_machine_swaps(void) { return s_swaps; }
@@ -216,7 +246,7 @@ static int save_live_blob(struct CPUState *cpu) {
  * control back to machine 0 forever. */
 static void dual_machine1_entry(void *arg) {
     (void)arg;
-    psx_scheduler_run(s_cpu);
+    psx_scheduler_run(dual_cpu(1));
     fprintf(stderr, "dual: machine 1 guest exited -- parking\n");
     dual_disable("machine 1 exit");
     for (;;)
@@ -323,12 +353,19 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
                 fprintf(stderr, "dual: no banks available -- copying state per switch\n");
                 s_fastswap = 0;
             } else {
+                /* CPU regs travel by struct, not by blob: machine 1 starts
+                 * from the fork state with the resolved dispatchable pc. */
+                s_cpu_bank1 = *cpu;
+                s_cpu_bank1.pc = pc;
+                if (cpu_bank_enabled())
+                    excl |= 1u << BS_SEC_CPU;
                 boot_state_set_section_exclude(excl);
                 fprintf(stdout,
-                        "dual: fast swap on (banked:%s%s%s)\n",
+                        "dual: fast swap on (banked:%s%s%s%s)\n",
                         (excl & (1u << BS_SEC_RAM))    ? " ram"    : "",
                         (excl & (1u << BS_SEC_SPURAM)) ? " spuram" : "",
-                        (excl & (1u << BS_SEC_VRAM))   ? " vram"   : "");
+                        (excl & (1u << BS_SEC_VRAM))   ? " vram"   : "",
+                        (excl & (1u << BS_SEC_CPU))    ? " cpu"    : "");
             }
         }
     }
@@ -376,6 +413,27 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
     }
     sio1_device_attach(s_dev[0], s_ep[0]);
     sio1_device_attach(s_dev[1], s_ep[1]);
+    /* Wire latency >= the armed lookahead is the barrier's causality guard: a
+     * byte sent at T becomes due at T+latency, and the peer's clock can lead
+     * the sender by at most the lookahead -- so with latency >= lookahead no
+     * receiver is ever already PAST a byte's due cycle when it lands. On the
+     * cooperative scheduler this only shifts delivery by <=242 us of guest
+     * time (well under the driver's tolerance, proven at slice=8192); under
+     * threads (Stage D) it is what lets both machines run a full quantum in
+     * parallel without observing each other mid-quantum.
+     * PSX_DUAL_WIRE_LATENCY=<cycles> overrides for A/B. */
+    {
+        uint32_t lat = fine_floor();
+        const char *e = getenv("PSX_DUAL_WIRE_LATENCY");
+        if (e && e[0]) {
+            unsigned long v = strtoul(e, NULL, 0);
+            if (v <= 33868800ul) lat = (uint32_t)v;
+        }
+        psx_link_set_latency_cycles(s_ep[0], lat);
+        psx_link_set_latency_cycles(s_ep[1], lat);
+        fprintf(stdout, "dual: wire latency = %u cycles (%.0f us guest)\n",
+                lat, lat / 33.8688);
+    }
     sio1_device_reset(s_dev[1], psx_get_cycle_count());
     /* Seed machine 1's SIO1 REGISTER FILE from the primary's. Machine 0 keeps
      * the live device (with whatever the boot already programmed into it);
@@ -437,6 +495,10 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
 
 static void switch_machines(struct CPUState *cpu) {
     int to = s_live ^ 1;
+    /* With CPU banking the caller's pointer is only the LIVE machine's struct;
+     * every save/load below must target the struct of the machine it concerns,
+     * not whichever chain happened to poll. */
+    cpu = dual_cpu(s_live);
     /* Where each machine was when it last yielded. A machine whose PC never
      * moves is not executing -- it is spinning or parked, which no amount of
      * link/SIO work can fix. */
@@ -464,7 +526,8 @@ static void switch_machines(struct CPUState *cpu) {
     {
         const double t_load = dual_mono_ms();
         int loaded = boot_state_load_buffer(s_blob[to], s_blob_len[to],
-                                            s_bios_checksum, s_entry_pc, cpu);
+                                            s_bios_checksum, s_entry_pc,
+                                            dual_cpu(to));
         s_load_ms += dual_mono_ms() - t_load;
         if (!loaded) {
         /* Roll the host statics back and keep running this machine. */
@@ -478,7 +541,21 @@ static void switch_machines(struct CPUState *cpu) {
     }
     psx_sched_machine_swap_in(s_ctx[to]);
     sio1_dual_install(s_dev[to]);
-    psx_cycles_resync_after_restore(cpu);
+    /* Interior-pointer registrations must follow the machine. main.cpp wires
+     * the memory system's SR view and the IRQ layer's CAUSE view as raw
+     * pointers INTO main's CPUState (&cpu.cop0[12]/[13]). With per-machine CPU
+     * structs, leaving them aimed at machine 0 makes machine 1 evaluate
+     * interrupt enables against a FROZEN SR and assert IP2 into the WRONG
+     * CAUSE -- it never takes an interrupt, and its BIOS boot unwinds ~214k
+     * cycles in, the moment the kernel starts depending on exceptions. */
+    if (s_fastswap && cpu_bank_enabled()) {
+        extern void memory_set_sr_ptr(const uint32_t *p);
+        extern void psx_irq_set_cause_ptr(uint32_t *p);
+        CPUState *nc = dual_cpu(to);
+        memory_set_sr_ptr(&nc->cop0[12]);
+        psx_irq_set_cause_ptr(&nc->cop0[13]);
+    }
+    psx_cycles_resync_after_restore(dual_cpu(to));
     interrupts_resync_after_restore();
     /* NO cdrom_accelerate_after_savestate (exact-state resume) and NO
      * psx_frontend_on_savestate_loaded (re-anchors pacing/FPS/audio --
@@ -591,8 +668,31 @@ static void switch_machines(struct CPUState *cpu) {
     }
 }
 
+/* ---- Bounded-skew barrier ------------------------------------------------
+ *
+ * THE synchronization contract between the two consoles, stated once so the
+ * cooperative scheduler below and the threaded runner (Stage D) enforce the
+ * same rule: a machine may not advance past
+ *
+ *     peer_clock + lookahead
+ *
+ * where lookahead = current_slice() (coarse while the wire is idle, the char
+ * time while a byte is in flight). With that bound, a byte sent at cycle T is
+ * observed at most `lookahead` cycles late on the peer's timeline -- never
+ * lost, never reordered, because the crossover rings deliver by due-cycle and
+ * the receiver's clock can lag the sender by at most the bound. Empirical
+ * tolerance so far: the WipEout libcomb handshake completed and streamed
+ * symmetric traffic at lookahead=8192 (242 us of guest time).
+ *
+ * On fibers "may not advance past" means "yield at the barrier" (the peer is
+ * behind by construction, so switching IS the wait). Under threads the same
+ * predicate becomes a blocking wait until the peer's clock catches up. */
+int psx_dual_barrier_reached(uint64_t now) {
+    return now >= s_cycles[s_live ^ 1] + current_slice();
+}
+
 void psx_dual_machine_poll(struct CPUState *cpu, uint32_t resume_pc) {
-    uint64_t now, other;
+    uint64_t now;
     if (!s_requested)
         return;
     /* Only switch where the un-swapped host statics are quiescent. */
@@ -604,8 +704,7 @@ void psx_dual_machine_poll(struct CPUState *cpu, uint32_t resume_pc) {
     }
     now = psx_get_cycle_count();
     s_cycles[s_live] = now;
-    other = s_cycles[s_live ^ 1];
-    if (now < other + current_slice())
+    if (!psx_dual_barrier_reached(now))
         return;                          /* keep running this machine */
     /* Record where this machine suspends so the peer can switch back. */
     s_fiber[s_live] = psx_fiber_current();

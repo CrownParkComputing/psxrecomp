@@ -13469,7 +13469,10 @@ session_reboot:
          * PSX_DUAL_CONSOLE=1 requests it, =0 vetoes a config request. */
         const char *e = std::getenv("PSX_DUAL_CONSOLE");
         if (e && e[0] == '1') psx_dual_machine_request(0);
-        else if (e && e[0] == '0') g_psx_dual_active = 0;
+        /* The old veto cleared g_psx_dual_active -- the wrong flag: the
+         * config request lives in s_requested and try_activate re-raises
+         * the active flag at the first safe poll, so =0 did nothing. */
+        else if (e && e[0] == '0') psx_dual_machine_cancel();
     }
     psx_event_step_conservative_env_init();
     /* Seed per-player device routing from the resolved [controller] config.

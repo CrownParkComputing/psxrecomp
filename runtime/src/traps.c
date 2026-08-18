@@ -14,6 +14,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include "psx_fiber.h"   /* cross-platform fibers (Win32 fibers / POSIX ucontext) */
+#include "fntrace.h"
 #include "psx_scheduler.h" /* deterministic TCB scheduler carve-out (scaffolding) */
 #include "parity_trace.h"  /* general two-process control-flow parity ring */
 

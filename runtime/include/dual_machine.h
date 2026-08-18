@@ -46,6 +46,10 @@ void psx_dual_machine_request(int local_machine);
  * it longjmps into the other machine via psx_scheduler_resume_at. */
 void psx_dual_machine_poll(struct CPUState *cpu, uint32_t resume_pc);
 
+/* Veto a pending config-file dual request before activation
+ * (PSX_DUAL_CONSOLE=0). No-op once two machines are running. */
+void psx_dual_machine_cancel(void);
+
 /* 1 = present/audio allowed (dual inactive, or the live machine is the
  * local one). Consulted by the vblank present path in main.cpp. */
 int psx_dual_present_gate(void);

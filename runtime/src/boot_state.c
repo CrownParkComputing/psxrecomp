@@ -53,7 +53,7 @@ extern uint8_t*  memory_get_ram_ptr(void);
 static uint32_t s_section_exclude;
 /* Only these may be excluded — each has a matching guard at its write site. */
 #define BS_SEC_EXCLUDABLE ((1u << BS_SEC_RAM) | (1u << BS_SEC_VRAM) | \
-                           (1u << BS_SEC_SPURAM))
+                           (1u << BS_SEC_SPURAM) | (1u << BS_SEC_CPU))
 
 static unsigned bs_popcount(uint32_t v) {
     unsigned n = 0;
@@ -417,7 +417,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
 
     ok = write_header_le(o, &h);
 
-    if (ok) ok = write_cpu_section(o, cpu);
+    if (ok && !(s_section_exclude & (1u << BS_SEC_CPU)))
+        ok = write_cpu_section(o, cpu);
     if (ok && !(s_section_exclude & (1u << BS_SEC_RAM)))
         ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
