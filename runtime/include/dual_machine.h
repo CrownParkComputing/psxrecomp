@@ -50,6 +50,11 @@ void psx_dual_machine_poll(struct CPUState *cpu, uint32_t resume_pc);
  * local one). Consulted by the vblank present path in main.cpp. */
 int psx_dual_present_gate(void);
 
+/* Runtime A/V ownership (F6 focus). Sets the machine psx_dual_present_gate()
+ * lets through; the other console runs headless. */
+void psx_dual_set_local_machine(int machine);
+int  psx_dual_get_local_machine(void);
+
 /* Input routing: which machine(s) receive the host pads. The excluded
  * machine is fed neutral pads. 0 = both (default), 1 = machine 0 only,
  * 2 = machine 1 only. Needed for asymmetric menu navigation (the link

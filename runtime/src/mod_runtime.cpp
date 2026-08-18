@@ -66,7 +66,13 @@ struct RuntimeMods {
     std::filesystem::path effective_disc_path;
     uint32_t entry_phys = 0;
     bool initialized = false;
-    bool main_applied = false;
+    /* PER-MACHINE. Dual-console runs two independent guests that each boot the
+     * disc and each reach the EXE entry, so a single process-global one-shot
+     * meant only whichever console got there FIRST received the mod plan --
+     * the other silently booted stock, i.e. the two consoles ran different
+     * games and could never link. Index by psx_dual_machine_live() (-1 =>
+     * single console => slot 0). */
+    bool main_applied[2] = { false, false };
     bool disc_enabled = false;
     bool disc_guard_failed = false;
 };
@@ -1060,7 +1066,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.effective_disc_path.clear();
     s.entry_phys = 0;
     s.initialized = false;
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
     s.manager.set_root(root);
@@ -1093,7 +1099,7 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     s.raw_overlay_index.clear();
     s.user_overlay_index.clear();
     s.effective_disc_path.clear();
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
     s.error.clear();
@@ -1286,7 +1292,7 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
     s.plan = std::move(plan);
     build_disc_index(s);
     s.effective_disc_path = std::move(effective_disc);
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.error.clear();
     return true;
 }
@@ -1307,10 +1313,18 @@ const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
 
 } // namespace PSXRecompV4
 
+extern "C" int psx_dual_machine_live(void);
+
+/* Which console is asking. -1 (single console) folds to slot 0. */
+static int mod_runtime_machine_slot() {
+    return (psx_dual_machine_live() == 1) ? 1 : 0;
+}
+
 extern "C" void mod_runtime_on_dispatch(uint32_t target) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
-    if (!s.initialized || s.main_applied ||
+    const int slot = mod_runtime_machine_slot();
+    if (!s.initialized || s.main_applied[slot] ||
         (target & 0x1FFFFFFFu) != s.entry_phys) return;
 
     /* Disc overlays can rewrite the boot EXE while the BIOS LoadExe path
@@ -1323,14 +1337,14 @@ extern "C" void mod_runtime_on_dispatch(uint32_t target) {
             "psxrecomp: mod plan %s rejected at 0x%08X "
             "(expected-byte guard failed; booting unmodified)\n",
             s.plan.fingerprint.c_str(), (unsigned)failed_at);
-        s.main_applied = true;
+        s.main_applied[slot] = true;
         return;
     }
     for (const ModResolution::Write& write : s.plan.writes) {
         if (write.target != ModPatchTarget::MainExe) continue;
         apply_main_write(write);
     }
-    s.main_applied = true;
+    s.main_applied[slot] = true;
     if (!s.plan.writes.empty())
         std::fprintf(stdout, "psxrecomp: applied mod plan %s\n",
                      s.plan.fingerprint.c_str());
@@ -1356,7 +1370,7 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
      * Re-psx_write + dirty_ram_mark_executable_range after overlay invalidate
      * soft-locks enhanced 8 MB sessions; leave bytes alone. */
     if (restored_main_has_replacements(s)) {
-        s.main_applied = true;
+        s.main_applied[mod_runtime_machine_slot()] = true;
         return;
     }
 
@@ -1366,7 +1380,7 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
         apply_main_write(write);
         applied = true;
     }
-    s.main_applied = true;
+    s.main_applied[mod_runtime_machine_slot()] = true;
     if (applied)
         std::fprintf(stdout,
             "psxrecomp: reapplied mod plan %s after savestate restore\n",

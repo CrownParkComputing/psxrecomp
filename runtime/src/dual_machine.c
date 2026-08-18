@@ -84,6 +84,7 @@ static PsxLinkEndpoint *s_ep[2];
 static struct CPUState *s_cpu;          /* the shared CPUState object */
 static uint64_t  s_swaps;
 static int       s_fastswap;   /* RAM handed over by bank pointer, not blob */
+static uint32_t  s_last_pc[2];  /* PC each machine last yielded at */
 static uint32_t  s_slice_coarse = DUAL_SLICE_COARSE_DEFAULT;
 static uint32_t  s_bios_checksum;
 static uint32_t  s_entry_pc;
@@ -110,6 +111,15 @@ int psx_dual_present_gate(void) {
     return !s_active || s_live == s_local;
 }
 
+/* Move A/V ownership to a console at runtime (F6 focus). This is the ONE
+ * display-ownership concept -- `s_local` is what psx_dual_present_gate() has
+ * always tested, and sdl_vblank_present() already returns early for the
+ * non-local machine, so nothing else needs its own mute. */
+void psx_dual_set_local_machine(int machine) {
+    s_local = machine ? 1 : 0;
+}
+int psx_dual_get_local_machine(void) { return s_local; }
+
 int psx_dual_machine_live(void) { return s_active ? s_live : -1; }
 uint64_t psx_dual_machine_swaps(void) { return s_swaps; }
 void psx_dual_machine_cycles(uint64_t out[2]) {
@@ -124,11 +134,26 @@ static void dual_disable(const char *why) {
     g_psx_dual_active = 0;
 }
 
+/* Is either console using the serial port? This gates the FINE slice, so a
+ * false negative is fatal to the link: the machines keep trading 282240-cycle
+ * quanta (8.3 ms of guest time) while the driver waits on a handshake whose
+ * character time is 704 cycles (21 us), and every reply lands hundreds of
+ * character-times late -> ESTABLISH LINK times out.
+ *
+ * TXEN|RXEN is NOT the right trigger, though it is tempting: WipEout opens the
+ * port during boot (ctrl=0x0305) and leaves it open, so arming on that pins the
+ * fine slice on forever -- measured 10.6k swaps/s and ~100 ms/s of blob cost,
+ * dropping the menus to single-digit fps -- while buying nothing, because with
+ * no byte in flight there is nothing to be timely about. `active` (a shift in
+ * flight or chars queued) fires the instant either side actually transmits,
+ * which is exactly when the slice needs to tighten. */
 static int link_armed(void) {
     for (int m = 0; m < 2; m++) {
+        uint16_t ctrl;
         if (!s_dev[m]) continue;
         if (sio1_device_active(s_dev[m])) return 1;
-        if (sio1_device_peek_ctrl(s_dev[m]) & SIO1_CTRL_DTR) return 1;
+        ctrl = sio1_device_peek_ctrl(s_dev[m]);
+        if (ctrl & SIO1_CTRL_DTR) return 1;
     }
     return 0;
 }
@@ -213,7 +238,18 @@ static int fork_at_game_start(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("PSX_DUAL_FORK");
-        v = (e && e[0] == 'b') ? 0 : 1;
+        /* DEFAULT = boot (BIOS reset). A game-start fork looks attractive --
+         * machine 1 inherits the booted, mod-patched primary and skips the
+         * SCEA animation -- but it leaves the secondary NOT EXECUTING: its
+         * scheduler context is initialised clean ("no TCB fibers yet"), which
+         * is only correct at BIOS reset, so psx_scheduler_run() has nothing to
+         * run and machine 1 never enters the guest (proved by a frozen RAM
+         * digest and aconstant 0x00000000 yield PC). Cloning machine 0's context is
+         * not possible: it holds jmp_bufs into machine 0's live fiber stacks.
+         * At a BIOS-reset fork machine 1 boots the disc itself, which is why
+         * mod_runtime's main_applied had to become per-machine -- otherwise
+         * only the first console to reach the EXE entry got the mod plan. */
+        v = (e && e[0] == 'g') ? 1 : 0;
     }
     return v;
 }
@@ -229,6 +265,20 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
     if (!pc)
         return;
     savestate_get_integrity(&s_bios_checksum, &s_entry_pc);
+    {
+        /* PSX_DUAL_INPUT_ROUTE=both|a|b — starting pad routing. A link handshake
+         * is asymmetric, and two machines forked from one state with identical
+         * input stay identical forever, so bring-up needs one console driven at
+         * a time. F6 cycles this live (see dual_focus_apply in main.cpp). */
+        const char *e = getenv("PSX_DUAL_INPUT_ROUTE");
+        if (e && e[0]) {
+            int r = (e[0] == 'a' || e[0] == 'A' || e[0] == '1') ? 1
+                  : (e[0] == 'b' || e[0] == 'B' || e[0] == '2') ? 2 : 0;
+            psx_dual_set_input_route(r);
+            fprintf(stdout, "dual: input route = %s (PSX_DUAL_INPUT_ROUTE)\n",
+                    r == 0 ? "both" : (r == 1 ? "A (primary)" : "B (secondary)"));
+        }
+    }
     {
         const char *e = getenv("PSX_DUAL_SLICE");
         if (e && e[0]) {
@@ -327,6 +377,46 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
     sio1_device_attach(s_dev[0], s_ep[0]);
     sio1_device_attach(s_dev[1], s_ep[1]);
     sio1_device_reset(s_dev[1], psx_get_cycle_count());
+    /* Seed machine 1's SIO1 REGISTER FILE from the primary's. Machine 0 keeps
+     * the live device (with whatever the boot already programmed into it);
+     * machine 1's is freshly created, so without this it powers on blank while
+     * its guest -- forked from a state where the port WAS configured -- believes
+     * it is already open and never re-programs it. Observed exactly that:
+     * A[ctrl=0305] vs B[ctrl=0000] for a whole session, no handshake possible.
+     * Harmless when forking at BIOS reset (nothing programmed yet); required
+     * once the fork moved to game start (PSX_DUAL_FORK=game).
+     *
+     * Registers ONLY: the snapshot's later sections carry the attached
+     * endpoint, and the two devices hold OPPOSITE ends of the crossover --
+     * copying those would splice A's wire end over B's. Section ends are
+     * [0]=regs, [1]=fsm+endpoint, [2]=total. */
+    {
+        uint32_t na = sio1_device_snap_bytes(s_dev[0]);
+        uint32_t nb = sio1_device_snap_bytes(s_dev[1]);
+        uint32_t ea[3], eb[3];
+        sio1_device_snap_section_ends(s_dev[0], ea);
+        sio1_device_snap_section_ends(s_dev[1], eb);
+        if (na == nb && ea[0] == eb[0] && ea[0] <= nb) {
+            uint8_t *ba = (uint8_t *)malloc(na);
+            uint8_t *bb = (uint8_t *)malloc(nb);
+            uint64_t now = psx_get_cycle_count();
+            if (ba && bb) {
+                sio1_device_snap_write(s_dev[0], ba, now);
+                sio1_device_snap_write(s_dev[1], bb, now);
+                memcpy(bb, ba, ea[0]);          /* regs only */
+                if (!sio1_device_snap_read(s_dev[1], bb, nb, now))
+                    fprintf(stderr, "dual: sio1 reg seed rejected\n");
+            }
+            free(ba);
+            free(bb);
+        } else {
+            fprintf(stderr,
+                    "dual: sio1 reg seed skipped (layout %u/%u regs %u/%u)\n",
+                    na, nb, ea[0], eb[0]);
+        }
+        fprintf(stdout, "dual: sio1 seeded A ctrl=%04X -> B ctrl=%04X\n",
+                sio1_device_peek_ctrl(s_dev[0]), sio1_device_peek_ctrl(s_dev[1]));
+    }
     sio1_dual_suppress_snapshot_apply(1);
 
     /* Rewind's snapshot ring would interleave two different machines. */
@@ -347,6 +437,10 @@ static void try_activate(struct CPUState *cpu, uint32_t hint) {
 
 static void switch_machines(struct CPUState *cpu) {
     int to = s_live ^ 1;
+    /* Where each machine was when it last yielded. A machine whose PC never
+     * moves is not executing -- it is spinning or parked, which no amount of
+     * link/SIO work can fix. */
+    s_last_pc[s_live] = cpu->pc;
     if (!save_live_blob(cpu)) {
         fprintf(stderr, "dual: save failed at switch (machine %d) -- retry\n",
                 s_live);
@@ -406,17 +500,76 @@ static void switch_machines(struct CPUState *cpu) {
         if (diag) {
             struct timespec ts;
             uint64_t now_ms;
+            uint32_t ram_a = 0, ram_b = 0;
+            uint32_t tx_a = 0, rx_a = 0, ov_a = 0, irq_a = 0;
+            uint32_t tx_b = 0, rx_b = 0, ov_b = 0, irq_b = 0;
+            unsigned ctrl_a = 0, ctrl_b = 0, stat_a = 0, stat_b = 0;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
+            if (s_dev[0]) {
+                sio1_device_get_counters(s_dev[0], &tx_a, &rx_a, &ov_a, &irq_a);
+                ctrl_a = sio1_device_peek_ctrl(s_dev[0]);
+                stat_a = sio1_device_peek_stat(s_dev[0], psx_get_cycle_count());
+            }
+            if (s_dev[1]) {
+                sio1_device_get_counters(s_dev[1], &tx_b, &rx_b, &ov_b, &irq_b);
+                ctrl_b = sio1_device_peek_ctrl(s_dev[1]);
+                stat_b = sio1_device_peek_stat(s_dev[1], psx_get_cycle_count());
+            }
+            (void)ov_a; (void)ov_b;
+            /* Sampled RAM digest per machine. The two consoles are forked from
+             * one state and (while input routes to BOTH) fed identical input,
+             * so they should be deterministic twins -- if these two digests
+             * ever differ, they have DIVERGED and any link handshake between
+             * them is hopeless. Banks are host-addressable, so this costs one
+             * strided pass and no machine switch. Sampled 1:256 words. */
+            {
+                const uint8_t *pa = memory_ram_bank_ptr(0);
+                const uint8_t *pb = memory_ram_bank_ptr(1);
+                uint32_t n = memory_get_ram_bytes();
+                ram_a = ram_b = 2166136261u;
+                if (pa && pb) {
+                    uint32_t off;
+                    for (off = 0; off + 4u <= n; off += 1024u) {
+                        uint32_t wa, wb;
+                        memcpy(&wa, pa + off, 4);
+                        memcpy(&wb, pb + off, 4);
+                        ram_a = (ram_a ^ wa) * 16777619u;
+                        ram_b = (ram_b ^ wb) * 16777619u;
+                    }
+                }
+            }
             if (!last_ms) last_ms = now_ms;
             if (now_ms - last_ms >= 1000u) {
                 fprintf(stderr,
                         "[DUAL] swaps/s=%llu slice=%u armed=%d blob=%zu KiB "
-                        "save=%.1f load=%.1f ms/s total_swaps=%llu\n",
+                        "save=%.1f load=%.1f ms/s m0=%llu m1=%llu d=%+lld "
+                        "pc A=%08X B=%08X ram A=%08X B=%08X %s "
+                        "sio A[ctrl=%04X stat=%04X dsr=%d tx=%u rx=%u irq=%u] "
+                        "B[ctrl=%04X stat=%04X dsr=%d tx=%u rx=%u irq=%u] total_swaps=%llu\n",
                         (unsigned long long)(s_swaps - last_swaps),
                         current_slice(), link_armed(),
                         (s_blob_len[0] + 1023u) / 1024u,
                         s_save_ms, s_load_ms,
+                        /* Per-machine guest cycle counts: both must ADVANCE and
+                         * stay within a slice of each other. A frozen m1 means
+                         * the secondary never really cold-started; a diverging
+                         * d= means the scheduler is starving one of them. */
+                        (unsigned long long)s_cycles[0],
+                        (unsigned long long)s_cycles[1],
+                        (long long)((int64_t)s_cycles[0] - (int64_t)s_cycles[1]),
+                        /* Per-machine SIO1 traffic. `armed` only tests DTR /
+                         * device-active, and WipEout's libcomb driver enables
+                         * TXEN|RXEN (ctrl=0x0305) but NEVER asserts DTR — so
+                         * armed stays 0 even when the link is working. tx/rx
+                         * are the real signal: rx climbing on BOTH sides means
+                         * bytes are crossing the wire. */
+                        s_last_pc[0], s_last_pc[1],
+                        ram_a, ram_b, ram_a == ram_b ? "TWIN" : "DIVERGED",
+                        ctrl_a, stat_a, (stat_a & SIO1_STAT_DSR) ? 1 : 0,
+                        tx_a, rx_a, irq_a,
+                        ctrl_b, stat_b, (stat_b & SIO1_STAT_DSR) ? 1 : 0,
+                        tx_b, rx_b, irq_b,
                         (unsigned long long)s_swaps);
                 last_ms = now_ms; last_swaps = s_swaps;
                 s_save_ms = 0.0; s_load_ms = 0.0;

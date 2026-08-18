@@ -25,6 +25,7 @@
 
 #include "analysis_db.h"
 #include "analysis_export.h"
+#include "widescreen_scan.h"
 #include "ps1_exe_parser.h"
 
 namespace fs = std::filesystem;
@@ -60,6 +61,13 @@ OUTPUT
   --disasm <file>              annotated listing for --at (or whole image)
   --at <0xADDR>        function to disassemble with --disasm
   --diff <file>        compare against a previous run's TSV
+
+WIDESCREEN
+  --scan-widescreen    find [widescreen.cull] site candidates statically
+  --ws-w-imms <list>   screen_w_imms override, e.g. 0x140,0x141 (else discovered)
+  --ws-h-imms <list>   screen_h_imms override, e.g. 0xF0,0xE0
+  --emit-ws-sites <f>  write a ready-to-paste [widescreen.cull] TOML block
+  --ws-min-confidence <n>  gate for --emit-ws-sites (default 70)
   --top <n>            rows in the stdout report's top lists (default 15)
   --quiet              suppress the stdout report
 
@@ -153,6 +161,10 @@ int main(int argc, char** argv) {
     Options opts;
     fs::path out_dir, symbol_addrs, ghidra, tsv, disasm, diff;
     bool emit_symbols = false, quiet = false, no_refs = false;
+    bool scan_ws = false;
+    fs::path ws_sites;
+    WsScanOptions ws_opts;
+    int ws_min_conf = 70;
     Confidence min_conf = Confidence::High;
     uint32_t disasm_at = 0;
     int top_n = 15;
@@ -179,6 +191,21 @@ int main(int argc, char** argv) {
         else if (a == "--disasm")    disasm = need("--disasm");
         else if (a == "--diff")      diff = need("--diff");
         else if (a == "--quiet")     quiet = true;
+        else if (a == "--scan-widescreen") scan_ws = true;
+        else if (a == "--emit-ws-sites") { ws_sites = need("--emit-ws-sites"); scan_ws = true; }
+        else if (a == "--ws-min-confidence") ws_min_conf = std::atoi(need("--ws-min-confidence").c_str());
+        else if (a == "--ws-w-imms" || a == "--ws-h-imms") {
+            const bool width = (a == "--ws-w-imms");
+            std::string list = need(a.c_str());
+            auto& dst = width ? ws_opts.w_imms : ws_opts.h_imms;
+            std::string tok;
+            std::istringstream ls(list);
+            while (std::getline(ls, tok, ',')) {
+                uint32_t v = 0;
+                if (!tok.empty() && parse_addr(tok, v)) dst.push_back(v);
+            }
+            scan_ws = true;
+        }
         else if (a == "--top")       top_n = std::atoi(need("--top").c_str());
         else if (a == "--at") {
             uint32_t v = 0;
@@ -291,6 +318,22 @@ int main(int argc, char** argv) {
             fmt::print(stderr, "error: {}\n", err); return 1;
         }
         fmt::print("  wrote {}\n", disasm.string());
+    }
+    if (scan_ws) {
+        WsScanResult ws = scan_widescreen(*exe, db, ws_opts);
+        if (!quiet) print_ws_report(ws, db, top_n);
+        if (!out_dir.empty()) {
+            if (!write_ws_sites_json(ws, out_dir / "widescreen_sites.json", err)) {
+                fmt::print(stderr, "error: {}\n", err); return 1;
+            }
+            fmt::print("  wrote {}/widescreen_sites.json\n", out_dir.string());
+        }
+        if (!ws_sites.empty()) {
+            if (!write_ws_sites_toml(ws, ws_sites, ws_min_conf, err)) {
+                fmt::print(stderr, "error: {}\n", err); return 1;
+            }
+            fmt::print("  wrote {}\n", ws_sites.string());
+        }
     }
     if (!diff.empty()) {
         if (!print_diff(db, diff, err)) {

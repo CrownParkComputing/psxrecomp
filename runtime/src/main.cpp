@@ -6195,35 +6195,38 @@ struct NetplayVblankEpilogue {
  * the owner proves that is the cause and makes the window usable meanwhile:
  * the muted machine still runs, it just does not present. Default "both" =
  * historical behaviour. */
-static int dual_present_owner(void) {
-    static int owner = -2;              /* -2 unread, -1 = both */
-    if (owner == -2) {
-        const char *e = std::getenv("PSX_DUAL_PRESENT_OWNER");
-        /* Default: the PRIMARY owns the window and the secondary runs headless.
-         * Letting both present is not just visually wrong (the window alternates
-         * between two consoles at unrelated points in their own timelines) --
-         * it also costs the primary its frame rate, because every present the
-         * secondary makes takes a turn at the swap/vsync the primary needed.
-         * Measured 26 -> 48 fps on the intro just by muting the secondary.
-         * PSX_DUAL_PRESENT_OWNER=both restores the old free-for-all. */
-        if (!e || !e[0]) owner = 0;
-        else if (e[0] == 'b') owner = -1;
-        else owner = (e[0] == '1') ? 1 : 0;
-    }
-    return owner;
+
+/* F6 — dual-console FOCUS: which console your pad drives, and which one the
+ * window shows, moved together. Link bring-up needs asymmetric menu navigation
+ * (one console hosts, the other joins), and two machines forked from the same
+ * state with the same input are deterministic twins that can never complete a
+ * handshake. Driving a console you cannot see is equally useless, so input and
+ * display follow each other:
+ *
+ *   both  -> pads to BOTH consoles, window shows the primary  (default)
+ *   A     -> pads to console A only, window shows A; B gets neutral pads
+ *   B     -> pads to console B only, window shows B; A gets neutral pads
+ *
+ * Replaces needing the TCP `dual_input` command (PSX_DEBUG_TOOLS-only). The
+ * starting route also comes from PSX_DUAL_INPUT_ROUTE=both|a|b. */
+static void dual_focus_apply(int route, const char *how) {
+    static const char *name[3] = { "BOTH", "A (primary)", "B (secondary)" };
+    char msg[96];
+    psx_dual_set_input_route(route);
+    /* Show whichever console is being driven; "both" keeps the primary.
+     * psx_dual_present_gate() already mutes the non-local machine's A/V --
+     * s_local is the ONE ownership concept, so nothing else needs a mute. */
+    psx_dual_set_local_machine(route == 2 ? 1 : 0);
+    std::snprintf(msg, sizeof msg, "Dual focus: %s", name[route]);
+    host_osd_set_status(msg);
+    std::fprintf(stdout, "dual: focus -> %s (input+display, %s)\n",
+                 name[route], how);
+    std::fflush(stdout);
 }
 
-static int dual_present_muted(void) {
-    int owner, live;
-    if ((owner = dual_present_owner()) < 0) return 0;
-    live = psx_dual_machine_live();
-    return live >= 0 && live != owner;
-}
 
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
-    /* Non-owner console: run the guest, skip the window entirely. */
-    if (dual_present_muted()) return ep;
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
      * next tick has a live native chain under its dispatch again. */
@@ -6497,6 +6500,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 if (key == SDLK_ESCAPE && psx_netplay_active()) {
                     netplay_soft_exit("netplay_escape");
                     return ep;
+                }
+                if (key == SDLK_F6 && !key_repeat && psx_dual_machine_live() >= 0) {
+                    /* both -> A -> B -> both */
+                    dual_focus_apply((psx_dual_get_input_route() + 1) % 3, "F6");
+                    continue;
                 }
                 if (!key_repeat &&
                     host_keymap_match(HOST_KEYMAP_REWIND, (int)key, (int)mod)) {
@@ -11735,7 +11743,14 @@ int main(int argc, char** argv) {
                 gc.runtime.link_backend == "crossover") {
                 /* Stage B dual-console: two in-process machines cross-
                  * wired on SIO1. Activation is lazy (first safe poll). */
-                psx_dual_machine_request(0);
+                {
+                    /* PSX_DUAL_PRESENT_OWNER=0|1 picks the console that owns
+                     * the window/audio; F6 moves it live. "both" is not a mode:
+                     * two consoles presenting into one window IS the
+                     * display-wrestling artefact, not a feature. */
+                    const char *e = std::getenv("PSX_DUAL_PRESENT_OWNER");
+                    psx_dual_machine_request((e && e[0] == '1') ? 1 : 0);
+                }
             }
             if (gc.runtime.has_link && gc.runtime.link_enabled) {
                 if (!sio1_set_backend(gc.runtime.link_backend.c_str()))
