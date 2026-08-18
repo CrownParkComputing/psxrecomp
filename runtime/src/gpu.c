@@ -2364,6 +2364,18 @@ static uint16_t vram_write_pixels[1024 * 512];
 /* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
  * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
 static uint32_t s_d24_upload_x1 = 0;
+/* Rows that received a CPU->VRAM rect since the current depth24 session began.
+ * While 24-bit scanout is on, the display band's rows outside the movie image
+ * were drawn by earlier 15-bit screens; on a double-buffered movie the two
+ * bands hold that leftover at DIFFERENT rows, so the bars alternate content
+ * every couple of frames -- the "old SCEA splash flickers behind the FMV"
+ * artifact. ensure_cpu at entry made the bars truthful, but truthful leftovers
+ * still flicker. Rows never written as 24-bit content present as black
+ * instead (gpu_depth24_present_row), which is what a letterboxed movie is
+ * supposed to look like. Cleared at every depth24 ENTRY; a savestate restore
+ * marks all rows (restored VRAM is authoritative). */
+static uint8_t  s_d24_row_written[512];
+static uint32_t gpu_display_depth_bit(void);  /* display_depth declared below */
 static int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */
 static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
 static void depth24_note_upload(uint32_t x, uint32_t w);
@@ -2377,6 +2389,11 @@ static void gp0_commit_cpu_to_vram(void) {
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
     depth24_note_upload(vram_write_x, vram_write_w);
+    if (gpu_display_depth_bit()) {
+        uint32_t row;
+        for (row = 0; row < vram_write_h && row < 512u; row++)
+            s_d24_row_written[(vram_write_y + row) & 511u] = 1u;
+    }
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -2482,6 +2499,7 @@ static uint32_t hres1;            /* bits 17-18: horizontal resolution 1 */
 static uint32_t vres;             /* bit 19: vertical resolution (0=240, 1=480) */
 static uint32_t video_mode;       /* bit 20: 0=NTSC, 1=PAL */
 static uint32_t display_depth;    /* bit 21: 0=15bit, 1=24bit */
+static uint32_t gpu_display_depth_bit(void) { return display_depth & 1u; }
 static uint32_t vertical_interlace; /* bit 22 */
 
 /* Display enable (set by GP1(03h)) */
@@ -2703,6 +2721,7 @@ static void gpu_reset_state(int clear_vram) {
     vram_write_x = vram_write_y = 0;
     vram_write_w = vram_write_h = 0;
     vram_write_col = vram_write_row = 0;
+    memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
     vram_write_remaining = 0;
     vram_read_active = 0;
     vram_read_x = vram_read_y = 0;
@@ -3240,6 +3259,13 @@ void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out
     if (valid > count)
         valid = count;
 
+    if (!s_d24_row_written[vy]) {
+        /* No 24-bit content has landed on this row this session: present the
+         * letterbox bar as black rather than leftover 15-bit screen bytes. */
+        for (x = 0; x < count; x++)
+            out[x] = 0xFF000000u;
+        return;
+    }
     for (x = 0; x < valid; x++) {
         uint32_t byte_x = base_byte_x + x * 3u;
         uint32_t bx1 = byte_x + 1u;
@@ -5834,8 +5860,10 @@ static void gp1_display_mode(uint32_t val) {
     vres = (val >> 2) & 1;
     video_mode = (val >> 3) & 1;
     gpu_vblank_period_refresh();
-    if (new_depth != display_depth)
+    if (new_depth != display_depth) {
         s_d24_upload_x1 = 0; /* rising/falling: drop stale coverage */
+        memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
+    }
     display_depth = new_depth;
     vertical_interlace = (val >> 5) & 1;
     /* GPUSTAT.13 holds the legacy constant 0 in progressive (see the vblank
@@ -5997,6 +6025,7 @@ static int gpu_snap_parse(PstR *r) {
     RI(draw_offset_x); RI(draw_offset_y);
     RU(hres1); RU(hres2); RU(vres); RU(video_mode); RU(display_depth); RU(vertical_interlace);
     gpu_vblank_period_refresh();  /* video_mode just changed under the cache */
+    memset(s_d24_row_written, 1, sizeof(s_d24_row_written));
     RU(display_disabled); RU(irq1_flag); RU(dma_direction); RU(lcf);
     RU(display_area_x); RU(display_area_y);
     RU(h_display_x1); RU(h_display_x2); RU(v_display_y1); RU(v_display_y2);
