@@ -737,6 +737,47 @@ AnalysisDb build_analysis_db(const PS1Executable& exe,
         f.sig.sig_confident = !saw_backward_branch && !f.partial;
     }
 
+    // ---- pass 2.5: PSY-Q kernel dispatch thunks ---------------------------
+    // Shape: an immediate load of 0xA0/0xB0/0xC0 into some register, a `jr` on
+    // that register, and an immediate load of the call index into $t1. This is
+    // an exact pattern, not a heuristic, so a match is Verified — which matters
+    // because the generic rules score these stubs `low` (no prologue, no
+    // jr $ra) despite them being among the most-called code in any image.
+    for (auto& f : db.functions) {
+        if (f.is_data || f.size < 12 || f.size > 32) continue;
+        uint32_t table = 0, idx = 0, tbl_reg = 32;
+        bool have_jr = false;
+        for (uint32_t pc = f.addr; pc < f.end && pc < f.addr + 16; pc += 4) {
+            if (!in_image(pc)) break;
+            DecodedInstruction d = MipsDecoder::decode(read_w(pc), pc);
+            const bool imm_load = (d.opcode == 0x09 || d.opcode == 0x0D) &&
+                                  d.rs == REG_ZERO;   // ADDIU/ORI rt, $zero, k
+            if (imm_load) {
+                if (d.uimm16 == 0xA0 || d.uimm16 == 0xB0 || d.uimm16 == 0xC0) {
+                    table = d.uimm16;
+                    tbl_reg = d.rt;
+                } else if (d.rt == 9) {               // $t1 carries the index
+                    idx = d.uimm16;
+                }
+            } else if (d.opcode == 0x00 && d.funct == 0x08 && d.rs == tbl_reg) {
+                have_jr = true;
+            }
+        }
+        if (!table || !have_jr) continue;
+
+        const char* nm = bios_call_name(table, idx);
+        f.bios_call = fmt::format("{:02X}:{:02X}{}{}", table, idx,
+                                  *nm ? " " : "", nm);
+        f.name = *nm ? fmt::format("bios_{:02X}_{:02X}_{}", table, idx, nm)
+                     : fmt::format("bios_{:02X}_{:02X}", table, idx);
+        f.confidence = Confidence::Verified;
+        f.confidence_reason =
+            fmt::format("PSY-Q kernel dispatch thunk to {:02X}({:02X}h)",
+                        table, idx);
+        f.sig.prototype = fmt::format("/* kernel {:02X}({:02X}h) */ {}",
+                                      table, idx, f.name);
+    }
+
     // ---- pass 3: indirect sites + static jump-table recovery ---------------
     for (size_t fi = 0; fi < db.functions.size(); ++fi) {
         FunctionRecord& f = db.functions[fi];
@@ -755,6 +796,17 @@ AnalysisDb build_analysis_db(const PS1Executable& exe,
             site.reg = d.rs;
             site.kind = is_jr ? "jr" : "jalr";
             site.classification = "unresolved";
+
+            // The `jr` inside a recognized kernel thunk IS the dispatch — its
+            // target is the A0/B0/C0 vector, which pass 2.5 already identified
+            // exactly. Leaving it in the unresolved bucket would inflate the
+            // coverage gap with the one class of indirect transfer the tool
+            // understands best.
+            if (!f.bios_call.empty()) {
+                site.classification = fmt::format("bios_dispatch:{}", f.bios_call);
+                db.indirect.push_back(std::move(site));
+                continue;
+            }
 
             if (is_jr && opts.resolve_jump_tables) {
                 // The emitter's proven form first; the general slice walk only
@@ -902,47 +954,6 @@ AnalysisDb build_analysis_db(const PS1Executable& exe,
             static_cast<uint32_t>(callees[i].size());
     }
 
-    // ---- pass 6.5: PSY-Q kernel dispatch thunks ---------------------------
-    // Shape: an immediate load of 0xA0/0xB0/0xC0 into some register, a `jr` on
-    // that register, and an immediate load of the call index into $t1. This is
-    // an exact pattern, not a heuristic, so a match is Verified — which matters
-    // because the generic rules score these stubs `low` (no prologue, no
-    // jr $ra) despite them being among the most-called code in any image.
-    for (auto& f : db.functions) {
-        if (f.is_data || f.size < 12 || f.size > 32) continue;
-        uint32_t table = 0, idx = 0, tbl_reg = 32;
-        bool have_jr = false;
-        for (uint32_t pc = f.addr; pc < f.end && pc < f.addr + 16; pc += 4) {
-            if (!in_image(pc)) break;
-            DecodedInstruction d = MipsDecoder::decode(read_w(pc), pc);
-            const bool imm_load = (d.opcode == 0x09 || d.opcode == 0x0D) &&
-                                  d.rs == REG_ZERO;   // ADDIU/ORI rt, $zero, k
-            if (imm_load) {
-                if (d.uimm16 == 0xA0 || d.uimm16 == 0xB0 || d.uimm16 == 0xC0) {
-                    table = d.uimm16;
-                    tbl_reg = d.rt;
-                } else if (d.rt == 9) {               // $t1 carries the index
-                    idx = d.uimm16;
-                }
-            } else if (d.opcode == 0x00 && d.funct == 0x08 && d.rs == tbl_reg) {
-                have_jr = true;
-            }
-        }
-        if (!table || !have_jr) continue;
-
-        const char* nm = bios_call_name(table, idx);
-        f.bios_call = fmt::format("{:02X}:{:02X}{}{}", table, idx,
-                                  *nm ? " " : "", nm);
-        f.name = *nm ? fmt::format("bios_{:02X}_{:02X}_{}", table, idx, nm)
-                     : fmt::format("bios_{:02X}_{:02X}", table, idx);
-        f.confidence = Confidence::Verified;
-        f.confidence_reason =
-            fmt::format("PSY-Q kernel dispatch thunk to {:02X}({:02X}h)",
-                        table, idx);
-        f.sig.prototype = fmt::format("/* kernel {:02X}({:02X}h) */ {}",
-                                      table, idx, f.name);
-    }
-
     // ---- pass 7: symbols ---------------------------------------------------
     if (!opts.symbols_toml.empty()) {
         std::vector<SymbolEntry> syms;
@@ -964,7 +975,7 @@ AnalysisDb build_analysis_db(const PS1Executable& exe,
 
     // ---- pass 8: confidence + prototypes ----------------------------------
     for (auto& f : db.functions) {
-        if (!f.bios_call.empty()) continue; // pass 6.5 already decided
+        if (!f.bios_call.empty()) continue; // pass 2.5 already decided
         if (f.is_data) {
             f.confidence = Confidence::DataRegion;
             f.confidence_reason = "classified as data";

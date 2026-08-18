@@ -314,6 +314,10 @@ def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> P
         project_root / "build-recompiler",
         ROOT / "recompiler" / "build",
         ROOT / "recompiler" / "build" / "Release",
+        # Dedicated minimal tree used by ensure_analyzer(); see there for why
+        # the analyzer does not share the emitters' build directory.
+        project_root / "psxrecomp" / "recompiler" / "build-analyze",
+        ROOT / "recompiler" / "build-analyze",
     ]
     for d in search_dirs:
         for name in names:
@@ -384,6 +388,124 @@ def ensure_emitters(
         pct=0.12,
         message="Building psxrecomp-game + psxrecomp-bios…",
     )
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        # psxrecomp-analyze is deliberately NOT built here. It has its own
+        # ensure_analyzer()/build tree, and requesting it from the shared
+        # emitters build breaks `ensure-emitters` outright on any checkout whose
+        # recompiler/CMakeLists.txt predates the target ("ninja: error: unknown
+        # target"). The emitters path must keep working on old framework pins.
+        ("psxrecomp-game", "psxrecomp-bios"),
+        download_toolchain=download_toolchain,
+        clean=force,
+    )
+
+    try:
+        game, bios = find_emitters(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"emitters build finished but binaries not found: {exc}"
+        ) from exc
+    progress.log(f"Emitters built: {game} , {bios}")
+    return game, bios
+
+
+def ensure_analyzer(
+    project_root: Path,
+    progress: ProgressReporter,
+    *,
+    download_toolchain: bool = True,
+) -> Path:
+    """Return psxrecomp-analyze, building ONLY that target when it is missing.
+
+    Every build tree created before this target existed has game+bios but no
+    analyzer, so `analyze` has to be able to add one. It must not do that by
+    rebuilding the emitters: they already work, a relink is slow, and on a repo
+    whose tree was configured with the portable cmake-clang toolchain against a
+    newer system glibc the psxrecomp-game link fails outright on
+    ``__isoc23_strtoul`` — a pre-existing toolchain mismatch that has nothing to
+    do with analysis. Building the one target that is actually missing avoids
+    dragging that failure into an unrelated command.
+    """
+    try:
+        return find_psxrecomp_analyze(project_root)
+    except FileNotFoundError:
+        pass
+
+    progress.phase("emitters", pct=0.12, message="Building psxrecomp-analyze…")
+    src = recompiler_source_dir(project_root)
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        ("psxrecomp-analyze",),
+        download_toolchain=download_toolchain,
+        build_dir_override=src / "build-analyze",
+        # The analyzer needs fmt and nothing else. Configuring its own tree with
+        # libchdr and the test suite off keeps `analyze` independent of whatever
+        # state the emitters' build directory is in — a half-configured cache, a
+        # cold FetchContent needing the network, or a project path containing a
+        # colon, all of which fail the shared configure for reasons that have
+        # nothing to do with static analysis.
+        extra_cmake_args=("-DPSXRECOMP_ENABLE_CHD=OFF", "-DBUILD_TESTING=OFF"),
+    )
+    try:
+        tool = find_psxrecomp_analyze(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"psxrecomp-analyze build finished but the binary was not found: {exc}"
+        ) from exc
+    progress.log(f"Analyzer built: {tool}")
+    return tool
+
+
+def _toolchain_stamp(clang_cxx: Optional[str], cmake_tool: Optional[str]) -> str:
+    """Identity of the toolchain that a build directory's objects were made with.
+
+    The portable toolchain is addressed through a stable ``latest`` symlink, so
+    an upgrade behind it leaves CMAKE_CXX_COMPILER unchanged and CMake's
+    compiler-change detection never fires. Ninja then relinks object files
+    built by the previous toolchain.
+
+    That is not theoretical: cmake-clang-v1 v1.0.10 shipped no sysroot and
+    compiled against the host's glibc, so `strtoul` became `__isoc23_strtoul`
+    (glibc >= 2.38). v1.0.14 added a bundled older sysroot that exports no such
+    symbol, and every build tree from before the upgrade failed to link with
+    "undefined symbol: __isoc23_strtoul" while nothing looked out of date.
+
+    Resolving the symlink puts the concrete version in the stamp, so the
+    upgrade becomes visible and the tree can be wiped.
+    """
+    parts: list[str] = []
+    for tool in (clang_cxx, cmake_tool):
+        if not tool:
+            continue
+        real = Path(tool).resolve()
+        parts.append(str(real))
+        try:
+            parts.append(str(real.stat().st_size))
+        except OSError:
+            pass
+        manifest = real.parent.parent / "retcomm-toolchain.json"
+        if manifest.is_file():
+            try:
+                parts.append(manifest.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
+def _build_recompiler_targets(
+    project_root: Path,
+    progress: ProgressReporter,
+    targets: tuple[str, ...],
+    *,
+    download_toolchain: bool = True,
+    build_dir_override: Path | None = None,
+    extra_cmake_args: tuple[str, ...] = (),
+    clean: bool = False,
+) -> Path:
+    """Configure recompiler/ and build `targets`. Returns the build directory."""
     if not activate_embedded_toolchain(project_root, progress):
         if not download_toolchain or not ensure_toolchain_for_rebuild(
             project_root, progress, download=True
@@ -414,6 +536,9 @@ def ensure_emitters(
     except FileNotFoundError:
         pass
 
+    if build_dir_override is not None:
+        build_dir = build_dir_override
+
     build_dir.mkdir(parents=True, exist_ok=True)
     ninja = _which_tool("ninja")
     clang_c = _which_tool("clang")
@@ -421,6 +546,37 @@ def ensure_emitters(
     cmake = _which_tool("cmake")
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
+
+    # Wipe when the caller asked for a clean build, or when the toolchain that
+    # produced this tree's objects is not the one about to link them.
+    stamp_file = build_dir / ".retcomm-toolchain-stamp"
+    stamp = _toolchain_stamp(clang_cxx, cmake)
+    if clean:
+        progress.log(f"Clean rebuild requested — removing {build_dir}")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and stamp_file.is_file():
+        try:
+            previous = stamp_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            previous = ""
+        if previous and previous != stamp:
+            progress.log(
+                "Toolchain changed since this build directory was configured — "
+                f"removing {build_dir} so objects are rebuilt against it"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and not stamp_file.is_file() and (build_dir / "CMakeCache.txt").is_file():
+        # A tree configured before stamping existed. Its objects may predate the
+        # current toolchain with no way to tell, and a mismatch surfaces only as
+        # an undefined symbol at link time. Rebuild once, then stamp.
+        progress.log(
+            f"Unstamped build directory {build_dir} — rebuilding once so its "
+            "objects are known to match the active toolchain"
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
 
     cache_file = build_dir / "CMakeCache.txt"
     gen: list[str] = []
@@ -453,6 +609,7 @@ def ensure_emitters(
     # no MSYS2 GCC DLLs (same as tools/ci/build_emitters.sh).
     if clang_c is not None or clang_cxx is not None:
         cmake_args.append("-DPSXRECOMP_STATIC_CLI=ON")
+    cmake_args.extend(extra_cmake_args)
 
     progress.log(" ".join(cmake_args))
     proc = subprocess.run(
@@ -469,21 +626,9 @@ def ensure_emitters(
         )
 
     jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 4)
-    build_cmd = [
-        str(cmake),
-        "--build",
-        str(build_dir),
-        "--parallel",
-        jobs,
-        "--target",
-        "psxrecomp-game",
-        "--target",
-        "psxrecomp-bios",
-        # Built alongside the emitters so `analyze` never has to configure a
-        # second build tree. It shares their sources and costs one extra link.
-        "--target",
-        "psxrecomp-analyze",
-    ]
+    build_cmd = [str(cmake), "--build", str(build_dir), "--parallel", jobs]
+    for target in targets:
+        build_cmd += ["--target", target]
     progress.log(" ".join(build_cmd))
     proc = subprocess.run(build_cmd, capture_output=True, text=True)
     for stream in (proc.stdout, proc.stderr):
@@ -492,16 +637,16 @@ def ensure_emitters(
                 if line.strip():
                     progress.log(line)
     if proc.returncode != 0:
-        raise RuntimeError(f"emitters cmake build failed (exit {proc.returncode})")
-
-    try:
-        game, bios = find_emitters(project_root)
-    except FileNotFoundError as exc:
         raise RuntimeError(
-            f"emitters build finished but binaries not found under {build_dir}: {exc}"
-        ) from exc
-    progress.log(f"Emitters built: {game} , {bios}")
-    return game, bios
+            f"recompiler cmake build failed (exit {proc.returncode}) for "
+            + ", ".join(targets)
+        )
+    if stamp:
+        try:
+            stamp_file.write_text(stamp, encoding="utf-8")
+        except OSError:
+            pass
+    return build_dir
 
 
 def framework_root(project_root: Path) -> Path:
@@ -1529,8 +1674,7 @@ def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
     except FileNotFoundError:
         progress.phase("emitters", pct=0.1, message="Building psxrecomp-analyze…")
         try:
-            ensure_emitters(project_root, progress)
-            tool = find_psxrecomp_analyze(project_root)
+            tool = ensure_analyzer(project_root, progress)
         except Exception as exc:  # noqa: BLE001
             progress.error(str(exc), code=EXIT_ERROR)
             return EXIT_ERROR
