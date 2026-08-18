@@ -45,6 +45,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 /* Declarations only -- STB_IMAGE_IMPLEMENTATION lives in
  * psx_window_icon.cpp, whose STBI_NO_STDIO must be matched here or the
  * declarations disagree with the definitions that exist. */
+#include <random>
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
 #include "gpu_vk_renderer.h"
@@ -13653,9 +13654,42 @@ session_reboot:
      * exists and stb_image is already linked for the HD texture pack. A
      * relative path resolves against the disc directory, so a pack of team
      * wallpapers can sit beside the disc like the texture pack does. */
-    if (!g_bezel_path.empty() && g_gl_active) {
-        std::filesystem::path bp(g_bezel_path);
-        if (bp.is_relative()) bp = resolved_disc.parent_path() / bp;
+    if (!g_bezel_path.empty() && g_bezel_path != "off" && g_gl_active) {
+        /* Resolve the setting to a file.
+         *
+         *   "random"      one of the bundled team logos, chosen ONCE per
+         *                 launch and kept for the whole session -- a mark that
+         *                 changed mid-run would read as a glitch;
+         *   "qirex" etc.  that team;
+         *   anything else a path, relative to the disc directory.
+         *
+         * Bundled art lives next to the executable so a stock install has it
+         * without touching the disc folder. */
+        std::filesystem::path bp;
+        const std::filesystem::path bez_dir =
+            exe_dir_from_argv(argv[0]) / "bezels";
+        if (g_bezel_path == "random") {
+            std::vector<std::filesystem::path> pool;
+            std::error_code bec;
+            for (const auto &e : std::filesystem::directory_iterator(bez_dir, bec)) {
+                if (bec) break;
+                if (e.is_regular_file(bec) && e.path().extension() == ".png")
+                    pool.push_back(e.path());
+            }
+            std::sort(pool.begin(), pool.end());   /* directory order is not defined */
+            if (!pool.empty()) {
+                std::random_device rd;
+                bp = pool[rd() % pool.size()];
+            }
+        } else {
+            bp = std::filesystem::path(g_bezel_path);
+            if (!bp.has_extension()) {             /* a team name */
+                std::filesystem::path named = bez_dir / (g_bezel_path + ".png");
+                std::error_code nec;
+                if (std::filesystem::exists(named, nec)) bp = named;
+            }
+            if (bp.is_relative()) bp = resolved_disc.parent_path() / bp;
+        }
         std::vector<unsigned char> file;
         if (FILE *bf = std::fopen(bp.string().c_str(), "rb")) {
             std::fseek(bf, 0, SEEK_END);

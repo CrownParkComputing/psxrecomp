@@ -5143,6 +5143,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
  * menu -- and gets it wrong. A still image has no such question: it looks the
  * same in a race and in a menu, which is the whole point of a bezel. */
 static GLuint s_bezel_tex = 0;
+static int    s_bezel_w = 0, s_bezel_h = 0;
 
 int gl_renderer_set_bezel(const void *rgba, int w, int h) {
     if (s_bezel_tex) { glDeleteTextures(1, &s_bezel_tex); s_bezel_tex = 0; }
@@ -5152,35 +5153,68 @@ int gl_renderer_set_bezel(const void *rgba, int w, int h) {
     if (!s_bezel_tex) return 0;
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    /* REPEAT so a single logo can tile down a tall margin. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, rgba);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    s_bezel_w = w; s_bezel_h = h;
     return 1;
 }
 
 int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
 
-/* Cover the drawable with the bezel, before the game quad, so the frame paints
- * over the centre and only the margins keep the art. */
+/* Draw the bezel into ONE viewport, cover-cropped to that viewport's aspect.
+ *
+ * Cover, not stretch: scale to fill and crop the overflow, centred. Stretching
+ * distorts any artwork whose aspect does not match, and a margin rarely does --
+ * a portrait poster squeezed across a 7680-wide window is unrecognisable, while
+ * the same poster cover-cropped into a tall narrow margin fits it naturally. */
+/* Tile the bezel down one margin, preserving the logo's aspect.
+ *
+ * A margin is tall and narrow; a single logo stretched to fill it would be
+ * grotesque and cover-cropping one would show a sliver. Tiling keeps every
+ * copy at its authored proportions and fills any margin size, which is what a
+ * repeating mark is for. The count is derived from the margin width so the
+ * logo reads at a consistent size regardless of resolution or window shape. */
+static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
+    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
+    const float img = (float)s_bezel_w / (float)s_bezel_h;
+    /* One logo spans the margin width, with a little air either side. */
+    const float tile_w = 1.0f / 0.78f;
+    /* Same on-screen scale vertically: how many logo-heights fit the margin. */
+    const float tile_h = ((float)vh / ((float)vw * 0.78f)) / img;
+    glViewport(vx, vy, vw, vh);
+    p_glUniform4f(s_present_uUvRect,
+                  -(tile_w - 1.0f) * 0.5f, 0.0f,
+                   (tile_w + 1.0f) * 0.5f, tile_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* Bezel into the left and right margins, one copy each, before the game quad.
+ * Per-margin rather than one image behind everything: the margins are tall and
+ * narrow, so portrait artwork fills them naturally, and each side gets the
+ * whole picture instead of one picture cut in half by the frame. */
 static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
+    (void)ly; (void)lh;
     if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
-    if (lx <= 0 && ly <= 0 && lw >= ww && lh >= wh) return;  /* no margins */
+    const int right_x = lx + lw;
+    const int right_w = ww - right_x;
+    if (lx <= 0 && right_w <= 0) return;          /* no margins to fill */
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
-    glViewport(0, 0, ww, wh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
-    p_glUniform4f(s_present_uUvRect, 0.0f, 0.0f, 1.0f, 1.0f);
     p_glBindVertexArray(s_present_vao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (lx > 0)      bezel_draw_rect(0, 0, lx, wh);
+    if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
 }
