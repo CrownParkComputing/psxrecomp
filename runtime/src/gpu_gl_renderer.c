@@ -5161,11 +5161,29 @@ int gl_renderer_set_bezel(const void *rgba, int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    /* Pad the image with transparent margin before upload, so tiles do not
+     * butt against each other. GL_REPEAT tiles edge to edge with no notion of
+     * spacing, so the gap has to exist in the texture: 5% added on each side
+     * leaves 10% between neighbours, horizontally and vertically. Padding both
+     * axes by the same fraction preserves the aspect, so the tiling maths
+     * downstream is unchanged. */
+    const int px_pad = (w * 5) / 100, py_pad = (h * 5) / 100;
+    const int pw = w + px_pad * 2, ph = h + py_pad * 2;
+    unsigned char *padded =
+        (unsigned char *)calloc((size_t)pw * (size_t)ph, 4);
+    if (padded) {
+        const unsigned char *src8 = (const unsigned char *)rgba;
+        for (int y = 0; y < h; y++)
+            memcpy(padded + (((size_t)(y + py_pad) * pw) + px_pad) * 4,
+                   src8 + (size_t)y * w * 4, (size_t)w * 4);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, rgba);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                 padded ? pw : w, padded ? ph : h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, padded ? padded : rgba);
+    free(padded);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    s_bezel_w = w; s_bezel_h = h;
+    s_bezel_w = padded ? pw : w; s_bezel_h = padded ? ph : h;
     /* Backdrop from the art: mean of the opaque pixels, darkened. Each team
      * then brings its own colour instead of sitting on black, which read as a
      * hole punched in the screen rather than as part of the design. Weighted by
