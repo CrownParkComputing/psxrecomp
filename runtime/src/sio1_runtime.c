@@ -9,6 +9,7 @@
  * runtime stubs (the lesson from test_sio_card_protocol.c's stub wall).
  */
 #include "sio1.h"
+#include "psx_link_shm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +60,15 @@ int sio1_set_backend(const char *name) {
     if (strcmp(name, "loopback") == 0) {
         ep = psx_link_loopback_create();
         if (!ep) return 0;
+    } else if (strcmp(name, "shm") == 0) {
+        /* Two-process link: each console is a full single-console runtime;
+         * the cable is a shared-memory ring pair (psx_link_shm.h). Name and
+         * role come from env so two instances on one machine can pair without
+         * distinct game.tomls: PSX_LINK_SHM_NAME, PSX_LINK_SHM_ROLE=a|b. */
+        const char *nm = getenv("PSX_LINK_SHM_NAME");
+        const char *rl = getenv("PSX_LINK_SHM_ROLE");
+        ep = psx_link_shm_open(nm, rl && rl[0] ? rl[0] : 0);
+        if (!ep) return 0;
     } else if (strcmp(name, "null") == 0 || strcmp(name, "crossover") == 0) {
         /* "crossover" endpoints are attached by the dual-console driver via
          * sio1_device_attach; until that driver runs, behave as no-cable. */
@@ -68,6 +78,7 @@ int sio1_set_backend(const char *name) {
     }
     if (g_owned_loopback) {
         psx_link_loopback_destroy(g_owned_loopback);
+        psx_link_shm_close(g_owned_loopback);
         g_owned_loopback = NULL;
     }
     if (ep->ops != psx_link_null()->ops)

@@ -996,6 +996,18 @@ void psx_check_interrupts(CPUState* cpu) {
             psx_dual_machine_poll(cpu, s_compiled_interrupt_resume_pc);
         }
     }
+    /* Two-process shm link: bounded-skew barrier against the peer process.
+     * Same one-load-and-branch cost when inactive as the dual poll above;
+     * when this side runs ahead of peer+lookahead it naps until the peer
+     * catches up (psx_link_shm.c). Throttled: the barrier bound is thousands
+     * of cycles, so checking every 64th interrupt poll loses nothing. */
+    {
+        extern int psx_link_shm_active(void);
+        extern void psx_link_shm_poll(uint64_t cycle_now);
+        static uint32_t s_shm_div;
+        if (psx_link_shm_active() && (++s_shm_div & 0x3Fu) == 0)
+            psx_link_shm_poll(psx_get_cycle_count());
+    }
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);
     const int np_active = psx_netplay_active();

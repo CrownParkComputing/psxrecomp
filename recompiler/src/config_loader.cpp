@@ -519,10 +519,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             for (char& c : rt.link_backend)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (rt.link_backend != "null" && rt.link_backend != "loopback" &&
-                rt.link_backend != "crossover") {
+                rt.link_backend != "crossover" && rt.link_backend != "shm") {
                 throw std::runtime_error(fmt::format(
-                    "[runtime.link] backend must be 'null', 'loopback' or "
-                    "'crossover', got '{}'", rt.link_backend));
+                    "[runtime.link] backend must be 'null', 'loopback', "
+                    "'crossover' or 'shm', got '{}'", rt.link_backend));
             }
         }
         if (lk.contains("latency_cycles")) {
