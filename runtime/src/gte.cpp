@@ -932,6 +932,19 @@ void gte_rtpt(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 // NCLIP (0x06) — Normal Clipping (2D cross product for backface culling)
 // ---------------------------------------------------------------------------
+/* Exact-sign coverage counters (free-running; debug server geom_correction
+ * reply). A fallback means the integer sign decided — the regime where the
+ * widescreen X-squash rounding can flip a thin face for a frame. */
+static uint64_t s_nclip_precise_hits = 0;
+static uint64_t s_nclip_fallbacks = 0;
+static uint64_t s_nclip_corrected = 0;
+extern "C" void gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
+                                        uint64_t *corrected) {
+    if (hits) *hits = s_nclip_precise_hits;
+    if (fallbacks) *fallbacks = s_nclip_fallbacks;
+    if (corrected) *corrected = s_nclip_corrected;
+}
+
 void gte_nclip(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     int32_t sx0 = static_cast<int16_t>(gte->SXY[0] & 0xFFFF);
@@ -955,17 +968,22 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
      * substitute is honest about the face's true orientation. */
     int32_t px0, py0, px1, py1, px2, py2;
     if (gpu_ws_precise_nclip_enabled() &&
-        pgxp_get_gte_sxy(0, &px0, &py0) &&
-        pgxp_get_gte_sxy(1, &px1, &py1) &&
-        pgxp_get_gte_sxy(2, &px2, &py2)) {
+        !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+        pgxp_get_gte_sxy_checked(0, gte->SXY[0], 1, &px0, &py0) &&
+        pgxp_get_gte_sxy_checked(1, gte->SXY[1], 1, &px1, &py1) &&
+        pgxp_get_gte_sxy_checked(2, gte->SXY[2], 1, &px2, &py2)) {
+        s_nclip_precise_hits++;
         const double fx0 = px0 / 65536.0, fy0 = py0 / 65536.0;
         const double fx1 = px1 / 65536.0, fy1 = py1 / 65536.0;
         const double fx2 = px2 / 65536.0, fy2 = py2 / 65536.0;
         const double cross = fx0 * (fy1 - fy2) +
                              fx1 * (fy2 - fy0) +
                              fx2 * (fy0 - fy1);
-        if (cross > 0.0 && out <= 0) out = 1;
-        else if (cross < 0.0 && out >= 0) out = -1;
+        if (cross > 0.0 && out <= 0) { out = 1; s_nclip_corrected++; }
+        else if (cross < 0.0 && out >= 0) { out = -1; s_nclip_corrected++; }
+    } else if (gpu_ws_precise_nclip_enabled() &&
+               !s_gte_replay_sandbox && s_speculative_depth == 0) {
+        s_nclip_fallbacks++;
     }
     gte->MAC0 = out;
     gte->set_error_flag();
@@ -1565,11 +1583,19 @@ extern "C" int gte_replay_side_effects_begin(void) {
     if (s_gte_replay_sandbox) return 0;
     s_gte_replay_saved_caller_ra = s_gte_caller_ra;
     s_gte_replay_sandbox = 1;
+    /* Replay passes must be shadow-silent: the record pass already wrote the
+     * authoritative shadows, and a replay's memory hooks re-validating stale
+     * FIFO shadows against different vertices drop flags and overwrite live
+     * slots (arena-wide provenance kill => one-frame integer-sign NCLIP
+     * blinks under overlay diff mode). Suppression makes every psx_pgxp_*
+     * hook a no-op for the bracket, like the speculative validation passes. */
+    pgxp_suppress_begin();
     return 1;
 }
 extern "C" void gte_replay_side_effects_end(void) {
     using namespace PSXRecomp::GTE;
     if (!s_gte_replay_sandbox) return;
+    pgxp_suppress_end();
     s_gte_caller_ra = s_gte_replay_saved_caller_ra;
     s_gte_replay_sandbox = 0;
 }

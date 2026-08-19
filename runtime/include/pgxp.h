@@ -58,6 +58,11 @@ void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed);
 /* Current SXY FIFO shadow (index 0..3 selects GTE data regs 12..15).
  * Returns nonzero when the shadow is live and carries X/Y precision. */
 int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16);
+/* Validate-on-read variant: check!=0 additionally requires the shadow's packed
+ * word to equal expect (the live guest SXY word) - the engine's single safety
+ * invariant, which sign-consumers must not skip. */
+int pgxp_get_gte_sxy_checked(uint32_t index, uint32_t expect, int check,
+                             int32_t *x16, int32_t *y16);
 
 /* Guest write to a GTE data register outside gte_execute (MTC2/CTC2 handled
  * by psx_pgxp_cop2; this is for direct gte_write_data paths): reg 15 performs
@@ -98,6 +103,7 @@ typedef struct PGXPStats {
     uint64_t w_valid;            /* lookups that also carried a usable depth */
     uint64_t produced;           /* RTPS/RTPT projections pushed into shadows */
     uint64_t swc2_stores;        /* GTE reg shadows copied to RAM shadows     */
+    uint64_t invalidations;      /* generation bumps (each kills all shadows) */
 } PGXPStats;
 
 void pgxp_get_stats(PGXPStats *out);
