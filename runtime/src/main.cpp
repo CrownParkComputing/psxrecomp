@@ -1151,7 +1151,8 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
  * newly-seen texture. */
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
-static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::string   g_hd_texture_dir;
+static std::vector<std::string> g_hd_texture_exclude; /* [video] hd_texture_exclude */   /* relocates the whole convention (dev knob) */
 static std::string   g_bezel_path;      /* [video] bezel -- margin artwork */
 static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
@@ -11404,6 +11405,7 @@ int main(int argc, char** argv) {
             g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
+            g_hd_texture_exclude = gc.runtime.video_hd_texture_exclude;
             g_bezel_path       = gc.runtime.video_bezel;
             if (gc.runtime.runtime_cpu_overclock != 100u) {
                 psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
@@ -13113,6 +13115,14 @@ int main(int argc, char** argv) {
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
                   g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
+    /* Config-owned exclusions survive pack-directory regeneration (the pack
+     * dir is gitignored game content; losing its exclude.txt silently
+     * re-enabled font-atlas substitution - the doubled-glyph defect). */
+    for (const std::string &hx : g_hd_texture_exclude) {
+        unsigned h = 0;
+        if (std::sscanf(hx.c_str(), "%x", &h) == 1)
+            tex_pack_add_excluded((uint32_t)h);
+    }
     /* Coverage report for the launcher's per-pack stats. atexit alongside the
      * other end-of-session flushes; a no-op when no pack is active. */
     std::atexit(tex_pack_write_coverage);
