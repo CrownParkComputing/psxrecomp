@@ -22,11 +22,6 @@ int  gl_renderer_init_context(struct SDL_Window *win);
 /* Set the GL swap interval / vsync mode (1=vsync, 0=immediate, -1=adaptive).
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
-/* Nonzero while the blocking Swap is the game's frame clock (driver vsync
- * owns cadence): unchanged-frame present skips are disabled, because a
- * skipped swap would silently unpace that frame. */
-void gl_renderer_set_swap_paces(int on);
-
 /* Presentation-only frame interpolation. High-refresh sub-presents blend the
  * two most recent stable display images; guest simulation timing is unchanged. */
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,

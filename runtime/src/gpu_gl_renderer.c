@@ -4068,9 +4068,9 @@ int gl_renderer_cpu_auth_dual(void) {
  * nothing new, so "fps readout off" ran the game at a fluctuating ~2x — the
  * readout's persistent OSD line forced a swap per frame and masked it).
  * Real hardware scans out every vblank regardless of change; when the swap
- * paces, so do we. Set from apply_present_cadence(). */
-static int s_swap_paces = 0;
-void gl_renderer_set_swap_paces(int on) { s_swap_paces = on ? 1 : 0; }
+ * paces, so do we. Queried LIVE at every skip decision (frontend
+ * psx_present_swap_paces) so no cached copy can go stale. */
+extern int psx_present_swap_paces(void);
 
 void gl_renderer_present_probe_reset(void) {
     s_probe_skip = 0;
@@ -5320,30 +5320,41 @@ static void bezel_sdf_rect(int vx, int vy, int vw, int vh,
  * program's texture mode so the whole pattern carries one dim factor. Same
  * authored-aspect tiling math as the original bezel: one mark spans the
  * margin's short dimension (with a little air), repeats along the long one. */
-static void bezel_tiles_col(int vx, int vy, int vw, int vh, float alpha) {
+/* mark_px floors the drawn mark size: a thin margin no longer shrinks the
+ * marks into busy little rows — they stay window-proportioned and the band
+ * crops them symmetrically instead (texture wrap handles the overflow). */
+static void bezel_tiles_col(int vx, int vy, int vw, int vh, float alpha,
+                            float mark_px) {
     if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
     const float img = (float)s_bezel_w / (float)s_bezel_h;
-    const float tile_w = 1.0f / 0.78f;
-    const float tile_h = img * tile_w * (float)vh / (float)vw;
+    float mark_w = (float)vw * 0.78f;
+    if (mark_w < mark_px) mark_w = mark_px;
+    const float tile_px_w = mark_w / 0.78f;          /* mark + air         */
+    const float u_count = (float)vw / tile_px_w;
+    const float v_count = (float)vh / (tile_px_w / img);
     glViewport(vx, vy, vw, vh);
     p_glUniform1i(s_bezel_shade_uTexOn, 1);
     p_glUniform4f(s_bezel_shade_uRgba, 0.0f, 0.0f, 0.0f, alpha);
     p_glUniform4f(s_bezel_shade_uRect,
-                  -(tile_w - 1.0f) * 0.5f, 0.0f,
-                   (tile_w + 1.0f) * 0.5f, tile_h);
+                  0.5f - u_count * 0.5f, 0.0f,
+                  0.5f + u_count * 0.5f, v_count);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
-static void bezel_tiles_band(int vx, int vy, int vw, int vh, float alpha) {
+static void bezel_tiles_band(int vx, int vy, int vw, int vh, float alpha,
+                             float mark_px) {
     if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
     const float img = (float)s_bezel_w / (float)s_bezel_h;
-    const float tile_h = 1.0f / 0.78f;
-    const float tile_w = tile_h * (float)vw / ((float)vh * img);
+    float mark_h = (float)vh * 0.78f;
+    if (mark_h < mark_px) mark_h = mark_px;
+    const float tile_px_h = mark_h / 0.78f;          /* mark + air         */
+    const float v_count = (float)vh / tile_px_h;
+    const float u_count = (float)vw / (tile_px_h * img);
     glViewport(vx, vy, vw, vh);
     p_glUniform1i(s_bezel_shade_uTexOn, 1);
     p_glUniform4f(s_bezel_shade_uRgba, 0.0f, 0.0f, 0.0f, alpha);
     p_glUniform4f(s_bezel_shade_uRect,
-                  0.0f, -(tile_h - 1.0f) * 0.5f,
-                  tile_w, (tile_h + 1.0f) * 0.5f);
+                  0.5f - u_count * 0.5f, 0.5f - v_count * 0.5f,
+                  0.5f + u_count * 0.5f, 0.5f + v_count * 0.5f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -5436,11 +5447,14 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
         const float wm_a = BEZEL_WATERMARK_A * fade;
         const float min_dim = (float)(ww < wh ? ww : wh);
         if (wm_a > 0.003f) {
-            if (lx > 0)      bezel_tiles_col(0, 0, lx, wh, wm_a);
-            if (right_w > 0) bezel_tiles_col(right_x, 0, right_w, wh, wm_a);
+            const float mark_px = min_dim * 0.20f;
+            if (lx > 0)      bezel_tiles_col(0, 0, lx, wh, wm_a, mark_px);
+            if (right_w > 0) bezel_tiles_col(right_x, 0, right_w, wh, wm_a,
+                                             mark_px);
             if (top_h > 0)   bezel_tiles_band(band_x, top_y, band_w, top_h,
-                                              wm_a);
-            if (bot_h > 0)   bezel_tiles_band(band_x, 0, band_w, bot_h, wm_a);
+                                              wm_a, mark_px);
+            if (bot_h > 0)   bezel_tiles_band(band_x, 0, band_w, bot_h, wm_a,
+                                              mark_px);
         }
 
         /* Distance-field shade over ground + watermark: near-black beside
@@ -5592,7 +5606,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    if (!s_swap_paces &&
+    if (!psx_present_swap_paces() &&
         s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_VRAM &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
@@ -5704,7 +5718,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    if (!s_swap_paces &&
+    if (!psx_present_swap_paces() &&
         s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
