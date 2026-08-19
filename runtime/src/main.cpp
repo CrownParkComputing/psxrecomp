@@ -5664,6 +5664,14 @@ static void load_transition_note(int read_active, int load_active,
     e->read_active = (uint8_t)(read_active != 0);
     e->load_active = (uint8_t)(load_active != 0);
     e->turbo_active = (uint8_t)(turbo_active != 0);
+    /* Pacing-state audit trail: any unpaced/present-skip mode engaging or
+     * releasing mid-play is exactly the class of bug users report as "the
+     * speed is busted", and the ring above is only reachable through the
+     * debug server. One line per transition is cheap and self-documents. */
+    if (turbo_active != prev_turbo)
+        std::fprintf(stdout, "[pace] turbo_loads %s (frame %u, host %ums)\n",
+                     turbo_active ? "ENGAGED" : "released",
+                     e->frame, e->host_ms);
     prev_read = read_active;
     prev_load = load_active;
     prev_turbo = turbo_active;
@@ -6702,6 +6710,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 else
                     snprintf(msg, sizeof(msg), "Fast forward: %dx", mult);
                 host_osd_push(msg, 900);
+                std::fprintf(stdout,
+                             "[pace] manual fast-forward ENGAGED (%s, host %ums)\n",
+                             msg, (unsigned)SDL_GetTicks());
                 /* Release the vsync ceiling for the duration of the hold. */
                 g_turbo_vsync_forced_off = 1;
                 apply_present_cadence();
@@ -6726,6 +6737,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 /* Restore the configured present cadence on release. */
                 g_turbo_vsync_forced_off = 0;
                 apply_present_cadence();
+                std::fprintf(stdout,
+                             "[pace] manual fast-forward released (host %ums)\n",
+                             (unsigned)SDL_GetTicks());
             }
             turbo_was_down = 0;
         }
