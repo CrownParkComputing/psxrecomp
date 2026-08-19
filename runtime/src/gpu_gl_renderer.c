@@ -5293,6 +5293,49 @@ static void bezel_draw_band(int vx, int vy, int vw, int vh) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+/* Padding shade: a procedural darkening gradient drawn OVER the bezel layer,
+ * derived from the live viewport rectangle. The area adjacent to the game is
+ * near-black and low-contrast; the pattern re-emerges gradually toward the
+ * outer screen edges, so the bezel reads as environmental texture instead of
+ * a second UI layer competing with gameplay. The game framebuffer itself is
+ * never touched — the shade exists only in the padding rects, which also
+ * makes it aspect-agnostic (columns shade along X, bands along Y).
+ *
+ * The same quads implement the transition fade: on any viewport-rect change
+ * (aspect contraction into a menu, a window resize) the padding starts fully
+ * black and reveals the pattern over ~200 ms, so the eye follows the moving
+ * game image rather than a full-intensity pattern popping in on frame one. */
+static const char *BEZEL_SHADE_FS =
+    "#version 330\n"
+    "in vec2 v_uv; out vec4 frag;\n"
+    "uniform int  u_axis;\n"   /* 0: gradient along X, 1: along Y */
+    "uniform vec2 u_a;\n"      /* black alpha at t=0 / t=1 */
+    "void main(){\n"
+    "  float t = (u_axis == 1) ? v_uv.y : v_uv.x;\n"
+    "  float a = mix(u_a.x, u_a.y, smoothstep(0.0, 1.0, t));\n"
+    "  frag = vec4(0.0, 0.0, 0.0, a);\n"
+    "}\n";
+static GLuint s_bezel_shade_prog = 0;
+static GLint  s_bezel_shade_uAxis = -1, s_bezel_shade_uA = -1,
+              s_bezel_shade_uRect = -1;
+/* Fade-in state: restarted whenever the viewport rect moves. */
+static int      s_bezel_prev_rect[4] = { -1, -1, -1, -1 };
+static uint64_t s_bezel_fade_start_ms = 0;
+#define BEZEL_FADE_MS      200.0f
+#define BEZEL_SHADE_NEAR   0.94f   /* padding beside the game: near-black   */
+#define BEZEL_SHADE_FAR    0.72f   /* outer screen edge: pattern stays faint */
+
+extern uint64_t psx_host_mono_ms(void);
+
+static void bezel_shade_rect(int vx, int vy, int vw, int vh,
+                             int axis, float a0, float a1) {
+    if (vw <= 0 || vh <= 0) return;
+    glViewport(vx, vy, vw, vh);
+    p_glUniform1i(s_bezel_shade_uAxis, axis);
+    p_glUniform2f(s_bezel_shade_uA, a0, a1);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
 /* Bezel into the left and right margins, one copy each, before the game quad.
  * Per-margin rather than one image behind everything: the margins are tall and
  * narrow, so portrait artwork fills them naturally, and each side gets the
@@ -5338,6 +5381,51 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
     if (top_h > 0)   bezel_draw_band(band_x, top_y, band_w, top_h);
     if (bot_h > 0)   bezel_draw_band(band_x, 0, band_w, bot_h);
+
+    /* Shade the padding: near-black beside the viewport, easing out to a
+     * faint pattern at the screen edges; the whole layer fades in from black
+     * for ~200 ms after the viewport rect moves. Drawn over backdrop+tiles,
+     * never over the game rect. */
+    if (!s_bezel_shade_prog) {
+        s_bezel_shade_prog = build_program(PRESENT_VS, BEZEL_SHADE_FS);
+        if (s_bezel_shade_prog) {
+            s_bezel_shade_uAxis =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_axis");
+            s_bezel_shade_uA =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_a");
+            s_bezel_shade_uRect =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_uv_rect");
+        }
+    }
+    if (s_bezel_shade_prog) {
+        const uint64_t now = psx_host_mono_ms();
+        if (s_bezel_prev_rect[0] != lx || s_bezel_prev_rect[1] != ly ||
+            s_bezel_prev_rect[2] != lw || s_bezel_prev_rect[3] != lh) {
+            s_bezel_prev_rect[0] = lx; s_bezel_prev_rect[1] = ly;
+            s_bezel_prev_rect[2] = lw; s_bezel_prev_rect[3] = lh;
+            s_bezel_fade_start_ms = now;
+        }
+        float fade = (float)(now - s_bezel_fade_start_ms) / BEZEL_FADE_MS;
+        if (fade < 0.0f) fade = 0.0f;
+        if (fade > 1.0f) fade = 1.0f;
+        fade = fade * fade * (3.0f - 2.0f * fade);
+        /* At fade=0 the padding is solid black; at fade=1 the resting
+         * gradient (near/far) stands. Affine per endpoint, so folding the
+         * fade into the endpoints is exact. */
+        const float a_near = 1.0f - fade * (1.0f - BEZEL_SHADE_NEAR);
+        const float a_far  = 1.0f - fade * (1.0f - BEZEL_SHADE_FAR);
+        p_glUseProgram(s_bezel_shade_prog);
+        p_glUniform4f(s_bezel_shade_uRect, 0.0f, 0.0f, 1.0f, 1.0f);
+        /* v_uv.y is 1 at the BOTTOM of the drawn rect (PRESENT_VS V-flip). */
+        if (lx > 0)                       /* near edge = right side (t=1)   */
+            bezel_shade_rect(0, 0, lx, wh, 0, a_far, a_near);
+        if (right_w > 0)                  /* near edge = left side (t=0)    */
+            bezel_shade_rect(right_x, 0, right_w, wh, 0, a_near, a_far);
+        if (top_h > 0)                    /* near edge = band bottom (t=1)  */
+            bezel_shade_rect(band_x, top_y, band_w, top_h, 1, a_far, a_near);
+        if (bot_h > 0)                    /* near edge = band top (t=0)     */
+            bezel_shade_rect(band_x, 0, band_w, bot_h, 1, a_near, a_far);
+    }
     glDisable(GL_BLEND);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
