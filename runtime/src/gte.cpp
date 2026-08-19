@@ -312,6 +312,8 @@ static inline int64_t geom_slot(uint32_t packed) {
     return (int64_t)(y + GEOM_BIAS) * GEOM_AXIS + (x + GEOM_BIAS);
 }
 
+extern "C" void gpu_pgxp_rederive_enable(void);
+
 extern "C" void gte_geometry_correction_set(int enabled) {
     s_geom_enabled = enabled ? 1 : 0;
     s_geom_hits = 0;
@@ -324,6 +326,7 @@ extern "C" void gte_geometry_correction_set(int enabled) {
         if (!s_geom_cache) s_geom_enabled = 0;   /* fail closed: stay faithful */
     }
     gte_geom_generation_advance();
+    gpu_pgxp_rederive_enable();
 }
 
 /* Lookup census for the debug server: attempted, hit, and the two miss classes.
@@ -888,9 +891,17 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     int64_t sx = sx16 >> 16;
     int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
-    if (!s_gte_replay_sandbox)
-        pgxp_gte_push_sxy((int32_t)sx16, (int32_t)sy16, gte->SZ[3],
+    if (!s_gte_replay_sandbox) {
+        /* Shadow the pre-truncation position, clamped to +/-4096 px so an
+         * extreme projection blowup can't wrap the 16.16 int32 and land a
+         * garbage shadow back inside the frame. Well past the +/-1024
+         * hardware rails either way, so direction survives for clamp rescue. */
+        const int64_t kLim = (int64_t)4096 << 16;
+        int64_t cx16 = sx16 < -kLim ? -kLim : (sx16 > kLim - 1 ? kLim - 1 : sx16);
+        int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
+        pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
                           (uint32_t)gte->SXY[2]);
+    }
     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
@@ -929,23 +940,34 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
     int32_t sy1 = static_cast<int16_t>(gte->SXY[1] >> 16);
     int32_t sx2 = static_cast<int16_t>(gte->SXY[2] & 0xFFFF);
     int32_t sy2 = static_cast<int16_t>(gte->SXY[2] >> 16);
-    int32_t px0 = 0, py0 = 0, px1 = 0, py1 = 0, px2 = 0, py2 = 0;
-    if (gpu_ws_precise_nclip_enabled() &&
-        pgxp_get_gte_sxy(0, &px0, &py0) &&
-        pgxp_get_gte_sxy(1, &px1, &py1) &&
-        pgxp_get_gte_sxy(2, &px2, &py2)) {
-        sx0 = px0 >> 16;
-        sy0 = py0 >> 16;
-        sx1 = px1 >> 16;
-        sy1 = py1 >> 16;
-        sx2 = px2 >> 16;
-        sy2 = py2 >> 16;
-    }
     int64_t mac0 = (int64_t)sx0 * (sy1 - sy2) +
                    (int64_t)sx1 * (sy2 - sy0) +
                    (int64_t)sx2 * (sy0 - sy1);
     gte->check_mac0_overflow(mac0);
-    gte->MAC0 = static_cast<int32_t>(mac0);
+    int32_t out = static_cast<int32_t>(mac0);
+    /* Widescreen precise NCLIP: the X-squash scales winding areas by a
+     * positive factor, but integer SXY rounding flips the sign of thin
+     * glancing faces (trackside signs vanishing / flickering only at wide
+     * aspects). When the full sub-pixel shadow of all three vertices is
+     * live, take the SIGN from the exact cross product; keep the hardware
+     * magnitude so NCLIP-magnitude consumers (LOD heuristics) are untouched.
+     * A sign disagreement replaces a near-zero hardware value, so the +/-1
+     * substitute is honest about the face's true orientation. */
+    int32_t px0, py0, px1, py1, px2, py2;
+    if (gpu_ws_precise_nclip_enabled() &&
+        pgxp_get_gte_sxy(0, &px0, &py0) &&
+        pgxp_get_gte_sxy(1, &px1, &py1) &&
+        pgxp_get_gte_sxy(2, &px2, &py2)) {
+        const double fx0 = px0 / 65536.0, fy0 = py0 / 65536.0;
+        const double fx1 = px1 / 65536.0, fy1 = py1 / 65536.0;
+        const double fx2 = px2 / 65536.0, fy2 = py2 / 65536.0;
+        const double cross = fx0 * (fy1 - fy2) +
+                             fx1 * (fy2 - fy0) +
+                             fx2 * (fy0 - fy1);
+        if (cross > 0.0 && out <= 0) out = 1;
+        else if (cross < 0.0 && out >= 0) out = -1;
+    }
+    gte->MAC0 = out;
     gte->set_error_flag();
 }
 

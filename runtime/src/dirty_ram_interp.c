@@ -2811,6 +2811,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * pages overwritten by a runtime overlay (Tomba 2), not just [FLOOR, RAM). */
     int allow_local_dirty_flow = phys_is_overlay_flow_region(phys);
 
+    /* Backend-invariant mod_function_entry hooks: generated code fires
+     * psx_mod_function_entry at listed function entries, but a mod-patched
+     * (dirty) page runs HERE instead and would silently skip them. Fire the
+     * same hook on interp dispatch so the contract does not depend on which
+     * backend executes the page. The runtime filters by exact address, so
+     * this is a short scan over the (tiny) registered-plugin list. */
+    {
+        extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);
+        psx_mod_function_entry(cpu, addr);
+    }
+
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
     if (pc_entry) pc_entry->hits++;
