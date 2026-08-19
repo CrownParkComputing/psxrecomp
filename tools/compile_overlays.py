@@ -6598,6 +6598,10 @@ def main():
         # interiors. Compile each as an isolated dispatch-root shard, then give
         # every block in those fragments the same universal resume treatment.
         unresolved = sorted(static_requested_entries - existing_entries)
+        # PSX_STATIC_NO_ISOLATED=1: A/B guard — skip the isolated-fragment pass
+        # entirely (its universal-resume treatment is the newest machinery).
+        if os.environ.get('PSX_STATIC_NO_ISOLATED'):
+            unresolved = []
         fragment_built = 0
         new_fragment_parts = []
         for entry in unresolved:
