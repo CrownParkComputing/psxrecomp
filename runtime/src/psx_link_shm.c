@@ -38,6 +38,12 @@ typedef struct ShmSeg {
     uint32_t         version;
     _Atomic uint32_t present[2];
     _Atomic uint32_t paired;
+    /* Bumped whenever a claimer starts a fresh session (no live peer) or
+     * reclaims a dead side. Each process latches its epoch when it observes
+     * paired==1 with a generation it has not latched yet -- so a rejoining
+     * peer gets a fresh epoch pair instead of comparing link-times across
+     * unrelated boots. */
+    _Atomic uint32_t pair_gen;
     _Atomic uint64_t link_now[2];          /* published link-time per side */
     _Atomic uint64_t heartbeat_ms[2];      /* CLOCK_MONOTONIC ms, liveness only */
     _Atomic uint32_t out_lines[2];         /* my DTR/RTS -> peer DSR/CTS */
@@ -51,7 +57,7 @@ typedef struct ShmSeg {
 typedef struct ShmEnd {
     ShmSeg  *seg;
     int      side;                 /* 0 = A, 1 = B */
-    int      epoch_latched;
+    uint32_t latched_gen;          /* pair_gen the epoch below belongs to */
     uint64_t epoch;                /* local cycle at pairing */
     uint64_t waits_ms;             /* total barrier block time (diag) */
     PsxLinkEndpoint ep;
@@ -64,6 +70,16 @@ typedef struct ShmEnd {
 
 static ShmEnd *g_shm;              /* one link per process */
 
+/* Clean-quit release: mark our side free so the next launch claims it
+ * without waiting out the heartbeat. Crashes skip this; the dead-side
+ * reclaim in psx_link_shm_open covers them. */
+static void psx_link_shm_release_at_exit(void) {
+    ShmEnd *e = g_shm;
+    if (!e) return;
+    atomic_store(&e->seg->present[e->side], 0u);
+    atomic_store(&e->seg->heartbeat_ms[e->side], 0u);
+}
+
 static uint64_t mono_ms(void) {
 #if defined(_WIN32)
     return (uint64_t)GetTickCount64();
@@ -74,8 +90,14 @@ static uint64_t mono_ms(void) {
 #endif
 }
 
+static int epoch_valid(const ShmEnd *e) {
+    return e->latched_gen != 0 &&
+           e->latched_gen == atomic_load_explicit(&e->seg->pair_gen,
+                                                  memory_order_relaxed);
+}
+
 static uint64_t link_now(const ShmEnd *e, uint64_t cycle_now) {
-    return e->epoch_latched ? (cycle_now - e->epoch) : 0u;
+    return epoch_valid(e) ? (cycle_now - e->epoch) : 0u;
 }
 
 /* Peer alive = heartbeat within 3 s. Generous: a peer sitting in a pause
@@ -101,7 +123,7 @@ static int shm_tx(void *s, uint8_t b, uint64_t c) {
     ShmEnd *e = (ShmEnd *)s;
     ShmRing *r = out_ring(e);
     uint32_t tail, head, slot;
-    if (!shm_paired(e) || !e->epoch_latched) return 0;   /* no cable yet */
+    if (!shm_paired(e) || !epoch_valid(e)) return 0;     /* no cable yet */
     tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
     head = atomic_load_explicit(&r->head, memory_order_acquire);
     if (tail - head >= SHM_DEPTH) return 0;              /* wire overflow: drop */
@@ -116,7 +138,7 @@ static int shm_rx(void *s, uint8_t *o, uint64_t c) {
     ShmEnd *e = (ShmEnd *)s;
     ShmRing *r = in_ring(e);
     uint32_t head, tail, slot;
-    if (!e->epoch_latched) return 0;
+    if (!epoch_valid(e)) return 0;
     head = atomic_load_explicit(&r->head, memory_order_relaxed);
     tail = atomic_load_explicit(&r->tail, memory_order_acquire);
     if (head == tail) return 0;
@@ -131,7 +153,7 @@ static int shm_rx_peek(void *s, uint64_t *d) {
     ShmEnd *e = (ShmEnd *)s;
     ShmRing *r = in_ring(e);
     uint32_t head, tail;
-    if (!e->epoch_latched) return 0;
+    if (!epoch_valid(e)) return 0;
     head = atomic_load_explicit(&r->head, memory_order_relaxed);
     tail = atomic_load_explicit(&r->tail, memory_order_acquire);
     if (head == tail) return 0;
@@ -285,27 +307,68 @@ PsxLinkEndpoint *psx_link_shm_open(const char *name, char role) {
         return NULL;
     }
 
-    /* Claim a side. */
+    /* Claim a side. A side is only genuinely taken if its owner is ALIVE
+     * (fresh heartbeat): crashed or killed processes never release their
+     * claim, and a stale flag must not brick the wire (observed: two clean
+     * launches both refused because earlier test runs left both sides
+     * marked present). A claimed-but-dead side is a corpse -- take it over
+     * and bump the pair generation so any surviving peer re-latches its
+     * epoch against us instead of the dead process's timeline. */
     if (role == 'a') side = 0;
     else if (role == 'b') side = 1;
     else side = created ? 0 : 1;
     {
-        uint32_t expect = 0;
-        if (!atomic_compare_exchange_strong(&seg->present[side], &expect, 1u)) {
-            int other = side ^ 1;
-            expect = 0;
-            if (role != 0 ||        /* explicit role taken: fail loudly */
-                !atomic_compare_exchange_strong(&seg->present[other], &expect, 1u)) {
-                fprintf(stderr, "psx_link_shm: side %c of %s already claimed\n",
-                        side ? 'B' : 'A', name);
-#if defined(_WIN32)
-                UnmapViewOfFile(seg); CloseHandle(map);
-#else
-                munmap(seg, sizeof(ShmSeg));
-#endif
-                return NULL;
+        int claimed = 0;
+        for (int attempt = 0; attempt < 2 && !claimed; attempt++) {
+            int try_side = (attempt == 0) ? side : (side ^ 1);
+            uint32_t expect = 0;
+            if (attempt == 1 && role != 0)
+                break;              /* explicit role: no fallback side */
+            if (atomic_compare_exchange_strong(&seg->present[try_side],
+                                               &expect, 1u)) {
+                side = try_side; claimed = 1; break;
             }
-            side = other;
+            /* Occupied: live owner, or corpse? */
+            {
+                uint64_t hb = atomic_load(&seg->heartbeat_ms[try_side]);
+                if (hb == 0 || (mono_ms() - hb) >= SHM_DEAD_MS) {
+                    atomic_store(&seg->present[try_side], 1u);
+                    atomic_store(&seg->paired, 0u);
+                    atomic_fetch_add(&seg->pair_gen, 1u);
+                    fprintf(stdout,
+                            "psx_link_shm: reclaimed dead side %c\n",
+                            try_side ? 'B' : 'A');
+                    side = try_side; claimed = 1; break;
+                }
+            }
+        }
+        if (!claimed) {
+            fprintf(stderr, "psx_link_shm: side %c of %s already claimed "
+                    "by a LIVE process\n", side ? 'B' : 'A', name);
+#if defined(_WIN32)
+            UnmapViewOfFile(seg); CloseHandle(map);
+#else
+            munmap(seg, sizeof(ShmSeg));
+#endif
+            return NULL;
+        }
+    }
+    /* No live peer => this claim starts a fresh session: reset the wire so
+     * the arriving peer sees clean rings and a fresh pairing generation. */
+    {
+        uint64_t hb = atomic_load(&seg->heartbeat_ms[side ^ 1]);
+        int peer_live = atomic_load(&seg->present[side ^ 1]) &&
+                        hb != 0 && (mono_ms() - hb) < SHM_DEAD_MS;
+        if (!peer_live) {
+            atomic_store(&seg->paired, 0u);
+            atomic_fetch_add(&seg->pair_gen, 1u);
+            for (int r = 0; r < 2; r++) {
+                atomic_store(&seg->ring[r].tail, 0u);
+                atomic_store(&seg->ring[r].head, 0u);
+            }
+            atomic_store(&seg->out_lines[0], 0u);
+            atomic_store(&seg->out_lines[1], 0u);
+            atomic_store(&seg->present[side ^ 1], 0u);
         }
     }
 
@@ -322,6 +385,7 @@ PsxLinkEndpoint *psx_link_shm_open(const char *name, char role) {
 #endif
     atomic_store(&seg->heartbeat_ms[side], mono_ms());
     g_shm = e;
+    atexit(psx_link_shm_release_at_exit);
     fprintf(stdout, "psx_link_shm: attached '%s' as side %c (%s, lookahead=%u)\n",
             name, side ? 'B' : 'A', created ? "created" : "joined",
             seg->lookahead);
@@ -364,20 +428,27 @@ void psx_link_shm_poll(uint64_t cycle_now) {
         atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
                               memory_order_relaxed);
 
-    if (!e->epoch_latched) {
-        /* Pairing: latch the epoch the first time both sides are present.
-         * Both sides latch within one poll of each other -- microseconds of
-         * skew against a multi-thousand-cycle lookahead. */
+    if (!shm_paired(e)) {
+        /* Pairing: raise the flag the first time both sides are present.
+         * Idempotent from either side. */
         if (atomic_load_explicit(&e->seg->present[0], memory_order_relaxed) &&
-            atomic_load_explicit(&e->seg->present[1], memory_order_relaxed)) {
+            atomic_load_explicit(&e->seg->present[1], memory_order_relaxed))
             atomic_store_explicit(&e->seg->paired, 1u, memory_order_release);
-            e->epoch = cycle_now;
-            e->epoch_latched = 1;
-            atomic_store_explicit(&e->seg->link_now[e->side], 0u,
-                                  memory_order_relaxed);
-            fprintf(stdout, "psx_link_shm: PAIRED (side %c epoch=%llu)\n",
-                    e->side ? 'B' : 'A', (unsigned long long)e->epoch);
-        }
+        else
+            return;
+    }
+    if (!epoch_valid(e)) {
+        /* First poll of a new pairing generation: latch the epoch. Both
+         * sides latch within one poll of each other -- microseconds of skew
+         * against the frame-scale lookahead. */
+        e->epoch = cycle_now;
+        e->latched_gen = atomic_load_explicit(&e->seg->pair_gen,
+                                              memory_order_relaxed);
+        atomic_store_explicit(&e->seg->link_now[e->side], 0u,
+                              memory_order_relaxed);
+        fprintf(stdout, "psx_link_shm: PAIRED gen=%u (side %c epoch=%llu)\n",
+                e->latched_gen, e->side ? 'B' : 'A',
+                (unsigned long long)e->epoch);
         return;
     }
 
@@ -440,7 +511,11 @@ void psx_link_shm_poll(uint64_t cycle_now) {
                                             memory_order_relaxed);
                 if (mine <= peer + e->seg->lookahead) break;
                 if (!peer_alive(e)) break;        /* cable unplugged */
-                if ((mono_ms() - t0) > SHM_DEAD_MS) break;
+                /* NO wall-clock escape while the peer is alive: a peer whose
+                 * guest clock is stalled (disc load, pause menu, savestate
+                 * dialog) is exactly when lockstep must WAIT -- an early
+                 * give-up here let one side run 4M+ cycles past the bound.
+                 * Peer death is the only exit besides catching up. */
                 atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
                                       memory_order_relaxed);
             }
