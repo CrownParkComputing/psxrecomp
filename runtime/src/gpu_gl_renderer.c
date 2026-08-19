@@ -5271,16 +5271,47 @@ static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+/* Tile the bezel along a letterbox BAND (top/bottom margin): the transpose of
+ * bezel_draw_rect. A band is short and wide, so one logo spans the band
+ * HEIGHT (same air factor as the margins use for width) and repeats across,
+ * each copy at its authored aspect -- the marks read at the same size in the
+ * bands as in the side margins, which is what makes the frame look like one
+ * bezel instead of two different treatments. */
+static void bezel_draw_band(int vx, int vy, int vw, int vh) {
+    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
+    const float img = (float)s_bezel_w / (float)s_bezel_h;
+    /* One logo spans the band height, with a little air above and below. */
+    const float tile_h = 1.0f / 0.78f;
+    /* Horizontal repeats so each tile keeps the logo's own aspect: a tile is
+     * (vh/tile_h) tall on screen, so it must be (vh/tile_h)*img wide, and vw
+     * divided by that is the count. */
+    const float tile_w = tile_h * (float)vw / ((float)vh * img);
+    glViewport(vx, vy, vw, vh);
+    p_glUniform4f(s_present_uUvRect,
+                  0.0f, -(tile_h - 1.0f) * 0.5f,
+                  tile_w, (tile_h + 1.0f) * 0.5f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
 /* Bezel into the left and right margins, one copy each, before the game quad.
  * Per-margin rather than one image behind everything: the margins are tall and
  * narrow, so portrait artwork fills them naturally, and each side gets the
  * whole picture instead of one picture cut in half by the frame. */
 static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
-    (void)ly; (void)lh;
     if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
     const int right_x = lx + lw;
     const int right_w = ww - right_x;
-    if (lx <= 0 && right_w <= 0) return;          /* no margins to fill */
+    /* Letterbox bands (top/bottom margins): same treatment as the side
+     * margins, so a window taller than the content aspect (e.g. 32:9 content
+     * in a 16:9 window) gets the bezel instead of black bars. The bands span
+     * only the width between the side columns so no pixel is drawn twice. */
+    const int top_y = ly + lh;
+    const int top_h = wh - top_y;
+    const int bot_h = ly;
+    const int band_x = lx > 0 ? lx : 0;
+    const int band_w = (right_w > 0 ? right_x : ww) - band_x;
+    if (lx <= 0 && right_w <= 0 && top_h <= 0 && bot_h <= 0)
+        return;                                   /* no margins to fill */
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
@@ -5296,6 +5327,8 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     glClearColor(s_bezel_bg[0], s_bezel_bg[1], s_bezel_bg[2], 1.0f);
     if (lx > 0)      { glScissor(0, 0, lx, wh);            glClear(GL_COLOR_BUFFER_BIT); }
     if (right_w > 0) { glScissor(right_x, 0, right_w, wh); glClear(GL_COLOR_BUFFER_BIT); }
+    if (top_h > 0)   { glScissor(band_x, top_y, band_w, top_h); glClear(GL_COLOR_BUFFER_BIT); }
+    if (bot_h > 0)   { glScissor(band_x, 0, band_w, bot_h);     glClear(GL_COLOR_BUFFER_BIT); }
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
@@ -5303,6 +5336,8 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
                           GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     if (lx > 0)      bezel_draw_rect(0, 0, lx, wh);
     if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
+    if (top_h > 0)   bezel_draw_band(band_x, top_y, band_w, top_h);
+    if (bot_h > 0)   bezel_draw_band(band_x, 0, band_w, bot_h);
     glDisable(GL_BLEND);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
