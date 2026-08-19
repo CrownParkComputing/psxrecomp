@@ -1277,6 +1277,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::string netplay_required_disc_fp;
     std::string netplay_local_viewport;
     std::string netplay_local_viewport_aspect;
+    bool netplay_link_lobby = false;
     if (cfg.contains("netplay")) {
         const toml::value& np = toml::find(cfg, "netplay");
         if (np.contains("require_cue"))
@@ -1288,6 +1289,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 (uint32_t)toml::find<int64_t>(np, "required_leadout_lba");
             has_netplay_required_leadout = true;
         }
+        if (np.contains("link_lobby"))
+            netplay_link_lobby = toml::find<bool>(np, "link_lobby");
         if (np.contains("required_disc_fp")) {
             netplay_required_disc_fp = toml::find<std::string>(np, "required_disc_fp");
             for (char& c : netplay_required_disc_fp)
@@ -2165,6 +2168,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*has_netplay_required_leadout*/ has_netplay_required_leadout,
         /*netplay_required_leadout_lba*/ netplay_required_leadout_lba,
         /*netplay_required_disc_fp*/ netplay_required_disc_fp,
+        /*netplay_link_lobby*/ netplay_link_lobby,
         /*netplay_local_viewport*/ netplay_local_viewport,
         /*netplay_local_viewport_aspect*/ netplay_local_viewport_aspect,
         /*seeds_path*/       seeds_path,

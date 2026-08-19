@@ -2991,8 +2991,8 @@ void gpu_vblank_flush_present(void) {
      * same class of titles. Keep s_present_pending; retry after card idle
      * (sio_hold_present_for_card has a stale escape). */
     {
-        extern int psx_netplay_active(void);
-        if (psx_netplay_active() && sio_hold_present_for_card())
+        extern int psx_netplay_determinism_active(void);
+        if (psx_netplay_determinism_active() && sio_hold_present_for_card())
             return;
     }
     /* MotK menu wait (0x8006CD54↔0x8006CDA0) and post-FMV overlay wait
@@ -3000,11 +3000,11 @@ void gpu_vblank_flush_present(void) {
      * present on an A edge (sticky B must not allow that). Non-wait edges
      * (FMV / cutover) must present even if sticky still names the wait loop. */
     {
-        extern int psx_netplay_active(void);
+        extern int psx_netplay_determinism_active(void);
         extern uint32_t psx_compiled_irq_resume_pc(void);
         extern uint32_t psx_last_irq_check_pc(void);
         extern uint32_t psx_netplay_rb_sticky_bb_pc(void);
-        if (psx_netplay_active()) {
+        if (psx_netplay_determinism_active()) {
             const uint32_t wait_a = 0x8006CD54u;
             const uint32_t wait_b = 0x8006CDA0u;
             const uint32_t wait2_a = 0x800768C8u;
@@ -3088,12 +3088,15 @@ void gpu_vblank_tick(void) {
     if (!vblank_callback)
         return;
     {
-        extern int psx_netplay_active(void);
+        extern int psx_netplay_determinism_active(void);
         /* Offline selfcheck keeps immediate present: BB-edge defer +
          * post-IRQ flush reintroduces clk/tim/csv phase skew between warm
          * resim peers (selfcheck soak: many FAILs with d_cyc≠0). Netplay
-         * defers — both peers share the same present contract from boot. */
-        if (psx_netplay_active()) {
+         * AND link followers defer — every instance of a console must share
+         * the same present contract from boot (a follower on the immediate
+         * path ran at a different clk/tim/csv phase than the same console's
+         * client on another machine: race-start link handshake hang). */
+        if (psx_netplay_determinism_active()) {
             /* Coalesce to one deferred present (see arm_deferred_present). */
             if (s_present_pending < 1)
                 s_present_pending = 1;

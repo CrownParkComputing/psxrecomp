@@ -439,9 +439,9 @@ static int idle_skip_on(void) {
     /* Cycle-skip is a host enhancement; under netplay it forks peers (detector
      * streak / skip quanta are not part of the shared snap). Same for the
      * solo resim self-check — keep the window on the faithful cycle path. */
-    extern int psx_netplay_active(void);
+    extern int psx_netplay_determinism_active(void);
     extern int psx_selfcheck_enabled(void);
-    if (psx_netplay_active() || psx_selfcheck_enabled())
+    if (psx_netplay_determinism_active() || psx_selfcheck_enabled())
         return 0;
     if (g_idle_skip_enabled < 0) {
         /* No game config reached this process (for example a BIOS-only

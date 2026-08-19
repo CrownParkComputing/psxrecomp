@@ -1856,11 +1856,11 @@ static int s_depth24_skip_up;
 static DirtyRect s_d24_skip_fb;
 
 static void ensure_cpu(void) {
-    extern int psx_netplay_active(void);
+    extern int psx_netplay_determinism_active(void);
     if (!s_raster_ok || !s_gpu_dirty) return;
     /* Dual-raster / netplay: CPU VRAM is written on every GP0 (or pure SW).
      * Never glReadPixels — that forked peer snaps/resim. */
-    if (s_cpu_auth_dual || psx_netplay_active()) {
+    if (s_cpu_auth_dual || psx_netplay_determinism_active()) {
         s_gpu_dirty = 0;
         return;
     }

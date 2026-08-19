@@ -58,6 +58,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #define PSX_MAX_PLAYERS 2
 #endif
 #include "psx_netplay.h"
+#include "psx_link_pair.h"
+#include "overlay_api.h"
 #include "psx_stick.h"       /* radial SDL-stick -> DualShock response transform */
 #include "psx_netplay_rb.h"
 #include "psx_selfcheck.h"
@@ -2850,7 +2852,7 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_frame_interpolation)
         return 0;
-    if (g_netplay_vsync_forced_off || psx_netplay_active())
+    if (g_netplay_vsync_forced_off || psx_netplay_determinism_active())
         return 0;
     /* Wayland default: wall-clock pacer + swap interval 0 (same as PSX_VSYNC=0). */
     if (host_video_is_wayland() && !g_wayland_allow_vsync)
@@ -2859,7 +2861,7 @@ static int present_vsync_owns_cadence(void) {
 }
 
 static int present_effective_swap_interval(void) {
-    if (g_netplay_vsync_forced_off || psx_netplay_active())
+    if (g_netplay_vsync_forced_off || psx_netplay_determinism_active())
         return 0;
     if (g_turbo_vsync_forced_off)
         return 0;
@@ -3040,7 +3042,7 @@ static void sdl_audio_pump(bool discard_output = false) {
      * (queue full / !drc / no device) while the other kept advancing. */
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
     const bool legacy = audio_legacy_mode();
-    const int netplay = psx_netplay_active();
+    const int netplay = psx_netplay_determinism_active();
     static int had_audio = 0;
     uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
     int host_queue_ok = 0;
@@ -4290,7 +4292,7 @@ static int effective_player_mode_for_sio(const PlayerInput& p, int sio_slot) {
  * While delay-sync netplay is active, SIO connection/type are owned by
  * psx_netplay (session slots stay plugged); only refresh host SDL handles. */
 static void refresh_player_devices(void) {
-    const int netplay = psx_netplay_active();
+    const int netplay = psx_netplay_determinism_active();
     for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
         PlayerInput& p = g_players[s];
         if (p.kind != 2) close_player(p);           /* keyboard/none: no handle */
@@ -5266,6 +5268,18 @@ static void netplay_barrier_admit(int override) {
             netplay_soft_exit("netplay_load_failed");
             if (psx_return_to_lobby_requested()) return;
         }
+        /* PSX-Link: a dead/errored follower (marked from any pair hook) ends
+         * the session — there is no degraded solo mode for a linked race. */
+        if (psx_link_pair_failed()) {
+            netplay_soft_exit("link_pair_dead");
+            if (psx_return_to_lobby_requested()) return;
+        }
+        /* Persistent machine-fold mismatch with no episode running = one of
+         * the four instances is on a different timeline for good. */
+        if (psx_netplay_link_desynced()) {
+            netplay_soft_exit("link_fold_desync");
+            if (psx_return_to_lobby_requested()) return;
+        }
         /* Mutual INPUT/CONFIRM stall still refreshes last_peer_rx — detect
          * "no sim progress" separately (common rematch + TURN loss mode).
          * Save/load/memcard probe+chunk xfer uses a longer budget (TURN +
@@ -5322,6 +5336,10 @@ static void netplay_barrier_admit(int override) {
             last_stall_log_ms = now_ms;
         }
         psx_lobby_pump();
+        /* PSX-Link: the guest is parked, so the interrupts-site shm poll is
+         * not running — heartbeat from here or the follower declares us dead
+         * after 3s and exits. No-op without an shm link. */
+        psx_link_shm_poll(psx_get_cycle_count());
         if (psx_netplay_input_desync(&dt, &lh, &rh)) {
             if (!desync_logged) {
                 std::printf("psxrecomp: netplay INPUT desync tick=%u local=%08x remote=%08x — stalled\n",
@@ -5353,6 +5371,27 @@ static void netplay_barrier_admit(int override) {
                 local.lx = local.ly = local.rx = local.ry = 0x80u;
                 local.analog = 1;
                 local.connected = 1;
+                /* PSX_NET_TEST_MASH=1: deterministic-locally, varying wall-
+                 * driven button pattern for headless soak rigs. Local input
+                 * is ground truth, so this legitimately forces remote-side
+                 * mispredicts (rollback exercise) without a controller. */
+                {
+                    static int s_test_mash = -1;
+                    if (s_test_mash < 0) {
+                        const char* tm = std::getenv("PSX_NET_TEST_MASH");
+                        s_test_mash = (tm && tm[0] && tm[0] != '0') ? 1 : 0;
+                    }
+                    /* Hold off through BIOS/FMV settle — input churn during
+                     * the boot lockstep window stalls the settle machinery;
+                     * the interesting rollback surface is game time. */
+                    if (s_test_mash && psx_netplay_sim_tick() > 700u) {
+                        const uint64_t t = SDL_GetTicks64() / 250u;
+                        const uint16_t bits =
+                            (uint16_t)((t * 2654435761ull) >> 13);
+                        local.buttons =
+                            (uint16_t)(0xFFFFu ^ (bits & 0x50F0u));
+                    }
+                }
             } else {
                 capture_local_human_pad(&local);
             }
@@ -5366,6 +5405,13 @@ static void netplay_barrier_admit(int override) {
                                  psx_netplay_is_resimulating());
         }
         if (psx_netplay_poll_admit()) {
+            /* PSX-Link: pipeline barrier + TICK emit for the tick about to
+             * run. Follower death aborts the whole session. */
+            if (psx_netplay_link_active() &&
+                !psx_link_pair_on_admit(psx_netplay_sim_tick())) {
+                netplay_soft_exit("link_pair_dead");
+                if (psx_return_to_lobby_requested()) return;
+            }
             desync_logged = 0;
             if (admit_t0) {
                 const uint64_t t1 = SDL_GetPerformanceCounter();
@@ -6451,7 +6497,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 const int half = (speed >= 0.45 && speed <= 0.55) ? 1 : 0;
                 if (!g_present_half_rate_healed &&
                     !g_frame_interpolation &&
-                    !psx_netplay_active() &&
+                    !psx_netplay_determinism_active() &&
                     g_video_vsync != 0 &&
                     half) {
                     s_half_rate_windows++;
@@ -6635,7 +6681,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * ep.do_epilogue so admit runs every tick (including skip-present paths).
      * Offline keeps pace-before-present. Barrier wait stays UDP poll — do
      * not pair this order with SDL_Delay(0) busy-spin (tick-0 hang). */
-    ep.do_epilogue = psx_netplay_active() != 0 ? 1 : 0;
+    ep.do_epilogue = (psx_netplay_active() != 0 ||
+                      (psx_link_pair_follower_mode() &&
+                       psx_link_pair_follower_booted()))
+                         ? 1
+                         : 0;
     ep.override = override;
 
     /* Turbo-active / multitap arming share game-started detection. */
@@ -6643,6 +6693,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
     if (psx_netplay_active()) {
         psx_netplay_finish_frame();
+    } else if (psx_link_pair_follower_mode()) {
+        psx_link_pair_follower_note_finish();
     } else {
         /* Offline N-pad: enable multitap only once the game EXE is running.
          * Port comes from game.toml [controller] multitap_port (default Port 1;
@@ -6693,7 +6745,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     int load_run_value = 0;
     static int load_run = 0;
     static int release_run = 0;
-    if (g_turbo_loads_enabled && !psx_netplay_active() &&
+    if (g_turbo_loads_enabled && !psx_netplay_determinism_active() &&
         !psx_selfcheck_resim_active()) {
         /* Require a short sustained predicate on entry, then retain turbo over
          * a short false gap after it has engaged. Netplay / selfcheck keep
@@ -6745,7 +6797,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     int fmv_skip_active = 0;
     /* Never inject START / poke movie totals under netplay — host-side skip
      * forks peers (and stomps SIO after sealed publish during resim). */
-    if (g_auto_skip_fmv && !psx_netplay_active() &&
+    if (g_auto_skip_fmv && !psx_netplay_determinism_active() &&
         !psx_selfcheck_resim_active()) {
         uint32_t mc = mdec_get_decode_count();
         int mdec_decoding = (mc != s_fmv_skip_last_mdec);
@@ -6912,7 +6964,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * hitches; SW scanout is batched so 1/2 is affordable. Admit + wall pace
      * still run every tick. During MDEC-idle cutover present every frame.
      * Override: PSX_NET_FMV_PRESENT_DIV (1=every frame, 2=default, 4=legacy). */
-    if (psx_netplay_active() && gpu_display_is_depth24() &&
+    if (psx_netplay_determinism_active() && gpu_display_is_depth24() &&
         mdec_recently_active(8)) {
         static int s_fmv_present_div = -1;
         int div;
@@ -6943,7 +6995,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * Netplay paces in the epilogue AFTER present so Swap overlaps the
      * peer's guest quantum. Self-check replay runs uncapped like netplay
      * resim. */
-    if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+    if (!psx_netplay_determinism_active() && !psx_selfcheck_resim_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
         refresh_frame_pacer_period();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
@@ -7568,6 +7620,16 @@ static void sdl_vblank_present(void) {
         return;
     if (!psx_return_to_lobby_requested())
         netplay_barrier_admit(ep.override);
+    /* PSX-Link follower: the command stream is the admit barrier. LOADs
+     * longjmp; a 0 return means STOP or driver death — exit cleanly. */
+    if (psx_link_pair_follower_mode() && psx_link_pair_follower_booted()) {
+        if (!psx_link_pair_follower_admit()) {
+            std::printf("psxrecomp: link follower exiting\n");
+            std::fflush(stdout);
+            shutdown_runtime();
+            std::exit(0);
+        }
+    }
     /* Episode baseline applied during admit without longjmp — resume now that
      * present-body C++ destructors have run (mirrors savestate BB-edge path). */
     psx_netplay_rb_flush_resume();
@@ -7833,6 +7895,8 @@ namespace {
     int g_lnch_force_turn = 0;
     /* Lobby default on; host “Disable Rollback” clears this → delay_sync. */
     int g_lnch_rollback = 1;
+    int g_lnch_lobby_kind = 0;         /* 0 standard, 1 PSX-Link */
+    int g_lnch_link_lobby_supported = 0; /* game.toml [netplay] link_lobby */
     int g_lnch_multitap_analog = 1;
     int g_lnch_host_max_slots = 2;
 
@@ -9477,7 +9541,11 @@ namespace {
         caps.rollback = g_lnch_rollback != 0;
         caps.multitap_analog = g_lnch_multitap_analog != 0;
         if (s) caps.multitap_analog = s->multitap_analog != 0;
-        ae_np_fill_required_mods(&caps);
+        caps.lobby_kind = g_lnch_lobby_kind ? 1 : 0;
+        /* PSX-Link sessions run vanilla: the spawned follower boots outside
+         * the lobby's mod-sync machinery, so mods must not be required. */
+        if (caps.lobby_kind != 1)
+            ae_np_fill_required_mods(&caps);
         return caps;
     }
 
@@ -10147,6 +10215,7 @@ namespace {
         out->max_slots = row.max_slots;
         out->has_password = row.has_password;
         out->latency_ms = row.latency_ms;
+        out->lobby_kind = row.lobby_kind;
         return 1;
     }
 
@@ -11021,8 +11090,26 @@ namespace {
         out->force_turn = caps->force_turn ? 1 : 0;
         out->rollback =
             (caps && caps->valid && caps->rollback) ? 1 : 0;
+        out->lobby_kind = caps->lobby_kind ? 1 : 0;
         if (caps->session_bios[0])
             ae_np_set_session_bios_token(caps->session_bios);
+        return 1;
+    }
+
+    int ae_np_link_lobby_supported(void*) {
+        return g_lnch_link_lobby_supported ? 1 : 0;
+    }
+    int ae_np_lobby_kind_get(void*) {
+        /* Joined room: reflect the host's published kind. */
+        if (psx_lobby_in_lobby()) {
+            const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+            if (caps && caps->valid) return caps->lobby_kind ? 1 : 0;
+        }
+        return g_lnch_lobby_kind ? 1 : 0;
+    }
+    int ae_np_lobby_kind_set(void*, int kind) {
+        if (!g_lnch_link_lobby_supported) kind = 0;
+        g_lnch_lobby_kind = kind ? 1 : 0;
         return 1;
     }
 
@@ -11080,6 +11167,9 @@ namespace {
         ae_np_mod_xfer_cancel,
         ae_np_mod_xfer_progress,
         ae_np_mod_xfer_failed,
+        ae_np_link_lobby_supported,
+        ae_np_lobby_kind_get,
+        ae_np_lobby_kind_set,
     };
 
     /* Shared by first-boot launcher and soft-return rematch UI so capability
@@ -11193,6 +11283,43 @@ namespace {
     }
 }  // namespace
 #endif
+
+/* Resolve PSX-Link mode for a netplay session (idempotent; every launch path
+ * calls it).
+ *
+ * A link-capable title (game.toml [netplay] link_lobby) has NO multitap mode:
+ * its 3/4-player game is two serial-linked consoles, 2 players each. So the
+ * decision is purely about SEATING — if a console-B seat (2 or 3) is taken,
+ * the session runs linked, whatever match_caps.lobby_kind said. A standard
+ * 3/4-seat room would otherwise arm a multitap the game cannot use and land
+ * every seat on console A (observed: a P3 guest presented console A).
+ * lobby_kind still drives the lobby UI and browser badge; LAN rooms and older
+ * hosts simply never set it. */
+static void netplay_resolve_link_mode(PsxNetplayConfig& cfg) {
+    if (!cfg.enabled) return;
+    if (!g_lnch_link_lobby_supported && !cfg.link_lobby) return;
+    /* Seats believed occupied. An unset mask means "not published" — assume
+     * the declared width is full (the common CLI/env case). */
+    uint32_t occ = cfg.occupied_mask & 0xFu;
+    if (occ == 0u) {
+        const int n = cfg.slot_count > 4 ? 4 : cfg.slot_count;
+        occ = (n >= 4) ? 0xFu : (n == 3 ? 0x7u : 0x3u);
+    }
+    if (cfg.local_slot >= 2) occ |= (1u << (unsigned)cfg.local_slot) & 0xFu;
+    if (!(occ & 0xCu)) {
+        /* Console B empty — a plain session of the seated players. */
+        cfg.link_lobby = 0;
+        cfg.link_base_seat = 0;
+        return;
+    }
+    cfg.link_lobby = 1;
+    cfg.link_base_seat = (cfg.local_slot >= 2) ? 2 : 0;
+    cfg.slot_count = 4;
+    if (cfg.player_count < 2) cfg.player_count = 2;
+    /* Rollback episodes are pairwise inside a console group; a group with an
+     * empty seat has no episode counterpart. */
+    if (occ != 0xFu) cfg.rollback = 0;
+}
 
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
@@ -11473,6 +11600,7 @@ int main(int argc, char** argv) {
             g_netplay_disc_expect.required_leadout_lba =
                 gc.netplay_required_leadout_lba;
             g_netplay_disc_expect.required_disc_fp = gc.netplay_required_disc_fp;
+            g_lnch_link_lobby_supported = gc.netplay_link_lobby ? 1 : 0;
             g_netplay_local_viewport =
                 (gc.netplay_local_viewport == "vertical_split") ? 1 : 0;
             g_netplay_local_viewport_aspect =
@@ -13048,6 +13176,12 @@ int main(int argc, char** argv) {
                     if (net_cfg.player_count <= 0)
                         net_cfg.player_count = net_cfg.slot_count;
                     net_cfg.occupied_mask = ls.netplay_launch.occupied_mask;
+                    /* PSX-Link lobby kind from host match_caps. Whether it
+                     * actually engages (console-B seat occupied) and which
+                     * console this seat belongs to are resolved once, at the
+                     * netplay start site every launch path converges on. */
+                    net_cfg.link_lobby = ls.netplay_launch.lobby_kind == 1;
+                    net_cfg.link_base_seat = 0;
                     std::snprintf(net_cfg.bind_hostport, sizeof(net_cfg.bind_hostport), "%s",
                                   ls.netplay_launch.bind_hostport);
                     std::snprintf(net_cfg.peer_hostport, sizeof(net_cfg.peer_hostport), "%s",
@@ -13170,9 +13304,14 @@ int main(int argc, char** argv) {
 
     {
         /* Netplay: apply the host lobby mod plan (or clear when vanilla).
-         * Do not re-resolve the local offline selection from disk. */
+         * Do not re-resolve the local offline selection from disk.
+         * PSX-Link followers take the SAME branch: without it they fell into
+         * the offline path and applied the user's local mod plan — 8 MB RAM
+         * + patched disc — while every netplay client ran vanilla 2 MB
+         * (found as a RAM-part digest fork at tick 0 with byte-identical
+         * low-2MB contents). */
         std::string mod_error;
-        if (net_cfg.enabled) {
+        if (net_cfg.enabled || psx_link_pair_follower_mode()) {
             if (!PSXRecompV4::mod_runtime_commit_for_netplay(resolved_disc,
                                                             &mod_error)) {
                 std::fprintf(stderr,
@@ -13242,6 +13381,27 @@ int main(int argc, char** argv) {
         memcard_dir = memcard_dir.lexically_normal();
         memcard1_path.clear();
         memcard2_path.clear();
+    }
+
+    /* Link mode must be known before the per-console memcard dir below. */
+    netplay_resolve_link_mode(net_cfg);
+
+    /* PSX-Link: both consoles on every machine must boot with IDENTICAL
+     * (blank) memcards or console state forks at the first card probe. Give
+     * the driver a fresh per-session card dir; the follower is spawned with
+     * its own (other-console) dir. Card sync is future work. */
+    if (net_cfg.enabled && net_cfg.link_lobby) {
+        char sub[64];
+        std::snprintf(sub, sizeof sub, "psxlink-%u-%c",
+                      (unsigned)net_cfg.session_id,
+                      (net_cfg.link_base_seat >= 2) ? 'b' : 'a');
+        memcard_dir = memcard_dir / sub;
+        std::error_code mec;
+        std::filesystem::create_directories(memcard_dir, mec);
+        memcard1_path.clear();
+        memcard2_path.clear();
+        std::fprintf(stdout, "psxrecomp: link lobby memcards -> %s\n",
+                     memcard_dir.string().c_str());
     }
 
     std::filesystem::path resolved_bios =
@@ -14188,6 +14348,15 @@ session_reboot:
             net_cfg.slot_count = game_players >= 2 ? game_players : 2;
         if (net_cfg.slot_count > PSX_MAX_PLAYERS)
             net_cfg.slot_count = PSX_MAX_PLAYERS;
+        netplay_resolve_link_mode(net_cfg);
+        if (net_cfg.link_lobby) {
+            std::fprintf(stdout,
+                "psxrecomp: PSX-Link launch — seat %d on console %c "
+                "(local ports P%d/P%d), mask=0x%x rollback=%d\n",
+                net_cfg.local_slot, net_cfg.link_base_seat ? 'B' : 'A',
+                net_cfg.link_base_seat + 1, net_cfg.link_base_seat + 2,
+                (unsigned)net_cfg.occupied_mask, net_cfg.rollback);
+        }
         s_netplay_present_sim_watermark = 0; /* §74: sim restarts per session */
         const int nrc = psx_netplay_start(&net_cfg);
         if (nrc != 0) {
@@ -14196,6 +14365,112 @@ session_reboot:
                 "or bind/peer invalid (slot=%d bind=%s peer=%s)\n",
                 nrc, net_cfg.local_slot, net_cfg.bind_hostport, net_cfg.peer_hostport);
             return 1;
+        }
+        /* PSX-Link: bring up the local pair — claim the shm cable as this
+         * console's side, publish the determinism config, spawn the headless
+         * follower simulating the other console. Spawned EARLY so its
+         * process+BIOS bring-up overlaps ours; both park at netplay tick 0. */
+        if (psx_netplay_link_active()) {
+            static char shm_name[96];
+            static char mc_arg[512];
+            std::snprintf(shm_name, sizeof shm_name, "psxlink-%u-%u",
+                          (unsigned)net_cfg.session_id, (unsigned)getpid());
+            const int base = psx_netplay_link_base_seat();
+            const char role_other = (base >= 2) ? 'a' : 'b';
+            char sub[64];
+            std::snprintf(sub, sizeof sub, "psxlink-%u-%c",
+                          (unsigned)net_cfg.session_id, role_other);
+            /* memcard_dir already carries this driver's psxlink-<id>-<c>
+             * leaf; the follower gets the sibling console's leaf. */
+            std::filesystem::path fol_mc =
+                memcard_dir.parent_path() / sub;
+            std::error_code mec;
+            std::filesystem::create_directories(fol_mc, mec);
+            std::snprintf(mc_arg, sizeof mc_arg, "%s", fol_mc.string().c_str());
+
+            static char exe_buf[1024];
+            ssize_t n = -1;
+#if defined(__linux__)
+            n = readlink("/proc/self/exe", exe_buf, sizeof exe_buf - 1);
+#endif
+            if (n > 0) exe_buf[n] = '\0';
+            else std::snprintf(exe_buf, sizeof exe_buf, "%s", argv[0]);
+
+            /* fnv1a over the BIOS basename: the settle guarantees every
+             * machine resolved the same choice; the follower re-derives and
+             * must match. */
+            uint32_t bios_id = 2166136261u;
+            {
+                std::string bn =
+                    std::filesystem::path(bios_path_str).filename().string();
+                for (char ch : bn) {
+                    bios_id ^= (uint8_t)ch;
+                    bios_id *= 16777619u;
+                }
+            }
+
+            setenv("PSX_LINK_SHM_NAME", shm_name, 1);
+            setenv("PSX_LINK_SHM_ROLE", (base >= 2) ? "b" : "a", 1);
+            sio1_set_backend("shm");
+
+            static char env_name[128], env_role[32];
+            std::snprintf(env_name, sizeof env_name, "PSX_LINK_SHM_NAME=%s",
+                          shm_name);
+            std::snprintf(env_role, sizeof env_role, "PSX_LINK_SHM_ROLE=%c",
+                          role_other);
+            char *child_env[] = {
+                (char *)"PSX_NO_LAUNCHER=1",
+                (char *)"PSX_HEADLESS=1",
+                (char *)"PSX_LINK_FOLLOWER=1",
+                (char *)"PSX_SIO1_BACKEND=shm",
+                (char *)"PSX_NETPLAY=0",
+                (char *)"PSX_DUAL_CONSOLE=0",
+                (char *)"PSX_NET_LINK=0",
+                env_name,
+                env_role,
+                NULL,
+            };
+            char *child_argv[16];
+            {
+                int an = 0;
+                child_argv[an++] = exe_buf;
+                child_argv[an++] = (char *)"--memcard-dir";
+                child_argv[an++] = mc_arg;
+                child_argv[an++] = (char *)"--bios";
+                child_argv[an++] = (char *)bios_path_str.c_str();
+                /* Same disc image: a client launched with a disc override
+                 * must not leave the follower on the game.toml default. */
+                if (!disc_path_str.empty()) {
+                    child_argv[an++] = (char *)"--disc";
+                    child_argv[an++] = (char *)disc_path_str.c_str();
+                }
+                child_argv[an] = NULL;
+            }
+            PsxLinkPairClientCfg pcfg;
+            std::memset(&pcfg, 0, sizeof pcfg);
+            pcfg.base_seat = base;
+            pcfg.session_id = net_cfg.session_id;
+            pcfg.tick_len_cycles = 677376u;   /* PAL frame = upper bound */
+            {
+                const char *l = std::getenv("PSX_LINK_PAIR_LATENCY");
+                pcfg.latency_cycles =
+                    (l && l[0]) ? (uint32_t)std::strtoul(l, nullptr, 0) : 0u;
+            }
+            pcfg.flags = PSX_LINK_PAIR_F_SW_RASTER | PSX_LINK_PAIR_F_NO_IDLE |
+                         PSX_LINK_PAIR_F_NO_AUTOFMV | PSX_LINK_PAIR_F_NO_MODS |
+                         PSX_LINK_PAIR_F_BLANK_CARDS;
+            pcfg.bios_id = bios_id;
+            pcfg.codegen_hash = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
+            pcfg.shm_name = shm_name;
+            pcfg.exe_path = exe_buf;
+            pcfg.child_argv = child_argv;
+            pcfg.child_env = child_env;
+            if (!psx_link_pair_client_start(&pcfg)) {
+                std::fprintf(stderr,
+                             "psxrecomp: link pair start FAILED — cannot run "
+                             "a PSX-Link session\n");
+                return 1;
+            }
         }
         apply_netplay_local_viewport_aspect(net_cfg.enabled);
         std::printf("psxrecomp: netplay transport=%s slot=%d input_player=%d delay=%d "
@@ -14502,6 +14777,46 @@ session_reboot:
             device_trace_arm(1);
             std::fprintf(stdout, "psxrecomp: device-event trace ARMED\n");
             std::fflush(stdout);
+        }
+    }
+
+    /* PSX-Link follower: deterministic co-simulator of the other console.
+     * Apply the same determinism envelope netplay forces on the driver,
+     * attach the pair, and park until the driver's START + TICK(0). */
+    if (psx_link_pair_follower_mode()) {
+        psx_frontend_netplay_force_sw_gpu();
+        {
+            extern int g_idle_skip_enabled;
+            g_idle_skip_enabled = 0;
+        }
+        g_auto_skip_fmv = 0;
+        psx_rewind_shutdown();
+        uint32_t fol_bios = 0, fol_entry = 0;
+        savestate_get_integrity(&fol_bios, &fol_entry);
+        uint32_t fol_bios_id = 2166136261u;
+        {
+            std::string bn =
+                std::filesystem::path(bios_path_str).filename().string();
+            for (char ch : bn) {
+                fol_bios_id ^= (uint8_t)ch;
+                fol_bios_id *= 16777619u;
+            }
+        }
+        const uint32_t fol_flags =
+            PSX_LINK_PAIR_F_SW_RASTER | PSX_LINK_PAIR_F_NO_IDLE |
+            PSX_LINK_PAIR_F_NO_AUTOFMV | PSX_LINK_PAIR_F_NO_MODS |
+            PSX_LINK_PAIR_F_BLANK_CARDS;
+        if (!psx_link_pair_follower_boot(&cpu, fol_bios, fol_entry, fol_flags,
+                                         fol_bios_id,
+                                         (uint32_t)PSX_OVERLAY_CODEGEN_HASH)) {
+            std::fprintf(stderr, "psxrecomp: link follower boot FAILED\n");
+            return 1;
+        }
+        std::printf("psxrecomp: link follower waiting for driver START…\n");
+        std::fflush(stdout);
+        if (!psx_link_pair_follower_admit()) {
+            std::printf("psxrecomp: link follower: session ended pre-boot\n");
+            return 0;
         }
     }
 
@@ -14846,6 +15161,9 @@ soft_return_lobby:
                 if (net_cfg.player_count <= 0)
                     net_cfg.player_count = net_cfg.slot_count;
                 net_cfg.occupied_mask = ls.netplay_launch.occupied_mask;
+                /* Kind only; engagement + console resolved at the start site. */
+                net_cfg.link_lobby = ls.netplay_launch.lobby_kind == 1;
+                net_cfg.link_base_seat = 0;
                 std::snprintf(net_cfg.bind_hostport, sizeof(net_cfg.bind_hostport), "%s",
                               ls.netplay_launch.bind_hostport);
                 std::snprintf(net_cfg.peer_hostport, sizeof(net_cfg.peer_hostport), "%s",

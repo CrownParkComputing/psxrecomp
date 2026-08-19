@@ -1491,6 +1491,7 @@ static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out)
     /* Absent field → delay-sync (older hosts). New hosts always publish explicit. */
     out->rollback = json_get_bool(obj, "rollback", 0);
     out->multitap_analog = json_get_bool(obj, "multitap_analog", 0);
+    out->lobby_kind = json_get_int(obj, "lobby_kind", 0);
     json_get_str(obj, "language", out->language, sizeof(out->language));
     json_get_str(obj, "session_bios", out->session_bios, sizeof(out->session_bios));
     /* Normalize settled BIOS id. */
@@ -1533,7 +1534,8 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         "\"turbo_loads\":%s,\"bios_hle\":%s,\"fast_boot\":%s,"
                         "\"auto_skip_fmv\":%s,\"input_delay\":%d,\"input_prediction\":%d,"
                         "\"force_input_relay\":%s,\"force_turn\":%s,\"rollback\":%s,"
-                        "\"multitap_analog\":%s,\"language\":\"%s\",\"session_bios\":\"%s\"}",
+                        "\"multitap_analog\":%s,\"lobby_kind\":%d,"
+                        "\"language\":\"%s\",\"session_bios\":\"%s\"}",
                         caps->aspect_num, caps->aspect_den,
                         caps->turbo_loads ? "true" : "false",
                         caps->bios_hle ? "true" : "false",
@@ -1545,6 +1547,7 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         caps->force_turn ? "true" : "false",
                         caps->rollback ? "true" : "false",
                         caps->multitap_analog ? "true" : "false",
+                        caps->lobby_kind,
                         lang, sb);
         if (n < 0 || (size_t)n >= dst_cap) return n;
         if (caps->mod_count > 0) {
@@ -2028,6 +2031,7 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].player_count = json_get_int(chunk, "player_count", 0);
                     g_lc.list[n].max_slots = json_get_int(chunk, "max_slots", 2);
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
+                    g_lc.list[n].lobby_kind = json_get_int(chunk, "lobby_kind", 0);
                     json_get_str(chunk, "host_endpoint", g_lc.list[n].host_endpoint,
                                  sizeof(g_lc.list[n].host_endpoint));
                     g_lc.list[n].lan_count = json_parse_str_array(

@@ -34,6 +34,9 @@ typedef struct PsxLobbyRow {
     int      player_count;
     int      max_slots;
     int      has_password;
+    /* match_caps.lobby_kind echoed by newer servers (0 standard, 1 PSX-Link).
+     * Absent field parses as 0. */
+    int      lobby_kind;
     /* Host UDP endpoint from the server list (for one-shot latency probes). */
     char     host_endpoint[PSX_LOBBY_ENDPOINT_LEN];
     /* Legacy hub lan_endpoints (compat). Prefer local UDP beacon by lobby_id. */
@@ -110,6 +113,10 @@ typedef struct PsxLobbyMatchCaps {
     int  rollback;         /* 0/1 — invent/rollback netplay (default on) */
     /* DualShock-on-multitap-tap hack (0/1). Host-authoritative for the match. */
     int  multitap_analog;
+    /* Lobby kind: 0 = standard; 1 = PSX-Link (two consoles over the serial
+     * cable; 4 seats partitioned into console A = {0,1}, console B = {2,3}).
+     * Opaque to the server (rides match_caps). */
+    int  lobby_kind;
     char language[PSX_LOBBY_LANG_LEN];
     /* Settled match BIOS: "openbios" | "scph1001" | "" (unset / legacy). */
     char session_bios[16];

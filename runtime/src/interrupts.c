@@ -1009,8 +1009,8 @@ void psx_check_interrupts(CPUState* cpu) {
             psx_link_shm_poll(psx_get_cycle_count());
     }
     extern int g_ls_suppress_record;
-    extern int psx_netplay_active(void);
-    const int np_active = psx_netplay_active();
+    extern int psx_netplay_determinism_active(void);
+    const int np_active = psx_netplay_determinism_active();
     /* Publish this edge's resume PC BEFORE deferred present flush. The MotK
      * CDA0 gate reads s_last_interrupt_check_pc; leaving it at the previous
      * BB (CD54) made every CDA0 entry flush look like CD54 and no-op. Present
@@ -1071,7 +1071,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * host-only state (not in the snap), so replay delivery timing forked
      * across peers. Edge PC + I_STAT are guest-deterministic; the wait
      * ping-pong reaches B a few instructions later, so no starvation. */
-    if (!in_exception && psx_netplay_active()) {
+    if (!in_exception && np_active) {
         const uint32_t wait_a = 0x8006CD54u;
         const uint32_t wait2_a = 0x800768C8u;
         uint32_t edge = s_last_interrupt_check_pc;
@@ -1825,11 +1825,11 @@ irq_deliver_eval:
         if (s_str_mode_env < -1 || s_str_mode_env > 3) s_str_mode_env = -1;
     }
     {
-        extern int psx_netplay_active(void);
+        extern int psx_netplay_determinism_active(void);
         extern int psx_selfcheck_enabled(void);
         if (s_str_mode_env >= 0)
             s_str_mode = s_str_mode_env;
-        else if (psx_netplay_active() || psx_selfcheck_enabled())
+        else if (psx_netplay_determinism_active() || psx_selfcheck_enabled())
             s_str_mode = 3; /* netplay/selfcheck: TCB-stable always restore */
         else
             s_str_mode = 1;

@@ -570,6 +570,12 @@ int savestate_write_slot(int slot, const void* data, size_t size) {
 /* User APIs during netplay: guests cannot initiate; host must use
  * psx_netplay_request_* so peers hash-probe and sync over STATE_*. */
 static int netplay_user_blocked(void) {
+    extern int psx_link_pair_follower_mode(void);
+    if (psx_link_pair_follower_mode()) {
+        fprintf(stderr, "savestate: blocked — PSX-Link follower state is "
+                        "driven by its netplay client\n");
+        return 1;
+    }
     if (!psx_netplay_active()) return 0;
     if (!psx_netplay_is_host()) {
         fprintf(stderr, "savestate: netplay guest cannot save/load (host-only)\n");

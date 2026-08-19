@@ -34,6 +34,7 @@
 #include "netplay_input_hist.h"
 #include "netplay_state_digest.h"
 #include "psx_netplay_rb.h"
+#include "psx_link_pair.h"
 #include "psx_netplay_sched.h"
 #include "cpu_state.h"
 #include "cdrom.h"
@@ -87,6 +88,8 @@ void psx_netplay_config_defaults(PsxNetplayConfig *cfg)
     cfg->force_turn = 0;
     cfg->transport = 0;
     cfg->session_id = 1;
+    cfg->link_lobby = 0;
+    cfg->link_base_seat = 0;
     strncpy(cfg->bind_hostport, "0.0.0.0:7777", sizeof(cfg->bind_hostport) - 1);
     cfg->peer_hostport[0] = '\0';
 }
@@ -142,6 +145,17 @@ void psx_netplay_apply_env(PsxNetplayConfig *cfg)
         else if (strcmp(v, "delay") == 0 || strcmp(v, "delay-sync") == 0)
             cfg->rollback = 0;
     }
+    v = getenv("PSX_NET_OCCUPIED");
+    if (v && v[0])
+        cfg->occupied_mask = (uint32_t)strtoul(v, NULL, 0);
+    /* PSX-Link lobby overrides (headless test rigs): PSX_NET_LINK=1 arms
+     * link mode; PSX_NET_LINK_BASE=0|2 picks the console group. */
+    v = getenv("PSX_NET_LINK");
+    if (v && v[0] && v[0] != '0')
+        cfg->link_lobby = 1;
+    v = getenv("PSX_NET_LINK_BASE");
+    if (v && v[0])
+        cfg->link_base_seat = (int)strtol(v, NULL, 0);
 }
 
 void psx_netplay_normalize_pad(PsxNetPad *pad)
@@ -163,6 +177,11 @@ static void force_session_pads_connected(int slot_count)
     int i;
     if (slot_count < 2) slot_count = 2;
     if (slot_count > PSX_MAX_PLAYERS) slot_count = PSX_MAX_PLAYERS;
+    /* PSX-Link: each console is a plain 2-port machine; the 4-seat session
+     * must NOT arm the multitap (auto-arm at >=3 seats would corrupt the
+     * game's pad probing on both consoles). */
+    if (psx_netplay_link_active())
+        slot_count = 2;
     if (slot_count >= 3)
         sio_set_multitap(1);
     else
@@ -181,6 +200,10 @@ void psx_netplay_release_pads(void)
     int n = g_np_slot_count;
     if (n < 2) n = 2;
     if (n > PSX_MAX_PLAYERS) n = PSX_MAX_PLAYERS;
+    /* PSX-Link: each console is a plain 2-port machine — canonicalizing the
+     * 4-seat session width armed a multitap the game has no mode for. */
+    if (psx_netplay_link_active())
+        n = 2;
     /* Immediate digital + idle bus (not deferred type_req). Rematch dig0
      * baseline_ext was forking on pads when a DualShock host kept analog=1. */
     sio_netplay_canonicalize_session_pads(n);
@@ -387,6 +410,16 @@ void psx_start_consumer_note(int slot, uint32_t sim, uint16_t buttons)
 #if !defined(PSX_HAS_RECOMP_NET)
 
 int  psx_netplay_active(void) { return 0; }
+int  psx_netplay_link_active(void) { return 0; }
+int  psx_netplay_link_base_seat(void) { return 0; }
+int  psx_netplay_link_hash_enforced(void) { return 1; }
+void psx_netplay_apply_pad_blob(int port, const uint8_t row[8])
+{ (void)port; (void)row; }
+int  psx_netplay_determinism_active(void)
+{
+    extern int psx_link_pair_follower_mode(void);
+    return psx_link_pair_follower_mode();
+}
 int  psx_netplay_is_running(void) { return 0; }
 const char *psx_netplay_transport_name(void) { return "none"; }
 int  psx_netplay_ice_failed(void) { return 0; }
@@ -561,6 +594,23 @@ typedef struct {
     int                pending_rewind;
     uint32_t           pending_rewind_tick;
     int                pending_rewind_slot;
+    /* PSX-Link lobby: 4-seat session partitioned into console groups
+     * (A = seats {0,1}, B = {2,3}). This client applies only [link_base,
+     * link_base+2) to SIO ports 0/1 and forwards the other pair's rows to
+     * the local follower. Hash enforcement (FRAME_COMMIT ladder) runs on
+     * console A only, per link policy — B divergence feeds back through the
+     * local cable into A state and is caught there. */
+    int                link_active;
+    int                link_base;
+    int                link_enforced;
+    /* Fold-mismatch debounce (link mode): a FRAME_COMMIT mismatch can be a
+     * cross-generation transient (A-pair and B-pair episodes are independent;
+     * a peer's fold may still carry the other console's pre-correction
+     * component). Only a mismatch that persists with no local episode running
+     * is a real desync. */
+    uint32_t           link_mismatch_tick;
+    uint64_t           link_mismatch_ms;
+    int                link_desynced;
 } NetplayState;
 
 static NetplayState g_np;
@@ -920,6 +970,41 @@ static void np_check_core_diverge(void)
     const NpPartSlot *slot;
     if (!netplay_hc_peek_mismatch(&g_np.hc, &tick, &local_d, &peer_d)) {
         s_fork_tick = 0xffffffffu; /* resolved / no complete pair pending */
+        if (g_np.link_active)
+            g_np.link_mismatch_ms = 0;
+        return;
+    }
+    if (g_np.link_active) {
+        /* PSX-Link: the commit is a MACHINE fold (console A + console B), and
+         * the two console groups run INDEPENDENT episode timelines — during a
+         * correction window a peer's fold legitimately carries the other
+         * console's pre-correction component. Never feed folds into the rb
+         * abort/fork machinery (a B-pair episode wedged in an abort storm on
+         * exactly that); episode correctness rides the partner-scoped
+         * baseline/POST compares instead. A mismatch that PERSISTS while no
+         * local episode is active is a real cross-machine desync. */
+        uint64_t now = psx_host_mono_ms();
+        if (g_np.link_mismatch_ms == 0 || g_np.link_mismatch_tick != tick) {
+            g_np.link_mismatch_tick = tick;
+            g_np.link_mismatch_ms = now;
+        } else if (now - g_np.link_mismatch_ms > 4000ull &&
+                   !psx_netplay_rb_active_episode() &&
+                   !g_np.link_desynced) {
+            g_np.link_desynced = 1;
+            fprintf(stderr,
+                    "psxrecomp: LINK DESYNC — fold mismatch persisted 4s "
+                    "sim=%u local=%08x peer=%08x\n",
+                    (unsigned)tick, (unsigned)local_d, (unsigned)peer_d);
+            fflush(stderr);
+        }
+        if (s_core_diverge_logged)
+            return;
+        s_core_diverge_logged = 1;
+        fprintf(stderr,
+                "psxrecomp: link fold FIRST MISMATCH sim=%u local=%08x "
+                "peer=%08x (may be a cross-generation transient)\n",
+                (unsigned)tick, (unsigned)local_d, (unsigned)peer_d);
+        fflush(stderr);
         return;
     }
     /* Replay/Verify: never allow a false POST commit after mid-resim fork. */
@@ -1023,10 +1108,52 @@ static void np_emit_frame_commit(uint32_t tick)
         aux = aux_crc ^ 0xFFFFFFFFu;
     }
     np_part_ring_put(tick, &parts, av, cd, spu, mdec, aux);
-    netplay_hc_note_local(&g_np.hc, tick, parts.core);
-    if (tick == 0u)
-        psx_netplay_rb_boot_dig0_note_local(parts.core);
-    (void)rnet_session_send_rb_frame_commit(g_np.session, tick, parts.core);
+    {
+        uint32_t commit = parts.core;
+        if (g_np.link_active) {
+            /* PSX-Link: fold BOTH consoles on this machine, ordered A then
+             * B. The admit barrier for tick+1 waits on the follower's ack of
+             * `tick` anyway, so waiting here moves that block a few µs
+             * earlier at zero pipeline cost — and covers the follower with
+             * the session hash ladder (a follower running a different
+             * execution contract was invisible to client-vs-client compares
+             * and surfaced as a race-start link hang). */
+            uint32_t fol = 0;
+            if (!psx_link_shm_wait_follower_tick(tick) ||
+                !psx_link_shm_read_digest(tick, &fol)) {
+                /* Follower dead: skip emission; the admit loop's
+                 * pair-failed poll ends the session. */
+                np_check_core_diverge();
+                return;
+            }
+            {
+                const uint32_t a = g_np.link_base == 0 ? parts.core : fol;
+                const uint32_t b = g_np.link_base == 0 ? fol : parts.core;
+                uint32_t crc = 0xFFFFFFFFu;
+                crc = crc32_update(crc, (const uint8_t *)&a, sizeof(a));
+                crc = crc32_update(crc, (const uint8_t *)&b, sizeof(b));
+                commit = crc ^ 0xFFFFFFFFu;
+                if (tick == 0u && getenv("PSX_LINK_RAMDUMP")) {
+                    extern uint8_t *g_psx_ram;
+                    FILE *f = fopen("/tmp/link_ram_client.bin", "wb");
+                    if (f) { fwrite(g_psx_ram, 1, 2u << 20, f); fclose(f); }
+                }
+                if (tick < 3u) {
+                    fprintf(stderr,
+                            "psxrecomp: link fold tick=%u client=%08x "
+                            "follower=%08x A=%08x B=%08x -> %08x\n",
+                            (unsigned)tick, (unsigned)parts.core,
+                            (unsigned)fol, (unsigned)a, (unsigned)b,
+                            (unsigned)commit);
+                    fflush(stderr);
+                }
+            }
+        }
+        netplay_hc_note_local(&g_np.hc, tick, commit);
+        if (tick == 0u)
+            psx_netplay_rb_boot_dig0_note_local(commit);
+        (void)rnet_session_send_rb_frame_commit(g_np.session, tick, commit);
+    }
     (void)netplay_hc_heal_stale_gap(&g_np.hc);
     /* Breadcrumbs so both peers' logs line up by sim tick. Tag is local-only
      * (not peer agreement — that is hash_confirm resolved_through). */
@@ -1460,6 +1587,10 @@ static void np_host_drive_xfer(void)
     size_t n = 0;
 
     if (g_np.local_slot != 0 || !g_np.session) return;
+    /* PSX-Link: cross-machine state transfer is disabled — a console-B
+     * client must never ingest console-A state, and link sessions always
+     * start from deterministic boot. Unrecoverable desync soft-exits. */
+    if (g_np.link_active) return;
 
     switch (g_np.xfer) {
     case NP_XFER_MC_PROBE:
@@ -2097,10 +2228,38 @@ void psx_netplay_pad_trace_dev(int card, int fallback, int sdl_start,
     }
 }
 
-static void apply_pad_slot(int slot, const PsxNetPad *pad)
+/* Pack one pad as the 8-byte wire blob (layout: psx_netplay.h pad-blob). */
+static void np_pack_pad_row(const PsxNetPad *pad, uint8_t out[8])
 {
+    PsxNetPad n = *pad;
+    psx_netplay_normalize_pad(&n);
+    out[0] = (uint8_t)(n.buttons & 0xFFu);
+    out[1] = (uint8_t)((n.buttons >> 8) & 0xFFu);
+    out[2] = n.lx;
+    out[3] = n.ly;
+    out[4] = n.rx;
+    out[5] = n.ry;
+    out[6] = n.analog ? 1u : 0u;
+    out[7] = 1u;
+}
+
+static void apply_pad_slot_tick(int slot, const PsxNetPad *pad, uint32_t tick)
+{
+    int port = slot;
     if (slot < 0 || slot >= g_np.slot_count || slot >= PSX_MAX_PLAYERS || !pad) return;
-    const int on_tap = sio_pad_on_multitap(slot);
+    if (g_np.link_active) {
+        if (slot < g_np.link_base || slot >= g_np.link_base + 2) {
+            /* Other console's seat: forward the row (predicted or sealed —
+             * exactly what this engine applied) to the local follower. */
+            uint8_t row[8];
+            int other_base = g_np.link_base ? 0 : 2;
+            np_pack_pad_row(pad, row);
+            psx_link_pair_stage_row(tick, slot - other_base, row);
+            return;
+        }
+        port = slot - g_np.link_base;   /* my console: seats -> ports 0/1 */
+    }
+    const int on_tap = sio_pad_on_multitap(port);
     if (psx_start_bisect_enabled() && slot == g_np.local_slot) {
         uint32_t sim = g_np.session ? rnet_session_sim_tick(g_np.session) : 0u;
         psx_start_bisect_log("sio", sim, -1, -1, -1,
@@ -2164,14 +2323,14 @@ static void apply_pad_slot(int slot, const PsxNetPad *pad)
         g_sio_pad_have[slot] = 1u;
     }
     const int force_dig = on_tap && !sio_get_multitap_analog();
-    sio_set_pad_connected(slot, 1);
-    sio_set_pad_config_capable(slot, force_dig ? 0 : 1);
-    sio_set_pad_state_slot(slot, pad->buttons);
+    sio_set_pad_connected(port, 1);
+    sio_set_pad_config_capable(port, force_dig ? 0 : 1);
+    sio_set_pad_state_slot(port, pad->buttons);
     if (force_dig)
-        sio_set_pad_sticks(slot, 0x80, 0x80, 0x80, 0x80);
+        sio_set_pad_sticks(port, 0x80, 0x80, 0x80, 0x80);
     else
-        sio_set_pad_sticks(slot, pad->lx, pad->ly, pad->rx, pad->ry);
-    sio_request_pad_type(slot, (!force_dig && pad->analog) ? 1 : 0);
+        sio_set_pad_sticks(port, pad->lx, pad->ly, pad->rx, pad->ry);
+    sio_request_pad_type(port, (!force_dig && pad->analog) ? 1 : 0);
     if (psx_start_consumer_enabled()) {
         uint32_t sim = g_np.session ? rnet_session_sim_tick(g_np.session) : 0u;
         psx_start_consumer_note(slot, sim, pad->buttons);
@@ -2196,7 +2355,6 @@ static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slot
 {
     int i;
     int n;
-    (void)tick;
     (void)ctx;
     if (!by_slot || slots <= 0) return;
     n = g_np.slot_count;
@@ -2206,7 +2364,7 @@ static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slot
     for (i = 0; i < n; ++i) {
         PsxNetPad pad;
         decode_pad(&by_slot[i], &pad);
-        apply_pad_slot(i, &pad);
+        apply_pad_slot_tick(i, &pad, tick);
     }
 }
 
@@ -2232,7 +2390,7 @@ static void np_publish_hist_sio(uint32_t tick)
         if (!netplay_ih_get(&g_np.ih, i, tick, &row))
             continue;
         netplay_ih_frame_to_pad(&row, &pad);
-        apply_pad_slot(i, &pad);
+        apply_pad_slot_tick(i, &pad, tick);
     }
 }
 
@@ -2241,7 +2399,6 @@ static void np_rb_apply_frame_slot(int slot, uint32_t tick, uint16_t buttons,
 {
     RNetRbFrame row;
     PsxNetPad pad;
-    (void)tick;
     memset(&row, 0, sizeof(row));
     row.tick = tick;
     row.buttons = buttons;
@@ -2251,7 +2408,7 @@ static void np_rb_apply_frame_slot(int slot, uint32_t tick, uint16_t buttons,
     row.is_valid = 1;
     netplay_ih_frame_to_pad(&row, &pad);
     force_session_pads_connected(g_np.slot_count);
-    apply_pad_slot(slot, &pad);
+    apply_pad_slot_tick(slot, &pad, tick);
 }
 
 static void np_rb_bind_and_start(void)
@@ -3443,8 +3600,39 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
         host.on_signal = host_on_signal;
 #endif
 
+    /* PSX-Link mode config must be latched BEFORE any pad canonicalization
+     * below (force_session_pads_connected consults it). */
+    g_np.link_active = cfg->link_lobby ? 1 : 0;
+    g_np.link_base = (cfg->link_base_seat >= 2) ? 2 : 0;
+    g_np.link_enforced = (!g_np.link_active || g_np.link_base == 0) ? 1 : 0;
+    if (g_np.link_active && g_np.rollback) {
+        /* Rollback episodes are pairwise per console group; a solo group has
+         * no episode counterpart. Lobby launch enforces this too — this is
+         * the runtime backstop. */
+        uint32_t occ = cfg->occupied_mask ? cfg->occupied_mask : 0xFu;
+        if ((occ & 0xFu) != 0xFu) {
+            fprintf(stderr,
+                    "psx_netplay: link lobby with empty seats (mask=0x%x) — "
+                    "rollback needs both consoles full; using delay-sync\n",
+                    (unsigned)occ);
+            g_np.rollback = 0;
+        }
+    }
+
     g_np.session = rnet_session_create(&rcfg, &host);
     if (!g_np.session) return -2;
+    if (g_np.link_active) {
+        /* Digest/episode coordination is per console group: accept rollback
+         * episode + state packets only from my group partner. Input-plane
+         * packets stay session-wide. */
+        int partner = 2 * g_np.link_base + 1 - cfg->local_slot;
+        rnet_session_set_rb_peer_slot(g_np.session, partner);
+        fprintf(stderr,
+                "psx_netplay: link lobby console %c (seats %d/%d, episode "
+                "partner %d, FRAME_COMMIT = A+B pair fold)\n",
+                g_np.link_base ? 'B' : 'A', g_np.link_base, g_np.link_base + 1,
+                partner);
+    }
 
     if (use_ice) {
 #if defined(RNET_ENABLE_ICE)
@@ -3723,7 +3911,7 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
         }
         fflush(stdout);
     }
-    if (g_np.slot_count >= 3)
+    if (g_np.slot_count >= 3 && !g_np.link_active)
         sio_set_multitap(1);
     else
         sio_set_multitap(0);
@@ -3735,6 +3923,10 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
     g_np.xfer = NP_XFER_NONE;
     g_np.xfer_slot = 0;
     g_np.mc_sync_done = 0;
+    if (g_np.link_active) {
+        /* Blank per-console cards; no cross-machine card sync in link mode. */
+        g_np.mc_sync_done = 1;
+    }
     g_np.mc_sync_sent = 0;
     g_np.local_save_staged = 0;
     g_np.load_applied_local = 0;
@@ -3897,6 +4089,61 @@ void psx_netplay_cold_reset(void)
     psx_irq_clear_resume_latches();
 }
 
+int psx_netplay_link_active(void)
+{
+    return psx_netplay_active() && g_np.link_active;
+}
+
+int psx_netplay_determinism_active(void)
+{
+    /* PSX-Link followers are not session members, but they simulate a
+     * console whose OTHER copy runs inside a netplay client on a different
+     * machine — so they must run the exact netplay execution contract
+     * (present deferral, SPU advance decoupling, no turbo/idle-skip, TCB
+     * restore mode, CPU-authoritative VRAM, ...). Guards that fork guest
+     * execution key off THIS, not psx_netplay_active(). For everything that
+     * is not a link follower this is identical to psx_netplay_active(), so
+     * titles without PSX-Link see no behavior change. */
+    if (psx_link_pair_follower_mode())
+        return 1;
+    return psx_netplay_active();
+}
+
+int psx_netplay_link_base_seat(void)
+{
+    return g_np.link_base;
+}
+
+int psx_netplay_link_hash_enforced(void)
+{
+    return g_np.link_enforced;
+}
+
+int psx_netplay_link_desynced(void)
+{
+    return psx_netplay_active() && g_np.link_desynced;
+}
+
+void psx_netplay_apply_pad_blob(int port, const uint8_t row[8])
+{
+    PsxNetPad pad;
+    if (port < 0 || port > 1 || !row) return;
+    memset(&pad, 0, sizeof(pad));
+    pad.buttons = (uint16_t)row[0] | ((uint16_t)row[1] << 8);
+    pad.lx = row[2];
+    pad.ly = row[3];
+    pad.rx = row[4];
+    pad.ry = row[5];
+    pad.analog = row[6] ? 1u : 0u;
+    pad.connected = 1;
+    psx_netplay_normalize_pad(&pad);
+    sio_set_pad_connected(port, 1);
+    sio_set_pad_config_capable(port, 1);
+    sio_set_pad_state_slot(port, pad.buttons);
+    sio_set_pad_sticks(port, pad.lx, pad.ly, pad.rx, pad.ry);
+    sio_request_pad_type(port, pad.analog ? 1 : 0);
+}
+
 void psx_netplay_shutdown(void)
 {
     if (g_diag_file) {
@@ -3911,6 +4158,7 @@ void psx_netplay_shutdown(void)
         rnet_session_destroy(g_np.session);
         g_np.session = NULL;
     }
+    psx_link_pair_shutdown();
     psx_netplay_rb_shutdown();
     psx_netplay_rb_bind(NULL);
     /* Drop cushion/timesync/tip statics so soft-return rematch starts clean. */

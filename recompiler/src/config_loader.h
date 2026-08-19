@@ -845,6 +845,7 @@ struct GameConfig {
     bool                  has_netplay_required_leadout = false;
     uint32_t              netplay_required_leadout_lba = 0;
     std::string           netplay_required_disc_fp;  // lowercase hex SHA-256
+    bool                  netplay_link_lobby = false; // PSX-Link lobby type offered
     // local_viewport = "vertical_split": while real netplay is active, crop
     // presentation to this peer's left/right split-screen half. This is a
     // presentation-only helper for titles that still render native split-screen

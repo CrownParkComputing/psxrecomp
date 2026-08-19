@@ -560,7 +560,7 @@ void psx_rewind_note_frame(void)
      * compression still has to drain — throttling it on s_frame would strand
      * s_zpend.active (and its ~7 MB of buffers) until the guest resumed. */
     s_vblank_seq++;
-    if (s_open || psx_netplay_active())
+    if (s_open || psx_netplay_determinism_active())
         return;
     s_frame++;
     iv = rewind_capture_interval();
@@ -834,7 +834,7 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
         s_pump_seq = s_vblank_seq;
         (void)rewind_pump_compress(RW_ZSLICE);
     }
-    if (s_capture_due && !s_open && !psx_netplay_active())
+    if (s_capture_due && !s_open && !psx_netplay_determinism_active())
         (void)do_capture(cpu, resume_pc);
 }
 
@@ -842,7 +842,7 @@ int psx_rewind_toggle(void)
 {
     if (!psx_rewind_enabled())
         return 0;
-    if (psx_netplay_active()) {
+    if (psx_netplay_determinism_active()) {
         host_osd_push("Rewind off during netplay", 1500);
         return 0;
     }
