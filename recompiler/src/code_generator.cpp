@@ -2808,6 +2808,30 @@ GeneratedFunction CodeGenerator::generate_function(
                                        fallthrough_name);
             }
         }
+    } else if (!cfg.block_order.empty()) {
+        // No in-image fallthrough function exists (region/image boundary):
+        // a reachable last block that simply runs off the end must TAIL-
+        // TRANSFER to its continuation PC, never fall off the C function —
+        // the entry-switch prologue consumed cpu->pc to 0, so falling off
+        // returns pc==0 to the dispatcher and the top-level trampoline reads
+        // it as "program ended" (WipEout 3 static bake: region-truncated
+        // block_800D7FC0 in the 0xD5000 variant fell off at 0x800D8004 →
+        // deterministic "execution completed, PC=0" ~10 s into boot). The
+        // published continuation is routed by the dispatcher to whoever owns
+        // it (a neighboring region variant, AOT text, or the interpreter).
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            last_block.exit_instr.type == ControlFlowType::None ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        bool is_reachable = last_block.is_entry || !last_block.predecessors.empty();
+        if (runs_off_end && is_reachable) {
+            uint32_t cont = last_block.end_addr + 4u;
+            body_ss << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                cont);
+        }
     }
     body_ss << "    ;  /* label compatibility: C requires a statement after the last label */\n";
     body_ss << "}\n";
@@ -3036,6 +3060,25 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         if (needs_fallthrough) {
             body << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
                                 fallthrough_name);
+        }
+    } else if (!cfg.block_order.empty() &&
+               live_blocks.count(cfg.block_order.back())) {
+        // Image-edge fallthrough (mirrors generate_function): no in-image next
+        // function exists, so a live final block that runs off the end must
+        // tail-transfer to its continuation PC — falling off the C function
+        // returns the entry-switch's consumed pc==0 and the top-level
+        // trampoline reads "program ended" (the WipEout 3 static-bake boot
+        // exit: truncated block_800D7FC0 in the 0xD5000 region variant).
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            (last_block.exit_instr.type == ControlFlowType::None) ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        if (runs_off_end) {
+            body << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                last_block.end_addr + 4u);
         }
     }
     body << "    ;  /* label compatibility */\n";
