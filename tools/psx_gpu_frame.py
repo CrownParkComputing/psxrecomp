@@ -164,13 +164,33 @@ class DebugConn:
     def frame(self) -> int:
         return int(self.cmd("ping").get("frame", 0))
 
-    def pause(self) -> None:
-        self.cmd("pause")
+    def ring_span(self) -> Dict[str, Any]:
+        """Which frames the GP0 ring can still be asked for.
 
-    def resume(self) -> None:
-        self.cmd("continue")
+        This is the replacement for pausing. The ring holds ~1M packets, which
+        is several hundred frames, so the workflow is: let the game run, and
+        capture the frame AFTER you have seen the bug -- along with the frames
+        leading up to it. Reaching backwards beats freezing forwards.
+        """
+        r = self.cmd("gpu_ring_stats")
+        return {
+            "oldest": int(r.get("oldest_frame", 0)),
+            "newest": int(r.get("newest_frame", 0)),
+            "total": int(r.get("total", 0)),
+            "capacity": int(r.get("capacity", 0)),
+            "max_words": int(r.get("max_words", 12)),
+        }
+
+    # pause / continue / step / run_to_frame were REMOVED from psx-runtime --
+    # runtime/src/debug_server.c registers them only as handlers that return an
+    # error, because pause-step-read synthesizes a snapshot instead of reading
+    # the history the runtime already records, and it once turned a dropped
+    # client into an apparent freeze. They still work on the DuckStation oracle,
+    # which is why these wrappers exist at all; against psx-runtime they raise
+    # with the server's own migration message.
 
     def run_to_frame(self, frame: int) -> Dict[str, Any]:
+        """DuckStation only. Raises against psx-runtime, which removed it."""
         return self.cmd("run_to_frame", frame=int(frame))
 
     def screenshot(self, path: str) -> Dict[str, Any]:
@@ -595,11 +615,37 @@ def _union(a: Sequence[int], b: Sequence[int]) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def capture(conn: DebugConn, frame: Optional[int] = None, count: int = 65536,
-            label: str = "") -> Dict[str, Any]:
-    """Pull one frame's GP0 ring and decode it into a dump dict."""
+            label: str = "", verify_ring: bool = True) -> Dict[str, Any]:
+    """Pull one frame's GP0 ring and decode it into a dump dict.
+
+    Two failure modes are turned into errors rather than empty dumps, because
+    both look exactly like "that frame drew nothing", which is a conclusion you
+    might act on:
+
+      * the frame has fallen out of the ring (or has not happened yet), and
+      * the peer answered ok with no `entries` key at all -- which is what a
+        stub or a mismatched server does.
+    """
+    span = None
+    if verify_ring:
+        try:
+            span = conn.ring_span()
+        except DebugError:
+            span = None   # older server without gpu_ring_stats; carry on
     if frame is None:
-        frame = conn.frame()
+        frame = span["newest"] if span else conn.frame()
+    if span and span["total"] > 0 and not (span["oldest"] <= frame <= span["newest"]):
+        raise DebugError(
+            f"frame {frame} is not in the GP0 ring (it holds {span['oldest']}.."
+            f"{span['newest']}). Capture closer to the moment, or raise the ring "
+            f"size; a dump of an evicted frame is empty, not zero-drawn.")
+
     reply = conn.cmd("gpu_frame_dump", frame=int(frame), count=int(count))
+    if "entries" not in reply:
+        raise DebugError(
+            "gpu_frame_dump replied ok but carried no 'entries' -- this is not a "
+            "psx-runtime debug server. Check what is actually listening on "
+            f"{conn.host}:{conn.port}.")
     entries = reply.get("entries", [])
     prims = decode_entries(entries)
     raw_count = int(reply.get("count", len(entries)))
@@ -609,6 +655,7 @@ def capture(conn: DebugConn, frame: Optional[int] = None, count: int = 65536,
         "label": label,
         "frame": int(reply.get("frame", frame)),
         "source": {"host": conn.host, "port": conn.port},
+        "ring": span,
         "raw_count": raw_count,
         "requested": int(count),
         "capped": raw_count >= int(count),

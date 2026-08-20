@@ -2,18 +2,28 @@
 """gpu_frame_capture.py -- capture one frame's GP0 stream + screenshot, decoded
 and attributed to the guest functions that issued it.
 
-    # whatever is on screen right now, saved as the "bad" reference
+    # the newest frame the ring holds, saved as the "bad" reference
     python3 gpu_frame_capture.py --tag bad --out analysis/frames
 
-    # a specific frame, with the runtime driven there first
-    python3 gpu_frame_capture.py --run-to 41230 --tag good --out analysis/frames
+    # a specific past frame, and the four before it
+    python3 gpu_frame_capture.py --frame 41230 --frames 5 --tag bad
 
-    # just print who drew what, keep nothing
-    python3 gpu_frame_capture.py --summary --no-save
+    # what can I still ask for?
+    python3 gpu_frame_capture.py --ring
 
-Writes <out>/<tag>.json (a psx-gpu-frame dump), <out>/<tag>.png (the presented
-frame), and <out>/<tag>.opcodes.json (the GP0 opcode histogram) so a later
-diff or layer render has everything without needing the game still running.
+You do not pause the game to use this, and you cannot: pause / step /
+run_to_frame were removed from psx-runtime (runtime/src/debug_server.c) because
+pause-step-read synthesizes a snapshot instead of reading the history the
+runtime already keeps. The GP0 ring holds ~1M packets -- several hundred frames
+-- so the workflow is the other way round: play until the bug is on screen, then
+capture that frame AND the ones leading up to it. Reaching backwards beats
+freezing forwards, and it is the only thing that works for a glitch you cannot
+stop on.
+
+Writes <out>/<tag>.json (a psx-gpu-frame dump), <out>/<tag>.summary.json (the
+compact attribution RetComM Studio reads), <out>/<tag>.png (the presented
+frame), and <out>/<tag>.opcodes.json, so a later diff or layer render needs
+nothing still running.
 """
 
 from __future__ import annotations
@@ -77,11 +87,14 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--frame", type=int, default=None,
-                    help="frame to dump (default: whatever the runtime is on)")
-    ap.add_argument("--run-to", type=int, default=None,
-                    help="drive the runtime to this frame first, then dump it")
+                    help="frame to dump (default: the newest one the ring holds)")
     ap.add_argument("--frames", type=int, default=1,
-                    help="capture N consecutive frames (tag gets a -NN suffix)")
+                    help="also capture the N-1 frames BEFORE --frame, walking "
+                         "backwards through the ring (tag gets a -NN suffix, "
+                         "-00 being the newest)")
+    ap.add_argument("--ring", action="store_true",
+                    help="print which frames the GP0 ring can still be asked "
+                         "for, then exit")
     ap.add_argument("--count", type=int, default=65536, help="max GP0 packets to pull")
     ap.add_argument("--tag", default="frame", help="output basename")
     ap.add_argument("--out", default="analysis/frames", help="output directory")
@@ -93,22 +106,35 @@ def main(argv=None):
 
     try:
         with DebugConn(args.host, args.port, args.timeout) as conn:
-            if args.run_to is not None:
-                conn.run_to_frame(args.run_to)
+            span = conn.ring_span()
+            if args.ring:
+                print(f"GP0 ring: {span['total']} packet(s) seen, capacity "
+                      f"{span['capacity']}, {span['max_words']} words/packet")
+                if span["total"] == 0:
+                    print("  nothing recorded yet -- is a game running?")
+                else:
+                    print(f"  capturable frames: {span['oldest']}..{span['newest']}")
+                return 0
 
             outdir = os.path.abspath(args.out)
             if not args.no_save:
                 os.makedirs(outdir, exist_ok=True)
 
-            base_frame = args.frame if args.frame is not None else conn.frame()
-            for i in range(max(1, args.frames)):
-                frame = base_frame + i
-                if i:
-                    # Stepping keeps the pause state the caller set up; run_to
-                    # would resume free-running and blow past the frame.
-                    conn.cmd("step", n=1)
-                tag = args.tag if args.frames == 1 else f"{args.tag}-{i:02d}"
-                dump = capture(conn, frame=frame, count=args.count, label=tag)
+            base_frame = args.frame if args.frame is not None else span["newest"]
+            n = max(1, args.frames)
+            print(f"ring holds frames {span['oldest']}..{span['newest']}; "
+                  f"capturing {n} frame(s) ending at {base_frame}")
+            for i in range(n):
+                # Walk BACKWARDS: the ring is history, and the frames before the
+                # one you noticed are the ones that explain it.
+                frame = base_frame - i
+                if frame < span["oldest"]:
+                    print(f"  stopping at {frame}: older than the ring holds "
+                          f"({span['oldest']})", file=sys.stderr)
+                    break
+                tag = args.tag if n == 1 else f"{args.tag}-{i:02d}"
+                dump = capture(conn, frame=frame, count=args.count, label=tag,
+                               verify_ring=False)
 
                 if not args.no_save:
                     jp = os.path.join(outdir, f"{tag}.json")
@@ -125,11 +151,15 @@ def main(argv=None):
                     except DebugError as e:
                         print(f"  (gpu_opcodes unavailable: {e})", file=sys.stderr)
                     if not args.no_shot:
-                        try:
-                            r = conn.screenshot(os.path.join(outdir, f"{tag}.png"))
-                            print(f"wrote {r.get('path')}")
-                        except DebugError as e:
-                            print(f"  (screenshot failed: {e})", file=sys.stderr)
+                        if frame != span["newest"]:
+                            print("  (no screenshot: the framebuffer holds the "
+                                  "live frame, not this historical one)")
+                        else:
+                            try:
+                                r = conn.screenshot(os.path.join(outdir, f"{tag}.png"))
+                                print(f"wrote {r.get('path')}")
+                            except DebugError as e:
+                                print(f"  (screenshot failed: {e})", file=sys.stderr)
 
                 if args.summary or args.no_save:
                     summarise(dump, top=args.top)

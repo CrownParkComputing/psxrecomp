@@ -118,6 +118,51 @@ selected project's `game.toml` says.
 
 ---
 
+## You cannot pause the game, and you do not need to
+
+`pause`, `continue`, `step` and `run_to_frame` were **removed** from
+psx-runtime. `runtime/src/debug_server.c` still registers them, but only as
+handlers that return an error explaining the migration — pause-step-read
+synthesizes a snapshot ("what is state right NOW") instead of reading the
+history the runtime already records continuously, and in this codebase it forced
+the runtime into a wait loop where a dropped client looked like a freeze.
+
+The replacement is better for chasing a render bug. The GP0 ring holds
+`1 << 20` packets (`gpu.c`, `GP0_RING_CAP`) — several hundred frames — so the
+workflow runs the other way round:
+
+> Play until the bug is on screen. **Then** capture that frame, and the frames
+> leading up to it.
+
+Reaching backwards beats freezing forwards, and it is the only thing that works
+at all for a glitch you cannot reliably stop on.
+
+```bash
+python3 $P/gpu_frame_capture.py --ring        # what can I still ask for?
+# GP0 ring: 812344 packet(s) seen, capacity 1048576, 12 words/packet
+#   capturable frames: 40918..41230
+```
+
+`gpu_frame_dump` on a frame that has been evicted returns an **empty** dump, not
+an error — which reads exactly like "that frame drew nothing", a conclusion you
+might act on. So `capture()` checks the span first and refuses, and Studio's
+Frames tab shows the span next to the frame selector and marks an out-of-ring
+frame in red.
+
+What replaces each removed command:
+
+| Gone | Use instead |
+|---|---|
+| `run_to_frame N` | `--frame N` against the ring (any frame it still holds) |
+| `step` | `--frames N`, walking backwards from `--frame` |
+| `pause` + read state | `frame_range` / `get_frame` (per-frame records), `fn_entry_dump`, `wtrace_dump` |
+| `pause` + inspect drawing | `gpu_frame_dump frame=N` — what this whole toolchain does |
+
+Savestates are unaffected: `savestate` is a real handler, and a savestate plus a
+fixed frame number still makes a run reproducible.
+
+---
+
 ## Transport
 
 **One request per connection.** `io_thread_main()` in `debug_server.c` accepts,
@@ -134,10 +179,10 @@ from a hung emulator. `psx_gpu_frame.DebugConn` opens a socket per command;
 cd <your recomp project>
 P=psxrecomp/tools
 
-# 1. Put the game on the frame you want, then capture it twice: once while it
-#    still looks right, once after it breaks.
-python3 $P/gpu_frame_capture.py --tag good --out analysis/frames --summary
-python3 $P/gpu_frame_capture.py --tag bad  --out analysis/frames --summary
+# 1. Play until the bug is on screen. Capture the newest frame as the suspect,
+#    then reach BACK into the ring for one that still looked right.
+python3 $P/gpu_frame_capture.py --tag bad --out analysis/frames --summary
+python3 $P/gpu_frame_capture.py --frame 41100 --tag good --out analysis/frames --summary
 
 # 2. What changed?
 python3 $P/gpu_frame_diff.py analysis/frames/good.json analysis/frames/bad.json
@@ -149,8 +194,14 @@ python3 $P/gpu_frame_layers.py analysis/frames/bad.json --out analysis/frames/ba
 python3 $P/gpu_parity.py --frame 41230 --out analysis/frames/parity
 ```
 
-`--run-to N` drives the runtime to a frame before capturing, so a savestate plus
-a fixed frame number makes the whole thing reproducible.
+`--frames N` also grabs the N-1 frames *before* `--frame`, walking backwards
+through the ring — the frames leading up to the one you noticed are usually the
+ones that explain it. A savestate plus a fixed frame number still makes the whole
+thing reproducible.
+
+A screenshot is only written for the live frame: the framebuffer holds the
+present, not the historical frame you just dumped, and saving it beside an older
+dump would label it as something it is not.
 
 ### Artifacts
 
@@ -216,13 +267,23 @@ Studio's Frames tab has a **Save name** box that calls exactly this, so
 
 ## Parity scope
 
-`gpu_parity.py` compares **images**, not GP0 streams. The DuckStation oracle
+`gpu_parity.py` compares **images**, not GP0 streams. Only DuckStation is
+driven: it implements `run_to_frame`, psx-runtime does not, so the native side is
+sampled where it already is and DuckStation is advanced to meet it. A residual
+frame mismatch is reported rather than papered over. The DuckStation oracle
 patch (`tools/duckstation/psxrecomp_oracle.patch`) implements `screenshot`,
 `read_vram`, `gpu_state`, `run_to_frame`, `step` and `pause` — but not
 `gpu_frame_dump`, so there is no packet stream to compare on that side. Adding
 one to the patch is the obvious next step if image parity keeps saying "the
 streams must differ" without saying where; until then, `tools/cosim.py` brackets
 the divergence.
+
+Getting an oracle on Linux: `python3 tools/duckstation_oracle.py all` builds and
+installs a patched DuckStation into `~/.local/share/retcomm/oracle/duckstation/`
+— outside any game repo, shared by every title — and `start --disc <cue>` runs it
+headless on 4371. On Arch-family and NixOS hosts the build runs inside
+`ubuntu:22.04` via podman, because upstream's CMake refuses those hosts outright
+and its build scripts may not be patched. See `tools/duckstation/README.md`.
 
 Both instances must be driven identically — same disc, same starting state.
 Parity between two runs that were not driven the same way means nothing.

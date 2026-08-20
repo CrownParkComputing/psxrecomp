@@ -19,6 +19,18 @@ gpu_frame_dump, so there is no packet stream to compare on that side. Adding one
 to the patch is the obvious next step if image parity keeps saying "the streams
 must differ" without saying where.
 
+Only DuckStation gets driven. psx-runtime removed pause / step / run_to_frame
+(runtime/src/debug_server.c) -- it is designed to be read from, not steered --
+so the native side is sampled where it already is, and DuckStation is advanced
+to meet it. If the native run has already passed the frame DuckStation is on,
+there is nothing to do but restart the DuckStation side; that is reported rather
+than papered over.
+
+Getting the oracle: `python3 duckstation_oracle.py all` builds and installs a
+patched DuckStation into the RetComM data root (once, ~10 minutes), and
+`duckstation_oracle.py start --disc <cue>` runs it headless on 4371. Pass
+--start-oracle here to have this tool do that for you when nothing is listening.
+
 Both instances must already be running with their debug servers up, on the same
 disc, from the same starting state -- typically both loaded from the same
 savestate, or both run from boot with the same input script. Parity between two
@@ -43,6 +55,36 @@ from psx_gpu_frame import (  # noqa: E402
 
 GPU_STATE_FIELDS = ("display_area_x", "display_area_y", "disp_w", "disp_h",
                     "da_x", "da_y", "display_enable")
+
+
+def ensure_oracle(args) -> int:
+    """Start the installed DuckStation oracle if nothing is answering yet.
+
+    Opt-in (--start-oracle), because launching an emulator as a side effect of
+    running a diff tool is a surprise nobody asked for. When it is not
+    requested, a missing oracle just reports how to get one.
+    """
+    import subprocess as sp
+    probe = DebugConn(args.host, args.ds_port, timeout=2.0)
+    try:
+        probe.cmd("ping")
+        return 0
+    except DebugError:
+        pass
+    if not args.disc:
+        print("error: --start-oracle needs --disc (the same image psx-runtime "
+              "is running)", file=sys.stderr)
+        return 2
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "duckstation_oracle.py")
+    cmd = [sys.executable, tool, "start", "--disc", args.disc,
+           "--port", str(args.ds_port), "--wait", "90"]
+    print("starting the DuckStation oracle: " + " ".join(cmd))
+    if sp.run(cmd).returncode != 0:
+        print("error: could not start the oracle. `python3 duckstation_oracle.py "
+              "status` will say what is missing.", file=sys.stderr)
+        return 2
+    return 0
 
 
 def compare_images(pa, pb, out_path):
@@ -100,9 +142,16 @@ def main(argv=None):
     ap.add_argument("--native-port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--frame", type=int, default=None,
-                    help="drive BOTH to this guest frame before capturing")
+                    help="target guest frame (default: wherever the native run "
+                         "already is). Only DuckStation is driven to it.")
     ap.add_argument("--out", default="analysis/frames/parity")
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--start-oracle", action="store_true",
+                    help="if nothing answers on the DuckStation port, start the "
+                         "installed oracle first (needs --disc)")
+    ap.add_argument("--disc", default=None,
+                    help="disc image for --start-oracle; must be the same one "
+                         "psx-runtime is running")
     ap.add_argument("--dump-native", action="store_true",
                     help="also capture the native GP0 stream (no DuckStation counterpart)")
     args = ap.parse_args(argv)
@@ -111,20 +160,33 @@ def main(argv=None):
     os.makedirs(outdir, exist_ok=True)
     result = {"kind": "psx-gpu-parity", "version": 1, "frame": args.frame}
 
+    if args.start_oracle:
+        rc = ensure_oracle(args)
+        if rc:
+            return rc
+
     try:
         with DebugConn(args.host, args.native_port, args.timeout) as native, \
              DebugConn(args.host, args.ds_port, args.timeout) as ds:
-            if args.frame is not None:
-                native.run_to_frame(args.frame)
-                ds.run_to_frame(args.frame)
+            # The native side is read where it is; only DuckStation is steered.
+            target = args.frame if args.frame is not None else native.frame()
+            result["target_frame"] = target
+            try:
+                ds.run_to_frame(target)
+            except DebugError as e:
+                result["duckstation_drive_error"] = str(e)
+                print(f"warning: could not drive DuckStation to frame {target}: {e}",
+                      file=sys.stderr)
+
             fa, fb = native.frame(), ds.frame()
             result["native_frame"] = fa
             result["duckstation_frame"] = fb
             if fa != fb:
                 result["frame_mismatch"] = True
-                print(f"warning: frames differ (native {fa}, duckstation {fb}); "
-                      f"the comparison below is between DIFFERENT frames",
-                      file=sys.stderr)
+                print(f"warning: frames differ (native {fa}, duckstation {fb}). "
+                      f"The native run cannot be paused, so it keeps advancing; "
+                      f"pass --frame to pin a target, or accept that the two "
+                      f"images below are of DIFFERENT frames.", file=sys.stderr)
 
             pa = os.path.join(outdir, "native.png")
             pb = os.path.join(outdir, "duckstation.png")

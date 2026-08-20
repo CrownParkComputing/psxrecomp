@@ -351,7 +351,11 @@ class TestDebugConn(unittest.TestCase):
         self.assertEqual(dump["frame"], 4242)
         self.assertEqual(dump["raw_count"], 1)
         self.assertIn("0x80050000", dump["funcs"])
-        self.assertEqual(len(srv.requests), 3)
+        # ping, ping, gpu_ring_stats (declined here), gpu_frame_dump -- four
+        # commands, and therefore four separate connections. The count is the
+        # assertion: a client reusing one socket would never get this far.
+        self.assertEqual([r["cmd"] for r in srv.requests],
+                         ["ping", "ping", "gpu_ring_stats", "gpu_frame_dump"])
 
     def test_error_replies_raise_with_the_server_message(self):
         srv = OneShotServer(lambda req: {"ok": False, "error": "missing frame"})
@@ -360,6 +364,100 @@ class TestDebugConn(unittest.TestCase):
         with self.assertRaises(GF.DebugError) as cm:
             conn.cmd("gpu_frame_dump", frame=1)
         self.assertIn("missing frame", str(cm.exception))
+
+    def test_capture_uses_the_ring_span_when_no_frame_is_given(self):
+        stream = [entry(0, 0x20, [color(1, 1, 1), vert(0, 0), vert(4, 0), vert(0, 4)],
+                        func="0x80060000")]
+
+        def handler(req):
+            if req["cmd"] == "gpu_ring_stats":
+                return {"ok": True, "total": 5000, "capacity": 1 << 20,
+                        "max_words": 12, "oldest_frame": 900, "newest_frame": 1000}
+            if req["cmd"] == "gpu_frame_dump":
+                return {"ok": True, "frame": req["frame"], "count": len(stream),
+                        "max_words": 12, "entries": stream}
+            if req["cmd"] == "ping":
+                return {"ok": True, "frame": 1234}
+            return {"ok": False, "error": "unknown"}
+
+        srv = OneShotServer(handler)
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        self.assertEqual(conn.ring_span()["newest"], 1000)
+        # No --frame: take the newest the RING holds, not whatever ping says the
+        # runtime is on. Those differ, and only the ring one is dumpable.
+        dump = GF.capture(conn, label="t")
+        self.assertEqual(dump["frame"], 1000)
+        self.assertEqual(dump["ring"]["oldest"], 900)
+
+    def test_capture_refuses_a_frame_that_fell_out_of_the_ring(self):
+        def handler(req):
+            if req["cmd"] == "gpu_ring_stats":
+                return {"ok": True, "total": 5000, "capacity": 1 << 20,
+                        "max_words": 12, "oldest_frame": 900, "newest_frame": 1000}
+            return {"ok": True, "frame": 1, "count": 0, "entries": []}
+
+        srv = OneShotServer(handler)
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        with self.assertRaises(GF.DebugError) as cm:
+            GF.capture(conn, frame=42, label="t")
+        msg = str(cm.exception)
+        self.assertIn("900..1000", msg)
+        # An evicted frame must not be reported as a frame that drew nothing.
+        self.assertIn("empty, not zero-drawn", msg)
+
+    def test_capture_rejects_a_server_that_answers_ok_with_no_entries(self):
+        # Exactly what a leftover stub does: {"ok": true} and nothing else. The
+        # old code turned that into a cheerful 0-packet dump.
+        srv = OneShotServer(lambda req: {"ok": True})
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        with self.assertRaises(GF.DebugError) as cm:
+            GF.capture(conn, frame=5, label="t")
+        self.assertIn("not a psx-runtime debug server", str(cm.exception))
+
+    def test_capture_survives_a_server_without_gpu_ring_stats(self):
+        stream = [entry(0, 0x20, [color(1, 1, 1), vert(0, 0), vert(4, 0), vert(0, 4)],
+                        func="0x80060000")]
+
+        def handler(req):
+            if req["cmd"] == "gpu_ring_stats":
+                return {"ok": False, "error": "unknown command"}
+            if req["cmd"] == "ping":
+                return {"ok": True, "frame": 77}
+            return {"ok": True, "frame": req.get("frame", 0), "count": 1,
+                    "entries": stream}
+
+        srv = OneShotServer(handler)
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        dump = GF.capture(conn, label="t")
+        self.assertEqual(dump["frame"], 77)      # fell back to ping
+        self.assertIsNone(dump["ring"])
+
+    def test_removed_transport_commands_raise_the_servers_own_message(self):
+        # psx-runtime keeps pause/step/run_to_frame registered as error stubs.
+        # The tools must surface that text, not swallow it into a silent no-op.
+        removed = ("pause is removed; query a ring buffer",
+                   "run_to_frame is removed; use frame_range")
+
+        def handler(req):
+            if req["cmd"] == "pause":
+                return {"ok": False, "error": removed[0]}
+            if req["cmd"] == "run_to_frame":
+                return {"ok": False, "error": removed[1]}
+            return {"ok": True}
+
+        srv = OneShotServer(handler)
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        with self.assertRaises(GF.DebugError) as cm:
+            conn.run_to_frame(10)
+        self.assertIn("frame_range", str(cm.exception))
+        with self.assertRaises(GF.DebugError) as cm2:
+            conn.cmd("pause")
+        self.assertIn("ring buffer", str(cm2.exception))
 
     def test_summary_round_trips(self):
         stream = [entry(0, 0x22, [color(7, 7, 7), vert(0, 0), vert(9, 0), vert(0, 9)],
