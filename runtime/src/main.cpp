@@ -205,6 +205,18 @@ extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
                                                   uint32_t len);
 
+/* setenv(3) is POSIX and is absent from the MinGW CRT; the Windows spelling
+ * is _putenv_s, which always overwrites -- i.e. setenv(..., 1). Same #ifdef
+ * shape host/psxrecomp_codegen_host.c already uses for its PATH edits. */
+static void psx_setenv(const char *name, const char *value)
+{
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 /* Arm the dirty-RAM text-image guard with the boot EXE bytes. The guard is
  * load-bearing: dispatch native-safety (dirty_ram_text_native_ok) and the
  * fntrace alternate game-start latch both key off the registered image, so
@@ -14409,8 +14421,8 @@ session_reboot:
                 }
             }
 
-            setenv("PSX_LINK_SHM_NAME", shm_name, 1);
-            setenv("PSX_LINK_SHM_ROLE", (base >= 2) ? "b" : "a", 1);
+            psx_setenv("PSX_LINK_SHM_NAME", shm_name);
+            psx_setenv("PSX_LINK_SHM_ROLE", (base >= 2) ? "b" : "a");
             sio1_set_backend("shm");
 
             static char env_name[128], env_role[32];
