@@ -8830,19 +8830,38 @@ namespace {
         const bool stale = g_lnch_lan_modok_sent_ms == 0 ||
                            (now_ms - g_lnch_lan_modok_sent_ms) > 1000u;
         if ((changed || disagrees || host_thinks < 0) && stale) {
+            if (changed) {
+                std::fprintf(stdout,
+                    "psxrecomp: LAN mods: plan has %d package(s), %d missing "
+                    "here -> reporting %s to host\n",
+                    ae_np_spec_missing_count(g_lnch_lan_mod_spec, -2, nullptr),
+                    missing, ok ? "READY" : "MISSING");
+                std::fflush(stdout);
+            }
             g_lnch_lan_modok_sent = ok;
             g_lnch_lan_modok_sent_ms = now_ms;
             char msg[192];
             std::snprintf(msg, sizeof(msg), "MOTK5 MODOK\n%s\n%d\n",
                           ae_np_lan_local_player_id(), ok);
             char host[64];
-            if (ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host))) {
-                sockaddr_in to{};
-                to.sin_family = AF_INET;
-                to.sin_addr.s_addr = inet_addr(host);
-                to.sin_port =
-                    htons((uint16_t)ae_np_lan_endpoint_port(g_lnch_lan_endpoint));
+            const int port = ae_np_lan_endpoint_port(g_lnch_lan_endpoint);
+            sockaddr_in to{};
+            to.sin_family = AF_INET;
+            to.sin_port = htons((uint16_t)port);
+            /* inet_pton, matching the JOIN keepalive that is known to reach
+             * the host; inet_addr() maps a bad string to 255.255.255.255. */
+            const bool addr_ok =
+                ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host)) &&
+                inet_pton(AF_INET, host, &to.sin_addr) == 1;
+            if (addr_ok && g_lnch_lan_udp != kAeLanSockInvalid) {
                 ae_np_lan_udp_sendto(to, msg);
+            }
+            if (changed) {
+                std::fprintf(stdout,
+                    "psxrecomp: LAN mods: MODOK -> %s:%d (addr_ok=%d sock=%d)\n",
+                    host[0] ? host : "?", port, addr_ok ? 1 : 0,
+                    g_lnch_lan_udp != kAeLanSockInvalid ? 1 : 0);
+                std::fflush(stdout);
             }
         }
     }
@@ -8962,6 +8981,16 @@ namespace {
             }
             ae_np_lan_sock_close(&c);
         }
+    }
+
+    /* Shutdown for BOTH transfer threads. Safe to call repeatedly and from
+     * atexit; never leaves a joinable thread behind. */
+    static void ae_np_lan_mod_threads_stop(void) {
+        g_lan_mod_listen_run.store(false);
+        ae_np_lan_sock_close(&g_lan_mod_listen_sock);
+        if (g_lan_mod_listen_thr.joinable()) g_lan_mod_listen_thr.join();
+        g_lan_mod_dl_run.store(false);
+        if (g_lan_mod_dl_thr.joinable()) g_lan_mod_dl_thr.join();
     }
 
     static void ae_np_lan_mod_listen_stop() {
@@ -9249,7 +9278,13 @@ namespace {
         }
     }
 
+    static void ae_np_lan_mod_threads_stop(void);
+
     static void ae_np_lan_atexit_cleanup(void) {
+        /* Unconditional: the mod transfer threads exist for guests too, and a
+         * joinable std::thread destroyed at process teardown calls
+         * std::terminate ("terminate called without an active exception"). */
+        ae_np_lan_mod_threads_stop();
         if (!g_lnch_hosting_lan) return;
         std::error_code ec;
         std::filesystem::remove(ae_np_lan_file(), ec);
@@ -10405,6 +10440,20 @@ namespace {
             if (n <= 0) break;
             buf[n] = '\0';
 
+            if (g_lnch_hosting_lan && std::strncmp(buf, "MOTK5 ", 6) == 0) {
+                /* Rate-limited receipt trace: distinguishes "the peer never
+                 * sent it" from "it arrived and no handler claimed it". */
+                static uint32_t s_last_rx_ms = 0;
+                const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                if (nowm - s_last_rx_ms > 2000u) {
+                    s_last_rx_ms = nowm;
+                    char head[24] = {0};
+                    for (int i = 0; i < 20 && buf[i] && buf[i] != '\n'; ++i)
+                        head[i] = buf[i];
+                    std::fprintf(stdout, "psxrecomp: LAN rx '%s'\n", head);
+                    std::fflush(stdout);
+                }
+            }
             if (std::strncmp(buf, "MOTK1 PING", 10) == 0 && g_lnch_hosting_lan) {
                 ae_np_lan_udp_sendto(from, "MOTK1 PONG\n");
                 continue;
@@ -10746,7 +10795,45 @@ namespace {
                 AeLanLobbyState st;
                 if (!ae_np_read_lan_state(&st)) continue;
                 const int slot = ae_np_lan_find_slot_by_id(st, pid.c_str());
-                if (slot < 0 || slot >= kAeLanMaxSlots) continue;
+                {
+                    /* Unconditional (rate-limited) trace: "no output" was
+                     * ambiguous between not-parsed, not-matched and
+                     * matched-but-unchanged. Print the raw inputs. */
+                    static uint32_t s_last_trace_ms = 0;
+                    const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                    if (nowm - s_last_trace_ms > 1000u) {
+                        s_last_trace_ms = nowm;
+                        std::fprintf(stdout,
+                            "psxrecomp: LAN mods: MODOK pid='%s' ok=%d -> slot=%d "
+                            "(host_slot=%d, seats: 0='%s' 1='%s' 2='%s' 3='%s')\n",
+                            pid.c_str(), peer_ok, slot, st.host_slot,
+                            st.slot_id[0].c_str(), st.slot_id[1].c_str(),
+                            st.slot_id[2].c_str(), st.slot_id[3].c_str());
+                        std::fflush(stdout);
+                    }
+                }
+                if (slot < 0 || slot >= kAeLanMaxSlots) {
+                    /* Unseated / unknown id: the report is unusable and the
+                     * seat stays "not ready", which is exactly what stalls
+                     * the launch gate — say so instead of dropping silently. */
+                    static uint32_t s_last_warn_ms = 0;
+                    const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                    if (nowm - s_last_warn_ms > 3000u) {
+                        s_last_warn_ms = nowm;
+                        std::fprintf(stderr,
+                            "psxrecomp: LAN mods: MODOK from unknown player "
+                            "'%s' (not seated yet?) — seat stays not-ready\n",
+                            pid.c_str());
+                        std::fflush(stderr);
+                    }
+                    continue;
+                }
+                if (g_lnch_lan_slot_mods_ok[slot] != peer_ok) {
+                    std::fprintf(stdout,
+                                 "psxrecomp: LAN mods: seat %d reports %s\n",
+                                 slot, peer_ok ? "READY" : "MISSING MODS");
+                    std::fflush(stdout);
+                }
                 g_lnch_lan_slot_mods_ok[slot] = peer_ok;
                 /* Always echo the table back, even when nothing changed: the
                  * guest reconciles against this echo and keeps resending
