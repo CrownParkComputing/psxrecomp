@@ -23,6 +23,7 @@
 #include "lockstep.h"
 #include "data_shards.h"
 #include "dirty_ram_interp.h"
+#include "netplay_ram_dirty.h"
 #include "psx_cycles.h"
 #include "starvation_ring.h"
 #include "psx_ram.h"
@@ -231,6 +232,7 @@ int memory_ram_bank_activate(int slot) {
     ram = s_ram_banks[slot];
     g_psx_ram = s_ram_banks[slot];
     s_ram_bank_live = slot;
+    np_ram_dig_mark_all();   /* whole visible RAM just changed identity */
     return 1;
 }
 
@@ -290,6 +292,7 @@ static void psx_ram_apply_size_request(void) {
 
 void memory_clear_low_boot_scratch(void) {
     memset(ram, 0, 0x10u);
+    np_ram_dig_note_range(0, 0x10u);
 }
 
 /* ---- Dirty-page tracking for install-at-runtime code (CLAUDE.md Rule 18) ----
@@ -1390,6 +1393,7 @@ void memory_init(const char* bios_path) {
     i_mask = 0;
     /* Host dirty/text/overlay bitmaps survive memset(ram) and fork dig0. */
     dirty_ram_reset_for_boot();
+    np_ram_dig_mark_all();
     /* Re-latch kbless window from the newly activated psx_bios_image. */
     psx_kernel_bless_reset_for_boot();
 
@@ -2100,6 +2104,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, val, 4);
         overlay_watch_note_write(phys, 4);
+        np_ram_dig_note_write(phys);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
 #endif
@@ -2228,6 +2233,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 2);
         overlay_watch_note_write(phys, 2);
+        np_ram_dig_note_write(phys);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
 #endif
@@ -2563,6 +2569,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 1);
         overlay_watch_note_write(phys, 1);
+        np_ram_dig_note_write(phys);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
 #endif

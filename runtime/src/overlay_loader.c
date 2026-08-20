@@ -1,4 +1,5 @@
 #include "overlay_loader.h"
+#include "netplay_ram_dirty.h"
 #include "overlay_api.h"
 #include "overlay_path_canon.h"
 #include "code_provider.h"
@@ -4221,6 +4222,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     *cpu = cpu0;
     memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
+    np_ram_dig_mark_all();
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     /* Arm the own-interior native route for the NATIVE pass only (see
      * s_shadow_cand decl): the candidate's CPS continuation re-entries run
@@ -4328,6 +4330,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     *cpu = cpuI;
     memcpy(ram,  s_ramI,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spadI, SHADOW_SPAD_SIZE);
+    np_ram_dig_mark_all();
     g_psx_call_bail = 0;
     s_native_exec  = sv;
     s_suppress_irq = saved_supp;

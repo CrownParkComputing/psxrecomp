@@ -59,6 +59,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #endif
 #include "psx_netplay.h"
 #include "psx_link_pair.h"
+#include "psx_cpu_pin.h"
 #include "overlay_api.h"
 #include "psx_stick.h"       /* radial SDL-stick -> DualShock response transform */
 #include "psx_netplay_rb.h"
@@ -86,6 +87,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "mod_plugins.h"
 #include "psx_ram.h"
 #include "mod_runtime.h"
+#include "psx_sha256.h"   /* verify peer-sent mod packages before install */
 #include "crc32.h"
 #include "disc_identity.h"
 #include "disc_path.h"
@@ -5247,6 +5249,12 @@ static void netplay_barrier_admit(int override) {
         s_np_timing_frames++;
     }
     int liveness_rearamed = 0;
+    /* LINKPERF guest-window breakdown: the whole spin sits inside the
+     * admit-to-admit "guest" window, so attribute each refused-poll slice to
+     * netin (peer input not here yet) or spin (any other refusal). */
+    const int gw_on = psx_link_pair_perf_enabled();
+    uint64_t gw_prev = 0;
+    int gw_last_net = 0;
     for (;;) {
         uint32_t dt = 0, lh = 0, rh = 0;
         const Uint64 now_ms = SDL_GetTicks64();
@@ -5417,6 +5425,12 @@ static void netplay_barrier_admit(int override) {
                                  psx_netplay_is_resimulating());
         }
         if (psx_netplay_poll_admit()) {
+            /* Close the spin attribution BEFORE on_admit ends the guest
+             * window (the report snapshots the slots there). */
+            if (gw_prev)
+                psx_link_pair_perf_gw_add(gw_last_net ? PSX_LINK_PERF_GW_NETIN
+                                                      : PSX_LINK_PERF_GW_SPIN,
+                                          psx_link_pair_perf_now_us() - gw_prev);
             /* PSX-Link: pipeline barrier + TICK emit for the tick about to
              * run. Follower death aborts the whole session. */
             if (psx_netplay_link_active() &&
@@ -5431,6 +5445,18 @@ static void netplay_barrier_admit(int override) {
                 s_np_last_admit_end = t1;
             }
             return;
+        }
+        /* Refused: attribute the slice since the previous refusal to the
+         * reason the poll just gave, and restart the slice clock. */
+        if (gw_on) {
+            const uint64_t gw_now = psx_link_pair_perf_now_us();
+            const int gw_net = psx_netplay_admit_stall_is_net();
+            if (gw_prev)
+                psx_link_pair_perf_gw_add(gw_net ? PSX_LINK_PERF_GW_NETIN
+                                                 : PSX_LINK_PERF_GW_SPIN,
+                                          gw_now - gw_prev);
+            gw_prev = gw_now;
+            gw_last_net = gw_net;
         }
         /* Episode snap may have been applied during pump/try_admit without
          * longjmp — flush here (no present-body C++ RAII) before spinning.
@@ -7240,6 +7266,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 #ifndef PSX_SDL_NO_RENDER
         if (g_gl_active && g_gl_fbo_present && !di.depth24 &&
             !local_viewport_crop) {
+            const uint64_t gw_pres_t0 = psx_link_pair_perf_now_us();
             if (wide_present) {
                 /* GPU-direct native-wide present: blit the displayed buffer's
                  * wide FBO straight to the window (GPU-side, like the canonical
@@ -7250,6 +7277,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * the wide surface for this buffer doesn't exist yet. */
                 if (gl_renderer_present_wide_fbo((int)di.display_x, (int)di.display_y,
                                                  (int)h, g_video_aa ? 1 : 0)) {
+                    psx_link_pair_perf_gw_add(
+                        PSX_LINK_PERF_GW_PRESENT,
+                        psx_link_pair_perf_now_us() - gw_pres_t0);
                     netplay_note_present();
                     return ep;
                 }
@@ -7257,6 +7287,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
                                          (fmv_frame || nw_pin) ? 1 : 0);
+                psx_link_pair_perf_gw_add(
+                    PSX_LINK_PERF_GW_PRESENT,
+                    psx_link_pair_perf_now_us() - gw_pres_t0);
                 netplay_note_present();
                 return ep;
             }
@@ -7655,8 +7688,12 @@ static void sdl_vblank_present(void) {
     }
     uint64_t perf_start = runtime_perf_section_begin();
     refresh_frame_pacer_period();
-    if (present_should_wall_pace())
+    if (present_should_wall_pace()) {
+        const uint64_t gw_t0 = psx_link_pair_perf_now_us();
         frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+        psx_link_pair_perf_gw_add(PSX_LINK_PERF_GW_PACE,
+                                  psx_link_pair_perf_now_us() - gw_t0);
+    }
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     latency_ring_mark(LAT_PACED);
 }
@@ -7909,6 +7946,10 @@ namespace {
     int g_lnch_rollback = 1;
     int g_lnch_lobby_kind = 0;         /* 0 standard, 1 PSX-Link */
     int g_lnch_link_lobby_supported = 0; /* game.toml [netplay] link_lobby */
+    /* Shared dev channel. game.toml [netplay] dev_tag, or PSX_NETPLAY_DEV_TAG
+     * at runtime (which also lets a packaged RELEASE build join the channel
+     * without a rebuild — useful for testing a bundle before it ships). */
+    std::string g_lnch_netplay_dev_tag;
     int g_lnch_multitap_analog = 1;
     int g_lnch_host_max_slots = 2;
 
@@ -7959,10 +8000,44 @@ namespace {
         int can_scph1001 = 0;
     };
     AeLanSlotBios g_lnch_lan_slot_bios[kAeLanMaxSlots]{};
+    /* LAN / Direct-IP mod plan. There is no lobby server to relay match_caps,
+     * so the HOST publishes its applied plan as the same compact spec the
+     * PSX-Link pair uses (id@ver:feats;...) in MOTK5 UPDATE, and every peer
+     * reports back whether it can run it (MOTK5 MODOK). g_lnch_lan_slot_mods_ok
+     * is the host's view of that, mirrored to peers so any UI can gate on it. */
+    /* Seat trade state (see the seat self-service block below). */
+    struct AeSeatSwap {
+        int  in_active = 0;              /* somebody asked me to trade */
+        char in_who[64] = {0};
+        char in_id[PSX_LOBBY_ID_LEN] = {0};
+        int  in_from_slot = -1;
+        int  out_state = 0;              /* 0 idle 1 waiting 2 ok -1 declined */
+        int  out_target = -1;
+    };
+    AeSeatSwap g_seat_swap;
+    static int ae_np_lan_do_seat_move(int from_slot, int to_slot,
+                                      bool allow_swap);
+
+    std::string g_lnch_lan_mod_spec;
+    int      g_lnch_lan_modok_sent = -1;      /* last value reported to host */
+    uint32_t g_lnch_lan_modok_sent_ms = 0;    /* rate limit for the resend */
+    std::string g_lnch_lan_mod_fp;        /* host's portable plan fingerprint */
+    int g_lnch_lan_slot_mods_ok[kAeLanMaxSlots]{};
+    int g_lnch_lan_local_mods_ok = 1;
     /* Match-only BIOS token from lobby settle or LAN START ("openbios"|"scph1001"). */
     char g_lnch_session_bios[16]{};
 
     static int ae_np_lan_occupied(const AeLanLobbyState& state);
+    static void ae_np_refresh_mod_offer();
+    static void ae_np_sync_plan_fp_from_caps();
+    static const char* ae_np_lobby_version();
+    struct AeLanLobbyState;
+    static void ae_np_lan_send_update_to_peers(const AeLanLobbyState& state_in);
+    /* Direct peer-to-peer mod transfer listens next to the LAN lobby port. */
+    static int ae_np_lan_mod_port(void);
+    /* Recompute this peer's "can run the session plan" flag + (host) the
+     * published plan. Cheap; called from the LAN pump. */
+    static void ae_np_lan_refresh_mods(void);
     static int ae_np_lan_endpoint_port(const std::string& endpoint);
     static bool ae_np_read_lan_file_state(AeLanLobbyState* state);
     static void ae_np_set_session_bios_token(const char* token);
@@ -8654,6 +8729,461 @@ namespace {
         return (bool)f;
     }
 
+    int g_lnch_lan_mod_port_remote = 0;
+    static int ae_np_pkg_installed(const char* id, const char* ver);
+
+    /* Walk the session plan spec (id@ver:feats;...) and count entries this
+     * peer does not have installed. Shared by the readiness report and the
+     * launcher's lobby-mod list. */
+    static int ae_np_spec_missing_count(const std::string& spec,
+                                        int index_wanted,
+                                        RecompLauncherCNetplayLobbyMod* out) {
+        int missing = 0, index = 0;
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(';', pos);
+            if (end == std::string::npos) end = spec.size();
+            const std::string entry = spec.substr(pos, end - pos);
+            pos = end + 1;
+            if (entry.empty()) continue;
+            const size_t at = entry.find('@');
+            if (at == std::string::npos) continue;
+            const std::string id = entry.substr(0, at);
+            std::string rest = entry.substr(at + 1);
+            const size_t colon = rest.find(':');
+            const std::string ver =
+                colon == std::string::npos ? rest : rest.substr(0, colon);
+            const int have = ae_np_pkg_installed(id.c_str(), ver.c_str());
+            if (!have) ++missing;
+            if (out && index == index_wanted) {
+                std::snprintf(out->id, sizeof(out->id), "%s", id.c_str());
+                std::snprintf(out->version, sizeof(out->version), "%s", ver.c_str());
+                std::snprintf(out->name, sizeof(out->name), "%s", id.c_str());
+                out->installed = have;
+                out->builtin = (id.rfind("psx.", 0) == 0) ? 1 : 0;
+                out->size = 0;
+                return 1;            /* found the requested entry */
+            }
+            ++index;
+        }
+        if (out) return 0;
+        if (index_wanted == -2) return index;   /* -2 = "how many entries" */
+        return missing;
+    }
+
+    static int ae_np_lan_missing_mods_count(void) {
+        return ae_np_spec_missing_count(g_lnch_lan_mod_spec, -1, nullptr);
+    }
+
+    /* The transfer listener sits one port above the LAN lobby port so a guest
+     * that can reach the lobby can reach the transfer without extra discovery
+     * (the port still travels in MOTK5 so it can move later). */
+    static int ae_np_lan_mod_port(void) {
+        const int base = ae_np_lan_endpoint_port(g_lnch_lan_endpoint);
+        return base > 0 ? base + 1 : 0;
+    }
+
+    static void ae_np_lan_refresh_mods(void) {
+        if (!g_lnch_hosting_lan && !g_lnch_joined_lan) {
+            /* Left the room: forget what we told the host, so rejoining
+             * re-reports instead of trusting a latch from a dead session. */
+            g_lnch_lan_modok_sent = -1;
+            g_lnch_lan_modok_sent_ms = 0;
+            return;
+        }
+        if (g_lnch_hosting_lan) {
+            /* The host IS the plan: publish whatever it has enabled, and
+             * apply it locally (LAN never goes through match_caps). */
+            const std::string spec =
+                PSXRecompV4::mod_runtime_link_spec_from_session();
+            if (spec != g_lnch_lan_mod_spec) {
+                g_lnch_lan_mod_spec = spec;
+                g_lnch_lan_mod_fp =
+                    PSXRecompV4::mod_runtime_plan_fingerprint_portable();
+                PSXRecompV4::mod_runtime_set_session_plan_spec(spec);
+                AeLanLobbyState st;
+                if (ae_np_read_lan_state(&st))
+                    ae_np_lan_send_update_to_peers(st);
+            }
+            g_lnch_lan_local_mods_ok = 1;
+            return;
+        }
+        /* Guest: can I run the host's plan? Tell the host — and keep telling
+         * it until the host's own view (echoed back per seat in MOTK5 UPDATE)
+         * agrees. MODOK is a UDP datagram and the host drops one that arrives
+         * before this player is seated, so a single send-on-change silently
+         * lost the report and left the host showing "player missing mods"
+         * forever while this side showed everything green. Reconciling
+         * against the echo makes the exchange self-healing without an ack. */
+        const int missing = ae_np_lan_missing_mods_count();
+        const int ok = missing == 0 ? 1 : 0;
+        g_lnch_lan_local_mods_ok = ok;
+        /* g_lnch_lan_slot_mods_ok is the HOST's view; never write our own
+         * seat here or the disagreement we are looking for is masked. */
+        const int host_thinks =
+            (g_lnch_lan_my_slot >= 0 && g_lnch_lan_my_slot < kAeLanMaxSlots)
+                ? g_lnch_lan_slot_mods_ok[g_lnch_lan_my_slot]
+                : -1;
+        const uint32_t now_ms = (uint32_t)SDL_GetTicks64();
+        const bool disagrees = host_thinks >= 0 && host_thinks != ok;
+        const bool changed = g_lnch_lan_modok_sent != ok;
+        const bool stale = g_lnch_lan_modok_sent_ms == 0 ||
+                           (now_ms - g_lnch_lan_modok_sent_ms) > 1000u;
+        if ((changed || disagrees || host_thinks < 0) && stale) {
+            g_lnch_lan_modok_sent = ok;
+            g_lnch_lan_modok_sent_ms = now_ms;
+            char msg[192];
+            std::snprintf(msg, sizeof(msg), "MOTK5 MODOK\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), ok);
+            char host[64];
+            if (ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host))) {
+                sockaddr_in to{};
+                to.sin_family = AF_INET;
+                to.sin_addr.s_addr = inet_addr(host);
+                to.sin_port =
+                    htons((uint16_t)ae_np_lan_endpoint_port(g_lnch_lan_endpoint));
+                ae_np_lan_udp_sendto(to, msg);
+            }
+        }
+    }
+
+    /* ===== LAN / Direct-IP mod transfer (no lobby server, no ICE) =========
+     * The WS lobby moves packages over an ICE data channel that the signaling
+     * server brokers. LAN peers have direct IP reachability and no broker, so
+     * they use a plain TCP side-channel next to the lobby port: the host
+     * serves the session plan's packages, a guest pulls what it is missing.
+     *
+     * Threading contract: the mod manager is main-thread-only. The host
+     * therefore EXPORTS to an immutable snapshot on the main thread whenever
+     * the plan changes and the listener thread only ever reads that snapshot;
+     * the guest's download thread only fills a byte queue, and installation
+     * happens back on the main thread in the pump. No mod-manager access ever
+     * happens off the main thread. */
+    struct AeLanModBlob {
+        std::string id, ver, sha;
+        std::vector<uint8_t> bytes;
+    };
+    std::mutex               g_lan_mod_serve_mtx;
+    std::vector<AeLanModBlob> g_lan_mod_serve;      /* host: what we can send */
+    std::string              g_lan_mod_serve_spec;  /* plan the snapshot is for */
+    std::thread              g_lan_mod_listen_thr;
+    std::atomic<bool>        g_lan_mod_listen_run{false};
+    AeLanSock                g_lan_mod_listen_sock = kAeLanSockInvalid;
+
+    std::thread              g_lan_mod_dl_thr;
+    std::atomic<int>         g_lan_mod_dl_progress{-1};  /* -1 idle, -2 fail */
+    std::atomic<bool>        g_lan_mod_dl_run{false};
+    std::mutex               g_lan_mod_dl_mtx;
+    std::vector<AeLanModBlob> g_lan_mod_dl_done;
+    std::string              g_lan_mod_dl_err;
+
+    static bool ae_lan_sock_send_all(AeLanSock s, const void* p, size_t n) {
+        const char* b = static_cast<const char*>(p);
+        while (n) {
+            const int w = (int)send(s, b, (int)(n > 65536 ? 65536 : n), 0);
+            if (w <= 0) return false;
+            b += w;
+            n -= (size_t)w;
+        }
+        return true;
+    }
+
+    static bool ae_lan_sock_recv_all(AeLanSock s, void* p, size_t n) {
+        char* b = static_cast<char*>(p);
+        while (n) {
+            const int r = (int)recv(s, b, (int)(n > 65536 ? 65536 : n), 0);
+            if (r <= 0) return false;
+            b += r;
+            n -= (size_t)r;
+        }
+        return true;
+    }
+
+    /* Read a '\n'-terminated header line (bounded). */
+    static bool ae_lan_sock_recv_line(AeLanSock s, char* out, size_t cap) {
+        size_t i = 0;
+        while (i + 1 < cap) {
+            char c;
+            const int r = (int)recv(s, &c, 1, 0);
+            if (r <= 0) return false;
+            if (c == '\n') { out[i] = '\0'; return true; }
+            out[i++] = c;
+        }
+        return false;
+    }
+
+    static void ae_np_lan_mod_listen_main() {
+        while (g_lan_mod_listen_run.load()) {
+            sockaddr_in from{};
+#ifdef _WIN32
+            int flen = (int)sizeof(from);
+#else
+            socklen_t flen = sizeof(from);
+#endif
+            AeLanSock c = accept(g_lan_mod_listen_sock, (sockaddr*)&from, &flen);
+            if (c == kAeLanSockInvalid) {
+#ifdef _WIN32
+                Sleep(50);
+#else
+                struct timespec ts { 0, 50 * 1000 * 1000 };
+                nanosleep(&ts, nullptr);
+#endif
+                continue;
+            }
+            char line[256];
+            if (ae_lan_sock_recv_line(c, line, sizeof(line))) {
+                char id[96] = {0}, ver[32] = {0};
+                if (std::sscanf(line, "PSXMOD1 GET %95s %31s", id, ver) == 2) {
+                    AeLanModBlob blob;
+                    bool found = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_lan_mod_serve_mtx);
+                        for (const AeLanModBlob& b : g_lan_mod_serve) {
+                            if (b.id == id && b.ver == ver) {
+                                blob = b;          /* copy under the lock */
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (found) {
+                        char hdr[160];
+                        const int hn = std::snprintf(
+                            hdr, sizeof(hdr), "PSXMOD1 OK %u %s\n",
+                            (unsigned)blob.bytes.size(), blob.sha.c_str());
+                        if (hn > 0 && ae_lan_sock_send_all(c, hdr, (size_t)hn))
+                            (void)ae_lan_sock_send_all(c, blob.bytes.data(),
+                                                       blob.bytes.size());
+                    } else {
+                        const char err[] = "PSXMOD1 ERR not served\n";
+                        (void)ae_lan_sock_send_all(c, err, sizeof(err) - 1);
+                    }
+                }
+            }
+            ae_np_lan_sock_close(&c);
+        }
+    }
+
+    static void ae_np_lan_mod_listen_stop() {
+        if (!g_lan_mod_listen_run.load()) return;
+        g_lan_mod_listen_run.store(false);
+        ae_np_lan_sock_close(&g_lan_mod_listen_sock);
+        if (g_lan_mod_listen_thr.joinable()) g_lan_mod_listen_thr.join();
+    }
+
+    static void ae_np_lan_mod_listen_start(int port) {
+        if (g_lan_mod_listen_run.load() || port <= 0) return;
+        AeLanSock s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == kAeLanSockInvalid) return;
+        int yes = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = INADDR_ANY;
+        a.sin_port = htons((uint16_t)port);
+        if (bind(s, (sockaddr*)&a, sizeof(a)) != 0 || listen(s, 4) != 0) {
+            ae_np_lan_sock_close(&s);
+            return;
+        }
+        /* Non-blocking accept so the thread can observe the stop flag. */
+        (void)ae_np_lan_set_nonblock(s);
+        g_lan_mod_listen_sock = s;
+        g_lan_mod_listen_run.store(true);
+        g_lan_mod_listen_thr = std::thread(ae_np_lan_mod_listen_main);
+        std::fprintf(stdout,
+                     "psxrecomp: LAN mod transfer listening on port %d\n", port);
+        std::fflush(stdout);
+    }
+
+    /* MAIN THREAD: rebuild the served snapshot for the current plan. */
+    static void ae_np_lan_mod_build_serve(const std::string& spec) {
+        std::vector<AeLanModBlob> built;
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(';', pos);
+            if (end == std::string::npos) end = spec.size();
+            const std::string entry = spec.substr(pos, end - pos);
+            pos = end + 1;
+            const size_t at = entry.find('@');
+            if (at == std::string::npos) continue;
+            const std::string id = entry.substr(0, at);
+            std::string rest = entry.substr(at + 1);
+            const size_t colon = rest.find(':');
+            const std::string ver =
+                colon == std::string::npos ? rest : rest.substr(0, colon);
+            AeLanModBlob b;
+            b.id = id;
+            b.ver = ver;
+            std::string err;
+            if (!PSXRecompV4::mod_runtime_export_package(id, ver, b.bytes,
+                                                         &b.sha, &err)) {
+                std::fprintf(stderr,
+                             "psxrecomp: LAN mod serve: cannot export %s@%s: %s\n",
+                             id.c_str(), ver.c_str(), err.c_str());
+                continue;
+            }
+            built.push_back(std::move(b));
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_lan_mod_serve_mtx);
+            g_lan_mod_serve.swap(built);
+            g_lan_mod_serve_spec = spec;
+        }
+    }
+
+    /* GUEST worker: pull every missing package, byte-verified by the caller. */
+    static void ae_np_lan_mod_dl_main(std::string host, int port,
+                                      std::vector<std::pair<std::string,
+                                                            std::string>> want) {
+        int done = 0;
+        for (const auto& w : want) {
+            if (!g_lan_mod_dl_run.load()) break;
+            AeLanSock s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s == kAeLanSockInvalid) break;
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = inet_addr(host.c_str());
+            a.sin_port = htons((uint16_t)port);
+            if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
+                ae_np_lan_sock_close(&s);
+                std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+                g_lan_mod_dl_err = "cannot reach the host's mod transfer port";
+                g_lan_mod_dl_progress.store(-2);
+                g_lan_mod_dl_run.store(false);
+                return;
+            }
+            char req[192];
+            const int rn = std::snprintf(req, sizeof(req),
+                                         "PSXMOD1 GET %s %s\n",
+                                         w.first.c_str(), w.second.c_str());
+            char hdr[192];
+            AeLanModBlob blob;
+            blob.id = w.first;
+            blob.ver = w.second;
+            bool ok = rn > 0 && ae_lan_sock_send_all(s, req, (size_t)rn) &&
+                      ae_lan_sock_recv_line(s, hdr, sizeof(hdr));
+            if (ok) {
+                unsigned len = 0;
+                char sha[80] = {0};
+                if (std::sscanf(hdr, "PSXMOD1 OK %u %79s", &len, sha) == 2 &&
+                    len > 0 && len <= (64u << 20)) {
+                    blob.sha = sha;
+                    blob.bytes.resize(len);
+                    ok = ae_lan_sock_recv_all(s, blob.bytes.data(), len);
+                } else {
+                    ok = false;
+                }
+            }
+            ae_np_lan_sock_close(&s);
+            if (!ok) {
+                std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+                g_lan_mod_dl_err = "transfer from host failed";
+                g_lan_mod_dl_progress.store(-2);
+                g_lan_mod_dl_run.store(false);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+                g_lan_mod_dl_done.push_back(std::move(blob));
+            }
+            ++done;
+            g_lan_mod_dl_progress.store(
+                want.empty() ? 100 : (int)((done * 100) / (int)want.size()));
+        }
+        g_lan_mod_dl_run.store(false);
+    }
+
+    static int ae_np_lan_mod_download_start(void) {
+        if (g_lnch_hosting_lan || !g_lnch_joined_lan) return -1;
+        if (g_lan_mod_dl_run.load()) return 0;              /* already going */
+        char host[64];
+        if (!ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host)))
+            return -1;
+        const int port = g_lnch_lan_mod_port_remote > 0
+                             ? g_lnch_lan_mod_port_remote
+                             : ae_np_lan_endpoint_port(g_lnch_lan_endpoint) + 1;
+        if (port <= 0) return -1;
+        /* Ask only for what is actually missing. */
+        std::vector<std::pair<std::string, std::string>> want;
+        const int n = ae_np_spec_missing_count(g_lnch_lan_mod_spec, -2, nullptr);
+        for (int i = 0; i < n; ++i) {
+            RecompLauncherCNetplayLobbyMod lm{};
+            if (!ae_np_spec_missing_count(g_lnch_lan_mod_spec, i, &lm)) continue;
+            if (lm.installed) continue;
+            want.emplace_back(lm.id, lm.version);
+        }
+        if (want.empty()) return -1;
+        if (g_lan_mod_dl_thr.joinable()) g_lan_mod_dl_thr.join();
+        {
+            std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+            g_lan_mod_dl_done.clear();
+            g_lan_mod_dl_err.clear();
+        }
+        g_lan_mod_dl_progress.store(0);
+        g_lan_mod_dl_run.store(true);
+        g_lan_mod_dl_thr = std::thread(ae_np_lan_mod_dl_main, std::string(host),
+                                       port, want);
+        return 0;
+    }
+
+    /* MAIN THREAD pump: (host) keep the served snapshot current and the
+     * listener up; (guest) install whatever the worker has finished. */
+    static void ae_np_lan_mod_xfer_pump(void) {
+        if (g_lnch_hosting_lan) {
+            const int port = ae_np_lan_mod_port();
+            if (!g_lnch_lan_mod_spec.empty()) {
+                if (g_lan_mod_serve_spec != g_lnch_lan_mod_spec)
+                    ae_np_lan_mod_build_serve(g_lnch_lan_mod_spec);
+                ae_np_lan_mod_listen_start(port);
+            }
+            return;
+        }
+        if (!g_lnch_joined_lan) {
+            ae_np_lan_mod_listen_stop();
+            return;
+        }
+        std::vector<AeLanModBlob> ready;
+        {
+            std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+            ready.swap(g_lan_mod_dl_done);
+        }
+        for (AeLanModBlob& b : ready) {
+            /* Verify what the peer sent before installing it: this is code
+             * that will run on this machine. (The ICE path historically
+             * discarded this digest — do not repeat that here.) */
+            std::string err;
+            if (!b.sha.empty()) {
+                uint8_t digest[32];
+                psx_sha256_compute(b.bytes.data(), b.bytes.size(), digest);
+                char hex[65];
+                for (int i = 0; i < 32; ++i)
+                    std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
+                hex[64] = '\0';
+                const std::string check = hex;
+                if (check != b.sha) {
+                    std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+                    g_lan_mod_dl_err =
+                        "package digest mismatch — refused (" + b.id + ")";
+                    g_lan_mod_dl_progress.store(-2);
+                    continue;
+                }
+            }
+            if (!PSXRecompV4::mod_runtime_install_bytes(b.bytes.data(),
+                                                        b.bytes.size(), &err)) {
+                std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+                g_lan_mod_dl_err = err.empty() ? "install failed" : err;
+                g_lan_mod_dl_progress.store(-2);
+                continue;
+            }
+        }
+        if (!ready.empty()) {
+            ae_np_refresh_mod_offer();
+            ae_np_lan_refresh_mods();
+            if (!g_lan_mod_dl_run.load() && g_lan_mod_dl_progress.load() >= 0)
+                g_lan_mod_dl_progress.store(-1);   /* done -> idle */
+        }
+    }
+
     static void ae_np_lan_send_update_to_peers(const AeLanLobbyState& state_in) {
         AeLanLobbyState state = state_in;
         ae_np_lan_sync_legacy_names(state);
@@ -8686,11 +9216,36 @@ namespace {
                 b.valid ? 1 : 0, b.prefer_openbios ? 1 : 0, b.can_openbios ? 1 : 0,
                 b.can_scph1001 ? 1 : 0);
         }
-        if (off3 <= 0 && off4 <= 0) return;
+        /* MOTK5 carries the host's mod plan and each seat's mod readiness.
+         * New message version rather than extra lines on MOTK3/4, so a peer
+         * that predates it keeps parsing what it knows (same discipline as
+         * MOTK3 -> MOTK4). */
+        /* Every LAN receive buffer is 1536 bytes and this path has no
+         * fragmentation — keep the datagram comfortably under that. */
+        char msg5[1400];
+        int off5 = -1;
+        if (g_lnch_hosting_lan) {
+            g_lnch_lan_slot_mods_ok[state.host_slot] =
+                g_lnch_lan_local_mods_ok ? 1 : 0;
+            off5 = std::snprintf(msg5, sizeof(msg5),
+                                 "MOTK5 UPDATE\n%d\n%u\n%d\n%s\n",
+                                 state.max_slots,
+                                 (unsigned)(state.session_id ? state.session_id : 1u),
+                                 ae_np_lan_mod_port(),
+                                 g_lnch_lan_mod_spec.c_str());
+            for (int i = 0; i < state.max_slots && i < kAeLanMaxSlots &&
+                 off5 > 0 && off5 < (int)sizeof(msg5) - 8; ++i) {
+                off5 += std::snprintf(msg5 + off5, sizeof(msg5) - (size_t)off5,
+                                      "%d\n", g_lnch_lan_slot_mods_ok[i] ? 1 : 0);
+            }
+            if (off5 >= (int)sizeof(msg5)) off5 = -1;   /* spec too long */
+        }
+        if (off3 <= 0 && off4 <= 0 && off5 <= 0) return;
         for (int i = 0; i < kAeLanMaxSlots; ++i) {
             if (!g_lnch_lan_peer_ok[i]) continue;
             if (off3 > 0) ae_np_lan_udp_sendto(g_lnch_lan_peers[i], msg3);
             if (off4 > 0) ae_np_lan_udp_sendto(g_lnch_lan_peers[i], msg4);
+            if (off5 > 0) ae_np_lan_udp_sendto(g_lnch_lan_peers[i], msg5);
         }
     }
 
@@ -9378,8 +9933,19 @@ namespace {
             }
             ae_np_append_feat(&caps->mods[found], f.id);
         }
+        /* Publish how THIS machine resolves the plan; peers compare after
+         * applying it and refuse the launch on a mismatch. */
+        std::snprintf(caps->mod_plan_fp, sizeof(caps->mod_plan_fp), "%s",
+                      caps->mod_count > 0
+                          ? PSXRecompV4::mod_runtime_plan_fingerprint_portable()
+                                .c_str()
+                          : "");
 #endif
     }
+
+    /* Defined with the live lobby-mod callbacks below; the auto-ready tick
+     * (which runs earlier in this file) gates seat readiness on it. */
+    int ae_np_lobby_mods_missing(void*);
 
     static void ae_np_refresh_mod_offer() {
         PsxLobbyModOffer offer{};
@@ -9554,10 +10120,11 @@ namespace {
         caps.multitap_analog = g_lnch_multitap_analog != 0;
         if (s) caps.multitap_analog = s->multitap_analog != 0;
         caps.lobby_kind = g_lnch_lobby_kind ? 1 : 0;
-        /* PSX-Link sessions run vanilla: the spawned follower boots outside
-         * the lobby's mod-sync machinery, so mods must not be required. */
-        if (caps.lobby_kind != 1)
-            ae_np_fill_required_mods(&caps);
+        /* PSX-Link sessions carry mods like any other: the driver hands its
+         * applied plan to the spawned follower in the environment (see
+         * PSX_LINK_MODS), so the follower no longer boots outside the
+         * lobby's mod plan. */
+        ae_np_fill_required_mods(&caps);
         return caps;
     }
 
@@ -9724,15 +10291,47 @@ namespace {
     }
 
     int ae_np_connect(void*) {
-        psx_lobby_set_game_identity(g_lnch_netplay_game_name.c_str(), psx_lobby_game_version());
+        psx_lobby_set_game_identity(g_lnch_netplay_game_name.c_str(), ae_np_lobby_version());
         psx_lobby_set_disc_fp(g_session_disc_fp.c_str());
         psx_lobby_set_max_slots(g_lnch_game_players);
         const int rc = psx_lobby_connect(ae_np_default_url(nullptr));
         /* connect resets g_lc; re-apply so create/join never advertise "". */
-        psx_lobby_set_game_identity(g_lnch_netplay_game_name.c_str(), psx_lobby_game_version());
+        psx_lobby_set_game_identity(g_lnch_netplay_game_name.c_str(), ae_np_lobby_version());
         psx_lobby_set_disc_fp(g_session_disc_fp.c_str());
         psx_lobby_set_max_slots(g_lnch_game_players);
         return rc;
+    }
+
+    /* The version string this build advertises to the lobby. A dev tag turns
+     * it into "dev+<tag>": every build carrying the same tag matches, and no
+     * release browser (which pins an exact version) ever lists those rooms.
+     * Sanitized to the charset the lobby id/version fields already accept. */
+    static const char* ae_np_lobby_version() {
+        static std::string cached;
+        static int resolved = 0;
+        if (resolved) return cached.c_str();
+        resolved = 1;
+        std::string tag = g_lnch_netplay_dev_tag;
+        if (const char* env = std::getenv("PSX_NETPLAY_DEV_TAG"))
+            tag = env;                       /* runtime override wins */
+        std::string clean;
+        for (char c : tag) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')
+                clean.push_back(c);
+        }
+        if (clean.empty()) {
+            cached = psx_lobby_game_version();
+        } else {
+            cached = "dev+" + clean;
+            /* PSX_LOBBY_VERSION_LEN is 32 including the NUL. */
+            if (cached.size() > 31) cached.resize(31);
+            std::printf("psxrecomp: netplay dev channel '%s' — this build "
+                        "only sees and joins lobbies with the same tag\n",
+                        cached.c_str());
+            std::fflush(stdout);
+        }
+        return cached.c_str();
     }
 
     int ae_np_connected(void*) {
@@ -9961,6 +10560,203 @@ namespace {
 
             if (!g_lnch_remote_lan) continue;
 
+            /* Guest -> host: move myself to a free seat. */
+            if (std::strncmp(buf, "MOTK5 SEATMOVE\n", 15) == 0 &&
+                g_lnch_hosting_lan) {
+                char* p = buf + 15;
+                char* nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';
+                const std::string pid = p;
+                const int to_slot = std::atoi(nl + 1);
+                AeLanLobbyState st;
+                if (!ae_np_read_lan_state(&st)) continue;
+                const int from_slot = ae_np_lan_find_slot_by_id(st, pid.c_str());
+                if (from_slot < 0 || to_slot <= 0 || to_slot >= st.max_slots)
+                    continue;
+                if (!st.slot_name[to_slot].empty()) continue;  /* needs consent */
+                (void)ae_np_lan_do_seat_move(from_slot, to_slot, false);
+                continue;
+            }
+
+            /* Guest -> host: ask the player in <slot> to trade seats. The
+             * host relays the ask to that seat's peer; nothing moves yet. */
+            if (std::strncmp(buf, "MOTK5 SWAPREQ\n", 14) == 0 &&
+                g_lnch_hosting_lan) {
+                char* p = buf + 14;
+                char* nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';
+                const std::string pid = p;
+                const int target = std::atoi(nl + 1);
+                AeLanLobbyState st;
+                if (!ae_np_read_lan_state(&st)) continue;
+                const int from_slot = ae_np_lan_find_slot_by_id(st, pid.c_str());
+                if (from_slot < 0 || target <= 0 || target >= st.max_slots)
+                    continue;
+                if (st.slot_name[target].empty()) continue;
+                char ask[256];
+                std::snprintf(ask, sizeof(ask), "MOTK5 SWAPASK\n%s\n%s\n%d\n",
+                              pid.c_str(), st.slot_name[from_slot].c_str(),
+                              from_slot);
+                if (target == st.host_slot) {
+                    /* The host itself is being asked. */
+                    g_seat_swap.in_active = 1;
+                    std::snprintf(g_seat_swap.in_who, sizeof(g_seat_swap.in_who),
+                                  "%s", st.slot_name[from_slot].c_str());
+                    std::snprintf(g_seat_swap.in_id, sizeof(g_seat_swap.in_id),
+                                  "%s", pid.c_str());
+                    g_seat_swap.in_from_slot = from_slot;
+                } else if (target < kAeLanMaxSlots && g_lnch_lan_peer_ok[target]) {
+                    ae_np_lan_udp_sendto(g_lnch_lan_peers[target], ask);
+                }
+                continue;
+            }
+
+            /* Host -> peer: somebody wants your seat. */
+            if (std::strncmp(buf, "MOTK5 SWAPASK\n", 14) == 0 &&
+                !g_lnch_hosting_lan) {
+                char* p = buf + 14;
+                char* line[3] = {};
+                int ok = 1;
+                for (int i = 0; i < 3; ++i) {
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) { ok = 0; break; }
+                    *nl = '\0';
+                    line[i] = p;
+                    p = nl + 1;
+                }
+                if (!ok) continue;
+                g_seat_swap.in_active = 1;
+                std::snprintf(g_seat_swap.in_id, sizeof(g_seat_swap.in_id), "%s",
+                              line[0]);
+                std::snprintf(g_seat_swap.in_who, sizeof(g_seat_swap.in_who), "%s",
+                              line[1]);
+                g_seat_swap.in_from_slot = std::atoi(line[2]);
+                continue;
+            }
+
+            /* Peer -> host: the answer. Host applies it (it owns the table). */
+            if (std::strncmp(buf, "MOTK5 SWAPANS\n", 14) == 0 &&
+                g_lnch_hosting_lan) {
+                char* p = buf + 14;
+                char* line[3] = {};
+                int ok = 1;
+                for (int i = 0; i < 3; ++i) {
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) { ok = 0; break; }
+                    *nl = '\0';
+                    line[i] = p;
+                    p = nl + 1;
+                }
+                if (!ok) continue;
+                AeLanLobbyState st;
+                if (!ae_np_read_lan_state(&st)) continue;
+                const int answerer = ae_np_lan_find_slot_by_id(st, line[0]);
+                const int asker = ae_np_lan_find_slot_by_id(st, line[1]);
+                const int accepted = std::atoi(line[2]) ? 1 : 0;
+                char res[64];
+                std::snprintf(res, sizeof(res), "MOTK5 SWAPRES\n%d\n", accepted);
+                if (asker >= 0 && asker < kAeLanMaxSlots) {
+                    if (asker == st.host_slot) {
+                        g_seat_swap.out_state = accepted ? 2 : -1;
+                    } else if (g_lnch_lan_peer_ok[asker]) {
+                        ae_np_lan_udp_sendto(g_lnch_lan_peers[asker], res);
+                    }
+                }
+                if (accepted && answerer >= 0 && asker >= 0)
+                    (void)ae_np_lan_do_seat_move(asker, answerer, true);
+                continue;
+            }
+
+            /* Host -> asker: the verdict. */
+            if (std::strncmp(buf, "MOTK5 SWAPRES\n", 14) == 0 &&
+                !g_lnch_hosting_lan) {
+                g_seat_swap.out_state = std::atoi(buf + 14) ? 2 : -1;
+                continue;
+            }
+
+            if (std::strncmp(buf, "MOTK5 START\n", 12) == 0 &&
+                !g_lnch_hosting_lan) {
+                char* p = buf + 12;
+                char* nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';                       /* session id (unused) */
+                p = nl + 1;
+                nl = std::strchr(p, '\n');
+                if (nl) *nl = '\0';
+                const std::string spec = p ? p : "";
+                g_lnch_lan_mod_spec = spec;
+                PSXRecompV4::mod_runtime_set_session_plan_spec(spec);
+                if (nl) {                       /* optional fingerprint line */
+                    char* fp = nl + 1;
+                    char* fend = std::strchr(fp, '\n');
+                    if (fend) *fend = '\0';
+                    PSXRecompV4::mod_runtime_set_session_plan_fp(fp ? fp : "");
+                }
+                continue;
+            }
+
+            if (std::strncmp(buf, "MOTK5 UPDATE\n", 13) == 0 &&
+                !g_lnch_hosting_lan) {
+                /* max_slots, session_id, mod_port, spec, then per-seat ok. */
+                char* p = buf + 13;
+                char* line[4] = {};
+                int ok = 1;
+                for (int i = 0; i < 4; ++i) {
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) { ok = 0; break; }
+                    *nl = '\0';
+                    line[i] = p;
+                    p = nl + 1;
+                }
+                if (!ok) continue;
+                const int slots = std::atoi(line[0]);
+                g_lnch_lan_mod_port_remote = std::atoi(line[2]);
+                const std::string spec = line[3] ? line[3] : "";
+                if (spec != g_lnch_lan_mod_spec) {
+                    g_lnch_lan_mod_spec = spec;
+                    /* This is the plan this peer will launch with. */
+                    PSXRecompV4::mod_runtime_set_session_plan_spec(spec);
+                }
+                for (int i = 0; i < slots && i < kAeLanMaxSlots; ++i) {
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) break;
+                    *nl = '\0';
+                    g_lnch_lan_slot_mods_ok[i] = std::atoi(p) ? 1 : 0;
+                    p = nl + 1;
+                }
+                ae_np_lan_refresh_mods();
+                continue;
+            }
+
+            /* Guest -> host: "I can (not) run the session's mods". */
+            if (std::strncmp(buf, "MOTK5 MODOK\n", 12) == 0 &&
+                g_lnch_hosting_lan) {
+                char* p = buf + 12;
+                char* nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';
+                const std::string pid = p;
+                p = nl + 1;
+                nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';
+                const int peer_ok = std::atoi(p) ? 1 : 0;
+                AeLanLobbyState st;
+                if (!ae_np_read_lan_state(&st)) continue;
+                const int slot = ae_np_lan_find_slot_by_id(st, pid.c_str());
+                if (slot < 0 || slot >= kAeLanMaxSlots) continue;
+                g_lnch_lan_slot_mods_ok[slot] = peer_ok;
+                /* Always echo the table back, even when nothing changed: the
+                 * guest reconciles against this echo and keeps resending
+                 * until it arrives, so swallowing it here would leave it
+                 * retrying once a second forever. MODOK is rate limited on
+                 * the sender, so this cannot become a storm. */
+                ae_np_lan_send_update_to_peers(st);
+                continue;
+            }
+
             if (std::strncmp(buf, "MOTK4 UPDATE\n", 13) == 0) {
                 AeLanLobbyState st = g_lnch_remote_lan_state;
                 if (ae_np_lan_parse_motk4_update(buf + 13, &st) != 0) continue;
@@ -10153,9 +10949,18 @@ namespace {
         psx_lobby_mod_xfer_cancel();
     }
     int ae_np_mod_xfer_progress(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan)
+            return g_lan_mod_dl_progress.load();
         return psx_lobby_mod_xfer_progress();
     }
     int ae_np_mod_xfer_failed(void*, char* err, size_t err_cap) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) {
+            std::lock_guard<std::mutex> lk(g_lan_mod_dl_mtx);
+            if (g_lan_mod_dl_err.empty()) return 0;
+            if (err && err_cap)
+                std::snprintf(err, err_cap, "%s", g_lan_mod_dl_err.c_str());
+            return 1;
+        }
         return psx_lobby_mod_xfer_failed(err, err_cap);
     }
 
@@ -10163,6 +10968,9 @@ namespace {
         psx_lobby_pump();
         ae_np_lan_browse_pump();
         ae_np_lan_udp_pump();
+        ae_np_lan_refresh_mods();
+        ae_np_lan_mod_xfer_pump();
+        ae_np_sync_plan_fp_from_caps();
         ae_np_refresh_mod_offer();
         if (!g_lnch_hosting_lan && !g_lnch_joined_lan) {
             if (psx_lobby_is_host()) ae_np_host_xfer_tick();
@@ -10181,9 +10989,18 @@ namespace {
                 cur->can_openbios != s_last_offer.can_openbios ||
                 cur->can_scph1001 != s_last_offer.can_scph1001 ||
                 cur->prefer_openbios != s_last_offer.prefer_openbios;
-            if (!psx_lobby_local_ready() || offer_changed) {
-                (void)psx_lobby_set_ready(1);
+            /* Readiness now also means "I have this lobby's mods". The seat
+             * ready flag is the only per-seat signal the server already
+             * relays, so the host's launch gate can read it directly — a peer
+             * still downloading the host's plan holds the match. */
+            static int s_last_mods_ok = -1;
+            const int mods_ok = ae_np_lobby_mods_missing(nullptr) == 0 ? 1 : 0;
+            const int mods_changed = mods_ok != s_last_mods_ok;
+            if (!psx_lobby_local_ready() != !mods_ok || offer_changed ||
+                mods_changed) {
+                (void)psx_lobby_set_ready(mods_ok);
                 if (cur) s_last_offer = *cur;
+                s_last_mods_ok = mods_ok;
             }
         }
     }
@@ -10755,7 +11572,12 @@ namespace {
                     out->slot = slot;
                     std::snprintf(out->display_name, sizeof(out->display_name), "%s",
                                   state.slot_name[slot].c_str());
-                    out->ready = 1;
+                    /* Ready == "can run this session's mods" (LAN has no
+                     * server-side ready flag; this is the same meaning the
+                     * WS path publishes via set_ready). */
+                    out->ready = (slot == g_lnch_lan_my_slot)
+                                     ? (g_lnch_lan_local_mods_ok ? 1 : 0)
+                                     : (g_lnch_lan_slot_mods_ok[slot] ? 1 : 0);
                     out->is_host = (slot == state.host_slot) ? 1 : 0;
                     out->is_local = (slot == g_lnch_lan_my_slot) ? 1 : 0;
                     out->latency_ms = -1;
@@ -10826,6 +11648,163 @@ namespace {
         return -1;
     }
 
+    /* ===== seat self-service ============================================
+     * Rule: a player owns its OWN seat. Moving to a free seat is immediate;
+     * taking a seat somebody sits in is a trade that the other player must
+     * accept. The host arbitrates because it owns the seat table — that also
+     * makes two simultaneous requests resolve in arrival order instead of
+     * racing. */
+    static int ae_np_lan_slot_of_local(const AeLanLobbyState& st) {
+        return ae_np_lan_find_slot_by_id(st, ae_np_lan_local_player_id());
+    }
+
+    static void ae_np_lan_send_to_host(const char* msg) {
+        char host[64];
+        if (!ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host)))
+            return;
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_addr.s_addr = inet_addr(host);
+        to.sin_port = htons((uint16_t)ae_np_lan_endpoint_port(g_lnch_lan_endpoint));
+        ae_np_lan_udp_sendto(to, msg);
+    }
+
+    /* Host-side: perform a validated seat exchange and fan the new table. */
+    static int ae_np_lan_do_seat_move(int from_slot, int to_slot, bool allow_swap) {
+        AeLanLobbyState st;
+        if (!ae_np_read_lan_state(&st)) return -1;
+        if (from_slot < 0 || to_slot < 0 || from_slot == to_slot ||
+            from_slot >= st.max_slots || to_slot >= st.max_slots ||
+            from_slot >= kAeLanMaxSlots || to_slot >= kAeLanMaxSlots)
+            return -1;
+        /* Seat 0 is the sim authority; it is not tradeable. */
+        if (from_slot == 0 || to_slot == 0) return -1;
+        const bool occupied = !st.slot_name[to_slot].empty();
+        if (occupied && !allow_swap) return -1;
+        std::swap(st.slot_name[from_slot], st.slot_name[to_slot]);
+        std::swap(st.slot_id[from_slot], st.slot_id[to_slot]);
+        std::swap(g_lnch_lan_peers[from_slot], g_lnch_lan_peers[to_slot]);
+        std::swap(g_lnch_lan_peer_ok[from_slot], g_lnch_lan_peer_ok[to_slot]);
+        std::swap(g_lnch_lan_slot_bios[from_slot], g_lnch_lan_slot_bios[to_slot]);
+        std::swap(g_lnch_lan_slot_mods_ok[from_slot],
+                  g_lnch_lan_slot_mods_ok[to_slot]);
+        if (st.host_slot == from_slot) st.host_slot = to_slot;
+        else if (st.host_slot == to_slot) st.host_slot = from_slot;
+        st.started = false;
+        ae_np_lan_sync_legacy_names(st);
+        if (!ae_np_write_lan_state(st)) return -1;
+        ae_np_lan_send_update_to_peers(st);
+        return 0;
+    }
+
+    int ae_np_seat_move_self(void*, int to_slot) {
+        if (to_slot <= 0) return -1;                 /* seat 0 not tradeable */
+        if (g_lnch_hosting_lan) {
+            AeLanLobbyState st;
+            if (!ae_np_read_lan_state(&st)) return -1;
+            const int mine = st.host_slot;
+            if (!st.slot_name[to_slot].empty()) return -1;   /* use a request */
+            return ae_np_lan_do_seat_move(mine, to_slot, false);
+        }
+        if (g_lnch_joined_lan) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SEATMOVE\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), to_slot);
+            ae_np_lan_send_to_host(msg);
+            return 0;
+        }
+        /* Online: the server arbitrates (op:seat_move). */
+        if (ae_np_use_ws_members()) return psx_lobby_seat_move(to_slot);
+        return -1;
+    }
+
+    int ae_np_seat_swap_request(void*, int target_slot) {
+        if (target_slot <= 0) return -1;
+        if (g_lnch_joined_lan || g_lnch_hosting_lan) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SWAPREQ\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), target_slot);
+            if (g_lnch_hosting_lan) {
+                /* Host asks directly: relay to the seat's peer. */
+                AeLanLobbyState st;
+                if (!ae_np_read_lan_state(&st)) return -1;
+                if (target_slot >= kAeLanMaxSlots ||
+                    st.slot_name[target_slot].empty()) return -1;
+                char ask[256];
+                std::snprintf(ask, sizeof(ask), "MOTK5 SWAPASK\n%s\n%s\n%d\n",
+                              ae_np_lan_local_player_id(),
+                              st.slot_name[st.host_slot].c_str(), st.host_slot);
+                if (g_lnch_lan_peer_ok[target_slot])
+                    ae_np_lan_udp_sendto(g_lnch_lan_peers[target_slot], ask);
+            } else {
+                ae_np_lan_send_to_host(msg);
+            }
+            g_seat_swap.out_state = 1;
+            g_seat_swap.out_target = target_slot;
+            return 0;
+        }
+        if (ae_np_use_ws_members())
+            return psx_lobby_seat_swap_request(target_slot);
+        return -1;
+    }
+
+    int ae_np_seat_swap_incoming(void*, char* who, size_t who_cap,
+                                 int* from_slot) {
+        if (!g_lnch_hosting_lan && !g_lnch_joined_lan) {
+            char ignored[PSX_LOBBY_ID_LEN];
+            return psx_lobby_seat_swap_incoming(who, who_cap, ignored,
+                                                sizeof(ignored), from_slot);
+        }
+        if (!g_seat_swap.in_active) return 0;
+        if (who && who_cap) std::snprintf(who, who_cap, "%s", g_seat_swap.in_who);
+        if (from_slot) *from_slot = g_seat_swap.in_from_slot;
+        return 1;
+    }
+
+    int ae_np_seat_swap_respond(void*, int accept) {
+        if (!g_lnch_hosting_lan && !g_lnch_joined_lan) {
+            char who[64], asker[PSX_LOBBY_ID_LEN];
+            int from = -1;
+            if (!psx_lobby_seat_swap_incoming(who, sizeof(who), asker,
+                                              sizeof(asker), &from))
+                return -1;
+            const int rc = psx_lobby_seat_swap_answer(asker, accept);
+            psx_lobby_seat_swap_incoming_clear();
+            return rc;
+        }
+        if (!g_seat_swap.in_active) return -1;
+        char msg[224];
+        std::snprintf(msg, sizeof(msg), "MOTK5 SWAPANS\n%s\n%s\n%d\n",
+                      ae_np_lan_local_player_id(), g_seat_swap.in_id,
+                      accept ? 1 : 0);
+        if (g_lnch_hosting_lan) {
+            /* The host is the arbiter: apply directly. */
+            AeLanLobbyState st;
+            if (accept && ae_np_read_lan_state(&st)) {
+                const int mine = ae_np_lan_slot_of_local(st);
+                (void)ae_np_lan_do_seat_move(g_seat_swap.in_from_slot, mine, true);
+            }
+        } else {
+            ae_np_lan_send_to_host(msg);
+        }
+        g_seat_swap = AeSeatSwap{};
+        return 0;
+    }
+
+    int ae_np_seat_swap_outgoing(void*) {
+        if (!g_lnch_hosting_lan && !g_lnch_joined_lan)
+            return psx_lobby_seat_swap_outgoing();
+        return g_seat_swap.out_state;
+    }
+    void ae_np_seat_swap_clear(void*) {
+        if (!g_lnch_hosting_lan && !g_lnch_joined_lan) {
+            psx_lobby_seat_swap_outgoing_clear();
+            return;
+        }
+        g_seat_swap.out_state = 0;
+        g_seat_swap.out_target = -1;
+    }
+
     int ae_np_kick_member(void*, int slot) {
         if (g_lnch_hosting_lan) {
             AeLanLobbyState state;
@@ -10862,6 +11841,24 @@ namespace {
     int ae_np_request_start(void*, const RecompLauncherCSettings* settings) {
         if (g_lnch_hosting_lan) {
             AeLanLobbyState state;
+            /* Nobody may be launched into a plan they cannot run: hold the
+             * start until every seated peer reports it has the mods. The UI
+             * disables Play for the same reason; this is the backstop. */
+            if (!g_lnch_lan_mod_spec.empty()) {
+                AeLanLobbyState chk;
+                if (ae_np_read_lan_state(&chk)) {
+                    for (int i = 0; i < chk.max_slots && i < kAeLanMaxSlots; ++i) {
+                        if (chk.slot_name[i].empty()) continue;
+                        if (i == chk.host_slot) continue;
+                        if (!g_lnch_lan_slot_mods_ok[i]) {
+                            std::fprintf(stderr,
+                                "psxrecomp: LAN start held — seat %d does not "
+                                "have this session's mods yet\n", i);
+                            return -1;
+                        }
+                    }
+                }
+            }
             if (!ae_np_read_lan_state(&state) || ae_np_lan_occupied(state) < 2)
                 return -1;
             if (settings && settings->bios_path[0])
@@ -10894,9 +11891,19 @@ namespace {
                           g_lnch_rollback ? 1 : 0,
                           g_lnch_session_bios[0] ? g_lnch_session_bios
                                                 : "openbios");
+            /* MOTK5 START carries the mod plan alongside, so a guest that
+             * missed an UPDATE still launches with the host's exact plan. */
+            char start5[1400];
+            const int s5n = std::snprintf(start5, sizeof(start5),
+                                          "MOTK5 START\n%u\n%s\n%s\n",
+                                          (unsigned)state.session_id,
+                                          g_lnch_lan_mod_spec.c_str(),
+                                          g_lnch_lan_mod_fp.c_str());
             for (int i = 0; i < kAeLanMaxSlots; ++i) {
-                if (g_lnch_lan_peer_ok[i])
-                    ae_np_lan_udp_sendto(g_lnch_lan_peers[i], start_msg);
+                if (!g_lnch_lan_peer_ok[i]) continue;
+                if (s5n > 0 && s5n < (int)sizeof(start5))
+                    ae_np_lan_udp_sendto(g_lnch_lan_peers[i], start5);
+                ae_np_lan_udp_sendto(g_lnch_lan_peers[i], start_msg);
             }
             return 0;
         }
@@ -11124,6 +12131,114 @@ namespace {
         g_lnch_lobby_kind = kind ? 1 : 0;
         return 1;
     }
+    /* Lobby mod picker: re-publish caps (rebuilding required-mods from the
+     * currently enabled features) so peers see a host toggle immediately. */
+    void ae_np_push_match_caps_cb(void*) {
+        ae_np_push_match_caps(nullptr);
+    }
+
+    /* ===== live lobby mod plan (post-seat) ==============================
+     * The join-time need_mods flow only fires when the SERVER rejects a join,
+     * so it cannot cover a host enabling a mod while peers are already
+     * seated. These read the host's published match_caps directly and diff
+     * them against the local catalog, so every seated peer can see the plan
+     * and what it is missing at any moment. */
+    static int ae_np_pkg_installed(const char* id, const char* ver) {
+#if defined(RECOMP_LAUNCHER)
+        const RecompLauncherCModProvider* p =
+            PSXRecompV4::mod_runtime_launcher_provider();
+        if (!p || !p->package_count || !p->package_get || !id || !id[0]) return 0;
+        const int pc = p->package_count(p->ctx);
+        for (int i = 0; i < pc; ++i) {
+            RecompLauncherCModPackage pkg{};
+            if (!p->package_get(p->ctx, i, &pkg) || std::strcmp(pkg.id, id) != 0)
+                continue;
+            if (!ver || !ver[0]) return 1;          /* any version satisfies */
+            if (p->version_count && p->version_get) {
+                const int vc = p->version_count(p->ctx, pkg.id);
+                for (int v = 0; v < vc; ++v) {
+                    RecompLauncherCModVersion mv{};
+                    if (p->version_get(p->ctx, pkg.id, v, &mv) &&
+                        std::strcmp(mv.version, ver) == 0)
+                        return 1;
+                }
+            }
+            /* Provider without a version list: match the selected one. */
+            return std::strcmp(pkg.version, ver) == 0 ? 1 : 0;
+        }
+#else
+        (void)id; (void)ver;
+#endif
+        return 0;
+    }
+
+    /* Keep the runtime's session fingerprint in step with the host's caps. */
+    static void ae_np_sync_plan_fp_from_caps(void) {
+        const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+        if (!caps || !caps->valid) return;
+        PSXRecompV4::mod_runtime_set_session_plan_fp(caps->mod_plan_fp);
+    }
+
+    static const PsxLobbyMatchCaps* ae_np_live_caps() {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return nullptr;
+        if (!psx_lobby_in_lobby()) return nullptr;
+        const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+        if (!caps || !caps->valid || caps->mod_count <= 0) return nullptr;
+        return caps;
+    }
+
+    int ae_np_lobby_mods_count(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan)
+            return ae_np_spec_missing_count(g_lnch_lan_mod_spec, -2, nullptr);
+        const PsxLobbyMatchCaps* caps = ae_np_live_caps();
+        return caps ? caps->mod_count : 0;
+    }
+
+    int ae_np_lobby_mods_get(void*, int index,
+                             RecompLauncherCNetplayLobbyMod* out) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) {
+            if (!out) return 0;
+            return ae_np_spec_missing_count(g_lnch_lan_mod_spec, index, out);
+        }
+        const PsxLobbyMatchCaps* caps = ae_np_live_caps();
+        if (!out || !caps || index < 0 || index >= caps->mod_count) return 0;
+        const PsxLobbyModPkg& pkg = caps->mods[index];
+        std::snprintf(out->id, sizeof(out->id), "%s", pkg.id);
+        std::snprintf(out->version, sizeof(out->version), "%s", pkg.ver);
+        std::snprintf(out->name, sizeof(out->name), "%s",
+                      pkg.name[0] ? pkg.name : pkg.id);
+        out->builtin = pkg.builtin;
+        out->size = pkg.size;
+        out->installed = ae_np_pkg_installed(pkg.id, pkg.ver);
+        return 1;
+    }
+
+    int ae_np_lobby_mods_missing(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan)
+            return ae_np_lan_missing_mods_count();
+        const PsxLobbyMatchCaps* caps = ae_np_live_caps();
+        int missing = 0;
+        if (!caps) return 0;
+        for (int i = 0; i < caps->mod_count; ++i) {
+            if (!ae_np_pkg_installed(caps->mods[i].id, caps->mods[i].ver))
+                ++missing;
+        }
+        return missing;
+    }
+
+    int ae_np_lobby_mods_download(void*) {
+        /* LAN / Direct-IP: pull straight from the host over the direct
+         * transfer port — there is no signaling server in this path. */
+        if (g_lnch_joined_lan) return ae_np_lan_mod_download_start();
+        if (g_lnch_hosting_lan) return -1;
+        if (!ae_np_live_caps()) return -1;
+        if (psx_lobby_is_host()) return -1;      /* the host IS the source */
+        /* The join-time rejection primes the transfer target; when the plan
+         * changed after seating there was no rejection, so aim it at the
+         * live lobby's host. */
+        if (psx_lobby_mod_xfer_prime_live() != 0) return -1;
+        return psx_lobby_mod_xfer_start();
+    }
 
     RecompLauncherCNetplayCallbacks g_lnch_netplay_callbacks = {
         nullptr,
@@ -11182,6 +12297,17 @@ namespace {
         ae_np_link_lobby_supported,
         ae_np_lobby_kind_get,
         ae_np_lobby_kind_set,
+        ae_np_push_match_caps_cb,
+        ae_np_lobby_mods_count,
+        ae_np_lobby_mods_get,
+        ae_np_lobby_mods_missing,
+        ae_np_lobby_mods_download,
+        ae_np_seat_move_self,
+        ae_np_seat_swap_request,
+        ae_np_seat_swap_incoming,
+        ae_np_seat_swap_respond,
+        ae_np_seat_swap_outgoing,
+        ae_np_seat_swap_clear,
     };
 
     /* Shared by first-boot launcher and soft-return rematch UI so capability
@@ -11613,6 +12739,11 @@ int main(int argc, char** argv) {
                 gc.netplay_required_leadout_lba;
             g_netplay_disc_expect.required_disc_fp = gc.netplay_required_disc_fp;
             g_lnch_link_lobby_supported = gc.netplay_link_lobby ? 1 : 0;
+            g_lnch_netplay_dev_tag = gc.netplay_dev_tag;
+            /* Resolve (and announce) the lobby channel now rather than at
+             * first connect: a player on a dev channel should know before
+             * wondering why the release lobbies are missing. */
+            (void)ae_np_lobby_version();
             g_netplay_local_viewport =
                 (gc.netplay_local_viewport == "vertical_split") ? 1 : 0;
             g_netplay_local_viewport_aspect =
@@ -13323,7 +14454,37 @@ int main(int argc, char** argv) {
          * (found as a RAM-part digest fork at tick 0 with byte-identical
          * low-2MB contents). */
         std::string mod_error;
-        if (net_cfg.enabled || psx_link_pair_follower_mode()) {
+        const char* link_mods_env =
+            psx_link_pair_follower_mode() ? std::getenv("PSX_LINK_MODS")
+                                          : nullptr;
+        if (link_mods_env) {
+            /* PSX-Link follower: the driver hands over the session's applied
+             * plan (it cannot read match_caps — it never joins the lobby).
+             * Applying the SAME spec is what keeps both consoles on this
+             * machine on one plan; the fingerprint check below turns any
+             * residual disagreement (option values, disc identity) into a
+             * refusal instead of a tick-0 RAM digest fork. */
+            if (!PSXRecompV4::mod_runtime_apply_link_spec(link_mods_env,
+                                                          resolved_disc,
+                                                          &mod_error)) {
+                std::fprintf(stderr,
+                             "psxrecomp: link follower cannot apply the "
+                             "driver's mod plan: %s\n", mod_error.c_str());
+                return 1;
+            }
+            if (const char* want_fp = std::getenv("PSX_LINK_MOD_FP")) {
+                const std::string& got = PSXRecompV4::mod_runtime_fingerprint();
+                if (want_fp[0] && got != want_fp) {
+                    std::fprintf(stderr,
+                        "psxrecomp: link follower MOD PLAN MISMATCH — driver "
+                        "resolved %s, follower resolved %s (same spec, "
+                        "different result: check option values / disc image). "
+                        "Refusing to boot.\n",
+                        want_fp, got.empty() ? "(none)" : got.c_str());
+                    return 1;
+                }
+            }
+        } else if (net_cfg.enabled || psx_link_pair_follower_mode()) {
             if (!PSXRecompV4::mod_runtime_commit_for_netplay(resolved_disc,
                                                             &mod_error)) {
                 std::fprintf(stderr,
@@ -14430,6 +15591,26 @@ session_reboot:
                           shm_name);
             std::snprintf(env_role, sizeof env_role, "PSX_LINK_SHM_ROLE=%c",
                           role_other);
+            /* Hand the session's APPLIED mod plan to the follower: it never
+             * joins the lobby, so without this it commits vanilla while this
+             * client runs the host's mods (was a RAM-part digest fork at
+             * tick 0). Empty spec => vanilla, and the follower then takes the
+             * ordinary clear path. */
+            static std::string link_mod_spec, link_mod_fp;
+            static char env_mods[2048], env_mod_fp[128];
+            link_mod_spec = PSXRecompV4::mod_runtime_link_spec_from_session();
+            link_mod_fp = PSXRecompV4::mod_runtime_fingerprint();
+            std::snprintf(env_mods, sizeof env_mods, "PSX_LINK_MODS=%s",
+                          link_mod_spec.c_str());
+            std::snprintf(env_mod_fp, sizeof env_mod_fp, "PSX_LINK_MOD_FP=%s",
+                          link_mod_fp.c_str());
+            if (!link_mod_spec.empty()) {
+                std::printf("psxrecomp: link pair mods -> %s (plan %s)\n",
+                            link_mod_spec.c_str(),
+                            link_mod_fp.empty() ? "(none)"
+                                                : link_mod_fp.c_str());
+                std::fflush(stdout);
+            }
             char *child_env[] = {
                 (char *)"PSX_NO_LAUNCHER=1",
                 (char *)"PSX_HEADLESS=1",
@@ -14440,6 +15621,8 @@ session_reboot:
                 (char *)"PSX_NET_LINK=0",
                 env_name,
                 env_role,
+                env_mods,
+                env_mod_fp,
                 NULL,
             };
             char *child_argv[16];
@@ -14464,15 +15647,30 @@ session_reboot:
             pcfg.session_id = net_cfg.session_id;
             pcfg.tick_len_cycles = 677376u;   /* PAL frame = upper bound */
             {
+                /* Per-char wire latency. libcomb serializes request/reply
+                 * char-by-char and the guest BUSY-WAITS each arrival, so this
+                 * multiplies straight into guest time: at 1/8 frame (84672)
+                 * the measured session burned whole extra frames of simulated
+                 * spin per tick (27-45 ticks/s, notdue 100-600k/s). The read
+                 * barrier owns determinism now, so run near hardware char
+                 * time (~704 cycles at 529 kbps). Tune with
+                 * PSX_LINK_PAIR_LATENCY (cycles, floor 2048). */
                 const char *l = std::getenv("PSX_LINK_PAIR_LATENCY");
                 pcfg.latency_cycles =
-                    (l && l[0]) ? (uint32_t)std::strtoul(l, nullptr, 0) : 0u;
+                    (l && l[0]) ? (uint32_t)std::strtoul(l, nullptr, 0)
+                                : 8192u;
             }
+            /* NO_MODS is an assertion bit the follower compares: derive it
+             * from the plan actually applied, so a driver/follower plan
+             * disagreement refuses to pair instead of desyncing at tick 0. */
             pcfg.flags = PSX_LINK_PAIR_F_SW_RASTER | PSX_LINK_PAIR_F_NO_IDLE |
-                         PSX_LINK_PAIR_F_NO_AUTOFMV | PSX_LINK_PAIR_F_NO_MODS |
-                         PSX_LINK_PAIR_F_BLANK_CARDS;
+                         PSX_LINK_PAIR_F_NO_AUTOFMV |
+                         PSX_LINK_PAIR_F_BLANK_CARDS |
+                         (link_mod_spec.empty() ? PSX_LINK_PAIR_F_NO_MODS : 0u);
             pcfg.bios_id = bios_id;
             pcfg.codegen_hash = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
+            pcfg.mod_plan_hash =
+                PSXRecompV4::mod_runtime_link_spec_hash(link_mod_spec);
             pcfg.shm_name = shm_name;
             pcfg.exe_path = exe_buf;
             pcfg.child_argv = child_argv;
@@ -14814,13 +16012,17 @@ session_reboot:
                 fol_bios_id *= 16777619u;
             }
         }
+        const std::string fol_spec =
+            std::getenv("PSX_LINK_MODS") ? std::getenv("PSX_LINK_MODS") : "";
         const uint32_t fol_flags =
             PSX_LINK_PAIR_F_SW_RASTER | PSX_LINK_PAIR_F_NO_IDLE |
-            PSX_LINK_PAIR_F_NO_AUTOFMV | PSX_LINK_PAIR_F_NO_MODS |
-            PSX_LINK_PAIR_F_BLANK_CARDS;
+            PSX_LINK_PAIR_F_NO_AUTOFMV | PSX_LINK_PAIR_F_BLANK_CARDS |
+            (fol_spec.empty() ? PSX_LINK_PAIR_F_NO_MODS : 0u);
         if (!psx_link_pair_follower_boot(&cpu, fol_bios, fol_entry, fol_flags,
                                          fol_bios_id,
-                                         (uint32_t)PSX_OVERLAY_CODEGEN_HASH)) {
+                                         (uint32_t)PSX_OVERLAY_CODEGEN_HASH,
+                                         PSXRecompV4::mod_runtime_link_spec_hash(
+                                             fol_spec))) {
             std::fprintf(stderr, "psxrecomp: link follower boot FAILED\n");
             return 1;
         }
@@ -14830,6 +16032,10 @@ session_reboot:
             std::printf("psxrecomp: link follower: session ended pre-boot\n");
             return 0;
         }
+        /* Emulation thread → its own physical core (driver takes the other).
+         * After follower_admit: every service thread already exists, so none
+         * inherits the pin. */
+        psx_cpu_pin_link_role(1);
     }
 
     /* Delay-sync: do not free-run boot while HELLO/START is in flight.
@@ -14854,6 +16060,20 @@ session_reboot:
             }
         }
         g_auto_skip_fmv = 0;
+        /* Async present: hand quad+OSD+Swap to the present thread so the
+         * lockstep tick pays only the capture copy (PSX_GL_ASYNC_PRESENT=0
+         * restores the in-line present). Armed BEFORE the pin below so the
+         * present thread inherits the full process mask, and it unpins
+         * itself besides. */
+        if (g_gl_active && !g_headless) {
+            const char *ap = std::getenv("PSX_GL_ASYNC_PRESENT");
+            if (!ap || ap[0] != '0')
+                gl_renderer_set_present_async(1, g_host_refresh_hz);
+        }
+        /* PSX-Link pair: both sim threads on this machine need most of a
+         * core — give the driver and follower distinct physical cores. */
+        if (psx_netplay_link_active())
+            psx_cpu_pin_link_role(0);
         std::printf("psxrecomp: netplay lockstep armed (sim_tick=%u, vsync off)\n",
                     (unsigned)psx_netplay_sim_tick());
         std::fflush(stdout);

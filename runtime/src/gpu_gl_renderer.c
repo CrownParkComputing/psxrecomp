@@ -72,6 +72,7 @@
 #include "psx_savestate_menu.h"
 #include "host_time.h"
 #include "latency_ring.h"
+#include "psx_cpu_pin.h"  /* present thread floats off the pinned sim cores */
 #include "psx_rewind.h"
 
 #include "psx_sdl.h"
@@ -367,6 +368,15 @@ static GLint         s_interp_uBlendMode = -1;
 static int           s_interp_enabled = 0, s_interp_valid = 0;
 static int           s_interp_suspended = 0;
 static int           s_interp_blend_mode = 0;
+/* Async present (netplay): the interp thread machinery presents each captured
+ * frame as-is (alpha pinned to 1, one valid frame suffices) so the sim thread
+ * pays only the capture copy — the quad draw, OSD and SwapWindow (and any
+ * driver stall inside them) move to the present thread. */
+static int           s_interp_present_only = 0;
+/* Latched when the worker could not bind the window surface (single-thread-
+ * surface EGL platforms). Re-arms must not hand Swap to a dead thread. */
+static int           s_interp_thread_failed = 0;
+static int           s_interp_first_swap_logged = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
 static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
@@ -4791,8 +4801,8 @@ static void interp_reset_history(void) {
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
 }
 
-void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
-                                   int blend_mode) {
+static void interp_configure(int enabled, double host_hz, double target_hz,
+                             int blend_mode, int present_only) {
     double effective_hz = target_hz < 0.0
         ? -1.0
         : (target_hz >= 60.0 ? target_hz : host_hz);
@@ -4800,6 +4810,15 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
                   (effective_hz < 0.0 || effective_hz >= 50.0)) ? 1 : 0;
     const char *diag = getenv("PSX_GL_INTERP_DIAG");
     s_interp_diag = diag && diag[0] && diag[0] != '0';
+    if (active && s_interp_thread_failed) {
+        /* The worker already proved it cannot own this window's surface —
+         * a re-arm (rematch) must not hand Swap back to a dead thread. */
+        fprintf(stdout, "psxrecomp: GL %s stays disabled — present thread "
+                "cannot bind the window surface on this platform\n",
+                present_only ? "async present" : "frame interpolation");
+        fflush(stdout);
+        active = 0;
+    }
     if (active && !s_interp_ctx && s_ctx) {
         if (!s_interp_mutex) s_interp_mutex = SDL_CreateMutex();
         SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
@@ -4823,13 +4842,20 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
         }
     }
     if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
-    if (active != s_interp_enabled) interp_reset_history_unlocked();
+    if (active != s_interp_enabled ||
+        (present_only ? 1 : 0) != s_interp_present_only)
+        interp_reset_history_unlocked();
     s_interp_enabled = active;
+    s_interp_present_only = active ? (present_only ? 1 : 0) : 0;
     s_interp_host_hz = host_hz;
     s_interp_target_hz = active ? effective_hz : 0.0;
     s_interp_blend_mode = blend_mode == 1 ? 1 : 0;
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
-    if (active && effective_hz < 0.0)
+    if (active && present_only)
+        fprintf(stdout, "psxrecomp: GL async present enabled — present thread "
+                "owns quad+OSD+Swap at %.1f Hz, sim thread pays capture only\n",
+                effective_hz);
+    else if (active && effective_hz < 0.0)
         fprintf(stdout, "psxrecomp: GL frame interpolation enabled: uncapped "
                 "target on %.1f Hz display (%s blend)\n", host_hz,
                 s_interp_blend_mode ? "motion-adaptive" : "linear");
@@ -4839,6 +4865,20 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
                 s_interp_blend_mode ? "motion-adaptive" : "linear");
     else
         fprintf(stdout, "psxrecomp: GL frame interpolation disabled (host %.1f Hz)\n", host_hz);
+}
+
+void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
+                                   int blend_mode) {
+    interp_configure(enabled, host_hz, target_hz, blend_mode, 0);
+}
+
+/* Async present: reuse the interpolation worker (shared context, capture
+ * texture ring, fences, Swap ownership) without the blend — every captured
+ * frame presents as-is at the host cadence. The sim thread's present cost
+ * drops to flush + one GPU-side copy + fence. */
+void gl_renderer_set_present_async(int enabled, double host_hz) {
+    double hz = host_hz >= 50.0 ? host_hz : 60.0;
+    interp_configure(enabled, hz, hz, 0, enabled ? 1 : 0);
 }
 
 void gl_renderer_set_interpolation_suspended(int suspended) {
@@ -4930,7 +4970,9 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
     s_interp_force_4_3 = force_4_3;
     s_interp_source_path = source_path;
     s_interp_captures++;
-    int ready = s_interp_valid >= 2;
+    /* Present-only: one captured frame is presentable — hand Swap to the
+     * thread immediately instead of presenting the first frame in-line. */
+    int ready = s_interp_valid >= (s_interp_present_only ? 1 : 2);
     SDL_UnlockMutex(s_interp_mutex);
     return ready;
 }
@@ -4965,16 +5007,24 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
 }
 
 static int interp_present(void) {
-    if (!s_ctx || !s_interp_enabled || s_interp_suspended || s_interp_valid < 2) return 0;
-    uint64_t now = SDL_GetPerformanceCounter();
-    if (now <= s_interp_start || !s_interp_duration) return 0;
-    double a = (double)(now - s_interp_start) / (double)s_interp_duration;
-    /* Keep swapping at the host cadence after the blend completes.  Holding
-     * alpha at one is visually identical to leaving the current image on the
-     * front buffer, but avoids an irregular 2/3-swap pattern on 120/144/165 Hz
-     * displays while the next 59.94 Hz guest frame is being produced. */
-    if (a > 1.0) a = 1.0;
-    if (a < 0.0) a = 0.0;
+    if (!s_ctx || !s_interp_enabled || s_interp_suspended) return 0;
+    if (s_interp_valid < (s_interp_present_only ? 1 : 2)) return 0;
+    double a;
+    if (s_interp_present_only) {
+        /* No blend: draw the newest captured frame verbatim. With one valid
+         * frame prev may be a stale slot — alpha 1 gives it zero weight. */
+        a = 1.0;
+    } else {
+        uint64_t now = SDL_GetPerformanceCounter();
+        if (now <= s_interp_start || !s_interp_duration) return 0;
+        a = (double)(now - s_interp_start) / (double)s_interp_duration;
+        /* Keep swapping at the host cadence after the blend completes.  Holding
+         * alpha at one is visually identical to leaving the current image on the
+         * front buffer, but avoids an irregular 2/3-swap pattern on 120/144/165 Hz
+         * displays while the next 59.94 Hz guest frame is being produced. */
+        if (a > 1.0) a = 1.0;
+        if (a < 0.0) a = 0.0;
+    }
 
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
@@ -4996,12 +5046,45 @@ static int interp_present(void) {
                 lx, ly, lw, lh);
     gl_swap_with_osd();
     s_interp_swaps++;
+    if (!s_interp_first_swap_logged) {
+        /* One-time proof-of-life: separates "thread never presented"
+         * (bind/platform failure) from a content/staleness bug. */
+        s_interp_first_swap_logged = 1;
+        fprintf(stdout, "psxrecomp: GL present thread: first frame swapped "
+                "(%s mode)\n",
+                s_interp_present_only ? "async present" : "interpolation");
+        fflush(stdout);
+    }
     return 1;
 }
 
 static int interp_thread_main(void *opaque) {
     (void)opaque;
-    if (SDL_GL_MakeCurrent(s_win, s_interp_ctx) != 0) return -1;
+    /* A pinned emulation thread must not bequeath its single-core affinity:
+     * the present thread has to float away from the two sim cores. */
+    psx_cpu_pin_unpin_self();
+    if (SDL_GL_MakeCurrent(s_win, s_interp_ctx) != 0) {
+        /* EGL (Wayland/Mesa) allows a window surface to be current to ONE
+         * thread; the sim thread's context still holds it, so this bind is
+         * refused (GLX tolerates the share, which is why the same code works
+         * on X11/NVIDIA). Silent failure here froze the window on the last
+         * main-thread frame the moment capture claimed Swap ownership — so
+         * disable the worker loudly and hand present back to the sim thread. */
+        fprintf(stderr,
+                "psxrecomp: GL present/interp thread cannot bind the window "
+                "surface (%s) — single-thread-surface GL platform; falling "
+                "back to in-line present on the sim thread\n",
+                SDL_GetError());
+        fflush(stderr);
+        SDL_LockMutex(s_interp_mutex);
+        s_interp_thread_failed = 1;
+        s_interp_enabled = 0;
+        s_interp_present_only = 0;
+        s_interp_target_hz = 0.0;
+        interp_reset_history_unlocked();
+        SDL_UnlockMutex(s_interp_mutex);
+        return -1;
+    }
     SDL_GL_SetSwapInterval(0); /* host-period scheduler owns cadence */
     p_glGenVertexArrays(1, &s_interp_thread_vao);
     uint64_t freq = SDL_GetPerformanceFrequency();

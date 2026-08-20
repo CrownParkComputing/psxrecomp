@@ -44,6 +44,14 @@ int  psx_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
 int  psx_lobby_leave(void) { return -1; }
 int  psx_lobby_kick(int slot) { (void)slot; return -1; }
+int  psx_lobby_seat_move(int to_slot) { (void)to_slot; return -1; }
+int  psx_lobby_seat_swap_request(int t) { (void)t; return -1; }
+int  psx_lobby_seat_swap_answer(const char *a, int k) { (void)a; (void)k; return -1; }
+int  psx_lobby_seat_swap_incoming(char *w, size_t wc, char *a, size_t ac, int *f)
+{ (void)w; (void)wc; (void)a; (void)ac; (void)f; return 0; }
+void psx_lobby_seat_swap_incoming_clear(void) {}
+int  psx_lobby_seat_swap_outgoing(void) { return 0; }
+void psx_lobby_seat_swap_outgoing_clear(void) {}
 int  psx_lobby_move_member(int from_slot, int to_slot)
 { (void)from_slot; (void)to_slot; return -1; }
 int  psx_lobby_in_lobby(void) { return 0; }
@@ -107,6 +115,7 @@ const PsxLobbyModOffer *psx_lobby_mod_offer(void)
     static PsxLobbyModOffer z;
     return &z;
 }
+int  psx_lobby_version_is_dev(const char *v) { (void)v; return 0; }
 int  psx_lobby_need_mods_count(void) { return 0; }
 int  psx_lobby_need_mods_get(int index, PsxLobbyModPkg *out)
 { (void)index; (void)out; return 0; }
@@ -114,6 +123,7 @@ int  psx_lobby_need_mods_can_transfer(void) { return 0; }
 const char *psx_lobby_need_mods_lobby_id(void) { return ""; }
 const char *psx_lobby_pending_join_password(void) { return ""; }
 const char *psx_lobby_pending_join_bind(void) { return ""; }
+int  psx_lobby_mod_xfer_prime_live(void) { return -1; }
 int  psx_lobby_mod_xfer_start(void) { return -1; }
 void psx_lobby_mod_xfer_cancel(void) {}
 int  psx_lobby_mod_xfer_progress(void) { return -1; }
@@ -222,6 +232,12 @@ typedef struct {
     PsxLobbyModPkg need_mods[PSX_LOBBY_MAX_MODS];
     int need_mod_count;
     int need_mods_can_transfer;
+    /* Seat trade (server-arbitrated). */
+    int  seat_ask_active;
+    char seat_ask_who[64];
+    char seat_ask_id[PSX_LOBBY_ID_LEN];
+    int  seat_ask_from_slot;
+    int  seat_out_state;          /* 0 idle 1 waiting 2 accepted -1 declined */
     char need_mods_lobby_id[PSX_LOBBY_ID_LEN];
     char pending_join_password[64];
     char pending_join_bind[PSX_LOBBY_ENDPOINT_LEN];
@@ -985,8 +1001,21 @@ static const char *effective_game_version(const char *override_ver)
 }
 
 /* Release builds pin the lobby browser to our exact game_version.
- * Non-release ("dev") shows all versions of our title so testers can see
- * unofficial / mismatched hosts; join still requires an exact version match. */
+ * Bare "dev" shows all versions of our title so testers can see unofficial /
+ * mismatched hosts; join still requires an exact version match.
+ *
+ * A TAGGED dev channel ("dev+<tag>") is strict on purpose: the point of a
+ * tag is that a group of local builds finds each other and nothing else —
+ * an unfiltered list would bury those few rooms under every release lobby,
+ * and the rooms themselves stay invisible to release players because their
+ * browsers pin an exact version that no dev build ever advertises. */
+int psx_lobby_version_is_dev(const char *v)
+{
+    if (!v || !v[0]) return 0;
+    if (strcmp(v, "dev") == 0) return 1;
+    return strncmp(v, "dev+", 4) == 0;
+}
+
 static int list_filter_version_strict(void)
 {
     const char *gv = effective_game_version(NULL);
@@ -1351,6 +1380,17 @@ static int json_token_ok(const char *s)
     return 1;
 }
 
+/* Lowercase hex only (a plan fingerprint) — never trust a relayed string. */
+static int json_hex_ok(const char *s)
+{
+    if (!s) return 0;
+    for (; *s; ++s) {
+        const char ch = *s;
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return 0;
+    }
+    return 1;
+}
+
 static int json_feats_ok(const char *s)
 {
     if (!s) return 0;
@@ -1359,7 +1399,9 @@ static int json_feats_ok(const char *s)
         char ch = *s;
         if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
               (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' ||
-              ch == '-' || ch == '+' || ch == ','))
+              ch == '-' || ch == '+' || ch == ',' ||
+              /* option tail: feat=key~value */
+              ch == '=' || ch == '~'))
             return 0;
     }
     return 1;
@@ -1494,6 +1536,8 @@ static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out)
     out->lobby_kind = json_get_int(obj, "lobby_kind", 0);
     json_get_str(obj, "language", out->language, sizeof(out->language));
     json_get_str(obj, "session_bios", out->session_bios, sizeof(out->session_bios));
+    json_get_str(obj, "mod_plan_fp", out->mod_plan_fp, sizeof(out->mod_plan_fp));
+    if (!json_hex_ok(out->mod_plan_fp)) out->mod_plan_fp[0] = '\0';
     /* Normalize settled BIOS id. */
     if (out->session_bios[0] &&
         strcmp(out->session_bios, "openbios") != 0 &&
@@ -1535,7 +1579,8 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         "\"auto_skip_fmv\":%s,\"input_delay\":%d,\"input_prediction\":%d,"
                         "\"force_input_relay\":%s,\"force_turn\":%s,\"rollback\":%s,"
                         "\"multitap_analog\":%s,\"lobby_kind\":%d,"
-                        "\"language\":\"%s\",\"session_bios\":\"%s\"}",
+                        "\"language\":\"%s\",\"session_bios\":\"%s\","
+                        "\"mod_plan_fp\":\"%s\"}",
                         caps->aspect_num, caps->aspect_den,
                         caps->turbo_loads ? "true" : "false",
                         caps->bios_hle ? "true" : "false",
@@ -1548,7 +1593,8 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         caps->rollback ? "true" : "false",
                         caps->multitap_analog ? "true" : "false",
                         caps->lobby_kind,
-                        lang, sb);
+                        lang, sb, json_hex_ok(caps->mod_plan_fp)
+                                      ? caps->mod_plan_fp : "");
         if (n < 0 || (size_t)n >= dst_cap) return n;
         if (caps->mod_count > 0) {
             char mods[2048];
@@ -2298,6 +2344,23 @@ static void handle_server_json(const char *json)
         g_lc.xfer_host_done = 0;
         return;
     }
+    if (strcmp(op, "seat_swap_ask") == 0) {
+        /* Somebody wants this player's seat; the UI prompts and answers. */
+        g_lc.seat_ask_active = 1;
+        json_get_str(json, "asker_player_id", g_lc.seat_ask_id,
+                     sizeof(g_lc.seat_ask_id));
+        json_get_str(json, "asker_name", g_lc.seat_ask_who,
+                     sizeof(g_lc.seat_ask_who));
+        g_lc.seat_ask_from_slot = json_get_int(json, "from_slot", -1);
+        if (!g_lc.seat_ask_id[0]) g_lc.seat_ask_active = 0;
+        return;
+    }
+
+    if (strcmp(op, "seat_swap_result") == 0) {
+        g_lc.seat_out_state = json_get_bool(json, "accept", 0) ? 2 : -1;
+        return;
+    }
+
     if (strcmp(op, "mod_signal") == 0) {
         char text_buf[2048];
         int type = json_get_int(json, "type", 0);
@@ -3619,6 +3682,62 @@ int psx_lobby_kick(int slot)
     return 0;
 }
 
+int psx_lobby_seat_move(int to_slot)
+{
+    char msg[96];
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (to_slot <= 0 || to_slot >= PSX_LOBBY_MAX_MEMBERS) return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_move\",\"to_slot\":%d}", to_slot);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int psx_lobby_seat_swap_request(int target_slot)
+{
+    char msg[112];
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (target_slot <= 0 || target_slot >= PSX_LOBBY_MAX_MEMBERS) return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_request\",\"target_slot\":%d}",
+             target_slot);
+    queue_send(msg);
+    flush_pending();
+    g_lc.seat_out_state = 1;
+    return 0;
+}
+
+int psx_lobby_seat_swap_answer(const char *asker_player_id, int accept)
+{
+    char msg[192];
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (!asker_player_id || !asker_player_id[0]) return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_answer\",\"asker_player_id\":\"%s\","
+             "\"accept\":%s}",
+             asker_player_id, accept ? "true" : "false");
+    queue_send(msg);
+    flush_pending();
+    g_lc.seat_ask_active = 0;
+    return 0;
+}
+
+int psx_lobby_seat_swap_incoming(char *who, size_t who_cap,
+                                 char *asker_id, size_t asker_cap,
+                                 int *from_slot)
+{
+    if (!g_lc.seat_ask_active) return 0;
+    if (who && who_cap) snprintf(who, who_cap, "%s", g_lc.seat_ask_who);
+    if (asker_id && asker_cap) snprintf(asker_id, asker_cap, "%s", g_lc.seat_ask_id);
+    if (from_slot) *from_slot = g_lc.seat_ask_from_slot;
+    return 1;
+}
+
+void psx_lobby_seat_swap_incoming_clear(void) { g_lc.seat_ask_active = 0; }
+int  psx_lobby_seat_swap_outgoing(void) { return g_lc.seat_out_state; }
+void psx_lobby_seat_swap_outgoing_clear(void) { g_lc.seat_out_state = 0; }
+
 int psx_lobby_move_member(int from_slot, int to_slot)
 {
     char msg[96];
@@ -3788,6 +3907,24 @@ const char *psx_lobby_pending_join_password(void)
 const char *psx_lobby_pending_join_bind(void)
 {
     return g_lc.pending_join_bind[0] ? g_lc.pending_join_bind : g_lc.my_bind;
+}
+
+int psx_lobby_mod_xfer_prime_live(void)
+{
+    int i;
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (!g_lc.join.lobby_id[0]) return -1;
+    /* Host identity comes from the seat list, not the join rejection. */
+    for (i = 0; i < g_lc.member_count; ++i) {
+        if (!psx_lobby_member_is_host(&g_lc.members[i])) continue;
+        if (!g_lc.members[i].player_id[0]) break;
+        snprintf(g_lc.need_mods_lobby_id, sizeof(g_lc.need_mods_lobby_id),
+                 "%s", g_lc.join.lobby_id);
+        snprintf(g_lc.xfer_host_player_id, sizeof(g_lc.xfer_host_player_id),
+                 "%s", g_lc.members[i].player_id);
+        return 0;
+    }
+    return -1;
 }
 
 int psx_lobby_mod_xfer_start(void)

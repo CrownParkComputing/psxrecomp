@@ -257,6 +257,10 @@ void psx_netplay_wait_recv(int timeout_ms);
 void psx_netplay_admit_wait_info(char *stall_out, size_t stall_cap,
                                  uint32_t *sim_tick_out, int *lead_out);
 
+/* LINKPERF breakdown: 1 if try_admit last refused because the peer's input
+ * or confirm had not arrived (network wait), 0 for any other reason. */
+int  psx_netplay_admit_stall_is_net(void);
+
 /* Normalize sticks (deadzone → center) for stabler cross-device blobs. */
 void psx_netplay_normalize_pad(PsxNetPad *pad);
 

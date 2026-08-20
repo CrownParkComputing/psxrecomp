@@ -20,7 +20,11 @@ extern "C" {
 #define PSX_LOBBY_MOD_ID_LEN 96
 #define PSX_LOBBY_MOD_VER_LEN 32
 #define PSX_LOBBY_MOD_NAME_LEN 48
-#define PSX_LOBBY_MOD_FEATS_LEN 96
+/* Feature list per package: "feat[=opt~val[+opt~val]][,feat...]". Option
+ * values are part of the plan (two peers running the same feature with
+ * different options resolve different bytes), so this is sized for them —
+ * 96 silently truncated the moment options appeared. */
+#define PSX_LOBBY_MOD_FEATS_LEN 384
 
 #ifndef PSX_GAME_VERSION
 #define PSX_GAME_VERSION "dev"
@@ -120,6 +124,10 @@ typedef struct PsxLobbyMatchCaps {
     char language[PSX_LOBBY_LANG_LEN];
     /* Settled match BIOS: "openbios" | "scph1001" | "" (unset / legacy). */
     char session_bios[16];
+    /* Host's portable mod-plan fingerprint (resolve digest, disc excluded).
+     * Peers compare after applying the plan and refuse to launch on a
+     * mismatch instead of desyncing on the first tick. Empty = not published. */
+    char mod_plan_fp[72];
     /* Host-required packages (unique id+ver with any enabled feature). Empty = vanilla. */
     int  mod_count;
     PsxLobbyModPkg mods[PSX_LOBBY_MAX_MODS];
@@ -166,6 +174,8 @@ void psx_lobby_pump(void);
  */
 void psx_lobby_set_game_identity(const char *game_name, const char *game_version);
 const char *psx_lobby_game_version(void);
+/* 1 for the dev channel ("dev" or "dev+<tag>") — never a release pin. */
+int  psx_lobby_version_is_dev(const char *v);
 
 /*
  * TOC fingerprint (lowercase hex SHA-256 from DiscIdentity::disc_fp).
@@ -206,6 +216,20 @@ int  psx_lobby_kick(int slot);
 
 /* Host-only: swap/move a seated player between slots (server broadcasts update). */
 int  psx_lobby_move_member(int from_slot, int to_slot);
+/* Seat self-service (any seated player, not just the host). seat_move takes a
+ * FREE seat; taking an occupied one needs consent, so it is a request the
+ * occupant answers. The server arbitrates and broadcasts the new table. */
+int  psx_lobby_seat_move(int to_slot);
+int  psx_lobby_seat_swap_request(int target_slot);
+int  psx_lobby_seat_swap_answer(const char *asker_player_id, int accept);
+/* Incoming ask (1 = pending): who wants this player's seat. */
+int  psx_lobby_seat_swap_incoming(char *who, size_t who_cap,
+                                  char *asker_id, size_t asker_cap,
+                                  int *from_slot);
+void psx_lobby_seat_swap_incoming_clear(void);
+/* Outgoing verdict: 0 idle, 1 waiting, 2 accepted, -1 declined. */
+int  psx_lobby_seat_swap_outgoing(void);
+void psx_lobby_seat_swap_outgoing_clear(void);
 
 int  psx_lobby_in_lobby(void);
 int  psx_lobby_is_host(void);
@@ -294,6 +318,10 @@ int  psx_lobby_need_mods_can_transfer(void);
 const char *psx_lobby_need_mods_lobby_id(void);
 const char *psx_lobby_pending_join_password(void);
 const char *psx_lobby_pending_join_bind(void);
+/* Aim the mod transfer at the CURRENT lobby's host. The join-time need_mods
+ * rejection primes the same target; this covers the post-seat case (the host
+ * enabled a mod while everyone was already sitting in the room). 0 = primed. */
+int  psx_lobby_mod_xfer_prime_live(void);
 int  psx_lobby_mod_xfer_start(void);          /* guest: ask host to send missing pkgs */
 void psx_lobby_mod_xfer_cancel(void);
 int  psx_lobby_mod_xfer_progress(void);       /* -1 idle, -2 fail, 0..100 */

@@ -498,6 +498,7 @@ void psx_netplay_admit_wait_info(char *stall_out, size_t stall_cap,
     if (sim_tick_out) *sim_tick_out = 0;
     if (lead_out) *lead_out = 0;
 }
+int  psx_netplay_admit_stall_is_net(void) { return 0; }
 void psx_netplay_bind_cpu(struct CPUState *cpu) { (void)cpu; }
 uint32_t psx_netplay_resolved_through(void) { return 0; }
 int psx_netplay_hash_confirm_through(uint32_t tick) { (void)tick; return 0; }
@@ -646,9 +647,120 @@ static uint32_t s_deferred_rw_tick;
 static int s_deferred_rw_slot;
 static int s_deferred_rw_logged;
 
+/* PSX-Link fold forensics: per-tick partition digests of BOTH local consoles
+ * (client + follower), normalized to console order A,B. Filled every tick at
+ * FRAME_COMMIT; dumped as a window when the fold FIRST MISMATCH (or a
+ * persisted LINK DESYNC) fires. Both machines emit identical-format lines
+ * keyed by sim tick, so diffing the two logs names the diverging console,
+ * the partition (cpu/clk/tim/ram/dirty/sio1/spad), and the first bad tick. */
+typedef struct NpLinkDigSlot {
+    uint32_t tick;
+    uint8_t  valid;                /* 1 = full entry, 2 = commit skipped */
+    NetplayCoreParts cli;          /* local client console */
+    uint32_t cli_sio1;
+    uint32_t cli_spad;
+    uint64_t cli_cyc;              /* raw boundary state at digest time */
+    uint32_t cli_csv;
+    uint32_t cli_istat;
+    PsxLinkFolParts fol;           /* local follower console */
+} NpLinkDigSlot;
+#define NP_LINK_DIG_RING 128u
+static NpLinkDigSlot s_link_dig_ring[NP_LINK_DIG_RING];
+/* Fold-mismatch open/heal bookkeeping (transient vs persistent). */
+static int      s_link_mm_open;
+static uint32_t s_link_mm_open_tick;
+static uint64_t s_link_mm_open_ms;
+static uint32_t s_link_mm_events;
+#define NP_LINK_MM_LOG_CAP 5u
+
+static void np_link_dig_put(uint32_t tick, const NetplayCoreParts *cli,
+                            uint32_t cli_sio1, uint32_t cli_spad,
+                            uint64_t cli_cyc, uint32_t cli_csv,
+                            uint32_t cli_istat, const PsxLinkFolParts *fol)
+{
+    NpLinkDigSlot *s = &s_link_dig_ring[tick % NP_LINK_DIG_RING];
+    s->tick = tick;
+    s->cli = *cli;
+    s->cli_sio1 = cli_sio1;
+    s->cli_spad = cli_spad;
+    s->cli_cyc = cli_cyc;
+    s->cli_csv = cli_csv;
+    s->cli_istat = cli_istat;
+    s->fol = *fol;
+    s->valid = 1u;
+}
+
+/* The depth24+MDEC window skips FRAME_COMMIT emission — record that fact so
+ * the dump distinguishes "skipped here" from "aged out", and so a skip-window
+ * EDGE disagreement between machines is directly visible. */
+static void np_link_dig_put_skip(uint32_t tick)
+{
+    NpLinkDigSlot *s = &s_link_dig_ring[tick % NP_LINK_DIG_RING];
+    memset(s, 0, sizeof(*s));
+    s->tick = tick;
+    s->valid = 2u;
+}
+
+static void np_link_dig_dump(uint32_t tick, const char *why)
+{
+    const uint32_t from = tick > 15u ? tick - 15u : 0u;
+    uint32_t t;
+    fprintf(stderr,
+            "psxrecomp: link dig dump (%s) sim=%u window=%u..%u — diff these "
+            "lines against the peer machine's log by sim tick\n",
+            why, (unsigned)tick, (unsigned)from, (unsigned)tick);
+    for (t = from; t <= tick; t++) {
+        const NpLinkDigSlot *s = &s_link_dig_ring[t % NP_LINK_DIG_RING];
+        PsxLinkFolParts a, b;
+        if (!s->valid || s->tick != t)
+            continue;
+        if (s->valid == 2u) {
+            fprintf(stderr,
+                    "psxrecomp: link dig sim=%u (commit skipped: depth24+mdec "
+                    "window)%s\n",
+                    (unsigned)t, t == tick ? "  <-- mismatch tick" : "");
+            continue;
+        }
+        /* Normalize to console order: base seat 0 => client IS console A. */
+        {
+            PsxLinkFolParts cli;
+            cli.core = s->cli.core;  cli.cpu = s->cli.cpu;
+            cli.clk = s->cli.clock_irq; cli.tim = s->cli.timers;
+            cli.ram = s->cli.ram;    cli.dirty = s->cli.dirty;
+            cli.sio1 = s->cli_sio1;  cli.spad = s->cli_spad;
+            cli.cyc = s->cli_cyc;    cli.csv = s->cli_csv;
+            cli.istat = s->cli_istat;
+            if (g_np.link_base == 0) { a = cli; b = s->fol; }
+            else                     { a = s->fol; b = cli; }
+        }
+        fprintf(stderr,
+                "psxrecomp: link dig sim=%u "
+                "A[core=%08x cpu=%08x clk=%08x tim=%08x ram=%08x dirty=%08x "
+                "sio1=%08x spad=%08x cyc=%llu csv=%u istat=%04x] "
+                "B[core=%08x cpu=%08x clk=%08x tim=%08x ram=%08x dirty=%08x "
+                "sio1=%08x spad=%08x cyc=%llu csv=%u istat=%04x]%s\n",
+                (unsigned)t,
+                (unsigned)a.core, (unsigned)a.cpu, (unsigned)a.clk,
+                (unsigned)a.tim, (unsigned)a.ram, (unsigned)a.dirty,
+                (unsigned)a.sio1, (unsigned)a.spad,
+                (unsigned long long)a.cyc, (unsigned)a.csv, (unsigned)a.istat,
+                (unsigned)b.core, (unsigned)b.cpu, (unsigned)b.clk,
+                (unsigned)b.tim, (unsigned)b.ram, (unsigned)b.dirty,
+                (unsigned)b.sio1, (unsigned)b.spad,
+                (unsigned long long)b.cyc, (unsigned)b.csv, (unsigned)b.istat,
+                t == tick ? "  <-- mismatch tick" : "");
+    }
+    fflush(stderr);
+}
+
 static void np_part_ring_reset(void)
 {
     memset(s_part_ring, 0, sizeof(s_part_ring));
+    memset(s_link_dig_ring, 0, sizeof(s_link_dig_ring));
+    s_link_mm_open = 0;
+    s_link_mm_open_tick = 0;
+    s_link_mm_open_ms = 0;
+    s_link_mm_events = 0;
     s_core_diverge_logged = 0;
     s_live_dig_last_tick = 0xffffffffu;
     s_fork_tick = 0xffffffffu;
@@ -970,8 +1082,31 @@ static void np_check_core_diverge(void)
     const NpPartSlot *slot;
     if (!netplay_hc_peek_mismatch(&g_np.hc, &tick, &local_d, &peer_d)) {
         s_fork_tick = 0xffffffffu; /* resolved / no complete pair pending */
-        if (g_np.link_active)
+        if (g_np.link_active) {
+            if (s_link_mm_open) {
+                /* The streak cleared without the 4s desync latch firing —
+                 * measured transient (the race-start class opens for ~one
+                 * tick then heals; the dig dump above holds the forensics).
+                 * A REAL fork re-opens immediately as the ring ages, so the
+                 * open/heal pair count stays honest. */
+                s_link_mm_open = 0;
+                if (s_link_mm_events <= NP_LINK_MM_LOG_CAP) {
+                    fprintf(stderr,
+                            "psxrecomp: link fold mismatch HEALED — opened "
+                            "sim=%u, clean at sim=%u after %llums "
+                            "(event %u%s)\n",
+                            (unsigned)s_link_mm_open_tick,
+                            (unsigned)psx_netplay_sim_tick(),
+                            (unsigned long long)(psx_host_mono_ms() -
+                                                 s_link_mm_open_ms),
+                            (unsigned)s_link_mm_events,
+                            s_link_mm_events == NP_LINK_MM_LOG_CAP
+                                ? "; further events unlogged" : "");
+                    fflush(stderr);
+                }
+            }
             g_np.link_mismatch_ms = 0;
+        }
         return;
     }
     if (g_np.link_active) {
@@ -984,11 +1119,17 @@ static void np_check_core_diverge(void)
          * baseline/POST compares instead. A mismatch that PERSISTS while no
          * local episode is active is a real cross-machine desync. */
         uint64_t now = psx_host_mono_ms();
-        if (g_np.link_mismatch_ms == 0 || g_np.link_mismatch_tick != tick) {
-            g_np.link_mismatch_tick = tick;
+        /* Time the STREAK, not one tick: in a permanent fork the oldest
+         * mismatched tick ages out of the 128-slot ring and the watermark
+         * heals forward, so a per-tick timer reset every ~128 ticks and the
+         * latch never fired (observed: 2600 divergent ticks, no abort). The
+         * timer resets only when the ring goes clean. */
+        g_np.link_mismatch_tick = tick;
+        if (g_np.link_mismatch_ms == 0) {
             g_np.link_mismatch_ms = now;
         } else if (now - g_np.link_mismatch_ms > 4000ull &&
                    !psx_netplay_rb_active_episode() &&
+                   psx_netplay_is_running() &&
                    !g_np.link_desynced) {
             g_np.link_desynced = 1;
             fprintf(stderr,
@@ -996,15 +1137,32 @@ static void np_check_core_diverge(void)
                     "sim=%u local=%08x peer=%08x\n",
                     (unsigned)tick, (unsigned)local_d, (unsigned)peer_d);
             fflush(stderr);
+            np_link_dig_dump(tick, "link desync");
         }
-        if (s_core_diverge_logged)
-            return;
-        s_core_diverge_logged = 1;
-        fprintf(stderr,
-                "psxrecomp: link fold FIRST MISMATCH sim=%u local=%08x "
-                "peer=%08x (may be a cross-generation transient)\n",
-                (unsigned)tick, (unsigned)local_d, (unsigned)peer_d);
-        fflush(stderr);
+        /* Open a measured mismatch window instead of the old one-shot
+         * "FIRST MISMATCH" alarm: the race-start class provably opens and
+         * heals within a tick (see the HEALED log in the clean branch), so
+         * alarm-grade reporting belongs to the 4s LINK DESYNC latch above.
+         * Full forensics still dump once per session at the first open. */
+        if (!s_link_mm_open) {
+            s_link_mm_open = 1;
+            s_link_mm_open_tick = tick;
+            s_link_mm_open_ms = now;
+            s_link_mm_events++;
+            if (s_link_mm_events <= NP_LINK_MM_LOG_CAP) {
+                fprintf(stderr,
+                        "psxrecomp: link fold mismatch open sim=%u "
+                        "local=%08x peer=%08x (event %u — watching for "
+                        "heal)\n",
+                        (unsigned)tick, (unsigned)local_d, (unsigned)peer_d,
+                        (unsigned)s_link_mm_events);
+                fflush(stderr);
+            }
+            if (!s_core_diverge_logged) {
+                s_core_diverge_logged = 1;
+                np_link_dig_dump(tick, "first mismatch open");
+            }
+        }
         return;
     }
     /* Replay/Verify: never allow a false POST commit after mid-resim fork. */
@@ -1075,6 +1233,11 @@ static void np_emit_frame_commit(uint32_t tick)
     uint32_t spu = 0u;
     uint32_t mdec = 0u;
     uint32_t aux = 0u;
+    uint32_t cli_sio1 = 0u;
+    uint32_t cli_spad = 0u;
+    uint64_t cli_cyc = 0u;
+    uint32_t cli_csv = 0u;
+    uint32_t cli_istat = 0u;
     int crumb;
     if (!g_np.cpu || !g_np.session) return;
     /* TipHold Live invents are not sealed-input truth — emitting them poisoned
@@ -1088,24 +1251,42 @@ static void np_emit_frame_commit(uint32_t tick)
      * whole movie). Leaving FMV primes hash_confirm so the watermark is not
      * stuck on missing movie slots. */
     if (gpu_display_is_depth24() && mdec_recently_active(8) &&
-        !(g_np.rollback && psx_netplay_rb_is_resimulating()))
+        !(g_np.rollback && psx_netplay_rb_is_resimulating())) {
+        if (g_np.link_active)
+            np_link_dig_put_skip(tick);
         return;
+    }
     /* Present-edge: clear PC so parked-0 vs live-BB does not fork FRAME_COMMIT
      * while GPRs/RAM/clk match (was aborting good Replay on dig_cpu alone). */
-    psx_netplay_rb_cpu_for_present_digest(&dig_cpu, g_np.cpu);
-    netplay_core_digest_parts(&dig_cpu, &parts);
-    /* av/cd/spu/mdec every 32 ticks — VRAM + SPU-RAM CRC every frame is heavy. */
-    crumb = (tick == 0u || (tick % 32u) == 0u);
-    if (crumb) {
-        uint32_t aux_crc = 0xFFFFFFFFu;
-        av = netplay_av_digest();
-        cd = netplay_cdrom_digest();
-        spu = netplay_spu_digest();
-        mdec = netplay_mdec_digest();
-        /* Same fold as netplay_aux_digest — avoid hashing SPU RAM twice. */
-        aux_crc = crc32_update(aux_crc, (const uint8_t *)&spu, sizeof(spu));
-        aux_crc = crc32_update(aux_crc, (const uint8_t *)&mdec, sizeof(mdec));
-        aux = aux_crc ^ 0xFFFFFFFFu;
+    {
+        uint64_t dig_t0 = psx_link_pair_perf_now_us();
+        psx_netplay_rb_cpu_for_present_digest(&dig_cpu, g_np.cpu);
+        netplay_core_digest_parts(&dig_cpu, &parts);
+        if (g_np.link_active) {
+            /* Fold-mismatch forensics (cheap: small snapshots + 1KB CRC). */
+            extern uint32_t i_stat;
+            cli_sio1 = netplay_sio1_digest();
+            cli_spad = netplay_spad_digest();
+            cli_cyc = psx_cycle_count;
+            cli_csv = interrupts_get_cycles_since_vblank();
+            cli_istat = i_stat;
+        }
+        /* av/cd/spu/mdec every 32 ticks — VRAM + SPU-RAM CRC every frame is
+         * heavy. */
+        crumb = (tick == 0u || (tick % 32u) == 0u);
+        if (crumb) {
+            uint32_t aux_crc = 0xFFFFFFFFu;
+            av = netplay_av_digest();
+            cd = netplay_cdrom_digest();
+            spu = netplay_spu_digest();
+            mdec = netplay_mdec_digest();
+            /* Same fold as netplay_aux_digest — avoid hashing SPU RAM twice. */
+            aux_crc = crc32_update(aux_crc, (const uint8_t *)&spu, sizeof(spu));
+            aux_crc = crc32_update(aux_crc, (const uint8_t *)&mdec, sizeof(mdec));
+            aux = aux_crc ^ 0xFFFFFFFFu;
+        }
+        psx_link_pair_perf_gw_add(PSX_LINK_PERF_GW_DIGEST,
+                                  psx_link_pair_perf_now_us() - dig_t0);
     }
     np_part_ring_put(tick, &parts, av, cd, spu, mdec, aux);
     {
@@ -1118,15 +1299,18 @@ static void np_emit_frame_commit(uint32_t tick)
              * the session hash ladder (a follower running a different
              * execution contract was invisible to client-vs-client compares
              * and surfaced as a race-start link hang). */
-            uint32_t fol = 0;
-            if (!psx_link_shm_wait_follower_tick(tick) ||
-                !psx_link_shm_read_digest(tick, &fol)) {
+            PsxLinkFolParts fol_parts;
+            if (!psx_link_shm_wait_follower_tick_r(tick, PSX_LINK_WAIT_FOLD) ||
+                !psx_link_shm_read_parts(tick, &fol_parts)) {
                 /* Follower dead: skip emission; the admit loop's
                  * pair-failed poll ends the session. */
                 np_check_core_diverge();
                 return;
             }
+            np_link_dig_put(tick, &parts, cli_sio1, cli_spad, cli_cyc,
+                            cli_csv, cli_istat, &fol_parts);
             {
+                const uint32_t fol = fol_parts.core;
                 const uint32_t a = g_np.link_base == 0 ? parts.core : fol;
                 const uint32_t b = g_np.link_base == 0 ? fol : parts.core;
                 uint32_t crc = 0xFFFFFFFFu;
@@ -3849,6 +4033,7 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
         sb.input_delay = &g_np.input_delay;
         sb.input_prediction = &g_np.input_prediction;
         sb.local_slot = &g_np.local_slot;
+        sb.rollback = &g_np.rollback;
         /* Same Force TURN bit used for ICE relay-only (env may override). */
         {
             int ft = cfg->force_turn ? 1 : 0;
@@ -5040,6 +5225,19 @@ void psx_netplay_wait_recv(int timeout_ms)
 {
     if (!psx_netplay_active()) return;
     (void)rnet_session_wait_recv(g_np.session, timeout_ms);
+}
+
+/* LINKPERF guest-window breakdown: classify why try_admit last refused.
+ * 1 = the peer's input/confirm had not arrived (the network), 0 = anything
+ * else (pump, xfer, pacing artifacts). Cheap enough for the admit spin. */
+int psx_netplay_admit_stall_is_net(void)
+{
+    RNetSessionStats st;
+    if (!psx_netplay_active() || !g_np.session)
+        return 0;
+    rnet_session_get_stats(g_np.session, &st);
+    return st.last_stall == RNET_ADMIT_WAIT_REMOTE_INPUT ||
+           st.last_stall == RNET_ADMIT_WAIT_CONFIRM;
 }
 
 void psx_netplay_admit_wait_info(char *stall_out, size_t stall_cap,

@@ -289,6 +289,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
     ${PSXRECOMP_ROOT}/runtime/src/netplay_snap_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/netplay_state_digest.c
+    ${PSXRECOMP_ROOT}/runtime/src/netplay_ram_dirty.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cpu_pin.c
     ${PSXRECOMP_ROOT}/runtime/src/netplay_input_hist.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_netplay_rb.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_netplay_sched.c

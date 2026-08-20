@@ -1,4 +1,5 @@
 #include "boot_state.h"
+#include "netplay_ram_dirty.h"
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "dirty_ram_interp.h"
 #include "gpu.h"           /* gpu_get_vram — CPU-auth mirror under dual-raster   */
@@ -1027,6 +1028,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
+    np_ram_dig_mark_all();
 
     if (!s_quiet_load) {
         const double total_ms = boot_state_mono_ms() - t0;

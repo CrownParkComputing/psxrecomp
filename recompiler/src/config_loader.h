@@ -846,6 +846,10 @@ struct GameConfig {
     uint32_t              netplay_required_leadout_lba = 0;
     std::string           netplay_required_disc_fp;  // lowercase hex SHA-256
     bool                  netplay_link_lobby = false; // PSX-Link lobby type offered
+    // Shared dev channel tag. Local / unreleased builds advertise
+    // "dev+<tag>" instead of a release pin, so they find each other in the
+    // lobby browser and never appear to players on a versioned release.
+    std::string           netplay_dev_tag;
     // local_viewport = "vertical_split": while real netplay is active, crop
     // presentation to this peer's left/right split-screen half. This is a
     // presentation-only helper for titles that still render native split-screen

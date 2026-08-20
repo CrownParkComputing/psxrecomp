@@ -62,6 +62,7 @@ typedef struct ShmSeg {
     _Atomic uint32_t out_lines[2];         /* my DTR/RTS -> peer DSR/CTS */
     uint32_t         latency;              /* wire delay, cycles */
     uint32_t         lookahead;            /* barrier bound, cycles (WALL) */
+    uint32_t         pair_lookahead;       /* barrier bound, cycles (PAIR) */
     /* ---- PAIR mode ---- */
     _Atomic uint32_t pair_mode;            /* 1 once driver published cfg */
     PsxLinkPairCfg   pair_cfg;             /* driver-written, follower-read */
@@ -70,6 +71,9 @@ typedef struct ShmSeg {
      * BEFORE the done_tick release-store; the driver reads a slot only after
      * wait_follower_tick(t), so the release/acquire pair orders them. */
     uint32_t         fol_dig[256];
+    /* Full partition set per tick (fold-mismatch forensics), same keying and
+     * ordering contract as fol_dig. */
+    PsxLinkFolParts  fol_parts[256];
     _Atomic uint32_t load_ack;             /* completed LOAD commands */
     _Atomic uint32_t follower_err;         /* nonzero: follower fatal */
     ShmCmdRing       cmds;                 /* driver -> follower */
@@ -95,6 +99,35 @@ typedef struct ShmEnd {
 
 static ShmEnd *g_shm;              /* one link per process */
 
+/* ===== PSX_LINK_PERF counters (process-local; snapshot+reset each print) == */
+static struct {
+    uint64_t wait_tick_us[2];   /* [PSX_LINK_WAIT_ADMIT], [_FOLD] */
+    uint32_t wait_tick_n[2];
+    uint64_t wait_ack_us;       /* LOAD fence */
+    uint64_t push_block_us;     /* cmd ring full */
+    uint64_t pop_wait_us;       /* follower blocked for a command */
+    uint32_t pop_wait_n;
+    uint64_t naps;              /* nanosleep calls across all waits */
+    uint64_t tx_bytes, rx_bytes;
+    uint64_t rx_not_due;        /* rx() refused: due cycle not reached */
+    uint64_t tx_block_us;       /* wire full (pair mode blocks) */
+    uint32_t ring_max;          /* deepest inbound occupancy seen */
+    uint64_t rdbar_us;          /* cable read barrier: blocked on local peer */
+    uint32_t rdbar_n;
+    uint64_t ahead_us;          /* lookahead barrier: ran ahead, blocked */
+    uint32_t ahead_n;
+} g_perf;
+
+static uint64_t perf_now_us(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64() * 1000ull;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+#endif
+}
+
 /* Clean-quit release: mark our side free so the next launch claims it
  * without waiting out the heartbeat. Crashes skip this; the dead-side
  * reclaim in psx_link_shm_open covers them. */
@@ -115,7 +148,52 @@ static uint64_t mono_ms(void) {
 #endif
 }
 
+/* Rendezvous wait. The pair syncs several times per guest frame, so the old
+ * unconditional 100 us nanosleep dominated: measured 500-870 sleeps/s burning
+ * 86-174 ms/s of pure latency while the peer was typically only microseconds
+ * away. Spin briefly first (the peer is usually mid-tick on another core),
+ * then fall back to sleeping so a genuinely stalled peer costs no CPU.
+ * PSX_LINK_SPIN_US=0 restores the always-sleep behavior. */
+static uint32_t shm_spin_budget_us(void) {
+    static int us = -1;
+    if (us < 0) {
+        const char *e = getenv("PSX_LINK_SPIN_US");
+        us = (e && e[0]) ? (int)strtol(e, NULL, 0) : 250;
+        if (us < 0) us = 0;
+        if (us > 5000) us = 5000;
+    }
+    return (uint32_t)us;
+}
+
+static void shm_wait_reset(uint64_t *spin_start_us) { *spin_start_us = 0; }
+
+static void shm_wait_step(uint64_t *spin_start_us) {
+    const uint32_t budget = shm_spin_budget_us();
+    if (budget) {
+        uint64_t now = perf_now_us();
+        if (*spin_start_us == 0) *spin_start_us = now;
+        if (now - *spin_start_us < (uint64_t)budget) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+            return;
+        }
+    }
+    g_perf.naps++;
+#if defined(_WIN32)
+    Sleep(0);
+#else
+    {
+        struct timespec nap = { 0, 100000 };   /* 100 us */
+        nanosleep(&nap, NULL);
+    }
+#endif
+}
+
 static void shm_nap(void) {
+    g_perf.naps++;
 #if defined(_WIN32)
     Sleep(0);
 #else
@@ -172,18 +250,65 @@ static int shm_tx(void *s, uint8_t b, uint64_t c) {
          * Block until the reader frees a slot -- the guest cycle argument is
          * pinned by the caller, so due stays a pure function of the guest
          * timeline. Peer death degrades to the unplugged-cable drop. */
-        for (;;) {
-            shm_nap();
-            rd = atomic_load_explicit(&r->rd, memory_order_acquire);
-            if (wr - rd < SHM_DEPTH) break;
-            if (!peer_alive(e)) return 0;
+        {
+            uint64_t t0 = perf_now_us();
+            for (;;) {
+                shm_nap();
+                rd = atomic_load_explicit(&r->rd, memory_order_acquire);
+                if (wr - rd < SHM_DEPTH) break;
+                if (!peer_alive(e)) return 0;
+            }
+            g_perf.tx_block_us += perf_now_us() - t0;
         }
     }
+    g_perf.tx_bytes++;
+    atomic_store_explicit(&e->seg->link_now[e->side], link_now(e, c),
+                          memory_order_relaxed);
     slot = (uint32_t)(wr % SHM_DEPTH);
     r->byte[slot] = b;
     r->due[slot]  = link_now(e, c) + e->seg->latency;
     atomic_store_explicit(&r->wr, wr + 1u, memory_order_release);
     return 1;
+}
+
+/* PAIR mode: block until the peer has executed past my_link_now - latency,
+ * so every byte due by now is already written. Publishes OWN progress so a
+ * symmetric waiter on the other side unblocks. Returns 0 on peer death /
+ * follower error (unplugged-cable semantics; determinism is moot then). */
+static int pair_read_barrier(ShmEnd *e, uint64_t my_link) {
+    uint64_t need, spin = 0;
+    const uint32_t lat = e->seg->latency;
+    if (my_link <= (uint64_t)lat) return 1;
+    need = my_link - (uint64_t)lat;
+    atomic_store_explicit(&e->seg->link_now[e->side], my_link,
+                          memory_order_relaxed);
+    if (atomic_load_explicit(&e->seg->link_now[e->side ^ 1],
+                             memory_order_acquire) >= need)
+        return 1;
+    /* Slow path: the pair-cadence serialization cost. Timed so LINKPERF can
+     * print it (rdbar) instead of it hiding inside the emu residual. */
+    {
+        const uint64_t t0 = perf_now_us();
+        int r = 1;
+        shm_wait_reset(&spin);
+        for (;;) {
+            if (atomic_load_explicit(&e->seg->link_now[e->side ^ 1],
+                                     memory_order_acquire) >= need)
+                break;
+            if (!peer_alive(e)) { r = 0; break; }
+            if (atomic_load_explicit(&e->seg->follower_err,
+                                     memory_order_relaxed) != 0) {
+                r = 0;
+                break;
+            }
+            shm_wait_step(&spin);
+            atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
+                                  memory_order_relaxed);
+        }
+        g_perf.rdbar_us += perf_now_us() - t0;
+        g_perf.rdbar_n++;
+        return r;
+    }
 }
 
 static int shm_rx(void *s, uint8_t *o, uint64_t c) {
@@ -194,9 +319,22 @@ static int shm_rx(void *s, uint8_t *o, uint64_t c) {
     if (!epoch_valid(e)) return 0;
     rd = atomic_load_explicit(&r->rd, memory_order_relaxed);
     wr = atomic_load_explicit(&r->wr, memory_order_acquire);
-    if (rd >= wr) return 0;
+    /* Dues are monotonic (FIFO + constant latency), so a present head byte
+     * answers by itself; only an EMPTY queue is ambiguous — a byte due by
+     * now might simply not be written yet. Barrier only then. */
+    if (rd >= wr) {
+        if (!pair_mode(e) || !pair_read_barrier(e, link_now(e, c)))
+            return 0;
+        wr = atomic_load_explicit(&r->wr, memory_order_acquire);
+        if (rd >= wr) return 0;
+    }
     slot = (uint32_t)(rd % SHM_DEPTH);
-    if (r->due[slot] > link_now(e, c)) return 0;
+    {
+        uint32_t occ = (uint32_t)(wr - rd);
+        if (occ > g_perf.ring_max) g_perf.ring_max = occ;
+    }
+    if (r->due[slot] > link_now(e, c)) { g_perf.rx_not_due++; return 0; }
+    g_perf.rx_bytes++;
     *o = r->byte[slot];
     atomic_store_explicit(&r->rd, rd + 1u, memory_order_release);
     return 1;
@@ -209,7 +347,15 @@ static int shm_rx_peek(void *s, uint64_t *d) {
     if (!epoch_valid(e)) return 0;
     rd = atomic_load_explicit(&r->rd, memory_order_relaxed);
     wr = atomic_load_explicit(&r->wr, memory_order_acquire);
-    if (rd >= wr) return 0;
+    if (rd >= wr) {
+        /* "Queue empty" must be as deterministic as a byte: barrier, then
+         * re-check (a byte the peer had in flight may now be visible). */
+        if (!pair_mode(e) ||
+            !pair_read_barrier(e, link_now(e, psx_get_cycle_count())))
+            return 0;
+        wr = atomic_load_explicit(&r->wr, memory_order_acquire);
+        if (rd >= wr) return 0;
+    }
     /* Translate the stored link-time due back to the CALLER's local cycle
      * timeline: due_local = due_link + epoch. sio1 compares against local. */
     *d = r->due[rd % SHM_DEPTH] + e->epoch;
@@ -541,12 +687,44 @@ void psx_link_shm_poll(uint64_t cycle_now) {
             return;
     }
     if (pair_mode(e)) {
-        /* PAIR: the command channel paces (tick-ack barrier); this site only
-         * heartbeats and publishes link-time for the [SHMLINK] diag. */
-        if (epoch_valid(e))
-            atomic_store_explicit(&e->seg->link_now[e->side],
-                                  link_now(e, cycle_now),
-                                  memory_order_relaxed);
+        /* PAIR: delivery determinism lives at the READ (pair_read_barrier);
+         * this site (a) publishes link-time progress — the value read waits
+         * watch, so publish EVERY call, granularity = BB-edge spacing — and
+         * (b) keeps a LOOSE runaway bound so one side cannot speculate a
+         * whole ring ahead. The bound no longer constrains wire latency.
+         * Skipped until BOTH sides have executed a tick, so the follower's
+         * pre-START park cannot stall the driver's boot. */
+        uint64_t mine, limit;
+        if (!epoch_valid(e))
+            return;
+        mine = link_now(e, cycle_now);
+        atomic_store_explicit(&e->seg->link_now[e->side], mine,
+                              memory_order_relaxed);
+        if (!e->seg->pair_lookahead ||
+            atomic_load_explicit(&e->seg->done_tick, memory_order_relaxed) == 0u)
+            return;
+        limit = atomic_load_explicit(&e->seg->link_now[e->side ^ 1],
+                                     memory_order_relaxed)
+                + e->seg->pair_lookahead;
+        if (mine <= limit) return;
+        {
+            uint64_t t0 = mono_ms(), spin = 0;
+            shm_wait_reset(&spin);
+            for (;;) {
+                uint64_t peer;
+                shm_wait_step(&spin);
+                peer = atomic_load_explicit(&e->seg->link_now[e->side ^ 1],
+                                            memory_order_relaxed);
+                if (mine <= peer + e->seg->pair_lookahead) break;
+                if (!peer_alive(e)) break;
+                if (atomic_load_explicit(&e->seg->follower_err,
+                                         memory_order_relaxed) != 0)
+                    break;
+                atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
+                                      memory_order_relaxed);
+            }
+            e->waits_ms += mono_ms() - t0;
+        }
         return;
     }
     if (!epoch_valid(e)) {
@@ -611,6 +789,7 @@ void psx_link_shm_poll(uint64_t cycle_now) {
          * A dead peer unblocks as a disconnect. */
         {
             uint64_t t0 = mono_ms();
+            uint64_t p0 = perf_now_us();
             for (;;) {
                 uint64_t peer;
                 shm_nap();
@@ -627,6 +806,8 @@ void psx_link_shm_poll(uint64_t cycle_now) {
                                       memory_order_relaxed);
             }
             e->waits_ms += mono_ms() - t0;
+            g_perf.ahead_us += perf_now_us() - p0;
+            g_perf.ahead_n++;
         }
     }
 }
@@ -654,15 +835,21 @@ void psx_link_shm_stats(uint64_t *my_link_now, uint64_t *peer_link_now,
 int psx_link_shm_pair_init(const PsxLinkPairCfg *cfg) {
     ShmEnd *e = g_shm;
     if (!e || !cfg) return 0;
-    if (cfg->latency_cycles < cfg->tick_len_cycles) {
+    /* The read barrier makes ANY latency deterministic; the floor only has
+     * to exceed the publish granularity comfortably (BB edges, ~1k cycles).
+     * Hardware char time at the game's 529 kbps is ~704 cycles. */
+    if (cfg->latency_cycles < 2048u) {
         fprintf(stderr,
-                "psx_link_shm: pair latency %u < tick %u breaks the "
-                "determinism proof -- refusing\n",
-                cfg->latency_cycles, cfg->tick_len_cycles);
+                "psx_link_shm: pair latency %u below the 2048-cycle floor "
+                "-- refusing\n", cfg->latency_cycles);
         return 0;
     }
     e->seg->pair_cfg = *cfg;
     e->seg->latency = cfg->latency_cycles;
+    /* Runaway bound only (read waits own determinism): a quarter frame keeps
+     * the pair loosely coupled without per-char rendezvous. */
+    e->seg->pair_lookahead = cfg->tick_len_cycles ? cfg->tick_len_cycles / 4u
+                                                  : 169344u;
     atomic_store(&e->seg->done_tick, 0u);
     atomic_store(&e->seg->load_ack, 0u);
     atomic_store(&e->seg->follower_err, 0u);
@@ -708,10 +895,14 @@ int psx_link_shm_cmd_push(const PsxLinkPairCmd *cmd) {
     r = &e->seg->cmds;
     pushed = atomic_load_explicit(&r->pushed, memory_order_relaxed);
     consumed = atomic_load_explicit(&r->consumed, memory_order_acquire);
-    while (pushed - consumed >= SHM_CMD_DEPTH) {
-        shm_nap();
-        if (!peer_alive(e)) return 0;
-        consumed = atomic_load_explicit(&r->consumed, memory_order_acquire);
+    if (pushed - consumed >= SHM_CMD_DEPTH) {
+        uint64_t t0 = perf_now_us();
+        while (pushed - consumed >= SHM_CMD_DEPTH) {
+            shm_nap();
+            if (!peer_alive(e)) return 0;
+            consumed = atomic_load_explicit(&r->consumed, memory_order_acquire);
+        }
+        g_perf.push_block_us += perf_now_us() - t0;
     }
     r->cmd[pushed % SHM_CMD_DEPTH] = *cmd;
     atomic_store_explicit(&r->pushed, pushed + 1u, memory_order_release);
@@ -722,26 +913,40 @@ int psx_link_shm_cmd_push(const PsxLinkPairCmd *cmd) {
 
 /* done_tick stores EXECUTED-COUNT (tick + 1), so 0 = nothing executed yet
  * and wait(tick) is exact for tick 0. Sessions cap far below u32 wrap. */
-int psx_link_shm_wait_follower_tick(uint32_t tick) {
+int psx_link_shm_wait_follower_tick_r(uint32_t tick, int reason) {
     ShmEnd *e = g_shm;
+    uint64_t t0, spin = 0;
+    int idx = (reason == PSX_LINK_WAIT_FOLD) ? 1 : 0;
     if (!e) return 0;
+    t0 = perf_now_us();
+    shm_wait_reset(&spin);
+    g_perf.wait_tick_n[idx]++;
     for (;;) {
         uint32_t done = atomic_load_explicit(&e->seg->done_tick,
                                              memory_order_acquire);
-        if (done >= tick + 1u) return 1;
+        if (done >= tick + 1u) {
+            g_perf.wait_tick_us[idx] += perf_now_us() - t0;
+            return 1;
+        }
         if (atomic_load_explicit(&e->seg->follower_err,
                                  memory_order_relaxed) != 0)
             return 0;
         if (!peer_alive(e)) return 0;
-        shm_nap();
+        shm_wait_step(&spin);
         atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
                               memory_order_relaxed);
     }
 }
 
+int psx_link_shm_wait_follower_tick(uint32_t tick) {
+    return psx_link_shm_wait_follower_tick_r(tick, PSX_LINK_WAIT_ADMIT);
+}
+
 int psx_link_shm_wait_cmds_drained(void) {
     ShmEnd *e = g_shm;
+    uint64_t spin = 0;
     if (!e) return 0;
+    shm_wait_reset(&spin);
     for (;;) {
         uint64_t pushed = atomic_load_explicit(&e->seg->cmds.pushed,
                                                memory_order_relaxed);
@@ -749,7 +954,7 @@ int psx_link_shm_wait_cmds_drained(void) {
                                                  memory_order_acquire);
         if (consumed >= pushed) return 1;
         if (!peer_alive(e)) return 0;
-        shm_nap();
+        shm_wait_step(&spin);
         atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
                               memory_order_relaxed);
     }
@@ -763,14 +968,19 @@ int psx_link_shm_cmd_wait_pop(PsxLinkPairCmd *out) {
     if (!e || !out) return 0;
     r = &e->seg->cmds;
     consumed = atomic_load_explicit(&r->consumed, memory_order_relaxed);
+    {
+        uint64_t t0 = perf_now_us(), spin = 0;
+        g_perf.pop_wait_n++;
+        shm_wait_reset(&spin);
     for (;;) {
         pushed = atomic_load_explicit(&r->pushed, memory_order_acquire);
-        if (consumed < pushed) break;
+        if (consumed < pushed) { g_perf.pop_wait_us += perf_now_us() - t0; break; }
         if (!peer_alive(e)) return 0;
-        shm_nap();
+        shm_wait_step(&spin);
         if ((++s_hb_div & 0xFu) == 0)
             atomic_store_explicit(&e->seg->heartbeat_ms[e->side], mono_ms(),
                                   memory_order_relaxed);
+    }
     }
     *out = r->cmd[consumed % SHM_CMD_DEPTH];
     atomic_store_explicit(&r->consumed, consumed + 1u, memory_order_release);
@@ -803,6 +1013,22 @@ int psx_link_shm_read_digest(uint32_t tick, uint32_t *out) {
     return 1;
 }
 
+void psx_link_shm_publish_parts(uint32_t tick, const PsxLinkFolParts *p) {
+    ShmEnd *e = g_shm;
+    if (!e || !p) return;
+    e->seg->fol_parts[tick & 255u] = *p;
+    /* Keep the plain-core slot coherent for read_digest callers. */
+    e->seg->fol_dig[tick & 255u] = p->core;
+}
+
+int psx_link_shm_read_parts(uint32_t tick, PsxLinkFolParts *out) {
+    ShmEnd *e = g_shm;
+    if (!e || !out) return 0;
+    /* Same contract as read_digest: done_tick >= tick+1 observed first. */
+    *out = e->seg->fol_parts[tick & 255u];
+    return 1;
+}
+
 void psx_link_shm_set_done_tick(uint32_t tick) {
     ShmEnd *e = g_shm;
     if (!e) return;
@@ -818,11 +1044,16 @@ void psx_link_shm_load_ack_publish(void) {
 
 int psx_link_shm_wait_load_ack(uint32_t count) {
     ShmEnd *e = g_shm;
+    uint64_t t0, spin = 0;
     if (!e) return 0;
+    t0 = perf_now_us();
+    shm_wait_reset(&spin);
     for (;;) {
         if (atomic_load_explicit(&e->seg->load_ack, memory_order_acquire) >=
-            count)
+            count) {
+            g_perf.wait_ack_us += perf_now_us() - t0;
             return 1;
+        }
         if (atomic_load_explicit(&e->seg->follower_err,
                                  memory_order_relaxed) != 0)
             return 0;
@@ -844,6 +1075,29 @@ uint32_t psx_link_shm_follower_err(void) {
     return e ? atomic_load_explicit(&e->seg->follower_err,
                                     memory_order_relaxed)
              : 0u;
+}
+
+void psx_link_shm_perf_take(PsxLinkShmPerf *out) {
+    if (!out) return;
+    out->wait_admit_us = g_perf.wait_tick_us[0];
+    out->wait_admit_n  = g_perf.wait_tick_n[0];
+    out->wait_fold_us  = g_perf.wait_tick_us[1];
+    out->wait_fold_n   = g_perf.wait_tick_n[1];
+    out->wait_ack_us   = g_perf.wait_ack_us;
+    out->push_block_us = g_perf.push_block_us;
+    out->pop_wait_us   = g_perf.pop_wait_us;
+    out->pop_wait_n    = g_perf.pop_wait_n;
+    out->naps          = g_perf.naps;
+    out->tx_bytes      = g_perf.tx_bytes;
+    out->rx_bytes      = g_perf.rx_bytes;
+    out->rx_not_due    = g_perf.rx_not_due;
+    out->tx_block_us   = g_perf.tx_block_us;
+    out->ring_max      = g_perf.ring_max;
+    out->rdbar_us      = g_perf.rdbar_us;
+    out->rdbar_n       = g_perf.rdbar_n;
+    out->ahead_us      = g_perf.ahead_us;
+    out->ahead_n       = g_perf.ahead_n;
+    memset(&g_perf, 0, sizeof(g_perf));
 }
 
 void psx_link_shm_log_cursors(uint64_t *in_read, uint64_t *in_write,

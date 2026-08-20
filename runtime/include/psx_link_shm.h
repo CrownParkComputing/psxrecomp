@@ -83,6 +83,7 @@ typedef struct PsxLinkPairCfg {
     uint32_t flags;           /* PSX_LINK_PAIR_F_*                          */
     uint32_t bios_id;         /* settled BIOS identity                      */
     uint32_t codegen_hash;    /* AOT codegen hash (same binary contract)    */
+    uint32_t mod_plan_hash;   /* digest of the applied mod plan (0 = vanilla)*/
 } PsxLinkPairCfg;
 
 #define PSX_LINK_PAIR_F_SW_RASTER   (1u << 0)
@@ -139,12 +140,71 @@ int  psx_link_shm_wait_cmds_drained(void);
 int  psx_link_shm_cmd_wait_pop(PsxLinkPairCmd *out);
 void psx_link_shm_set_done_tick(uint32_t tick);
 
+/* ===== PSX_LINK_PERF=1 instrumentation ================================== */
+
+enum { PSX_LINK_WAIT_ADMIT = 0, PSX_LINK_WAIT_FOLD = 1 };
+
+typedef struct PsxLinkShmPerf {
+    uint64_t wait_admit_us;   /* driver blocked on the tick barrier         */
+    uint32_t wait_admit_n;
+    uint64_t wait_fold_us;    /* driver blocked for the follower's digest   */
+    uint32_t wait_fold_n;
+    uint64_t wait_ack_us;     /* driver blocked on the LOAD fence           */
+    uint64_t push_block_us;   /* command ring full                          */
+    uint64_t pop_wait_us;     /* follower idle waiting for a command        */
+    uint32_t pop_wait_n;
+    uint64_t naps;            /* sleep calls across every wait              */
+    uint64_t tx_bytes, rx_bytes;
+    uint64_t rx_not_due;      /* rx refused: due cycle not reached yet      */
+    uint64_t tx_block_us;     /* wire full                                  */
+    uint32_t ring_max;        /* deepest inbound occupancy                  */
+    /* Cable read barrier: guest needed a byte the LOCAL peer process had
+     * not published yet — host-time blocking INSIDE the guest window (the
+     * pair-cadence serialization cost, previously invisible inside emu). */
+    uint64_t rdbar_us;
+    uint32_t rdbar_n;
+    /* Lookahead barrier (psx_link_shm_poll): this side ran more than
+     * `lookahead` guest cycles ahead of the local peer and blocked. */
+    uint64_t ahead_us;
+    uint32_t ahead_n;
+} PsxLinkShmPerf;
+
+/* Snapshot AND reset the counters (call once per report interval). */
+void psx_link_shm_perf_take(PsxLinkShmPerf *out);
+int  psx_link_shm_wait_follower_tick_r(uint32_t tick, int reason);
+
 /* Follower post-run core digest per tick: published before done_tick, read
  * by the driver after wait_follower_tick(tick) — the machine's FRAME_COMMIT
  * folds it with the client's digest so BOTH consoles on every machine are
  * covered by the session's hash-confirm ladder. */
 void psx_link_shm_publish_digest(uint32_t tick, uint32_t core);
 int  psx_link_shm_read_digest(uint32_t tick, uint32_t *out);
+
+/* Full per-partition digest set for one console tick — fold-mismatch
+ * forensics. The follower publishes its console's partitions alongside the
+ * folded core; the driver rings them up with its own so a FIRST MISMATCH can
+ * name the diverging console AND partition by diffing the two machines'
+ * logs. sio1/spad exist because the observed race-start mismatch coincides
+ * with the first serial exchange. Same release/acquire contract as fol_dig
+ * (written before done_tick). */
+typedef struct PsxLinkFolParts {
+    uint32_t core;
+    uint32_t cpu;
+    uint32_t clk;
+    uint32_t tim;
+    uint32_t ram;
+    uint32_t dirty;
+    uint32_t sio1;
+    uint32_t spad;
+    /* Raw boundary state at digest time (not CRCs): a digest-boundary phase
+     * slip between machines reads directly as a cycle delta in the dump. */
+    uint64_t cyc;             /* psx_cycle_count at digest */
+    uint32_t csv;             /* cycles since vblank at digest */
+    uint32_t istat;           /* I_STAT at digest */
+} PsxLinkFolParts;
+
+void psx_link_shm_publish_parts(uint32_t tick, const PsxLinkFolParts *p);
+int  psx_link_shm_read_parts(uint32_t tick, PsxLinkFolParts *out);
 
 /* LOAD fence + health. load_ack counts completed LOAD commands (published
  * by the follower AFTER its restore, so the driver's wait covers the whole

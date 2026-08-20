@@ -49,6 +49,7 @@ typedef struct PsxLinkPairClientCfg {
     uint32_t    flags;            /* PSX_LINK_PAIR_F_* determinism envelope */
     uint32_t    bios_id;
     uint32_t    codegen_hash;
+    uint32_t    mod_plan_hash;    /* applied mod plan digest (0 = vanilla) */
     const char *shm_name;         /* segment name (session+pid derived) */
     const char *exe_path;         /* follower binary (self) */
     /* NULL-terminated argv for the follower (argv[0] = exe). The spawn adds
@@ -92,7 +93,8 @@ int  psx_link_pair_follower_booted(void);
  * until the driver publishes cfg (or dies). 1 = ok. */
 int  psx_link_pair_follower_boot(struct CPUState *cpu, uint32_t bios_checksum,
                                  uint32_t entry_pc, uint32_t own_flags,
-                                 uint32_t bios_id, uint32_t codegen_hash);
+                                 uint32_t bios_id, uint32_t codegen_hash,
+                                 uint32_t mod_plan_hash);
 /* Vblank-boundary barrier: publishes completion of the tick that just ran,
  * then executes commands until a TICK arms the next one (returns 1) or the
  * session ends (returns 0: STOP or driver death -- caller exits cleanly).
@@ -101,6 +103,27 @@ int  psx_link_pair_follower_admit(void);
 /* Called at the vblank present body's finish_frame point: digest the tick
  * that just ran at the SAME boundary phase the client digests its own. */
 void psx_link_pair_follower_note_finish(void);
+
+/* ===== PSX_LINK_PERF guest-window breakdown ============================= */
+
+/* The LINKPERF "guest" window spans from one admit to the next, so it holds
+ * more than emulation: digest work, the GL present, the frame pacer sleep,
+ * and the netplay admit spin (which itself splits into "peer input not here
+ * yet" — the network — and everything else). Contributors attribute their
+ * time into one of these slots; the reporter prints the split and derives
+ * emu as the residual. All calls are no-ops unless PSX_LINK_PERF=1. */
+enum {
+    PSX_LINK_PERF_GW_DIGEST = 0,  /* FRAME_COMMIT / follower digest compute */
+    PSX_LINK_PERF_GW_PRESENT,     /* GL present work on the sim thread      */
+    PSX_LINK_PERF_GW_PACE,        /* frame pacer sleep                      */
+    PSX_LINK_PERF_GW_NETIN,       /* admit spin: waiting on peer input      */
+    PSX_LINK_PERF_GW_SPIN,        /* admit spin: everything else            */
+    PSX_LINK_PERF_GW_COUNT
+};
+
+int      psx_link_pair_perf_enabled(void);   /* PSX_LINK_PERF=1 */
+uint64_t psx_link_pair_perf_now_us(void);
+void     psx_link_pair_perf_gw_add(int slot, uint64_t us);
 
 #ifdef __cplusplus
 }

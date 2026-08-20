@@ -28,6 +28,11 @@ void gl_renderer_set_swap_interval(int interval);
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
                                    int blend_mode);
 void gl_renderer_set_interpolation_suspended(int suspended);
+/* Async present: the interpolation worker thread owns quad+OSD+SwapWindow
+ * and re-presents the newest captured frame at host cadence (no blending);
+ * the sim thread pays only flush + capture copy + fence. Netplay uses this
+ * to take the present path off the lockstep critical path. */
+void gl_renderer_set_present_async(int enabled, double host_hz);
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,

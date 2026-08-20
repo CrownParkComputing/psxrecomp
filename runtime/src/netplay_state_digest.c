@@ -1,6 +1,7 @@
 #include "netplay_state_digest.h"
 #include "cdrom.h"
 #include "crc32.h"
+#include "netplay_ram_dirty.h"
 #include "dirty_ram_interp.h"
 #include "gpu.h"
 #include "interrupts.h"
@@ -159,9 +160,12 @@ void netplay_core_digest_parts(const CPUState* cpu, NetplayCoreParts* out)
     crc_tim = crc32_update(crc_tim, (const uint8_t*)irq_line, sizeof(irq_line));
     crc_tim = crc32_update(crc_tim, (const uint8_t*)frac, sizeof(frac));
 
+    /* Page-CRC cache: only pages stored to since the previous digest re-hash
+     * (netplay_ram_dirty.c). The partition value is a fold of page CRCs, not
+     * the old linear CRC — same-build-peers-only, nothing persists it. */
     ram = memory_get_ram_ptr();
     if (ram)
-        crc_ram = crc32_update(crc_ram, ram, memory_get_ram_bytes());
+        crc_ram = np_ram_dig_crc_raw(ram, memory_get_ram_bytes());
 
     wc = dirty_ram_get_bitmap_word_count();
     for (i = 0; i < wc; i++) {

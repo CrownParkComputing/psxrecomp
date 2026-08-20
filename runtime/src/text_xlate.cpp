@@ -2,6 +2,7 @@
  * See text_xlate.h + docs/STRING_TRANSLATION.md. */
 
 #include "text_xlate.h"
+#include "netplay_ram_dirty.h"
 #include "cpu_state.h"
 #include "psx_ram.h"
 
@@ -53,6 +54,7 @@ inline void gwb(uint8_t* ram, uint32_t va, uint8_t v) {
     if (p >= 0x00800000u) return;
     p = psx_ram_map_write(p);
     ram[p] = v;
+    np_ram_dig_note_write(p);
 }
 inline bool va_in_ram(uint32_t va) { uint32_t pa; return ram_fold(va, &pa); }
 // Bless a just-written patch region into the text-image guard (see the extern

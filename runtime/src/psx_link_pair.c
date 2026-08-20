@@ -19,10 +19,13 @@ int  psx_link_pair_failed(void) { return 0; }
 int  psx_link_pair_follower_mode(void) { return 0; }
 int  psx_link_pair_follower_booted(void) { return 0; }
 int  psx_link_pair_follower_boot(struct CPUState *c, uint32_t b, uint32_t e,
-                                 uint32_t f, uint32_t i, uint32_t h)
-{ (void)c; (void)b; (void)e; (void)f; (void)i; (void)h; return 0; }
+                                 uint32_t f, uint32_t i, uint32_t h, uint32_t m)
+{ (void)c; (void)b; (void)e; (void)f; (void)i; (void)h; (void)m; return 0; }
 int  psx_link_pair_follower_admit(void) { return 0; }
 void psx_link_pair_follower_note_finish(void) {}
+int      psx_link_pair_perf_enabled(void) { return 0; }
+uint64_t psx_link_pair_perf_now_us(void) { return 0; }
+void     psx_link_pair_perf_gw_add(int slot, uint64_t us) { (void)slot; (void)us; }
 #else
 
 #include <stdio.h>
@@ -65,6 +68,135 @@ extern uint32_t psx_netplay_rb_pair_snap_load_apply(void *ring, uint32_t tick,
 #define PAIR_ERR_LOAD_FAIL 2u
 #define PAIR_ERR_CFG       3u
 #define PAIR_ERR_ORDER     4u
+
+/* ===== PSX_LINK_PERF=1 reporter ========================================
+ * One line per second per process. Splits the wall second into guest work vs
+ * each rendezvous, so "who is waiting on whom" is answerable directly:
+ *   role=A/B kind=client/follower ticks/s
+ *   guest_ms  : the whole admit-to-admit window, split further into:
+ *     emu_ms  : residual — actual emulation work
+ *     dig_ms  : FRAME_COMMIT / follower digest computation
+ *     pres_ms : GL present work still on the sim thread
+ *     pace_ms : frame pacer sleep
+ *     netin_ms: admit spin while the peer's input had not arrived
+ *     spin_ms : admit spin for any other reason (pump, confirm, xfer)
+ *     rdbar_ms: cable read barrier — blocked until the LOCAL peer process
+ *               published the serial byte the guest needed (pair cadence)
+ *     ahead_ms: lookahead barrier — ran > lookahead cycles ahead, blocked
+ *   admit_ms  : driver blocked until the follower finished tick-1
+ *   fold_ms   : driver blocked for the follower's digest (fold emit)
+ *   ack_ms    : driver blocked on the rollback LOAD fence
+ *   pop_ms    : follower idle waiting for the next command
+ *   naps      : 100us sleeps burned in those waits
+ *   tx/rx     : cable bytes; notdue = rx refusals (byte present, not due yet)
+ *   ringmax   : deepest inbound queue
+ */
+static int pair_perf_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PSX_LINK_PERF");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static uint64_t pair_now_us(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64() * 1000ull;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+#endif
+}
+
+static struct {
+    uint64_t last_report_us;
+    uint64_t guest_us;        /* accumulated outside the barriers */
+    uint64_t mark_us;         /* last barrier-exit timestamp */
+    uint32_t ticks;
+    uint64_t gw_us[PSX_LINK_PERF_GW_COUNT];  /* guest-window breakdown */
+} g_pp;
+
+int psx_link_pair_perf_enabled(void) {
+    return pair_perf_on();
+}
+
+uint64_t psx_link_pair_perf_now_us(void) {
+    return pair_now_us();
+}
+
+void psx_link_pair_perf_gw_add(int slot, uint64_t us) {
+    if (!pair_perf_on()) return;
+    if (slot < 0 || slot >= PSX_LINK_PERF_GW_COUNT) return;
+    g_pp.gw_us[slot] += us;
+}
+
+static void pair_perf_mark_guest_start(void) {
+    if (!pair_perf_on()) return;
+    g_pp.mark_us = pair_now_us();
+}
+
+static void pair_perf_mark_guest_end(void) {
+    if (!pair_perf_on() || !g_pp.mark_us) return;
+    g_pp.guest_us += pair_now_us() - g_pp.mark_us;
+    g_pp.mark_us = 0;
+}
+
+static void pair_perf_report(const char *kind, int side_is_b) {
+    PsxLinkShmPerf p;
+    uint64_t now, span;
+    if (!pair_perf_on()) return;
+    now = pair_now_us();
+    if (g_pp.last_report_us == 0) { g_pp.last_report_us = now; return; }
+    span = now - g_pp.last_report_us;
+    if (span < 1000000ull) return;
+    psx_link_shm_perf_take(&p);
+    /* emu = the guest window minus everything attributed inside it. The fold
+     * and ack waits land inside the window (frame commit / LOAD fence run
+     * mid-frame), and so do the cable read-barrier + lookahead blocks (they
+     * fire from guest MMIO / the interrupts-site poll) — subtract all of
+     * them. Clamp: attribution overlaps or clock skew must never print a
+     * negative. */
+    {
+        uint64_t inside = p.wait_fold_us + p.wait_ack_us + p.rdbar_us +
+                          p.ahead_us;
+        uint64_t emu_us;
+        int i;
+        for (i = 0; i < PSX_LINK_PERF_GW_COUNT; i++)
+            inside += g_pp.gw_us[i];
+        emu_us = g_pp.guest_us > inside ? g_pp.guest_us - inside : 0;
+        fprintf(stderr,
+                "[LINKPERF] console=%c kind=%-8s ticks=%u guest=%llums "
+                "emu=%llums dig=%llums pres=%llums pace=%llums netin=%llums "
+                "spin=%llums rdbar=%llums/%u ahead=%llums/%u "
+                "admit=%llums/%u fold=%llums/%u ack=%llums pop=%llums/%u "
+                "naps=%llu tx=%llu rx=%llu notdue=%llu ringmax=%u txblk=%llums\n",
+                side_is_b ? 'B' : 'A', kind, (unsigned)g_pp.ticks,
+                (unsigned long long)(g_pp.guest_us / 1000ull),
+                (unsigned long long)(emu_us / 1000ull),
+                (unsigned long long)(g_pp.gw_us[PSX_LINK_PERF_GW_DIGEST] / 1000ull),
+                (unsigned long long)(g_pp.gw_us[PSX_LINK_PERF_GW_PRESENT] / 1000ull),
+                (unsigned long long)(g_pp.gw_us[PSX_LINK_PERF_GW_PACE] / 1000ull),
+                (unsigned long long)(g_pp.gw_us[PSX_LINK_PERF_GW_NETIN] / 1000ull),
+                (unsigned long long)(g_pp.gw_us[PSX_LINK_PERF_GW_SPIN] / 1000ull),
+                (unsigned long long)(p.rdbar_us / 1000ull), p.rdbar_n,
+                (unsigned long long)(p.ahead_us / 1000ull), p.ahead_n,
+                (unsigned long long)(p.wait_admit_us / 1000ull), p.wait_admit_n,
+                (unsigned long long)(p.wait_fold_us / 1000ull), p.wait_fold_n,
+                (unsigned long long)(p.wait_ack_us / 1000ull),
+                (unsigned long long)(p.pop_wait_us / 1000ull), p.pop_wait_n,
+                (unsigned long long)p.naps,
+                (unsigned long long)p.tx_bytes, (unsigned long long)p.rx_bytes,
+                (unsigned long long)p.rx_not_due, p.ring_max,
+                (unsigned long long)(p.tx_block_us / 1000ull));
+    }
+    fflush(stderr);
+    g_pp.last_report_us = now;
+    g_pp.guest_us = 0;
+    g_pp.ticks = 0;
+    memset(g_pp.gw_us, 0, sizeof(g_pp.gw_us));
+}
 
 static const uint8_t k_neutral_row[8] = {
     0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80, 0x01, 0x01,
@@ -111,12 +243,11 @@ int psx_link_pair_client_start(const PsxLinkPairClientCfg *cfg) {
     pc.session_id = cfg->session_id;
     pc.driver_side = (role == 'b') ? 1u : 0u;
     pc.tick_len_cycles = cfg->tick_len_cycles;
-    pc.latency_cycles = cfg->latency_cycles
-                            ? cfg->latency_cycles
-                            : cfg->tick_len_cycles + cfg->tick_len_cycles / 8u;
+    pc.latency_cycles = cfg->latency_cycles ? cfg->latency_cycles : 8192u;
     pc.flags = cfg->flags;
     pc.bios_id = cfg->bios_id;
     pc.codegen_hash = cfg->codegen_hash;
+    pc.mod_plan_hash = cfg->mod_plan_hash;
     if (!psx_link_shm_pair_init(&pc)) {
         drv_fail("pair init");
         return 0;
@@ -217,6 +348,9 @@ int psx_link_pair_on_admit(uint32_t tick) {
         g_drv.started = 1;
     }
 
+    pair_perf_mark_guest_end();
+    g_pp.ticks++;
+    pair_perf_report("client", g_drv.base_seat >= 2);
     /* Pipeline barrier: the determinism proof needs both sides done with
      * T-1 before either runs T (latency >= tick covers the in-tick overlap). */
     if (tick > 0 && !psx_link_shm_wait_follower_tick(tick - 1u)) {
@@ -243,6 +377,7 @@ int psx_link_pair_on_admit(uint32_t tick) {
         drv_fail("TICK push");
         return 0;
     }
+    pair_perf_mark_guest_start();
     return 1;
 }
 
@@ -343,7 +478,8 @@ int psx_link_pair_follower_mode(void) {
 
 int psx_link_pair_follower_boot(struct CPUState *cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint32_t own_flags,
-                                uint32_t bios_id, uint32_t codegen_hash) {
+                                uint32_t bios_id, uint32_t codegen_hash,
+                                uint32_t mod_plan_hash) {
     PsxLinkPairCfg cfg;
     int spins = 0;
     g_fol.last_ran = 0xFFFFFFFFu;               /* "none ran yet" sentinel */
@@ -367,12 +503,13 @@ int psx_link_pair_follower_boot(struct CPUState *cpu, uint32_t bios_checksum,
 #endif
     }
     if (cfg.codegen_hash != codegen_hash || cfg.bios_id != bios_id ||
-        cfg.flags != own_flags) {
+        cfg.flags != own_flags || cfg.mod_plan_hash != mod_plan_hash) {
         fprintf(stderr,
                 "psxrecomp: link follower CONFIG MISMATCH — "
-                "hash %08x/%08x bios %u/%u flags %x/%x — refusing pair\n",
+                "hash %08x/%08x bios %u/%u flags %x/%x modplan %08x/%08x — "
+                "refusing pair\n",
                 cfg.codegen_hash, codegen_hash, cfg.bios_id, bios_id,
-                cfg.flags, own_flags);
+                cfg.flags, own_flags, cfg.mod_plan_hash, mod_plan_hash);
         psx_link_shm_set_follower_err(PAIR_ERR_CFG);
         return 0;
     }
@@ -404,14 +541,36 @@ static void fol_exec_save(uint32_t tick) {
     }
 }
 
-void psx_link_pair_follower_note_finish(void) {
-    /* Same boundary phase as the client's psx_netplay_finish_frame digest. */
+/* Digest THIS follower console's tick and publish the full partition set
+ * (core + cpu/clk/tim/ram/dirty + sio1/spad — the forensics surface for the
+ * race-start fold mismatch). Shared by the finish_frame note and the late
+ * fallback in follower_admit so both paths publish identical shapes. */
+static void fol_publish_digests(void) {
     CPUState dig_cpu;
     NetplayCoreParts parts;
-    if (!g_fol.booted || !g_fol.have_ran || !g_fol.cpu)
-        return;
+    PsxLinkFolParts pub;
+    uint64_t dig_t0 = pair_perf_on() ? pair_now_us() : 0;
     psx_netplay_rb_cpu_for_present_digest(&dig_cpu, g_fol.cpu);
     netplay_core_digest_parts(&dig_cpu, &parts);
+    pub.core  = parts.core;
+    pub.cpu   = parts.cpu;
+    pub.clk   = parts.clock_irq;
+    pub.tim   = parts.timers;
+    pub.ram   = parts.ram;
+    pub.dirty = parts.dirty;
+    pub.sio1  = netplay_sio1_digest();
+    pub.spad  = netplay_spad_digest();
+    {
+        extern uint64_t psx_cycle_count;
+        extern uint32_t i_stat;
+        extern uint32_t interrupts_get_cycles_since_vblank(void);
+        pub.cyc   = psx_cycle_count;
+        pub.csv   = interrupts_get_cycles_since_vblank();
+        pub.istat = i_stat;
+    }
+    if (dig_t0)
+        psx_link_pair_perf_gw_add(PSX_LINK_PERF_GW_DIGEST,
+                                  pair_now_us() - dig_t0);
     if (g_fol.last_ran == 0u && getenv("PSX_LINK_RAMDUMP")) {
         extern uint8_t *g_psx_ram;
         FILE *f = fopen("/tmp/link_ram_follower.bin", "wb");
@@ -420,19 +579,33 @@ void psx_link_pair_follower_note_finish(void) {
     if (g_fol.last_ran < 3u) {
         fprintf(stderr,
                 "psxrecomp: link follower parts tick=%u core=%08x cpu=%08x "
-                "clk=%08x tim=%08x ram=%08x dirty=%08x\n",
-                (unsigned)g_fol.last_ran, (unsigned)parts.core,
-                (unsigned)parts.cpu, (unsigned)parts.clock_irq,
-                (unsigned)parts.timers, (unsigned)parts.ram,
-                (unsigned)parts.dirty);
+                "clk=%08x tim=%08x ram=%08x dirty=%08x sio1=%08x spad=%08x\n",
+                (unsigned)g_fol.last_ran, (unsigned)pub.core,
+                (unsigned)pub.cpu, (unsigned)pub.clk, (unsigned)pub.tim,
+                (unsigned)pub.ram, (unsigned)pub.dirty, (unsigned)pub.sio1,
+                (unsigned)pub.spad);
         fflush(stderr);
     }
-    psx_link_shm_publish_digest(g_fol.last_ran, parts.core);
+    psx_link_shm_publish_parts(g_fol.last_ran, &pub);
     g_fol.dig_published = 1;
+}
+
+void psx_link_pair_follower_note_finish(void) {
+    /* Same boundary phase as the client's psx_netplay_finish_frame digest. */
+    if (!g_fol.booted || !g_fol.have_ran || !g_fol.cpu)
+        return;
+    fol_publish_digests();
 }
 
 int psx_link_pair_follower_admit(void) {
     if (!g_fol.booted) return 0;
+    pair_perf_mark_guest_end();
+    g_pp.ticks++;
+    {
+        PsxLinkPairCfg cfg;
+        int b = psx_link_shm_pair_cfg(&cfg) ? (cfg.driver_side == 0) : 0;
+        pair_perf_report("follower", b);
+    }
     if (g_fol.have_ran) {
         /* The digest was published at the finish_frame boundary point
          * (psx_link_pair_follower_note_finish) — the SAME spot in the vblank
@@ -441,12 +614,8 @@ int psx_link_pair_follower_admit(void) {
          * follower digests of an identical console differed systematically
          * when the follower digested here instead). Late fallback only if a
          * present path skipped the note. */
-        if (!g_fol.dig_published) {
-            CPUState dig_cpu;
-            psx_netplay_rb_cpu_for_present_digest(&dig_cpu, g_fol.cpu);
-            psx_link_shm_publish_digest(g_fol.last_ran,
-                                        netplay_core_digest(&dig_cpu));
-        }
+        if (!g_fol.dig_published)
+            fol_publish_digests();
         g_fol.dig_published = 0;
         psx_link_shm_set_done_tick(g_fol.last_ran);
         g_fol.have_ran = 0;
@@ -496,6 +665,7 @@ int psx_link_pair_follower_admit(void) {
             psx_netplay_apply_pad_blob(1, c.rows[1]);
             g_fol.last_ran = c.tick;
             g_fol.have_ran = 1;
+            pair_perf_mark_guest_start();
             return 1;
         case PSX_LINK_CMD_LOAD: {
             uint32_t pc;
