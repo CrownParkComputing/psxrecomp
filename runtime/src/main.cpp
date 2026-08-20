@@ -6303,6 +6303,8 @@ static void rewind_host_pause_loop(void) {
         rewind_pause_present();
         SDL_Delay(8);
     }
+    /* Swallow the still-held close press so it doesn't bleed into the game. */
+    savestate_input_guard_arm();
 }
 
 /* Freeze guest in vblank present while the save-state slot menu is open. */
@@ -6344,6 +6346,8 @@ static void savestate_menu_host_pause_loop(void) {
         rewind_pause_present();
         SDL_Delay(8);
     }
+    /* Swallow the close press; a just-queued save must not snapshot it. */
+    savestate_input_guard_arm();
 }
 
 /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
@@ -13264,6 +13268,20 @@ int main(int argc, char** argv) {
                 uint32_t text_lo = gc.load_address & 0x1FFFFFFFu;
                 if (text_lo > 0x00010000u && text_lo < g_overlay_region_floor)
                     g_text_image_lo = text_lo;
+                /* PSX_OVERLAY_REGION_FLOOR: per-title override for games whose TEXT
+                 * range is itself partially overwritten by streamed level data
+                 * (Driver 2 streams mission code over pages inside its static text
+                 * range). Lowering the floor routes those regions through local-flow
+                 * chaining and makes them overlay-cache candidates, so live-byte
+                 * closures can own them instead of single-instruction dispatch
+                 * thrash. Clamped to stay above the kernel window. */
+                {
+                    const char* fenv = std::getenv("PSX_OVERLAY_REGION_FLOOR");
+                    if (fenv && fenv[0]) {
+                        uint32_t v = (uint32_t)strtoul(fenv, nullptr, 0) & 0x1FFFFFFFu;
+                        if (v >= 0x00010000u) g_overlay_region_floor = v;
+                    }
+                }
                 std::fprintf(stdout,
                     "psxrecomp: overlay_region_floor = 0x%05X (game text end), "
                     "text_image_lo = 0x%05X\n",
@@ -13953,6 +13971,19 @@ int main(int argc, char** argv) {
             std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
             /* Same keybinds.ini / config.ini the runtime reads — never cwd. */
             ae_rui_set_sidecar_paths(argv[0]);
+            /* A CLI --disc must seed the launcher's initial disc. Without this,
+             * the override suppresses the remembered settings/disc.cfg pick (the
+             * has_disc_path gate above) while contributing nothing itself, so the
+             * launcher opens with "No disc selected" and forces a manual pick on
+             * every launch. resolve_disc_for_runtime still applies the override
+             * authoritatively after the launcher returns. */
+            if (disc_override_path && disc_override_path[0]) {
+                std::filesystem::path cli_disc = normalize_disc_path_for_launch(
+                    std::filesystem::path(disc_override_path));
+                std::error_code cli_ec;
+                if (std::filesystem::exists(cli_disc, cli_ec))
+                    resolved_disc = cli_disc;
+            }
             std::string rui_initial_disc = resolved_disc.string();
             std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
                                      + " - Launcher";
