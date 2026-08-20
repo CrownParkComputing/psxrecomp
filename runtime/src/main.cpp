@@ -3975,6 +3975,48 @@ static void apply_sources_to_map(ControllerMap& map, const char* name,
     }
 }
 
+/* Undo Xbox/HIDAPI mis-captures where Left (etc.) was stored as another
+ * cardinal's SDL name (SFA3 #3: left = dpup while up already owns dpup). */
+static void heal_dpad_cardinal_collisions(ControllerMap& map) {
+    static const struct {
+        const char* name;
+        const char* def;
+        SDL_GameControllerButton expect;
+    } kCard[4] = {
+        {"up", "dpup", SDL_CONTROLLER_BUTTON_DPAD_UP},
+        {"down", "dpdown", SDL_CONTROLLER_BUTTON_DPAD_DOWN},
+        {"left", "dpleft", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+        {"right", "dpright", SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+    };
+    int btn[4] = {-1, -1, -1, -1};
+    for (int i = 0; i < 4; ++i) {
+        for (const auto& s : map[static_cast<size_t>(i)].sources) {
+            if (s.kind == ControllerSource::Kind::Button) {
+                btn[i] = s.id;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (btn[i] < 0 || btn[i] == static_cast<int>(kCard[i].expect)) continue;
+        const bool is_dpad =
+            btn[i] == SDL_CONTROLLER_BUTTON_DPAD_UP ||
+            btn[i] == SDL_CONTROLLER_BUTTON_DPAD_DOWN ||
+            btn[i] == SDL_CONTROLLER_BUTTON_DPAD_LEFT ||
+            btn[i] == SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+        if (!is_dpad) continue;
+        int owner = -1;
+        for (int j = 0; j < 4; ++j) {
+            if (btn[i] == static_cast<int>(kCard[j].expect)) {
+                owner = j;
+                break;
+            }
+        }
+        if (owner >= 0 && owner != i && btn[owner] == btn[i])
+            apply_sources_to_map(map, kCard[i].name, kCard[i].def);
+    }
+}
+
 static void set_default_controller_mapping_into(ControllerMap& map) {
     for (auto& entry : map) entry.sources.clear();
     /* D-pad and sticks are separate (launcher Gamepad Bindings layout). Digital
@@ -4140,6 +4182,10 @@ static void load_input_config(const char* argv0) {
         for (auto& entry : controller_map) entry.sources.clear();
         for (auto& kv : controller_maps_by_guid)
             for (auto& entry : kv.second) entry.sources.clear();
+    } else {
+        heal_dpad_cardinal_collisions(controller_map);
+        for (auto& kv : controller_maps_by_guid)
+            heal_dpad_cardinal_collisions(kv.second);
     }
 
     /* Configurable KEYBOARD keybinds (keybinds.ini, next to the exe) — separate
@@ -15117,21 +15163,19 @@ session_reboot:
      * window is resized; nearest preserves crisp pixels otherwise. */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
-     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
-     * as a game controller rather than a raw HID device. */
+    /* Prefer SDL HIDAPI for DualSense / non-Xbox pads. Do NOT force RAWINPUT
+     * off + HIDAPI Xbox on Windows: that path synthesizes D-pad from a hat and
+     * has been observed to drop Left or alias it as Up on Xbox One (SFA3 #3).
+     * Leave Windows Xbox on the platform default (XInput / GameInput). */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+#if !defined(_WIN32)
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+#endif
     /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
      * it also preserves DualSense rumble on the explicit SDL2 fallback. */
     SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
                             SDL_HINT_OVERRIDE);
-    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
-     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
-     * Xbox One/Series controller would be claimed by nobody -> not a GameController
-     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
-     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
     /* Per-monitor DPI awareness, BEFORE any SDL_Init.
      *
