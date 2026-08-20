@@ -159,13 +159,23 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 def data_root() -> Path:
-    """The RetComM shared data root — same one the launcher and Studio use."""
+    """The RetComM shared data root — same one the launcher and Studio use.
+
+    The precedence must match studio_runner.cpp's retcomm_data_dir() exactly,
+    XDG_DATA_HOME included. If the two disagree, the GUI reports an oracle
+    that is not where this tool installed it, and neither side is obviously
+    wrong — the worst kind of bug to chase.
+    """
     env = os.environ.get("RETCOMM_DATA_DIR")
     if env:
         return Path(env).expanduser()
     if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        base = (os.environ.get("LOCALAPPDATA")
+                or os.environ.get("USERPROFILE", str(Path.home())) + "/AppData/Local")
         return Path(base) / "retcomm"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "retcomm"
     return Path.home() / ".local" / "share" / "retcomm"
 
 
@@ -958,8 +968,64 @@ def state(lay: Layout) -> Dict[str, str]:
     return out
 
 
+def status_doc(lay: Layout) -> Dict[str, Any]:
+    """Everything a caller (or a GUI) needs to decide what button to offer."""
+    pin = load_pin()
+    doc: Dict[str, Any] = {}
+    if lay.manifest.is_file():
+        try:
+            with open(lay.manifest, "r", encoding="utf-8") as f:
+                doc.update(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            pass
+    st = state(lay)
+    running = st["running"] != "no"
+    answering = st["running"].startswith("yes")
+    doc.update({
+        # Set AFTER the manifest merge: oracle.json carries its own `kind`
+        # ("psxrecomp-duckstation-oracle") and would otherwise overwrite this
+        # one, so every installed oracle would report a document Studio then
+        # rejects as foreign — while an uninstalled one looked fine.
+        "kind": "psxrecomp-oracle-status",
+        "version": 1,
+        "root": str(lay.root),
+        "app": str(lay.app),
+        "binary": str(lay.binary),
+        "launcher": str(lay.launcher),
+        "port": int(pin.get("oracle_port", 4371)),
+        "source": st["source"] == "present",
+        "deps": st["deps"] == "present",
+        "patch_applied": st["patch"] == "applied",
+        "built": st["built"] == "yes",
+        "installed": st["installed"] == "yes",
+        "running": running,
+        "answering": answering,
+        "running_detail": st["running"],
+        "container_needed": bool(refused_environment()),
+        "container_reason": refused_environment(),
+        "container_engine": container_engine(),
+    })
+    # One word for a status line, so a GUI does not re-derive the ladder.
+    if answering:
+        doc["state"] = "answering"
+    elif running:
+        doc["state"] = "port-busy"
+    elif doc["installed"]:
+        doc["state"] = "installed"
+    elif doc["built"]:
+        doc["state"] = "built"
+    elif doc["source"]:
+        doc["state"] = "fetched"
+    else:
+        doc["state"] = "absent"
+    return doc
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     lay = Layout(Path(args.root) if args.root else None)
+    if args.json:
+        print(json.dumps(status_doc(lay), indent=1))
+        return 0
     print(f"root: {lay.root}")
     if lay.manifest.is_file():
         with open(lay.manifest, "r", encoding="utf-8") as f:
@@ -1141,6 +1207,8 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("status", help="where it is and what state it is in")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable, for RetComM Studio")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("path", help="print the install root")
@@ -1151,7 +1219,7 @@ def main(argv=None) -> int:
     for attr, default in (("cc", None), ("cxx", None), ("jobs", 0), ("lto", False),
                           ("reconfigure", False), ("cmake_arg", None),
                           ("force", False), ("bios", None), ("root", None),
-                          ("wayland", False), ("container", None)):
+                          ("wayland", False), ("container", None), ("json", False)):
         if not hasattr(args, attr):
             setattr(args, attr, default)
     try:

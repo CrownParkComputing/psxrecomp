@@ -50,6 +50,24 @@ class TestLocations(EnvGuard):
         self.assertEqual(DSO.oracle_root(), Path("/tmp/rc-test/oracle/duckstation"))
         self.assertEqual(DSO.download_cache(), Path("/tmp/rc-test/downloads"))
 
+    def test_xdg_data_home_is_honoured_like_studio_does(self):
+        """studio_runner.cpp's retcomm_data_dir() checks XDG_DATA_HOME before
+        ~/.local/share. If this tool did not, the GUI would look for an oracle
+        somewhere other than where the tool installed it, and neither side would
+        look wrong."""
+        os.environ.pop("RETCOMM_ORACLE_DIR", None)
+        os.environ.pop("RETCOMM_DATA_DIR", None)
+        os.environ["XDG_DATA_HOME"] = "/tmp/xdg-test"
+        self.assertEqual(DSO.data_root(), Path("/tmp/xdg-test/retcomm"))
+        self.assertEqual(DSO.oracle_root(),
+                         Path("/tmp/xdg-test/retcomm/oracle/duckstation"))
+
+    def test_retcomm_data_dir_beats_xdg(self):
+        os.environ.pop("RETCOMM_ORACLE_DIR", None)
+        os.environ["XDG_DATA_HOME"] = "/tmp/xdg-test"
+        os.environ["RETCOMM_DATA_DIR"] = "/tmp/explicit"
+        self.assertEqual(DSO.data_root(), Path("/tmp/explicit"))
+
     def test_oracle_dir_override_wins(self):
         os.environ["RETCOMM_DATA_DIR"] = "/tmp/rc-test"
         os.environ["RETCOMM_ORACLE_DIR"] = "/tmp/elsewhere"
@@ -172,6 +190,55 @@ class TestSettingsMerge(unittest.TestCase):
             p = Path(td) / "settings.ini"
             DSO.merge_ini(p, {"GPU": {"Renderer": "Software"}})
             self.assertIn("Renderer = Software", p.read_text())
+
+
+class TestStatusDoc(EnvGuard):
+    """The status document is the whole contract with RetComM Studio."""
+
+    def test_absent_install_reports_absent(self):
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        doc = DSO.status_doc(DSO.Layout())
+        self.assertEqual(doc["kind"], "psxrecomp-oracle-status")
+        self.assertEqual(doc["state"], "absent")
+        for k in ("source", "deps", "built", "installed", "running", "answering"):
+            self.assertFalse(doc[k], k)
+        self.assertIn("port", doc)
+        self.assertIn("container_needed", doc)
+
+    def test_state_ladder_is_ordered(self):
+        """A GUI picks its button off `state`, so the ladder must not skip."""
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        lay = DSO.Layout()
+        lay.src.mkdir(parents=True)
+        (lay.src / "CMakeLists.txt").write_text("")
+        self.assertEqual(DSO.status_doc(lay)["state"], "fetched")
+        (lay.build / "bin").mkdir(parents=True)
+        (lay.build / "bin" / DSO.exe_name()).write_text("")
+        self.assertEqual(DSO.status_doc(lay)["state"], "built")
+        lay.app.mkdir(parents=True)
+        (lay.app / DSO.exe_name()).write_text("")
+        self.assertEqual(DSO.status_doc(lay)["state"], "installed")
+
+    def test_kind_survives_an_existing_manifest(self):
+        """oracle.json has its own `kind`. Merging it must not overwrite the
+        status document's, or every INSTALLED oracle reports a document Studio
+        rejects as foreign — while an uninstalled one parses fine, so the bug
+        only appears once things are working."""
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        lay = DSO.Layout()
+        lay.root.mkdir(parents=True, exist_ok=True)
+        lay.manifest.write_text(json.dumps({
+            "kind": "psxrecomp-duckstation-oracle",
+            "version": 1,
+            "upstream_base": "deadbeef",
+        }))
+        doc = DSO.status_doc(lay)
+        self.assertEqual(doc["kind"], "psxrecomp-oracle-status")
+        self.assertEqual(doc["upstream_base"], "deadbeef")  # manifest data kept
+
+    def test_json_is_serialisable(self):
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        json.dumps(DSO.status_doc(DSO.Layout()))
 
 
 class TestPin(unittest.TestCase):
