@@ -35,11 +35,26 @@ if(BUILD_TESTING)
     add_test(NAME cause_ip2_combinational_test
              COMMAND cause_ip2_combinational_test)
 
-    add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
+    add_executable(psx_cyc_batch_test
+        tests/test_psx_cyc_batch.c
+        src/psx_cyc_steps.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
+
+    # Generated-code/runtime boundary benchmark. This is intentionally a
+    # separate target (not a ctest): it runs a fixed generated-style guest
+    # workload so IPO/native-code build options can be measured without
+    # launching a game or changing guest code.
+    add_executable(psx_runtime_hotpath_bench
+        tests/bench_psx_runtime_hotpath.c
+        src/psx_cyc_steps.c
+        src/psx_icache.c)
+    target_include_directories(psx_runtime_hotpath_bench PRIVATE include)
+    target_compile_definitions(psx_runtime_hotpath_bench PRIVATE
+        PSX_ENABLE_BLOCK_CYCLES=1
+        PSX_NO_DEBUG_TOOLS=1)
 
     add_executable(psx_icache_fastpath_test
         tests/test_psx_icache_fastpath.c
@@ -68,6 +83,17 @@ if(BUILD_TESTING)
     target_link_libraries(host_keymap_test PRIVATE ${PSX_SDL_LIBRARIES})
     add_test(NAME host_keymap_test COMMAND host_keymap_test)
 
+    add_executable(keyboard_pad_chord_test
+        tests/test_keyboard_pad_chord.c
+        src/psx_keybinds.c)
+    target_include_directories(keyboard_pad_chord_test PRIVATE
+        include ${PSX_SDL_INCLUDE_DIRS})
+    target_compile_definitions(keyboard_pad_chord_test PRIVATE
+        SDL_MAIN_HANDLED
+        $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>)
+    target_link_libraries(keyboard_pad_chord_test PRIVATE ${PSX_SDL_LIBRARIES})
+    add_test(NAME keyboard_pad_chord_test COMMAND keyboard_pad_chord_test)
+
     # Registered since before this change, but it did NOT LINK on origin/master:
     # sio.c had grown psx_read_word / psx_get_cycle_count / i_mask /
     # g_debug_last_store_pc references that this test's stub block never gained,
@@ -89,6 +115,7 @@ if(BUILD_TESTING)
         tests/test_gte_register_access.cpp
         src/gte.cpp
         src/pgxp.cpp
+        src/nd_intro_ot.c
     )
     target_include_directories(gte_register_access_test PRIVATE include)
     target_compile_definitions(gte_register_access_test PRIVATE
@@ -106,6 +133,24 @@ if(BUILD_TESTING)
     add_executable(pgxp_test tests/test_pgxp.cpp src/pgxp.cpp)
     target_include_directories(pgxp_test PRIVATE include)
     add_test(NAME pgxp_test COMMAND pgxp_test)
+
+    add_executable(pgxp_vertex_cache_test
+        tests/test_pgxp_vertex_cache.c
+        src/pgxp_vertex_cache.c)
+    target_include_directories(pgxp_vertex_cache_test PRIVATE include)
+    add_test(NAME pgxp_vertex_cache_test COMMAND pgxp_vertex_cache_test)
+
+    add_executable(tex_pack_rect_index_test
+        tests/test_tex_pack_rect_index.cpp)
+    target_include_directories(tex_pack_rect_index_test PRIVATE include)
+    add_test(NAME tex_pack_rect_index_test COMMAND tex_pack_rect_index_test)
+
+    add_executable(tex_pack_copy_test
+        tests/test_tex_pack_copy.cpp
+        src/tex_pack.cpp
+        src/crc32.c)
+    target_include_directories(tex_pack_copy_test PRIVATE include src)
+    add_test(NAME tex_pack_copy_test COMMAND tex_pack_copy_test)
 
     add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
     target_include_directories(psx_instr_cost_test PRIVATE include)
@@ -125,6 +170,12 @@ if(BUILD_TESTING)
         src/ws_ui_group.c)
     target_include_directories(ws_ui_group_test PRIVATE include)
     add_test(NAME ws_ui_group_test COMMAND ws_ui_group_test)
+
+    add_executable(ws_present_layout_test
+        tests/test_ws_present_layout.c
+        src/ws_present_layout.c)
+    target_include_directories(ws_present_layout_test PRIVATE include)
+    add_test(NAME ws_present_layout_test COMMAND ws_present_layout_test)
 
     add_executable(mod_gpu_dma_aperture_test
         tests/test_mod_gpu_dma_aperture.c)
@@ -400,6 +451,12 @@ if(BUILD_TESTING)
         add_test(NAME host_refresh_sanitize_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_refresh_sanitize.py)
+        add_test(NAME perf_round3_guards_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perf_round3_guards.py)
+        add_test(NAME pgxp_destructive_write_coverage_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_destructive_write_coverage.py)
     endif()
 
     # DISABLED, not de-registered. It links and runs, but 147 of its 309 checks

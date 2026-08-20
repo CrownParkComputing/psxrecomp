@@ -43,7 +43,13 @@ extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
 extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
-extern "C" int gpu_ws_present_native_43(void) { return 0; }
+extern "C" int gpu_ws_content_native_43(void) { return 0; }
+static int g_test_precise_nclip_enabled;
+extern "C" int gpu_ws_precise_nclip_enabled(void) {
+    return g_test_precise_nclip_enabled;
+}
+extern "C" void gpu_pgxp_rederive_enable(void) {}
+extern "C" uint32_t memory_get_ram_bytes(void) { return 2u * 1024u * 1024u; }
 extern "C" void psx_ws_note_gte_project(int) {}
 extern "C" {
 uint64_t s_frame_count = 0;
@@ -273,10 +279,11 @@ int test_writes() {
     for (unsigned iteration = 0; iteration < 64; ++iteration) {
         CPUState seed;
         randomize_gte(seed);
+        oracle_canonicalize(seed);
 
-        /* Valid helper writes must also normalize unrelated backing words.
-         * This preserves the old bridge's behavior when falling back from
-         * committed AOT C that predates helper routing for masked registers. */
+        /* The raw-import boundary canonicalizes once. Thereafter helper writes
+         * update only their architectural register/aliases; unrelated backing
+         * words already satisfy the invariant and need no repeated sweep. */
         for (uint8_t reg = 0; reg < 32; ++reg) {
             for (uint32_t edge : kEdgeValues) {
                 const uint32_t value = edge ^ (iteration ? random_u32() : 0u);
@@ -381,7 +388,8 @@ int test_command_marshaling() {
     for (uint8_t function : kFunctions) {
         for (unsigned iteration = 0; iteration < 96; ++iteration) {
             CPUState seed;
-            randomize_gte(seed);  // deliberately raw/noncanonical legacy state
+            randomize_gte(seed);
+            oracle_canonicalize(seed);
             CPUState expected = seed;
             CPUState actual = seed;
             const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
@@ -409,6 +417,7 @@ int test_command_marshaling() {
                     for (uint32_t lm = 0; lm < 2; ++lm) {
                         CPUState seed;
                         randomize_gte(seed);
+                        oracle_canonicalize(seed);
                         CPUState expected = seed;
                         CPUState actual = seed;
                         const uint32_t cmd = 0x12u | (mx << 17) | (vv << 15) |
@@ -430,6 +439,7 @@ int test_command_marshaling() {
     for (unsigned iteration = 0; iteration < 64; ++iteration) {
         CPUState expected;
         randomize_gte(expected);
+        oracle_canonicalize(expected);
         CPUState actual = expected;
         for (unsigned step = 0; step < 128; ++step) {
             const uint8_t function = kFunctions[random_u32() % kFunctions.size()];
@@ -448,6 +458,7 @@ int test_command_marshaling() {
     for (uint8_t function : kFunctions) {
         CPUState seed;
         randomize_gte(seed);
+        oracle_canonicalize(seed);
         CPUState expected = seed;
         CPUState actual = seed;
         const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
@@ -485,15 +496,27 @@ int test_command_timing_hook() {
 
 int test_precise_sxy_invalidation() {
     CPUState cpu{};
+    gte_precision_tracking_set(1);
+
+    /* SXYP is a FIFO push, not two isolated alias writes. The shadows must
+     * shift 12<-13 and 13<-14 before the new 14/15 value is invalidated. */
+    seed_precise_snapshot();
+    const auto before_sxyp = precise_snapshot();
+    gte_write_data(&cpu, 15, 0x12345678u);
+    const auto after_sxyp = precise_snapshot();
+    if (!after_sxyp[0].valid || !after_sxyp[1].valid ||
+        after_sxyp[0].packed != before_sxyp[1].packed ||
+        after_sxyp[1].packed != before_sxyp[2].packed ||
+        after_sxyp[2].valid || after_sxyp[3].valid)
+        return fail_value("SXYP shifts precise FIFO", 0, 15, 0x12345678u,
+                          before_sxyp[1].packed, after_sxyp[0].packed);
+
     for (uint8_t reg = 0; reg < 32; ++reg) {
         gte_test_set_precise_valid_mask(0xFu);
         gte_write_data(&cpu, reg, 0x12345678u);
-        /* The PGXP shadow drops exactly the register(s) the guest wrote:
-         * SXY0/SXY1 clear their own slot; SXY2 and SXYP clear both mirrors
-         * (regs 14+15). The untouched slots stay live — their register
-         * values did not change (SXYP's hardware FIFO shift makes 12/13
-         * stale in VALUE, which validate-on-read handles at use; liveness
-         * alone is not a correctness claim). */
+        /* The PGXP shadow drops exactly the newly written register(s):
+         * SXY0/SXY1 clear their own slot; SXY2 clears both mirrors; SXYP
+         * shifts live 13/14 shadows into 12/13 and clears new 14/15. */
         uint32_t expected = 0xFu;
         if (reg == 12 || reg == 13) expected &= ~(1u << (reg - 12));
         else if (reg == 14 || reg == 15) expected &= ~0xCu;
@@ -546,6 +569,33 @@ int test_precise_sxy_invalidation() {
         gte_test_get_geometry_generation() != 1u)
         return fail_value("timeline generation wrap", 0, 0, 0, 1u,
                           gte_test_get_precision_generation());
+    return 0;
+}
+
+int test_precise_nclip_never_flips_guest_sign() {
+    CPUState cpu{};
+    gte_precision_tracking_set(1);
+    g_test_precise_nclip_enabled = 1;
+
+    /* Native determinant is +1. These same-cell 16.16 positions have an exact
+     * negative determinant, so the old double path changed MAC0 to -1. */
+    const uint32_t packed[3] = {0x00000001u, 0xFFFFFFFEu, 0xFFFFFFFFu};
+    const int32_t x16[3] = {101245, -109694, -34340};
+    const int32_t y16[3] = {19509, -59658, -20365};
+    for (uint32_t i = 0; i < 3; ++i) {
+        cpu.gte_data[12 + i] = packed[i];
+        gte_test_seed_precise_projection(i, packed[i], x16[i], y16[i], 100);
+    }
+    uint64_t hit0 = 0, fallback0 = 0, disagree0 = 0;
+    gte_nclip_precise_stats(&hit0, &fallback0, &disagree0);
+    gte_execute(&cpu, 0x06u);
+    uint64_t hit1 = 0, fallback1 = 0, disagree1 = 0;
+    gte_nclip_precise_stats(&hit1, &fallback1, &disagree1);
+    g_test_precise_nclip_enabled = 0;
+    if (cpu.gte_data[24] != 1u || hit1 != hit0 + 1u ||
+        disagree1 != disagree0 + 1u)
+        return fail_value("precise NCLIP preserves guest sign", 0, 0x06u,
+                          0, 1u, cpu.gte_data[24]);
     return 0;
 }
 
@@ -661,6 +711,7 @@ int main() {
     if (int rc = test_command_marshaling()) return rc;
     if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
+    if (int rc = test_precise_nclip_never_flips_guest_sign()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");
     return 0;

@@ -1591,18 +1591,42 @@ int main(int argc, char** argv) {
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
+        ds << "#define PSX_GAME_LOOKUP_CACHE_SLOTS 1024u\n";
+        ds << "typedef struct {\n";
+        ds << "    uint32_t addr;\n";
+        ds << "    const PsxGameDispatchEntry* entry;\n";
+        ds << "    uint8_t valid;\n";
+        ds << "} PsxGameLookupCacheEntry;\n";
+        ds << "#if defined(_MSC_VER)\n";
+        ds << "#define PSX_GAME_LOOKUP_THREAD_LOCAL __declspec(thread)\n";
+        ds << "#else\n";
+        ds << "#define PSX_GAME_LOOKUP_THREAD_LOCAL _Thread_local\n";
+        ds << "#endif\n";
+        ds << "static PSX_GAME_LOOKUP_THREAD_LOCAL PsxGameLookupCacheEntry "
+              "s_psx_game_lookup_cache[PSX_GAME_LOOKUP_CACHE_SLOTS];\n\n";
         ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
         ds << "    extern uint32_t psx_ram_canon_code_addr(uint32_t);\n";
         ds << "    addr = psx_ram_canon_code_addr(addr);\n";
+        ds << "    uint32_t slot = (((addr >> 2) * 2654435761u) >> 22);\n";
+        ds << "    PsxGameLookupCacheEntry* memo = &s_psx_game_lookup_cache[slot];\n";
+        ds << "    if (memo->valid && memo->addr == addr) return memo->entry;\n";
         ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
         ds << "    while (lo < hi) {\n";
         ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
         ds << "        uint32_t key = k_psx_game_dispatch[mid].addr;\n";
         ds << "        if (addr < key) hi = mid;\n";
         ds << "        else if (addr > key) lo = mid + 1;\n";
-        ds << "        else return &k_psx_game_dispatch[mid];\n";
+        ds << "        else {\n";
+        ds << "            memo->addr = addr;\n";
+        ds << "            memo->entry = &k_psx_game_dispatch[mid];\n";
+        ds << "            memo->valid = 1u;\n";
+        ds << "            return memo->entry;\n";
+        ds << "        }\n";
         ds << "    }\n";
-        ds << "    return 0;\n";
+        ds << "    memo->addr = addr;\n";
+        ds << "    memo->entry = 0;\n";
+        ds << "    memo->valid = 1u;\n";
+        ds << "    return memo->entry;\n";
         ds << "}\n\n";
 
         ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";

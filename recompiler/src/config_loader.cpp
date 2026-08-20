@@ -570,6 +570,14 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             }
             rt.video_supersampling = static_cast<int>(n);
         }
+        if (video.contains("crtc_refresh_multiplier")) {
+            const auto n = toml::find<int64_t>(video, "crtc_refresh_multiplier");
+            if (n < 1 || n > 8) {
+                throw std::runtime_error(fmt::format(
+                    "[video] crtc_refresh_multiplier out of range (1..8): {}", n));
+            }
+            rt.video_crtc_refresh_multiplier = static_cast<uint32_t>(n);
+        }
         if (video.contains("antialiasing")) {
             rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
         }
@@ -1415,6 +1423,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_auto_ui_squash = false;
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
+    bool ws_fixed_outer_aspect = false;
     bool ws_precise_nclip = false;
     uint32_t ws_gameplay_state_addr = 0;
     std::vector<uint32_t> ws_gameplay_state_values;
@@ -1563,6 +1572,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_full_2d = toml::find<bool>(ws, "full_2d");
         if (ws.contains("gte_game_mode"))
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
+        if (ws.contains("fixed_outer_aspect"))
+            ws_fixed_outer_aspect = toml::find<bool>(
+                ws, "fixed_outer_aspect");
         if (ws.contains("precise_nclip"))
             ws_precise_nclip = toml::find<bool>(ws, "precise_nclip");
         const bool has_gameplay_state_addr = ws.contains("gameplay_state_addr");
@@ -2199,6 +2211,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
+        /*ws_fixed_outer_aspect*/ ws_fixed_outer_aspect,
         /*ws_precise_nclip*/      ws_precise_nclip,
         /*ws_gameplay_state_addr*/ ws_gameplay_state_addr,
         /*ws_gameplay_state_values*/ ws_gameplay_state_values,

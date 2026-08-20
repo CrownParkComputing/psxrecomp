@@ -23,6 +23,26 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
                    "(optimized). Use -DCMAKE_BUILD_TYPE=RelWithDebInfo/Debug to override.")
 endif()
 
+# Cross-translation-unit optimization for the generated game and runtime code.
+# Keep the framework default portable/fast-to-build; individual game projects
+# can opt in before including this file.  CMake deliberately chooses the
+# compiler-specific IPO mode (Clang uses ThinLTO) instead of hard-coding flags.
+option(PSX_ENABLE_LTO
+    "Enable interprocedural optimization for the psxrecomp runtime target" OFF)
+if(PSX_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(
+        RESULT _psx_ipo_supported
+        OUTPUT _psx_ipo_error
+        LANGUAGES C CXX)
+    if(NOT _psx_ipo_supported)
+        message(FATAL_ERROR
+            "PSX_ENABLE_LTO=ON, but this toolchain does not support IPO: "
+            "${_psx_ipo_error}")
+    endif()
+    message(STATUS "psxrecomp: LTO enabled for the runtime target")
+endif()
+
 # Content-addressed compiler cache (ccache). git branch operations (checkout /
 # merge / new branch) rewrite working-tree file mtimes, which makes ninja treat
 # the ~279 MB generated-C objects as stale and recompile them (~15 min) even when
@@ -257,6 +277,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
     ${PSXRECOMP_ROOT}/runtime/src/ws_ui_group.c
     ${PSXRECOMP_ROOT}/runtime/src/ws_aspect_cone_math.c
+    ${PSXRECOMP_ROOT}/runtime/src/ws_present_layout.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vram_dirty.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
@@ -301,6 +322,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/pgxp_vertex_cache.c
     ${PSXRECOMP_ROOT}/runtime/src/nd_intro_ot.c
     ${PSXRECOMP_ROOT}/runtime/src/crc32.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_sha256.c
@@ -316,6 +338,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader.cpp
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_cycles.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cyc_steps.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_icache.c
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
@@ -911,6 +934,9 @@ function(psxrecomp_add_runtime_target target)
     # CMAKE_C_STANDARD setting. cxx_std_17 likewise — game CMakeLists may omit
     # CMAKE_CXX_STANDARD; mod_packages.cpp must not compile as a pre-17 dialect.
     target_compile_features(${target} PRIVATE c_std_11 cxx_std_17)
+    if(PSX_ENABLE_LTO)
+        set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
 
     # Game-specific executable name. Every title instantiates this function with
     # the same CMake target name ("psx-runtime"), so without this they ALL produce
@@ -1286,9 +1312,8 @@ function(psxrecomp_add_runtime_target target)
             # Scoped to mods/packages, NOT mods/: both catalogs own only a
             # packages/ subtree, while mods/state.toml is USER STATE written at
             # runtime (which mods are enabled, with which options). Wiping the
-            # whole tree silently disabled every enabled mod on every rebuild --
-            # 8 MB, widescreen, framerate all reverting off, repeatedly misread
-            # as the mods themselves regressing.
+            # whole tree silently disabled every enabled mod on every rebuild,
+            # repeatedly misread as the mods themselves regressing.
             COMMAND ${CMAKE_COMMAND} -E rm -rf
                 "$<TARGET_FILE_DIR:${target}>/mods/packages"
             COMMAND ${CMAKE_COMMAND} -E copy_directory

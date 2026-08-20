@@ -46,6 +46,29 @@ static bool codegen_cycle_per_insn() {
     return true;
 }
 
+/* Emit the exact dependency clear with an arity-specialized shared runtime
+ * helper.  Bit zero is architecturally preserved by GPR_DEPRES. */
+static std::string emit_cyc_step(uint32_t mask) {
+    uint32_t regs[3] = {};
+    uint32_t count = 0;
+    const uint32_t original = mask;
+    mask &= 0xFFFFFFFEu;
+    while (mask && count < 3u) {
+        uint32_t reg = 0;
+        while (((mask >> reg) & 1u) == 0u) reg++;
+        regs[count++] = reg;
+        mask &= mask - 1u;
+    }
+    if (mask != 0u)
+        return fmt::format("psx_cyc_step(cpu, 0x{:X}u);", original);
+    if (count == 0u) return "psx_cyc_step_0(cpu);";
+    if (count == 1u) return fmt::format("psx_cyc_step_1(cpu, {}u);", regs[0]);
+    if (count == 2u)
+        return fmt::format("psx_cyc_step_2(cpu, {}u, {}u);", regs[0], regs[1]);
+    return fmt::format("psx_cyc_step_3(cpu, {}u, {}u, {}u);",
+                       regs[0], regs[1], regs[2]);
+}
+
 /* The BIOS address model of the profile this game is built against
  * (main_psx.cpp resolves [recompiler] bios_config, default the SCPH1001
  * profile, and sets it before generation). A game artifact depends on a
@@ -147,9 +170,8 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
  * surface it to the trampoline instead of overwriting it with the static
  * transfer. This is the compiled analogue of the dirty interpreter's
  * "Handler resumed elsewhere — surface to dispatch" contract; without it a
- * baked/compiled leader silently drops the guest's continuation (WipEout 3
- * static bake: deterministic top-level "execution completed, PC=0" ~10 s
- * into boot, root-caused to redirects dropped at compiled leaders). A
+ * baked/compiled leader silently drops the guest's continuation and may
+ * surface a null PC as a false top-level "program ended" result. A
  * published pc equal to the static continuation falls through (same-thread
  * restore publishes 0; the depth-guard rescue publishes the site PC). */
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
@@ -1809,8 +1831,7 @@ std::string CodeGenerator::translate_basic_block(
         uint32_t op = in >> 26;
         if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n",
-                                    psx_cyc_dep_res_mask(in));
+        ss << indent << emit_cyc_step(psx_cyc_dep_res_mask(in)) << "\n";
         ss << "#endif\n";
     };
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
@@ -2480,10 +2501,7 @@ std::string CodeGenerator::translate_basic_block(
             // interrupt check here let execution FALL OFF the C function with
             // the entry-switch's consumed pc==0: the dispatcher returned
             // "handled" with a null PC and the top-level trampoline read it
-            // as "program ended" (WipEout 3 static bake: the 0xD5000 region
-            // variant's truncated block_800D7FC0, continuation 0x800D8004,
-            // died the moment CD streaming loaded content matching that
-            // variant — the deterministic boot exit at ~frame 1221). Publish
+            // as "program ended". Publish
             // the continuation instead: the dispatcher routes it to whoever
             // owns it (a neighboring region variant, AOT text, or the
             // interpreter).
@@ -2674,8 +2692,8 @@ GeneratedFunction CodeGenerator::generate_function(
     }
     body_ss << "#endif\n";
 
-    // Cadence / RAM-prep mod hooks must run on CPS mid-function re-entry too:
-    // AOT interior blocks still `lw` guest RAM (e.g. SimVblankGate skip). Other
+    // Mod hooks that prepare guest state must run on CPS mid-function re-entry
+    // too: AOT interior blocks can consume that state immediately. Other
     // entry hooks (debug log, widescreen) stay AFTER the switch so they only
     // fire on a true prologue entry (cpu->pc == 0).
     if (config_.mod_function_entry_funcs.count(func.start_addr)) {
@@ -2834,9 +2852,7 @@ GeneratedFunction CodeGenerator::generate_function(
         // TRANSFER to its continuation PC, never fall off the C function —
         // the entry-switch prologue consumed cpu->pc to 0, so falling off
         // returns pc==0 to the dispatcher and the top-level trampoline reads
-        // it as "program ended" (WipEout 3 static bake: region-truncated
-        // block_800D7FC0 in the 0xD5000 variant fell off at 0x800D8004 →
-        // deterministic "execution completed, PC=0" ~10 s into boot). The
+        // it as "program ended". The
         // published continuation is routed by the dispatcher to whoever owns
         // it (a neighboring region variant, AOT text, or the interpreter).
         const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
@@ -3087,8 +3103,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         // function exists, so a live final block that runs off the end must
         // tail-transfer to its continuation PC — falling off the C function
         // returns the entry-switch's consumed pc==0 and the top-level
-        // trampoline reads "program ended" (the WipEout 3 static-bake boot
-        // exit: truncated block_800D7FC0 in the 0xD5000 region variant).
+        // trampoline reads it as "program ended".
         const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
         bool runs_off_end =
             (last_block.exit_instr.type == ControlFlowType::None) ||

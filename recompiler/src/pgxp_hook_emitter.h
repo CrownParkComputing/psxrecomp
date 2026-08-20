@@ -21,9 +21,9 @@ namespace PSXRecomp {
  * word themselves (a masked GTE register write must validate against the
  * word as loaded, not the register's masked value).
  *
- * Deliberately unhooked: AND/XOR/NOR/SLT-family and the exotic immediates —
- * they only ever DESTROY precision, and the engine's validate-on-read drops
- * their stale shadows without help. */
+ * Destructive GPR writes emit PGXP_GPR_WRITE. Numeric equality cannot prove a
+ * new value came from the old projection, so even byte-identical results must
+ * invalidate provenance. */
 void append_pgxp_hooks(uint32_t instr, std::string& code);
 
 } // namespace PSXRecomp
