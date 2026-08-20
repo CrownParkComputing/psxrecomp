@@ -1797,7 +1797,11 @@ function(psxrecomp_add_game_runtime target)
             if(NOT IS_ABSOLUTE "${_glob}")
                 set(_glob "${CMAKE_CURRENT_SOURCE_DIR}/${_glob}")
             endif()
-            file(GLOB _hits "${_glob}")
+            # Generation may change the shard count without touching the
+            # top-level CMakeLists.txt.  Ask CMake to re-run its glob check so
+            # a subsequent build cannot silently omit newly-created shards
+            # and fail at link time with undefined generated functions.
+            file(GLOB _hits CONFIGURE_DEPENDS "${_glob}")
             list(APPEND _psxg_full_list ${_hits})
         endforeach()
         if(NOT _psxg_full_list)

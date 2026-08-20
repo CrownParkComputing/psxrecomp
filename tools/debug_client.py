@@ -11,6 +11,8 @@ Options:
     --port PORT     Target port (default: 4370 for native)
     --ds            Shorthand for --port 4371 (DuckStation)
     --host HOST     Target host (default: 127.0.0.1)
+    --route-timeout SECONDS
+                    Bound the input-route completion wait (default: 30)
 
 Commands (shared — identical on both servers):
     ping                        Heartbeat + current frame
@@ -40,6 +42,9 @@ Commands (shared — identical on both servers):
     clear_input                 Remove input override
     quit                        Quit game
 
+Native deterministic route command:
+    input_route <route.json>    Upload and run an exact guest-frame input route
+
 Tier 1 write trace commands:
     wtrace_add <lo> <hi>        Add a trace range (up to 8, hex addrs)
     wtrace_del <slot>           Remove trace range by slot index
@@ -60,15 +65,24 @@ REPL commands:
     help                        Show this help
 """
 
+import argparse
+import hashlib
 import json
+import math
 import re
 import socket
 import sys
-import argparse
+import time
+from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 NATIVE_PORT = 4370
 DS_PORT = 4371
+
+INPUT_ROUTE_FORMAT = "psxrecomp-input-route-v1"
+INPUT_ROUTE_MAX_STEPS = 4096
+INPUT_ROUTE_MAX_FRAMES = 0x7FFFFFFF
+DEFAULT_ROUTE_TIMEOUT = 30.0
 
 REG_NAMES = [
     "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
@@ -150,6 +164,359 @@ def query(host, port, cmd_dict):
         return send_cmd(s, cmd_dict)
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic guest-frame input routes
+# ---------------------------------------------------------------------------
+
+class InputRouteError(RuntimeError):
+    """A route could not be loaded, uploaded, or completed."""
+
+
+class InputRouteTimeout(InputRouteError):
+    """The target did not report exact route completion before the deadline."""
+
+
+class _InputRouteTransport:
+    """Issue route commands across the server's one-request connections.
+
+    The native debug server closes every accepted socket after one response.
+    Reuse the CLI's already-connected socket for the first command, then open a
+    fresh connection to the same peer for each remaining upload/status command.
+    Test doubles without ``getpeername`` retain the same-socket behavior.
+    """
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.first = True
+        self.timeout = None
+        getter = getattr(sock, "gettimeout", None)
+        if getter is not None:
+            self.timeout = getter()
+        try:
+            peer = sock.getpeername()
+            self.peer = (peer[0], peer[1])
+        except (AttributeError, OSError, TypeError, IndexError):
+            self.peer = None
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+        if self.first:
+            setter = getattr(self.sock, "settimeout", None)
+            if setter is not None:
+                setter(timeout)
+
+    def request(self, command):
+        if self.first or self.peer is None:
+            self.first = False
+            return send_cmd(self.sock, command)
+
+        fresh = connect(self.peer[0], self.peer[1], timeout=self.timeout)
+        try:
+            return send_cmd(fresh, command)
+        finally:
+            fresh.close()
+
+
+def _input_route_transport(endpoint):
+    if isinstance(endpoint, _InputRouteTransport):
+        return endpoint
+    return _InputRouteTransport(endpoint)
+
+
+def _parse_route_integer(value, label, minimum, maximum):
+    """Parse an integer route field without accepting JSON booleans/floats."""
+    if isinstance(value, bool):
+        raise InputRouteError(f"{label} must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise InputRouteError(f"{label} must be an integer")
+        try:
+            parsed = int(text, 0)
+        except ValueError:
+            try:
+                parsed = int(text, 10)
+            except ValueError:
+                if re.fullmatch(r"[0-9a-fA-F]+", text):
+                    parsed = int(text, 16)
+                else:
+                    raise InputRouteError(f"{label} must be an integer")
+    else:
+        raise InputRouteError(f"{label} must be an integer")
+
+    if parsed < minimum or parsed > maximum:
+        raise InputRouteError(
+            f"{label} must be in [{minimum}, {maximum}], got {parsed}")
+    return parsed
+
+
+def _canonical_input_route(steps):
+    """Return the semantic route object used by the digest."""
+    return {
+        "format": INPUT_ROUTE_FORMAT,
+        "steps": [
+            {
+                "frames": step["frames"],
+                "pad_word": f"0x{step['buttons']:04X}",
+            }
+            for step in steps
+        ],
+    }
+
+
+def input_route_digest(steps):
+    """Return the stable SHA-256 digest for normalized route steps."""
+    encoded = json.dumps(
+        _canonical_input_route(steps),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def load_input_route(path):
+    """Load and normalize a v1 JSON route for the native input-route API.
+
+    The returned step fields use ``buttons``/``frames`` to match
+    ``input_route_append``. ``buttons`` is an active-low 16-bit pad word.
+    """
+    route_path = Path(path)
+    try:
+        document = json.loads(route_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise InputRouteError(f"cannot read route {route_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise InputRouteError(
+            f"invalid JSON in route {route_path}: {exc.msg} at line "
+            f"{exc.lineno} column {exc.colno}") from exc
+
+    if not isinstance(document, dict):
+        raise InputRouteError("route root must be a JSON object")
+    if document.get("format") != INPUT_ROUTE_FORMAT:
+        raise InputRouteError(
+            f"route format must be {INPUT_ROUTE_FORMAT!r}")
+
+    raw_steps = document.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise InputRouteError("route steps must be a non-empty JSON array")
+    if len(raw_steps) > INPUT_ROUTE_MAX_STEPS:
+        raise InputRouteError(
+            f"route has {len(raw_steps)} steps; maximum is "
+            f"{INPUT_ROUTE_MAX_STEPS}")
+
+    steps = []
+    for index, raw_step in enumerate(raw_steps):
+        label = f"steps[{index}]"
+        if not isinstance(raw_step, dict):
+            raise InputRouteError(f"{label} must be a JSON object")
+        if "pad_word" not in raw_step:
+            raise InputRouteError(f"{label}.pad_word is required")
+        if "frames" not in raw_step:
+            raise InputRouteError(f"{label}.frames is required")
+        buttons = _parse_route_integer(
+            raw_step["pad_word"], f"{label}.pad_word", 0, 0xFFFF)
+        frames = _parse_route_integer(
+            raw_step["frames"], f"{label}.frames", 1,
+            INPUT_ROUTE_MAX_FRAMES)
+        steps.append({"buttons": buttons, "frames": frames})
+
+    return {
+        "format": INPUT_ROUTE_FORMAT,
+        "steps": steps,
+        "step_count": len(steps),
+        "frame_count": sum(step["frames"] for step in steps),
+        "digest": input_route_digest(steps),
+    }
+
+
+def _require_route_ok(response, command):
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        detail = response.get("error", repr(response)) \
+            if isinstance(response, dict) else repr(response)
+        raise InputRouteError(f"{command} failed: {detail}")
+    return response
+
+
+def _set_route_socket_timeout(sock, timeout):
+    setter = getattr(sock, "settimeout", None)
+    if setter is not None:
+        setter(timeout)
+
+
+def _validate_route_timeout(timeout):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+            or not math.isfinite(timeout) or timeout <= 0:
+        raise InputRouteError("route timeout must be a finite number > 0")
+
+
+def wait_for_input_route_completion(sock, step_count, timeout=DEFAULT_ROUTE_TIMEOUT,
+                                    clock=time.monotonic):
+    """Wait until status proves every queued segment was consumed.
+
+    The loop deliberately has no wall-clock sleep. Route edges are owned by
+    the runtime's guest-VBlank sampler; this function only observes status.
+    ``clock`` is injectable so timeout behavior can be tested without waiting.
+    """
+    transport = _input_route_transport(sock)
+    _validate_route_timeout(timeout)
+    if not isinstance(step_count, int) or step_count <= 0:
+        raise InputRouteError("route step count must be a positive integer")
+
+    old_timeout = None
+    get_timeout = getattr(transport, "gettimeout", None)
+    if get_timeout is not None:
+        old_timeout = get_timeout()
+
+    deadline = clock() + float(timeout)
+    last_status = None
+    try:
+        while True:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise InputRouteTimeout(
+                    "input route completion timed out; last status="
+                    f"{json.dumps(last_status, sort_keys=True)}")
+            _set_route_socket_timeout(transport, remaining)
+            try:
+                status = _require_route_ok(
+                    transport.request({"cmd": "input_route_status"}),
+                    "input_route_status")
+            except (socket.timeout, TimeoutError) as exc:
+                raise InputRouteTimeout(
+                    "input route completion timed out while reading status") \
+                    from exc
+            last_status = status
+
+            if status.get("steps") != step_count:
+                raise InputRouteError(
+                    "input_route_status reported unexpected step count: "
+                    f"{status.get('steps')!r} (expected {step_count})")
+            active = status.get("active")
+            index = status.get("index")
+            remaining_frames = status.get("remaining")
+            if not isinstance(active, bool) \
+                    or isinstance(index, bool) or not isinstance(index, int) \
+                    or isinstance(remaining_frames, bool) \
+                    or not isinstance(remaining_frames, int):
+                raise InputRouteError(
+                    "input_route_status returned malformed progress: "
+                    f"{json.dumps(status, sort_keys=True)}")
+
+            now = clock()
+            if not active:
+                if index == step_count and remaining_frames == 0:
+                    if now <= deadline:
+                        return status
+                    raise InputRouteTimeout(
+                        "input route completed after the deadline; last status="
+                        f"{json.dumps(status, sort_keys=True)}")
+                raise InputRouteError(
+                    "input route stopped before exact completion: "
+                    f"{json.dumps(status, sort_keys=True)}")
+
+            if index < 0 or index >= step_count or remaining_frames <= 0:
+                raise InputRouteError(
+                    "input_route_status returned impossible progress: "
+                    f"{json.dumps(status, sort_keys=True)}")
+            if now >= deadline:
+                raise InputRouteTimeout(
+                    "input route completion timed out; last status="
+                    f"{json.dumps(status, sort_keys=True)}")
+    finally:
+        if get_timeout is not None:
+            _set_route_socket_timeout(transport, old_timeout)
+
+
+def _best_effort_stop_input_route(sock):
+    """Stop a timed-out route without hiding the original timeout error."""
+    transport = _input_route_transport(sock)
+    old_timeout = None
+    get_timeout = getattr(transport, "gettimeout", None)
+    if get_timeout is not None:
+        old_timeout = get_timeout()
+    try:
+        _set_route_socket_timeout(transport, 0.25)
+        _require_route_ok(
+            transport.request({"cmd": "input_route_stop"}), "input_route_stop")
+    except (InputRouteError, OSError, socket.timeout, TimeoutError):
+        pass
+    finally:
+        if get_timeout is not None:
+            _set_route_socket_timeout(transport, old_timeout)
+
+
+def run_input_route(sock, path, timeout=DEFAULT_ROUTE_TIMEOUT,
+                    clock=time.monotonic):
+    """Upload, start, and exactly complete one JSON input route."""
+    transport = _input_route_transport(sock)
+    route = load_input_route(path)
+    _validate_route_timeout(timeout)
+    steps = route["steps"]
+    _require_route_ok(
+        transport.request({"cmd": "input_route_clear"}), "input_route_clear")
+
+    for index, step in enumerate(steps, start=1):
+        response = _require_route_ok(
+            transport.request({
+                "cmd": "input_route_append",
+                "buttons": step["buttons"],
+                "frames": step["frames"],
+            }), "input_route_append")
+        if response.get("steps") != index:
+            raise InputRouteError(
+                "input_route_append reported unexpected step count: "
+                f"{response.get('steps')!r} (expected {index})")
+
+    start = _require_route_ok(
+        transport.request({"cmd": "input_route_start"}), "input_route_start")
+    if start.get("steps") != route["step_count"]:
+        raise InputRouteError(
+            "input_route_start reported unexpected step count: "
+            f"{start.get('steps')!r} (expected {route['step_count']})")
+    if isinstance(start.get("start_frame"), bool) \
+            or not isinstance(start.get("start_frame"), int):
+        raise InputRouteError(
+            "input_route_start did not return an integer start_frame")
+
+    try:
+        end_status = wait_for_input_route_completion(
+            transport, route["step_count"], timeout=timeout, clock=clock)
+    except InputRouteError:
+        _best_effort_stop_input_route(transport)
+        raise
+
+    end_frame_response = _require_route_ok(
+        transport.request({"cmd": "frame"}), "frame")
+    return {
+        "ok": True,
+        "completion": "exact",
+        "route_digest": route["digest"],
+        "route_format": route["format"],
+        "step_count": route["step_count"],
+        "frame_count": route["frame_count"],
+        "start": {
+            "frame": start["start_frame"],
+            "server": start,
+        },
+        "end": {
+            "frame": end_frame_response.get("frame"),
+            "status": end_status,
+            "server": end_frame_response,
+        },
+    }
+
+
+def format_input_route_receipt(receipt):
+    """Serialize a route receipt as one stable, machine-readable JSON line."""
+    return json.dumps(receipt, sort_keys=True, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +988,8 @@ def run_ts_compare(host, start, end):
 # Command execution
 # ---------------------------------------------------------------------------
 
-def run_command(sock, args, host=DEFAULT_HOST):
+def run_command(sock, args, host=DEFAULT_HOST,
+                route_timeout=DEFAULT_ROUTE_TIMEOUT):
     """Execute a command on the given socket. Returns formatted string."""
     if not args:
         return None
@@ -635,6 +1003,12 @@ def run_command(sock, args, host=DEFAULT_HOST):
         if len(args) < 3:
             return "Usage: ts_compare <start> <end>"
         return run_ts_compare(host, int(args[1]), int(args[2]))
+    if cmd in ("input_route", "route"):
+        if len(args) != 2:
+            return "Usage: input_route <route.json>"
+        receipt = run_input_route(
+            sock, args[1], timeout=route_timeout)
+        return format_input_route_receipt(receipt)
 
     cmd_dict, fmt = build_cmd(args)
     if cmd_dict is None:
@@ -648,7 +1022,7 @@ def run_command(sock, args, host=DEFAULT_HOST):
 # REPL
 # ---------------------------------------------------------------------------
 
-def repl(host, port):
+def repl(host, port, route_timeout=DEFAULT_ROUTE_TIMEOUT):
     try:
         sock = connect(host, port)
     except ConnectionRefusedError:
@@ -694,9 +1068,11 @@ def repl(host, port):
                 continue
 
             try:
-                result = run_command(sock, args, host)
+                result = run_command(sock, args, host, route_timeout)
                 if result:
                     print(result)
+            except InputRouteError as exc:
+                print(f"input route failed: {exc}")
             except (ConnectionResetError, BrokenPipeError, socket.timeout):
                 print("Connection lost. Reconnecting...")
                 try:
@@ -723,6 +1099,9 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--ds", action="store_true", help="Target DuckStation (port 4371)")
+    parser.add_argument("--route-timeout", type=float,
+                        default=DEFAULT_ROUTE_TIMEOUT,
+                        help="input-route completion timeout in seconds")
     parser.add_argument("args", nargs="*")
 
     opts = parser.parse_args()
@@ -733,7 +1112,7 @@ def main():
 
     if not opts.args:
         # REPL mode
-        repl(opts.host, port)
+        repl(opts.host, port, opts.route_timeout)
         return
 
     # Single command mode
@@ -744,9 +1123,12 @@ def main():
         sys.exit(1)
 
     try:
-        result = run_command(sock, opts.args, opts.host)
+        result = run_command(sock, opts.args, opts.host, opts.route_timeout)
         if result:
             print(result)
+    except InputRouteError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        sys.exit(2)
     finally:
         sock.close()
 

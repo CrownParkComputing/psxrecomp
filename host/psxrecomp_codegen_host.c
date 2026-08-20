@@ -20,6 +20,12 @@
 extern char** environ;
 #endif
 
+#if defined(RECOMP_LAUNCHER)
+/* Provided by recomp-ui.  Keep the setup host linkable without the optional
+ * launcher; its relaunch callback is unreachable in that configuration. */
+int recomp_launcher_relaunch_exe(char* out, size_t out_cap);
+#endif
+
 /* Forward decls — used by toolchain cache helpers before their definitions. */
 static int rmtree_path(const char* path);
 static int mkdir_p(const char* path);
@@ -3757,10 +3763,17 @@ void psxrecomp_codegen_host_forward_if_built(
 void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
     char exe[512];
     const char* near_exe;
+#if defined(RECOMP_LAUNCHER)
     if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
         fprintf(stderr, "psxrecomp-codegen: relaunch requested but no path\n");
         exit(1);
     }
+#else
+    (void)disc_path;
+    fprintf(stderr,
+            "psxrecomp-codegen: relaunch requires the optional launcher\n");
+    exit(1);
+#endif
     /* Prefer the final game binary (build/<exe>) over a Windows helper bat. */
     near_exe = g_exe_path[0] ? g_exe_path : exe;
     persist_relaunch_sidecars(near_exe, disc_path);

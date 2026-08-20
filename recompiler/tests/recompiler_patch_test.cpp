@@ -12,6 +12,7 @@
 #include "control_flow.h"
 #include "fmt/format.h"
 #include "gte_register_classification.h"
+#include "pgxp_hook_emitter.h"
 #include "recompiler_patch.h"
 
 namespace fs = std::filesystem;
@@ -1027,14 +1028,55 @@ void cfg_codegen_load_delay_test() {
     PSXRecomp::CodeGenerator generator(exe);
     const std::string code = generator.generate_function(function, cfg).full_code;
 
-    const size_t deferred = code.find("uint32_t psx_ldd_80003590 =");
+    const size_t declaration = code.find("uint32_t psx_ldd_80003590 = 0;");
+    const size_t deferred = code.find("psx_ldd_80003590 = psx_cyc_load_word");
     const size_t successor = code.find("cpu->gpr[1] = cpu->gpr[26]");
     const size_t writeback = code.find(
         "cpu->gpr[26] = psx_ldd_80003590;  /* load-delay writeback */");
-    check(deferred != std::string::npos && successor != std::string::npos &&
-          writeback != std::string::npos && deferred < successor &&
+    const size_t pgxp = code.find("PGXP_LOAD(0x8F5A4C38u, _pgxa, psx_ldd_80003590)");
+    check(declaration != std::string::npos && deferred != std::string::npos &&
+          successor != std::string::npos && writeback != std::string::npos &&
+          pgxp != std::string::npos && declaration < deferred && deferred < successor &&
           successor < writeback,
           "CFG codegen preserves MIPS-I dependent load-delay value semantics");
+}
+
+void pgxp_preprocessor_boundary_test() {
+    std::string code =
+        "if (cpu->gpr[3]) { cpu->lo = 1; }\n"
+        "#ifdef PSX_ENABLE_BLOCK_CYCLES\n"
+        "    psx_muldiv_set(cpu, 37u);\n"
+        "#endif";
+    PSXRecomp::append_pgxp_hooks(0x00430018u, code); // mult v0,v1
+    check(code.find("#endif PGXP_") == std::string::npos &&
+          code.find("#endif\nPGXP_MULDIV") != std::string::npos,
+          "PGXP hooks never append tokens to a preprocessor directive");
+}
+
+void unnamed_straight_line_fallthrough_codegen_test() {
+    constexpr uint32_t base = 0x80010000u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = base;
+    exe.header.file_size = 4u;
+    append_word(exe.code_data, 0x00000000u); // reachable nop-only fragment
+
+    PSXRecomp::Function function{};
+    function.start_addr = base;
+    function.end_addr = base + 4u;
+    function.size = 4u;
+    function.name = "unnamed_fallthrough";
+
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator generator(exe);
+    const std::string code = generator.generate_function(function, cfg).full_code;
+    const std::string bridge = generator.cps_enabled()
+        ? "cpu->pc = 0x80010004u; return;"
+        : "call_by_address(cpu, 0x80010004u); return;";
+
+    check(code.find(bridge) != std::string::npos,
+          "reachable unnamed fallthrough publishes the architectural next PC");
 }
 
 } // namespace
@@ -1052,6 +1094,8 @@ int main() {
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();
         cfg_codegen_load_delay_test();
+        pgxp_preprocessor_boundary_test();
+        unnamed_straight_line_fallthrough_codegen_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

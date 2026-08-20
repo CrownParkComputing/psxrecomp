@@ -1909,8 +1909,22 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    emitted.replace(pos, lhs.size(), "uint32_t " + temp + " =");
+                    emitted.replace(pos, lhs.size(), temp + " =");
+                    /* append_pgxp_hooks() wraps loads and validates the loaded
+                     * value.  A deferred load has not reached the GPR yet, so
+                     * the hook must validate the temporary rather than the old
+                     * architectural register value. */
+                    const size_t hook = emitted.find("PGXP_LOAD(", pos);
+                    if (hook != std::string::npos) {
+                        const std::string reg = reg_name(
+                            static_cast<uint32_t>(load_dest));
+                        const std::string hook_value = ", " + reg + ");";
+                        const size_t value = emitted.find(hook_value, hook);
+                        if (value != std::string::npos)
+                            emitted.replace(value + 2u, reg.size(), temp);
+                    }
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
+                    ss << config_.indent << "uint32_t " << temp << " = 0;\n";
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
                     delayed_load_active = true;
@@ -2704,13 +2718,14 @@ GeneratedFunction CodeGenerator::generate_function(
     //      (indicating a split-function where the branch targets are in the next piece)
     // Functions that have dead code after a jr $ra (e.g., padding) must NOT get a
     // fallthrough call — condition 1 guards against that.
-    if (!fallthrough_name.empty() && !cfg.block_order.empty()) {
+    if (!cfg.block_order.empty()) {
         const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
         bool needs_fallthrough = false;
 
         if (last_block.exit_instr.type == ControlFlowType::None) {
             needs_fallthrough = true;
-        } else if ((last_block.exit_instr.type == ControlFlowType::Branch ||
+        } else if (!fallthrough_name.empty() &&
+                   (last_block.exit_instr.type == ControlFlowType::Branch ||
                     last_block.exit_instr.type == ControlFlowType::Jump) &&
                    last_block.successors.empty()) {
             // Branch/jump with no in-function successors — likely a split-function bug.
@@ -2730,8 +2745,28 @@ GeneratedFunction CodeGenerator::generate_function(
             const BasicBlock& last = cfg.blocks.at(cfg.block_order.back());
             bool is_reachable = last.is_entry || !last.predecessors.empty();
             if (is_reachable) {
-                body_ss << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
-                                       fallthrough_name);
+                if (!fallthrough_name.empty()) {
+                    body_ss << fmt::format(
+                        "    {}(cpu);  /* fallthrough to next function */\n",
+                        fallthrough_name);
+                } else if (cps_enabled_) {
+                    // Discovery can conservatively split a real straight-line
+                    // region before it has named the successor. The flat CPS
+                    // dispatcher initializes cpu->pc to zero before entry, so
+                    // silently returning here turns an unresolved fallthrough
+                    // into a false guest exit. Publish the architectural next
+                    // PC and let the dispatcher resolve it statically or via
+                    // its explicit unknown-code path.
+                    body_ss << fmt::format(
+                        "    cpu->pc = 0x{:08X}u; return;"
+                        "  /* unresolved straight-line fallthrough */\n",
+                        func.end_addr);
+                } else {
+                    body_ss << fmt::format(
+                        "    call_by_address(cpu, 0x{:08X}u); return;"
+                        "  /* unresolved straight-line fallthrough */\n",
+                        func.end_addr);
+                }
             }
         }
     }

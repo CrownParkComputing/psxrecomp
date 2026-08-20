@@ -299,6 +299,12 @@ if(BUILD_TESTING)
     target_include_directories(frame_pacing_test PRIVATE include)
     add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 
+    add_executable(freeze_heartbeat_detection_test
+        tests/test_freeze_heartbeat_detection.c)
+    target_include_directories(freeze_heartbeat_detection_test PRIVATE include)
+    add_test(NAME freeze_heartbeat_detection_test
+             COMMAND freeze_heartbeat_detection_test)
+
     add_executable(gpu_primitive_reject_test tests/test_gpu_primitive_reject.c)
     target_include_directories(gpu_primitive_reject_test PRIVATE include)
     add_test(NAME gpu_primitive_reject_test COMMAND gpu_primitive_reject_test)

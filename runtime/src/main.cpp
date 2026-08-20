@@ -79,6 +79,10 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
 
+#if defined(PSX_HAS_GAME_CODEGEN)
+extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+#endif
+
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
@@ -86,7 +90,6 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #if defined(PSX_HAS_GAME_CODEGEN)
 extern "C" void psx_game_codegen_setup_apply(RecompLauncherCGameInfo* gi);
 extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
-extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 #endif
 #include "psx_sdl.h"
@@ -12733,10 +12736,10 @@ session_reboot:
             g_host_refresh_hz = host_hz;
             if (host_hz >= 58.8 && host_hz <= 61.2) {
                 g_frame_period_ms = 1000.0 / host_hz;
-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %.2f Hz panel "
                             "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
             } else {
-                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                std::printf("psxrecomp: host panel %.2f Hz not ~60 Hz; keeping PSX "
                             "59.94 Hz pacing\n", dm.refresh_rate);
             }
         }

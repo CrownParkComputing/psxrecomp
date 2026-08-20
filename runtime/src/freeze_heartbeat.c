@@ -115,7 +115,7 @@ static int    s_sym_initialized = 0;
  *      never flips (Tomba dwarf-village dialogue freeze, issue #1:
  *      ~51 fps, exc_re ~1.6K/frame — UNDER every threshold above, so
  *      A/B/C all miss it). Detected by cur_fn + store_pc + dirty_insns
- *      all stable across the window while frame_delta is healthy.
+ *      all stable at every sample in the window while frame_delta is healthy.
  *
  * Window = 20 ticks = 2.0 sec. Long enough that legitimate startup
  * activity (boot, FMV decode, save load) doesn't trip it; short enough
@@ -164,6 +164,30 @@ static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
 static uint32_t    s_ring_count = 0;
 
+/* A host pacing/debug wait can leave the oldest and newest heartbeat samples
+ * looking identical even though the guest state changed between them. A
+ * logical guest spin must remain pinned for every sample in the window; an
+ * endpoint-only comparison turns those benign endpoint coincidences into
+ * repeated multi-megabyte dumps. Keep this predicate pure so the exact
+ * window semantics can be regression-tested without the runtime dependencies. */
+static int hb_logic_pinned_window(const HbRingEntry *ring,
+                                  uint32_t oldest_idx, uint32_t newest_idx) {
+    const HbRingEntry *first = &ring[oldest_idx];
+    uint32_t idx = oldest_idx;
+
+    for (;;) {
+        const HbRingEntry *sample = &ring[idx];
+        if (sample->current_func != first->current_func ||
+            sample->last_store_pc != first->last_store_pc ||
+            sample->dirty_ram_insns != first->dirty_ram_insns)
+            return 0;
+        if (idx == newest_idx)
+            return 1;
+        idx = (idx + 1u) % RING_CAP;
+    }
+}
+
+#ifndef FREEZE_HEARTBEAT_UNIT_TEST
 /* Wedge detection state.
  *   s_dump_armed - 1 if a wedge dump is allowed to fire; cleared after
  *                  firing, re-armed when the wedge clears (healthy tick). */
@@ -783,15 +807,13 @@ static void heartbeat_write(void) {
 
         /* Logical-hang (kind D) signature: the executing function, the last
          * store PC, and the retired dirty-RAM instruction count are all
-         * unchanged across the whole window. Requiring all three pinned makes
-         * this specific to a guest spin loop — a legitimate long native
-         * compute would still move last_store_pc, and any interpreted/overlay
-         * work would advance dirty_insns. Checked only when frames are
+         * unchanged at every sample in the window. Requiring all three
+         * pinned makes this specific to a guest spin loop — a legitimate long
+         * native compute would still move last_store_pc, and any interpreted /
+         * overlay work would advance dirty_insns. Checked only when frames are
          * advancing healthily (kinds 1/2/3 take precedence below). */
         int logic_pinned =
-            (s_ring[newest_idx].current_func    == s_ring[oldest_idx].current_func) &&
-            (s_ring[newest_idx].last_store_pc   == s_ring[oldest_idx].last_store_pc) &&
-            (s_ring[newest_idx].dirty_ram_insns == s_ring[oldest_idx].dirty_ram_insns);
+            hb_logic_pinned_window(s_ring, oldest_idx, newest_idx);
 
         if (frame_delta == 0)
             wedge_kind = 1;
@@ -1088,3 +1110,4 @@ void freeze_heartbeat_start(const char *backend_label) {
     if (s_thread) s_started = 1;
 #endif
 }
+#endif /* !FREEZE_HEARTBEAT_UNIT_TEST */
