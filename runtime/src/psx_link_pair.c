@@ -30,7 +30,9 @@ void psx_link_pair_follower_note_finish(void) {}
 #include <string.h>
 #include <time.h>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#  include <windows.h>   /* Sleep — the tick-0 pairing gate's 1 ms nap */
+#else
 #  include <signal.h>
 #  include <sys/types.h>
 #  include <sys/wait.h>
