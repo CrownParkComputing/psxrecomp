@@ -67,6 +67,57 @@ counts and static names in different columns for the same reason.
 
 ---
 
+## The build must actually have a debug server
+
+**Release + `-DPSX_DEBUG_TOOLS=ON` is the combination you want.** Not a Debug
+build: a Debug build of a recomp is far too slow to reach the frame you are
+chasing.
+
+`runtime/src/debug_server.c` is always compiled, but `debug_server_init()` is
+only *called* when `PSX_NO_DEBUG_TOOLS` is undefined (`runtime/src/main.cpp`).
+`PSX_DEBUG_TOOLS` defaults **ON** for `Debug` / `RelWithDebInfo` and **OFF** for
+`Release` / `MinSizeRel` (`runtime/runtime.cmake`), so a plain
+`cmake -DCMAKE_BUILD_TYPE=Release` produces a lean binary that opens no port at
+all. Every "the tool won't connect" starts here.
+
+```bash
+cmake -S . -B build-release -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release -DPSX_DEBUG_TOOLS=ON
+cmake --build build-release --target psx-runtime
+```
+
+Check an existing build dir without reconfiguring it:
+
+```bash
+grep -E '^(PSX_DEBUG_TOOLS|CMAKE_BUILD_TYPE):' build-release/CMakeCache.txt
+```
+
+`PSX_DEBUG_TOOLS` is an `option()`, so it lives in the cache: changing
+`CMAKE_BUILD_TYPE` on an **existing** build dir does *not* flip it. Pass the
+`-D` explicitly, or start a fresh build dir.
+
+In RetComM Studio this is the **Build tab → Debug tools** row: a selector that
+injects the flag, a **Configure for debugging** button that sets Release + ON in
+one click, and a status line that reads the configured build dir and says
+whether the server will be there. The Frames tab shows the same line when it
+cannot connect, so "not connected" never has to be guessed at.
+
+### The port is a runtime setting, not a build flag
+
+The debug port comes from `game.toml`:
+
+```toml
+[runtime]
+debug_port = 4370
+```
+
+If that key is absent the runtime uses the compiled `DEFAULT_DEBUG_PORT` (4370
+for `psx-runtime`, 4380 for `psx-beetle`), and `--debug-port <n>` on the command
+line overrides both. Studio's Frames tab defaults its port field to whatever the
+selected project's `game.toml` says.
+
+---
+
 ## Transport
 
 **One request per connection.** `io_thread_main()` in `debug_server.c` accepts,
