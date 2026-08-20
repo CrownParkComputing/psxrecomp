@@ -130,9 +130,6 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <unordered_map>
 #include <vector>
 #include <map>
-#ifdef _WIN32
-#include <psapi.h>   /* GetModuleInformation (self-profile sampler) */
-#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -142,6 +139,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <psapi.h>   /* GetModuleInformation (self-profile sampler) */
 #include <commdlg.h>
 #else
 #include <arpa/inet.h>
@@ -11118,16 +11116,13 @@ static DWORD WINAPI self_profile_thread(LPVOID param) {
     FILE *f = fopen("psx_self_profile.txt", "wb");
     if (f) {
         fprintf(f, "samples=%d external=%d (exe base offsets, 64B buckets; "
-                   "addr2line VA = 0x140000000 + offset)
-", count, external);
+                   "addr2line VA = 0x140000000 + offset)\n", count, external);
         for (size_t i = 0; i < top.size() && i < 120; i++)
-            fprintf(f, "%6d  0x%llx
-", top[i].first,
+            fprintf(f, "%6d  0x%llx\n", top[i].first,
                     (unsigned long long)top[i].second);
         fclose(f);
     }
-    fprintf(stdout, "psxrecomp: [self-profile] %d samples (%d external) -> psx_self_profile.txt
-",
+    fprintf(stdout, "psxrecomp: [self-profile] %d samples (%d external) -> psx_self_profile.txt\n",
             count, external);
     fflush(stdout);
     return 0;
@@ -12049,8 +12044,7 @@ int main(int argc, char** argv) {
                             0, FALSE, DUPLICATE_SAME_ACCESS);
             spa.seconds = secs;
             CreateThread(NULL, 0, self_profile_thread, &spa, 0, NULL);
-            std::fprintf(stdout, "psxrecomp: [self-profile] armed for %d s
-", secs);
+            std::fprintf(stdout, "psxrecomp: [self-profile] armed for %d s\n", secs);
         }
     }
 #endif
