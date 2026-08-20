@@ -1,0 +1,32 @@
+# WipEout 3 Special Edition (Europe) — registry entry.
+# Container layout verified 2026-08-20; compressed entries use a bespoke
+# Psygnosis codec (not stock LZSS — exhaustively ruled out). Stored entries
+# (36-54% of bytes) carve directly; VAGs keep original build filenames.
+
+[game]
+serial = "SCES-02845"
+name = "WipEout 3 Special Edition"
+
+[[container]]
+glob = "WIPEOUT3/*.PBP"
+format = "psyg_pb"
+
+[[container]]
+glob = "WIPEOUT3/*.PB"
+format = "psyg_pb"
+
+[[container]]
+glob = "WIPEOUTC/*.PBP"
+format = "psyg_pb"
+
+[[container]]
+glob = "WIPEOUTC/*.PB"
+format = "psyg_pb"
+
+[[skip]]
+glob = "*.STR"
+reason = "FMV stream (MDEC)"
+
+[[skip]]
+glob = "TRACK*.WAV"
+reason = "RIFF CD audio, already playable"

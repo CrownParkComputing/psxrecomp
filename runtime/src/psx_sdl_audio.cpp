@@ -46,13 +46,18 @@ extern "C" SDL_AudioDeviceID psx_sdl_audio_open(
     }
 
     const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s_audio_stream);
-    SDL_AudioSpec obtained = requested;
-    (void)SDL_GetAudioDeviceFormat(device, &obtained, nullptr);
     if (have) {
+        /* Report the STREAM'S INPUT spec, not the device format: SDL3
+         * converts whatever we feed FROM `requested` TO the device rate
+         * internally. Reporting the device rate here made the DRC render
+         * at (typically) 48 kHz intent while SDL re-resampled it as
+         * 44.1 kHz — a constant ~0.92x pitch-down on every SDL3 build plus
+         * a perpetual ring overfill drained by overflow_drops clicks. The
+         * DRC is the only resampler; SDL3 must see honest 44.1 kHz input. */
         std::memset(have, 0, sizeof(*have));
-        have->freq = obtained.freq;
-        have->format = obtained.format;
-        have->channels = obtained.channels;
+        have->freq = requested.freq;
+        have->format = requested.format;
+        have->channels = requested.channels;
         have->samples = want->samples;
     }
 

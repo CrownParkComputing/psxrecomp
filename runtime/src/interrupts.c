@@ -1509,6 +1509,8 @@ irq_deliver_eval:
      * disarms the RFE-flag escape). */
     g_rfe_escape_pending = 0;
     {
+        extern uint32_t g_async_rfe_resume_pc;   /* dirty_ram_interp.c */
+        extern uint64_t g_async_rfe_set_count;
         uint32_t real_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                   : s_compiled_interrupt_resume_pc;
         /* Top-level flush_resume / savestate: resync cleared the latches and
@@ -1552,6 +1554,15 @@ irq_deliver_eval:
             cpu->cop0[COP0_EPC]  = real_pc;     /* architectural: the real resume PC */
             g_exception_real_epc = real_pc;
             g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE; /* set at the actual RFE/SYSCALL return */
+            /* Async-RFE latch (Tomba 2 frame-1997 fix): persist the most
+             * recent real interruption PC so a game-driven asynchronous
+             * ReturnFromException (sentinel RFE with in_exception==0, e.g. a
+             * card-ISR longjmp installed via HookEntryInt) resumes the guest
+             * here instead of resolving to pc=0 (abnormal top-level exit).
+             * The latch was documented but never assigned — the whole rescue
+             * in the traps/dirty sentinel gates was inert. */
+            g_async_rfe_resume_pc = real_pc;
+            g_async_rfe_set_count++;
         } else {
             uint32_t sentinel = PSX_EXC_SENTINEL_PC;
             cpu->write_word(sentinel, 0x00000000u); /* NOP, read by the handler's BD check */
@@ -1882,14 +1893,30 @@ irq_deliver_eval:
         same_thread_resume = 1;
         {
             extern int psx_scheduler_top_level_resume_active(void);
-            if (psx_scheduler_top_level_resume_active()) {
+            /* pc=0 means "the interrupted native frame is still on the host
+             * stack below us — return and it continues". That contract also
+             * breaks whenever dispatch has already collapsed to TOP LEVEL
+             * (depth 0): statically-baked overlay functions cross into AOT
+             * text via CPS returns, so the interrupted chain may hold no
+             * host frames at all, and a published 0 reaches the main loop
+             * as a bogus GUEST_EXIT (WipEout 3 ntsc120full8 static bake:
+             * deterministic "execution completed, PC=0" ~10 s into boot,
+             * ra=0x800D7FC0 epc=0x8015FAEC). Same remedy as the scheduler
+             * case: prefer the compiled interrupt resume PC. */
+            if (psx_scheduler_top_level_resume_active() ||
+                g_psx_dispatch_depth <= 0) {
                 uint32_t resume = s_compiled_interrupt_resume_pc;
                 if (resume == 0u)
                     resume = s_last_interrupt_check_pc;
                 if (resume != 0u)
                     cpu->pc = resume;
                 /* else keep post-RFE cpu->pc — never publish 0 */
+                psx_pc0_journal_note(PSX_PC0J_IRQ_RESCUE, cpu, resume,
+                                     g_exc_escape_reason);
             } else {
+                psx_pc0_journal_note(PSX_PC0J_IRQ_SAME_THREAD, cpu,
+                                     s_compiled_interrupt_resume_pc,
+                                     g_exc_escape_reason);
                 cpu->pc = 0;   /* continue the interrupted live chain */
             }
         }

@@ -254,6 +254,14 @@ struct RuntimeConfig {
     // Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
 
+    // Ape Escape LOAD card-IRQ unstick pump ([runtime] ape_card_unstick).
+    // A per-game kernel-nest repair that force-re-edges I_MASK.7/IRQ7 after a
+    // LOAD-style probe abort. OPT-IN: on WipEout 3 under the x2 CRTC the
+    // arming detector misfires and the forced IRQ storm wedges the kernel
+    // card driver (completion events never deliver -> memcard screen hangs).
+    // Env PSX_APE_CARD_UNSTICK=0/1 still overrides either way.
+    bool                  ape_card_unstick = false;
+
     // bios_hle: High-Level Emulation tier for BIOS kernel services
     // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). DEFAULT ON as of
     // 2026-07-06 (user-directed player default: instant boot-skip for every
@@ -459,6 +467,13 @@ struct RuntimeConfig {
     // means the directory the disc image lives in, which is where a pack
     // authored for RetroArch already expects to sit.
     std::string           video_hd_texture_dir;
+
+    // hd_texture_exclude: texture hashes (hex) never substituted from the HD
+    // pack, merged with the pack dir's optional exclude.txt. Config-owned so
+    // the exclusions survive pack-directory regeneration - the pack dir is
+    // game content (gitignored), and losing its exclude.txt silently
+    // re-enabled font-atlas substitution (the doubled-glyph defect).
+    std::vector<std::string> video_hd_texture_exclude;
 
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the

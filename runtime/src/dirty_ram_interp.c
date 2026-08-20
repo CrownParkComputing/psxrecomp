@@ -200,6 +200,10 @@ uint32_t g_pczero_in_exc      = 0;
 uint32_t g_pczero_async_rfe   = 0;
 uint32_t g_pczero_dirty_safe  = 0;
 uint64_t g_pczero_count       = 0;
+/* Which dirty_ram_dispatch_inner sub-path produced the last handled dispatch:
+ * 1=sentinel 2=AOT-compiled 3=static-overlay 4=DLL-shard 5=interp. Read by the
+ * pc0 tripwire so a null-PC return names its producer. */
+uint32_t g_dd_last_route      = 0;
 
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
@@ -2359,6 +2363,11 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     if (r == 1 && cpu->pc == 0u) {
         extern uint32_t g_async_rfe_resume_pc, g_dirty_safe_resume_pc;
         g_pczero_count++;
+        /* Journal every occurrence (site 15): the dirty/overlay dispatch chain
+         * reported handled yet published a null PC — at top level this IS the
+         * abnormal exit. a = dispatched addr; d = occurrence count. */
+        psx_pc0_journal_note(15u, cpu, addr,
+                             (uint32_t)g_pczero_count | (g_dd_last_route << 28));
         if (!g_pczero_latched) {
             g_pczero_latched    = 1;
             g_pczero_addr       = addr;
@@ -2683,9 +2692,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     int clean_game_text_miss = 0;
 
     if (addr == 0x80000048u) {
+        g_dd_last_route = 1;
         g_sentinel_reach_dirty++;
         if (!psx_get_in_exception()) g_sentinel_reach_traps++; /* reuse: in_exc==0 dirty reaches */
         g_sentinel_reach_async = g_async_rfe_resume_pc;
+        psx_pc0_journal_note(PSX_PC0J_DIRTY_SENTINEL, cpu, addr,
+                             (psx_get_in_exception() ? 1u : 0u) |
+                             (g_async_rfe_resume_pc ? 2u : 0u));
         cpu->pc = 0;
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
@@ -2714,6 +2727,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             ls_func_enter(addr, cpu);
             int prev_phase = g_exec_phase;
             g_exec_phase = 3;
+            g_dd_last_route = 2;
             int _gc = psx_dispatch_game_compiled(cpu, addr);
             g_exec_phase = prev_phase;
             ls_func_exit(addr, cpu, _gc);
@@ -2741,6 +2755,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
     {
         extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
+        g_dd_last_route = 3;
         if (psx_overlay_dispatch(cpu, addr)) return 1;
     }
 #endif
@@ -2771,6 +2786,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
     {
         extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+        g_dd_last_route = 4;
         if (overlay_loader_dispatch(cpu, addr)) {
             if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 1);
             return 1;
@@ -2779,7 +2795,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 /* Every exit retires any deferred load writeback: once we hand control back to
  * compiled code (or the dispatch loop) nothing downstream knows a register
  * write is still owed, and the pipeline would have drained by then anyway. */
-#define OV_FPLOG_RET1() do { dirty_ram_ld_delay_flush(cpu); if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
+#define OV_FPLOG_RET1() do { g_dd_last_route = 5; dirty_ram_ld_delay_flush(cpu); if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
 
     if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) {
         /* Bulk host transfers can populate post-EXE executable RAM without
@@ -2814,6 +2830,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * is_local_dirty_target / phys_is_overlay_flow_region). Includes boot-text
      * pages overwritten by a runtime overlay (Tomba 2), not just [FLOOR, RAM). */
     int allow_local_dirty_flow = phys_is_overlay_flow_region(phys);
+
+    /* Backend-invariant mod_function_entry hooks: generated code fires
+     * psx_mod_function_entry at listed function entries, but a mod-patched
+     * (dirty) page runs HERE instead and would silently skip them. Fire the
+     * same hook on interp dispatch so the contract does not depend on which
+     * backend executes the page. The runtime filters by exact address, so
+     * this is a short scan over the (tiny) registered-plugin list. */
+    {
+        extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);
+        psx_mod_function_entry(cpu, addr);
+    }
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -3025,6 +3052,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             g_dirty_ram_last_unsupported_pc     = g_unsupported_pc;
             g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
             g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
+            psx_pc0_journal_note(PSX_PC0J_DIRTY_UNSUPPORTED, cpu,
+                                 g_unsupported_pc, g_unsupported_insn);
             cpu->pc = 0;
             OV_FPLOG_RET1();
         }

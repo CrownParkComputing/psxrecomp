@@ -658,6 +658,28 @@ static uint32_t g_text_exact_last_ref = 0;
  * PSX_TEXT_GUARD_MEMO=0 disables the memo (bisect switch: if a stale-native
  * class ever appears, this proves or clears the memo in one run). */
 static uint32_t g_text_guard_gen = 1u;
+/* Page-granular guard generations: bumped only for the PAGE a diverging
+ * guarded write touched. The native-ok memo keys on the SUM over a function's
+ * own range pages (plus the global gen for image-registration/bless events),
+ * so CD streaming into unrelated text pages — hundreds of transitions per
+ * frame during races — no longer invalidates every memoized verdict in the
+ * game (measured: psx_game_text_native_ok at 6.8% of the emu thread with the
+ * memo never hitting). A diverging write to a covered page still invalidates
+ * exactly the functions on it. */
+static uint32_t text_guard_page_gen[DIRTY_RAM_PAGE_COUNT];
+static inline uint32_t text_guard_ranges_gen(const uint32_t *lo_len_pairs,
+                                             uint32_t count) {
+    uint32_t sum = g_text_guard_gen;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0 || phys >= RAM_SIZE || len > RAM_SIZE - phys) continue;
+        uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+        uint32_t lp = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+        for (uint32_t pg = fp; pg <= lp; pg++) sum += text_guard_page_gen[pg];
+    }
+    return sum;
+}
 
 #define TEXT_OK_MEMO_SLOTS 8192u          /* power of two */
 typedef struct {
@@ -716,11 +738,12 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
-        /* Live text now diverges here: any memoized "native ok" covering this
-         * address must be re-decided. A store that MATCHES the reference is
-         * deliberately not invalidated — it can only flip a verdict no->yes,
-         * and keeping the stale "no" costs interpretation, not correctness. */
-        g_text_guard_gen++;
+        /* Live text now diverges here: any memoized "native ok" covering THIS
+         * PAGE must be re-decided (page-granular; see text_guard_page_gen).
+         * A store that MATCHES the reference is deliberately not invalidated —
+         * it can only flip a verdict no->yes, and keeping the stale "no" costs
+         * interpretation, not correctness. */
+        text_guard_page_gen[page]++;
     }
 }
 
@@ -780,7 +803,8 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
     if (text_ok_memo_enabled()) {
         memo = &s_text_ok_memo[text_ok_memo_slot(lo_len_pairs, exec_pc)];
         if (memo->key == lo_len_pairs && memo->exec_pc == exec_pc &&
-            memo->count == count && memo->gen == g_text_guard_gen)
+            memo->count == count &&
+            memo->gen == text_guard_ranges_gen(lo_len_pairs, count))
             return memo->ok;
     }
 
@@ -829,7 +853,7 @@ done:
         memo->key     = lo_len_pairs;
         memo->exec_pc = exec_pc;
         memo->count   = count;
-        memo->gen     = g_text_guard_gen;
+        memo->gen     = text_guard_ranges_gen(lo_len_pairs, count);
         memo->ok      = ok;
     }
     return ok;

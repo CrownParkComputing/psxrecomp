@@ -38,6 +38,13 @@ inline int16_t get_imm16(uint32_t i) { return (int16_t)(i & 0xFFFF); }
  * after the directive — it only warns. That bug dropped 3268 hooks (1641
  * MULDIV + 1627 ALU) across 54 shards of one game's AOT output. */
 void append_pgxp_hooks(uint32_t instr, std::string& code) {
+    /* A translation ending in a preprocessor directive (the block-cycles
+     * muldiv wrappers end in `#endif`) would swallow an appended hook: the
+     * preprocessor discards tokens after #endif (the "extra tokens at end of
+     * #endif" warning class), so the MULT/DIV/MFLO/MFHI hooks silently never
+     * ran. Give the hook its own line. */
+    if (code.size() >= 6 && code.compare(code.size() - 6, 6, "#endif") == 0)
+        code += "\n    ";
     const uint32_t opcode = (instr >> 26) & 0x3F;
     const uint32_t rs = get_rs(instr);
     const uint32_t rt = get_rt(instr);

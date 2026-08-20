@@ -81,8 +81,27 @@ static int      s_deferred_invalidate = 0;
 
 /* Single hot-path gate for every hook. */
 static int g_pgxp_active = 0;
+/* ALU/MULDIV hooks are needed only by tier-2 CPU propagation (s_cpu_mode) and
+ * by the correction consumers' dataflow chains (SLL/SRL z-ride, OR-repack —
+ * texture/geometry correction). The exact-sign NCLIP chain is LOAD/STORE/COP2
+ * only (swc2 -> RAM -> lw -> mtc2), so an NCLIP-only arm (corrections off,
+ * cpu_mode off) can skip the per-ALU-instruction call bodies entirely —
+ * measured at 3.6% of the emu thread on the WipEout 3 120 Hz profile.
+ * gpu_pgxp_rederive_enable maintains the flag. */
+static int g_pgxp_full_hooks = 0;
+/* Inline gate read by the PGXP_ALU/PGXP_MULDIV macros in every generated TU
+ * (pgxp_hooks.h): skip even the hook CALL when nothing consumes ALU shadows. */
+extern "C" { int g_pgxp_alu_armed = 0; }
+static void recompute_alu_armed(void) {
+    g_pgxp_alu_armed = (g_pgxp_active && (g_pgxp_full_hooks || s_cpu_mode)) ? 1 : 0;
+}
+extern "C" void pgxp_set_full_hooks(int on) {
+    g_pgxp_full_hooks = on ? 1 : 0;
+    recompute_alu_armed();
+}
 static inline void recompute_active(void) {
     g_pgxp_active = (s_enabled && s_suppress == 0) ? 1 : 0;
+    recompute_alu_armed();
 }
 
 static PGXPStats s_stats;
@@ -93,6 +112,7 @@ static PGXPStats s_stats;
 
 extern "C" void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+    s_stats.invalidations++;
     if (++s_gen == 0) {
         /* generation wrapped: physically clear so stale slots can't revive */
         if (s_ram) std::memset(s_ram, 0, s_ram_words * sizeof(PGXPValue));
@@ -104,6 +124,7 @@ extern "C" void pgxp_invalidate_all(void) {
 }
 
 extern "C" void pgxp_set_enabled(int enabled) {
+    int resized = 0;
     if (enabled) {
         /* Cover the REAL guest RAM, not the stock 2 MB. With the 8 MB mod the
          * extension is real memory, and a 2 MB-wrapped shadow aliased every
@@ -129,11 +150,17 @@ extern "C" void pgxp_set_enabled(int enabled) {
                 std::free(s_ram);
                 s_ram = fresh;
                 s_ram_words = want;
+                resized = 1;
             } else if (!s_ram) {
                 enabled = 0;                  /* fail closed: stay faithful   */
             }
         }
     }
+    /* Idempotence: a redundant re-derive (config apply, correction toggle,
+     * debug-server A/B) must not cost a generation bump - every bump kills
+     * all live shadows and blinks one frame of exact-sign NCLIP coverage. */
+    if (s_enabled == (enabled ? 1 : 0) && !resized)
+        return;
     s_enabled = enabled ? 1 : 0;
     pgxp_invalidate_all();
     recompute_active();
@@ -141,7 +168,10 @@ extern "C" void pgxp_set_enabled(int enabled) {
 
 extern "C" int pgxp_enabled(void) { return s_enabled; }
 
-extern "C" void pgxp_set_cpu_mode(int enabled) { s_cpu_mode = enabled ? 1 : 0; }
+extern "C" void pgxp_set_cpu_mode(int enabled) {
+    s_cpu_mode = enabled ? 1 : 0;
+    recompute_alu_armed();
+}
 extern "C" int  pgxp_cpu_mode(void) { return s_cpu_mode; }
 
 extern "C" void  pgxp_set_tolerance(float pixels) { s_tolerance = pixels; }
@@ -462,6 +492,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                              uint32_t result, uint32_t s1, uint32_t s2) {
     (void)cpu;
     if (!g_pgxp_active) return;
+    if (!g_pgxp_full_hooks && !s_cpu_mode) return;
 
     uint32_t op = f_op(instr);
     uint32_t dst_reg;
@@ -697,6 +728,8 @@ extern "C" void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr,
                                 uint32_t s1, uint32_t s2) {
     (void)cpu; (void)instr; (void)s1; (void)s2;
     if (!g_pgxp_active) return;
+    if (!g_pgxp_full_hooks && !s_cpu_mode) return;  /* see psx_pgxp_alu gate;
+        * a stale HI/LO/GPR shadow is dropped by pv_validate at any consumer */
     /* Products/quotients of screen coordinates are not screen coordinates:
      * record the results as known-but-imprecise so MFHI/MFLO stay honest. */
     pv_reset(&s_gpr[PGXP_REG_HI], hi);
@@ -724,9 +757,22 @@ extern "C" void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
 }
 
 extern "C" int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
+    return pgxp_get_gte_sxy_checked(index, 0u, 0, x16, y16);
+}
+
+/* Validate-on-read variant: the engine's single safety invariant is that a
+ * shadow is believed only while its packed word matches the live guest word.
+ * gte_nclip was the one consumer skipping that check, so any staleness class
+ * (e.g. an SXYP MTC2 shifting the real FIFO while shadows 12/13 keep
+ * describing pre-shift words) could invent a silently WRONG winding sign
+ * instead of an honest integer fallback. check!=0 enforces the compare. */
+extern "C" int pgxp_get_gte_sxy_checked(uint32_t index, uint32_t expect,
+                                        int check, int32_t *x16, int32_t *y16) {
     if (index >= 4) return 0;
     const PGXPValue *pv = &s_gte[12 + index];
     if (!pv_live(pv) || (pv->flags & PGXP_F_VXY) != PGXP_F_VXY)
+        return 0;
+    if (check && pv->value != expect)
         return 0;
     if (x16) *x16 = pv->x16;
     if (y16) *y16 = pv->y16;

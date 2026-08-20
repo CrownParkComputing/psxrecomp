@@ -171,17 +171,25 @@ bool FullFunctionEmitter::emit_function(
         const char* e = std::getenv("PSX_CPS");
         return e == nullptr || e[0] != '0';
     }();
+    /* Redirect-honoring checks — see CodeGenerator::emit_interrupt_check:
+     * an exception epilogue that publishes a resume PC different from this
+     * site's static continuation must surface to the trampoline, never be
+     * overwritten by the static transfer (the dropped-continuation class
+     * behind the WipEout 3 static-bake top-level PC=0 exit). */
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
+        uint32_t rt = bios_runtime_pc(resume_pc);
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
-                           bios_runtime_pc(resume_pc));
+               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", rt) + indent +
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n", rt);
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                           resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -713,7 +721,7 @@ bool FullFunctionEmitter::emit_function(
     auto emit_icache_fetch = [&](uint32_t rom_addr) {
         if (!per_insn_cycles) return;
         if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_interp(cpu, 0x{:08X}u);\n#endif\n",
                            relocate_ra(rom_addr));
     };
 
@@ -1202,9 +1210,10 @@ bool FullFunctionEmitter::emit_function(
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
                 "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
+                "        if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume */\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally — unless this load's successor reads
@@ -1638,6 +1647,10 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
     out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
+    out += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
+    out += "#ifndef PSX_ICACHE_FETCH\n"
+           "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+           "#endif\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
@@ -1914,7 +1927,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        (w1 & 0xFFFF0000u) != 0x25080000u ||\n";
     out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    out += "    psx_icache_fetch(cpu, addr);\n";
+    out += "    psx_icache_fetch_interp(cpu, addr);\n";
     out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
                        psx_cyc_dep_res_mask(0x3C080000u));
     out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
@@ -2153,6 +2166,12 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            if (outermost) {\n";
     out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
+    out += "            /* Top-level pc==0 exit is the abnormal-run terminator: name the\n";
+    out += "             * last dispatched target in the pc0 journal before surfacing. */\n";
+    out += "            if (stop_addr == 0u) {\n";
+    out += "                extern void psx_pc0_trampoline_exit(CPUState* cpu, uint32_t last_target);\n";
+    out += "                psx_pc0_trampoline_exit(cpu, addr);\n";
+    out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
     out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";
@@ -2300,6 +2319,10 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
     full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
+    full_c += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
+    full_c += "#ifndef PSX_ICACHE_FETCH\n"
+              "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+              "#endif\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";

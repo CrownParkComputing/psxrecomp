@@ -140,18 +140,34 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
     return ss.str();
 }
 
+/* Both check emitters honor an exception REDIRECT: when the delivery's
+ * epilogue publishes a resume PC different from this site's static
+ * continuation (guest RFE to a non-EPC target — longjmp-style handlers,
+ * SetCustomExitFromException, thread switch), the compiled code must
+ * surface it to the trampoline instead of overwriting it with the static
+ * transfer. This is the compiled analogue of the dirty interpreter's
+ * "Handler resumed elsewhere — surface to dispatch" contract; without it a
+ * baked/compiled leader silently drops the guest's continuation (WipEout 3
+ * static bake: deterministic top-level "execution completed, PC=0" ~10 s
+ * into boot, root-caused to redirects dropped at compiled leaders). A
+ * published pc equal to the static continuation falls through (same-thread
+ * restore publishes 0; the depth-guard rescue publishes the site PC). */
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
                                                 const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc) + indent +
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                       resume_pc);
 }
 
 std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
                                                      const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                       resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {
@@ -1812,7 +1828,7 @@ std::string CodeGenerator::translate_basic_block(
         if (!(insn_addr == block.start_addr || (insn_addr & 0xCu) == 0 ||
               extra_labels_.count(insn_addr))) return;
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", insn_addr);
+        ss << indent << fmt::format("PSX_ICACHE_FETCH(cpu, 0x{:08X}u);\n", insn_addr);
         ss << "#endif\n";
     };
     auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {
@@ -2458,7 +2474,27 @@ std::string CodeGenerator::translate_basic_block(
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
                               next_addr);
+        } else if (cps_enabled_) {
+            // No successor block and no known function owns the next PC —
+            // the block runs off the region/image edge. Emitting only the
+            // interrupt check here let execution FALL OFF the C function with
+            // the entry-switch's consumed pc==0: the dispatcher returned
+            // "handled" with a null PC and the top-level trampoline read it
+            // as "program ended" (WipEout 3 static bake: the 0xD5000 region
+            // variant's truncated block_800D7FC0, continuation 0x800D8004,
+            // died the moment CD streaming loaded content matching that
+            // variant — the deterministic boot exit at ~frame 1221). Publish
+            // the continuation instead: the dispatcher routes it to whoever
+            // owns it (a neighboring region variant, AOT text, or the
+            // interpreter).
+            ss << emit_interrupt_check(next_addr, config_.indent);
+            ss << config_.indent
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                              next_addr);
         } else {
+            // Non-CPS legacy: the check-only fall-through remains valid (the
+            // function nests; a C return continues the caller). Same split as
+            // upstream PR #161.
             ss << emit_interrupt_check(next_addr, config_.indent);
         }
     }
@@ -2792,6 +2828,30 @@ GeneratedFunction CodeGenerator::generate_function(
                                        fallthrough_name);
             }
         }
+    } else if (!cfg.block_order.empty()) {
+        // No in-image fallthrough function exists (region/image boundary):
+        // a reachable last block that simply runs off the end must TAIL-
+        // TRANSFER to its continuation PC, never fall off the C function —
+        // the entry-switch prologue consumed cpu->pc to 0, so falling off
+        // returns pc==0 to the dispatcher and the top-level trampoline reads
+        // it as "program ended" (WipEout 3 static bake: region-truncated
+        // block_800D7FC0 in the 0xD5000 variant fell off at 0x800D8004 →
+        // deterministic "execution completed, PC=0" ~10 s into boot). The
+        // published continuation is routed by the dispatcher to whoever owns
+        // it (a neighboring region variant, AOT text, or the interpreter).
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            last_block.exit_instr.type == ControlFlowType::None ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        bool is_reachable = last_block.is_entry || !last_block.predecessors.empty();
+        if (runs_off_end && is_reachable) {
+            uint32_t cont = last_block.end_addr + 4u;
+            body_ss << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                cont);
+        }
     }
     body_ss << "    ;  /* label compatibility: C requires a statement after the last label */\n";
     body_ss << "}\n";
@@ -3020,6 +3080,25 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         if (needs_fallthrough) {
             body << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
                                 fallthrough_name);
+        }
+    } else if (!cfg.block_order.empty() &&
+               live_blocks.count(cfg.block_order.back())) {
+        // Image-edge fallthrough (mirrors generate_function): no in-image next
+        // function exists, so a live final block that runs off the end must
+        // tail-transfer to its continuation PC — falling off the C function
+        // returns the entry-switch's consumed pc==0 and the top-level
+        // trampoline reads "program ended" (the WipEout 3 static-bake boot
+        // exit: truncated block_800D7FC0 in the 0xD5000 region variant).
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            (last_block.exit_instr.type == ControlFlowType::None) ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        if (runs_off_end) {
+            body << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                last_block.end_addr + 4u);
         }
     }
     body << "    ;  /* label compatibility */\n";
@@ -3308,6 +3387,14 @@ std::string CodeGenerator::build_shared_decls_header(const std::vector<Generated
     h << "/* Generated by PSXRecomp - shared declarations for split full.c shards. DO NOT EDIT. */\n";
     h << "#pragma once\n";
     h << "#include \"psx_runtime.h\"\n\n";
+    // Per-insn i-cache fetch (see generate_file): inline tag-hit in-process,
+    // exported slow entry in DLL shards.
+    h << "#ifdef PSX_OVERLAY_DLL_BUILD\n"
+         "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch((c),(a))\n"
+         "#else\n"
+         "#include \"psx_icache.h\"\n"
+         "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+         "#endif\n\n";
     emit_runtime_externs(h);
     emit_unaligned_helpers(h, /*as_inline=*/true);
     if (!gen_funcs.empty()) {
@@ -3331,6 +3418,17 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
+    // Per-instruction i-cache fetch: in-process builds (static bake / AOT)
+    // use the inline tag-hit (psx_icache.h) — the out-of-line call per
+    // instruction was a measured steady-state tax. DLL shards cannot touch
+    // host globals directly and keep the exported slow entry (identical
+    // cache evolution; the inline's miss path IS that entry).
+    ss << "#ifdef PSX_OVERLAY_DLL_BUILD\n"
+          "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch((c),(a))\n"
+          "#else\n"
+          "#include \"psx_icache.h\"\n"
+          "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+          "#endif\n\n";
     emit_runtime_externs(ss);
     emit_unaligned_helpers(ss, /*as_inline=*/false);
 

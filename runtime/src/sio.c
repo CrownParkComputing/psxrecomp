@@ -425,7 +425,13 @@ static int sio_txn_open = 0;
 static void sio_arm_card_ct_defer_guard(void) {
     extern uint64_t psx_get_cycle_count(void);
     uint64_t now = psx_get_cycle_count();
-    uint64_t until = now + (uint64_t)gpu_vblank_period_cycles() * 2ull;
+    /* The libcard A6C10/B4E38 handshake this covers is CYCLE-fixed, so the
+     * window must be stock-period relative: at CRTC x2 the raw period halves
+     * and "~2 VBlank periods" would silently mean half the intended cover
+     * (audited 2026-08-19, finding #6). */
+    extern uint32_t gpu_get_crtc_refresh_multiplier(void);
+    uint64_t until = now + (uint64_t)gpu_vblank_period_cycles() *
+                     (uint64_t)gpu_get_crtc_refresh_multiplier() * 2ull;
     if (until > s_card_ct_defer_until_cyc)
         s_card_ct_defer_until_cyc = until;
 }
@@ -495,15 +501,24 @@ static int s_ape_unstick_pending = 0;
 static uint64_t s_ape_unstick_cool_cyc = 0;
 static int s_ape_torn_pulses = 0;
 
+/* Config default ([runtime] ape_card_unstick), set at boot. OFF unless the
+ * game opts in: this pump force-re-edges I_MASK.7/IRQ7, and a misfired arm
+ * (WipEout 3 under the x2 CRTC) storms the kernel card ISR so completion
+ * events never deliver and the memcard screen hangs forever. */
+static int s_ape_unstick_cfg = 0;
+void sio_set_ape_card_unstick(int on) { s_ape_unstick_cfg = on ? 1 : 0; }
+
 static int ape_unstick_enabled(void) {
     if (s_ape_unstick_env < 0) {
         const char *e = getenv("PSX_APE_CARD_UNSTICK");
-        if (e && e[0] == '0')
-            s_ape_unstick_env = 0;
+        if (e && e[0])
+            s_ape_unstick_env = (e[0] == '0') ? 0 : 1;
         else
-            s_ape_unstick_env = 1;
+            s_ape_unstick_env = -2;   /* no env: fall through to config */
     }
-    return s_ape_unstick_env;
+    if (s_ape_unstick_env >= 0)
+        return s_ape_unstick_env;
+    return s_ape_unstick_cfg;
 }
 
 /* Defined later; sio_tick calls the pump. */

@@ -135,6 +135,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <map>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -144,6 +145,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <psapi.h>   /* GetModuleInformation (self-profile sampler) */
 #include <commdlg.h>
 #else
 #include <arpa/inet.h>
@@ -1189,7 +1191,8 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
  * newly-seen texture. */
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
-static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::string   g_hd_texture_dir;
+static std::vector<std::string> g_hd_texture_exclude; /* [video] hd_texture_exclude */   /* relocates the whole convention (dev knob) */
 static std::string   g_bezel_path;      /* [video] bezel -- margin artwork */
 static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
@@ -1400,10 +1403,27 @@ extern "C" int psx_mod_set_native_vblank_rate(
     /*
      * Above the physical panel rate (and in uncapped mode), swap-interval
      * blocking would silently replace the requested guest cadence with the
-     * display cadence. The frame pacer owns fixed-rate timing here.
-     */
-    if (frames_per_second == 0 || frames_per_second > 60)
+     * display cadence. The frame pacer owns fixed-rate timing here — UNLESS
+     * the panel actually runs at the requested rate: then driver vsync is
+     * the better cadence owner (it absorbs sub-frame jitter that the wall
+     * pacer converts into debt/catch-up oscillation — the 99.7-122.5 fps
+     * seesaw measured on the 120 Hz mod with a 120.0 Hz panel). The
+     * present-cadence policy (present_vsync_owns_cadence) already contains
+     * the matching band check and keeps the pacer/vsync XOR intact; only
+     * force vsync off when the panel genuinely cannot match. */
+    if (frames_per_second == 0)
         g_video_vsync = 0;
+    /* fps > 60 no longer forces vsync off: the present-cadence policy is
+     * already an XOR — present_effective_swap_interval() returns the
+     * configured vsync ONLY when present_vsync_owns_cadence() (which
+     * requires the panel to match the CRTC rate within 2%), and 0
+     * otherwise, with the wall pacer engaged exactly when vsync does not
+     * own. On a panel that matches the modded rate (120 Hz mod on a
+     * 120.0 Hz display) driver vsync then owns cadence and absorbs the
+     * sub-frame jitter the wall pacer converts into debt/catch-up
+     * oscillation (measured: 99.7-122.5 fps seesaw). On a non-matching
+     * panel the swap interval resolves to 0 and the pacer owns, same as
+     * the old forced-off behavior. */
     if (frames_per_second) {
         std::fprintf(stdout,
             "psxrecomp: mod selected native guest VBlank pacing at %u FPS "
@@ -1719,6 +1739,9 @@ static void netplay_local_viewport_projection_aspect(
 static int g_ws_projection_num = 4;
 static int g_ws_projection_den = 3;
 static int g_ws_projection_mode = -1;
+extern "C" int psx_ws_scene_wide_active(void);  /* gpu.c: ws scene gate */
+extern "C" uint64_t psx_gpu_display_flip_count(void);  /* gpu.c: internal fps */
+
 static void refresh_widescreen_projection() {
     if (!g_ws_engaged) return;
 
@@ -2890,6 +2913,16 @@ static int present_effective_swap_interval(void) {
 
 static int present_should_wall_pace(void) {
     return g_frame_period_ms > 0.0 && !present_vsync_owns_cadence();
+}
+
+/* Live query for the GL presenter: nonzero while the blocking Swap is the
+ * game's frame clock. While true, unchanged-frame present skips must be
+ * disabled — a skipped swap is an unpaced frame (the "fps readout off makes
+ * it stupid fast" bug). Evaluated at each skip decision so no cached copy
+ * can go stale across init order or cadence changes. */
+extern "C" int psx_present_swap_paces(void) {
+    return present_vsync_owns_cadence() &&
+           present_effective_swap_interval() != 0;
 }
 
 static void apply_present_cadence(void) {
@@ -5868,6 +5901,14 @@ static void load_transition_note(int read_active, int load_active,
     e->read_active = (uint8_t)(read_active != 0);
     e->load_active = (uint8_t)(load_active != 0);
     e->turbo_active = (uint8_t)(turbo_active != 0);
+    /* Pacing-state audit trail: any unpaced/present-skip mode engaging or
+     * releasing mid-play is exactly the class of bug users report as "the
+     * speed is busted", and the ring above is only reachable through the
+     * debug server. One line per transition is cheap and self-documents. */
+    if (turbo_active != prev_turbo)
+        std::fprintf(stdout, "[pace] turbo_loads %s (frame %u, host %ums)\n",
+                     turbo_active ? "ENGAGED" : "released",
+                     e->frame, e->host_ms);
     prev_read = read_active;
     prev_load = load_active;
     prev_turbo = turbo_active;
@@ -6512,6 +6553,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
             const double speed = fps / psx_crtc_frame_hz();
+            /* Internal rendered-frame rate (display-origin flips): the game
+             * actually finishing frames, as distinct from the vblank rate —
+             * the two diverge under load and users need both on screen. */
+            static uint64_t s_fps_last_flips = 0;
+            const uint64_t flips_now = psx_gpu_display_flip_count();
+            const double render_fps =
+                (double)(flips_now - s_fps_last_flips) / seconds;
+            s_fps_last_flips = flips_now;
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -6522,11 +6571,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char title[256];
                 if (display_fps > 0.0) {
                     snprintf(title, sizeof(title),
-                             "%s  [Game %.0f fps %.2fx | Display %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, display_fps);
+                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps | Display %.0f fps]",
+                             s_fps_base_title.c_str(), fps, speed, render_fps,
+                             display_fps);
                 } else {
-                    snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
-                             s_fps_base_title.c_str(), fps, speed);
+                    snprintf(title, sizeof(title),
+                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps]",
+                             s_fps_base_title.c_str(), fps, speed, render_fps);
                 }
                 SDL_SetWindowTitle(sdl_window, title);
             }
@@ -6534,11 +6585,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char osd[96];
                 if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
-                             "Game %.0f FPS  %.2fx | Display %.0f FPS",
-                             fps, speed, display_fps);
+                             "VBl %.0f/s %.2fx  Render %.0f FPS  Disp %.0f",
+                             fps, speed, render_fps, display_fps);
                 } else {
-                    snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
-                             fps, speed);
+                    snprintf(osd, sizeof(osd),
+                             "VBl %.0f/s %.2fx  Render %.0f FPS",
+                             fps, speed, render_fps);
                 }
                 host_osd_set_status(osd);
             }
@@ -6561,10 +6613,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
                 netplay_present_gap_stats(&gap_p95, &gap_max);
                 std::fprintf(stderr,
-                    "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
+                    "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu | "
                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
                     "present_gap_p95=%u ms max=%u ms (n=%llu)\n",
-                    fps, speed, (unsigned long long)s_frame_count,
+                    fps, speed, render_fps, (unsigned long long)s_frame_count,
                     guest_ms, admit_ms, replay_pct,
                     (unsigned)gap_p95, (unsigned)gap_max,
                     (unsigned long long)s_np_timing_frames);
@@ -6572,8 +6624,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_np_guest_ticks = 0;
                 s_np_timing_frames = 0;
             } else {
-                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                             fps, speed, (unsigned long long)s_frame_count);
+                std::fprintf(stderr,
+                             "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu\n",
+                             fps, speed, render_fps,
+                             (unsigned long long)s_frame_count);
             }
             std::fflush(stderr);
 
@@ -6868,6 +6922,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     load_transition_note(cdrom_data_read_active(), logical_load_active,
                          turbo_loads_active, load_run_value);
 
+
+
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
      * video together. Detect "MDEC produced a frame since the last vblank AND XA
      * is streaming"; a short hold rides out brief inter-frame gaps. The present/
@@ -6973,6 +7029,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 else
                     snprintf(msg, sizeof(msg), "Fast forward: %dx", mult);
                 host_osd_push(msg, 900);
+                std::fprintf(stdout,
+                             "[pace] manual fast-forward ENGAGED (%s, host %ums)\n",
+                             msg, (unsigned)SDL_GetTicks());
                 /* Release the vsync ceiling for the duration of the hold. */
                 g_turbo_vsync_forced_off = 1;
                 apply_present_cadence();
@@ -6997,6 +7056,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 /* Restore the configured present cadence on release. */
                 g_turbo_vsync_forced_off = 0;
                 apply_present_cadence();
+                std::fprintf(stdout,
+                             "[pace] manual fast-forward released (host %ums)\n",
+                             (unsigned)SDL_GetTicks());
             }
             turbo_was_down = 0;
         }
@@ -12596,6 +12658,59 @@ static void netplay_resolve_link_mode(PsxNetplayConfig& cfg) {
     if (occ != 0xFu) cfg.rollback = 0;
 }
 
+/* PSX_SELF_PROFILE=<seconds>: 1 kHz instruction-pointer sampler over the main
+ * (emu) thread, histogrammed by exe-relative offset and dumped to
+ * psx_self_profile.txt at the end of the window. Play-build-safe hot-spot
+ * attribution without WPA/ETL symbolization: feed the offsets (plus the PE
+ * link base 0x140000000) to llvm-addr2line -e <exe>. Env-gated diagnostic —
+ * zero cost when unset. */
+#ifdef _WIN32
+struct SelfProfArgs { HANDLE thread; int seconds; };
+static DWORD WINAPI self_profile_thread(LPVOID param) {
+    SelfProfArgs *a = (SelfProfArgs *)param;
+    const int n = a->seconds * 1000;
+    static uintptr_t rips[600000];
+    int count = 0;
+    HMODULE exe = GetModuleHandleA(NULL);
+    MODULEINFO mi; memset(&mi, 0, sizeof(mi));
+    GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof(mi));
+    uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
+    uintptr_t size = (uintptr_t)mi.SizeOfImage;
+    for (int i = 0; i < n && count < 600000; i++) {
+        Sleep(1);
+        if (SuspendThread(a->thread) == (DWORD)-1) continue;
+        CONTEXT ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(a->thread, &ctx)) rips[count++] = (uintptr_t)ctx.Rip;
+        ResumeThread(a->thread);
+    }
+    /* Bucket by 64-byte line inside the exe; everything else = external. */
+    std::map<uintptr_t, int> hist;
+    int external = 0;
+    for (int i = 0; i < count; i++) {
+        if (rips[i] >= base && rips[i] < base + size)
+            hist[(rips[i] - base) & ~63ull]++;
+        else external++;
+    }
+    std::vector<std::pair<int, uintptr_t>> top;
+    for (auto &kv : hist) top.push_back({kv.second, kv.first});
+    std::sort(top.rbegin(), top.rend());
+    FILE *f = fopen("psx_self_profile.txt", "wb");
+    if (f) {
+        fprintf(f, "samples=%d external=%d (exe base offsets, 64B buckets; "
+                   "addr2line VA = 0x140000000 + offset)\n", count, external);
+        for (size_t i = 0; i < top.size() && i < 120; i++)
+            fprintf(f, "%6d  0x%llx\n", top[i].first,
+                    (unsigned long long)top[i].second);
+        fclose(f);
+    }
+    fprintf(stdout, "psxrecomp: [self-profile] %d samples (%d external) -> psx_self_profile.txt\n",
+            count, external);
+    fflush(stdout);
+    return 0;
+}
+#endif
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -12955,6 +13070,7 @@ int main(int argc, char** argv) {
             g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
+            g_hd_texture_exclude = gc.runtime.video_hd_texture_exclude;
             g_bezel_path       = gc.runtime.video_bezel;
             if (gc.runtime.runtime_cpu_overclock != 100u) {
                 psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
@@ -13231,6 +13347,7 @@ int main(int argc, char** argv) {
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            sio_set_ape_card_unstick(gc.runtime.ape_card_unstick ? 1 : 0);
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
             /* Developer compatibility finding, applied before BIOS selection.
@@ -13551,6 +13668,20 @@ int main(int argc, char** argv) {
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+#ifdef _WIN32
+    if (const char *e = std::getenv("PSX_SELF_PROFILE")) {
+        int secs = atoi(e);
+        if (secs > 0) {
+            static SelfProfArgs spa;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                            GetCurrentProcess(), &spa.thread,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+            spa.seconds = secs;
+            CreateThread(NULL, 0, self_profile_thread, &spa, 0, NULL);
+            std::fprintf(stdout, "psxrecomp: [self-profile] armed for %d s\n", secs);
+        }
+    }
+#endif
     if (const char *e = std::getenv("PSX_WAYLAND_ALLOW_VSYNC"))
         g_wayland_allow_vsync = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
@@ -14790,6 +14921,14 @@ int main(int argc, char** argv) {
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
                   g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
+    /* Config-owned exclusions survive pack-directory regeneration (the pack
+     * dir is gitignored game content; losing its exclude.txt silently
+     * re-enabled font-atlas substitution - the doubled-glyph defect). */
+    for (const std::string &hx : g_hd_texture_exclude) {
+        unsigned h = 0;
+        if (std::sscanf(hx.c_str(), "%x", &h) == 1)
+            tex_pack_add_excluded((uint32_t)h);
+    }
     /* Coverage report for the launcher's per-pack stats. atexit alongside the
      * other end-of-session flushes; a no-op when no pack is active. */
     std::atexit(tex_pack_write_coverage);
@@ -16315,6 +16454,20 @@ session_reboot:
     }
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
+    /* The PC=0 top-level exit is an abnormal-boot class (see interrupts.c:
+     * approximate exception-resume PCs severing the live native chain). The
+     * registers at exit name the culprit without needing a debug-tools build:
+     * ra = who returned/jumped here, epc = the last exception context. */
+    {
+        extern uint32_t g_debug_current_func_addr, g_debug_last_store_pc;
+        std::fprintf(stdout,
+                     "psxrecomp runtime: [exit regs] ra=0x%08X sp=0x%08X "
+                     "epc=0x%08X sr=0x%08X func=0x%08X last_store_pc=0x%08X "
+                     "v0=0x%08X a0=0x%08X t9=0x%08X\n",
+                     cpu.gpr[31], cpu.gpr[29], cpu.cop0[14], cpu.cop0[12],
+                     g_debug_current_func_addr, g_debug_last_store_pc,
+                     cpu.gpr[2], cpu.gpr[4], cpu.gpr[25]);
+    }
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
       extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
       extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
@@ -16323,6 +16476,29 @@ session_reboot:
                    (unsigned long long)g_dirty_ram_insns_run, g_slice_exit_pc, g_slice_exit_reason,
                    g_slice_exit_iter, g_slice_exit_dispatchable, g_slice_exit_dirty,
                    g_slice_exit_in_text, g_slice_exit_want); }
+    { extern int g_pczero_latched; extern uint32_t g_pczero_addr, g_pczero_ra, g_pczero_in_exc;
+      extern uint64_t g_pczero_count;
+      std::fprintf(stdout, "psxrecomp runtime: [pczero tripwire] latched=%u count=%llu addr=0x%08X ra=0x%08X in_exc=%u\n",
+                   g_pczero_latched, (unsigned long long)g_pczero_count,
+                   g_pczero_addr, g_pczero_ra, g_pczero_in_exc); }
+    /* pc=0 escape journal tail: names the exact runtime site that published
+     * (or rescued) each recent null PC, with frame/depth/ra/epc context —
+     * the play-build replacement for the debug-only fntrace ring, which is
+     * compiled out here (the exit trace JSON was blind: fntrace_seq=0). */
+    {
+        uint64_t n = g_pc0j_seq < PSX_PC0J_CAP ? g_pc0j_seq : PSX_PC0J_CAP;
+        std::fprintf(stdout, "psxrecomp runtime: [pc0 journal] %llu total, last %llu:\n",
+                     (unsigned long long)g_pc0j_seq, (unsigned long long)n);
+        for (uint64_t i = 0; i < n; i++) {
+            const Pc0JournalEntry *e =
+                &g_pc0j_ring[(g_pc0j_seq - n + i) % PSX_PC0J_CAP];
+            std::fprintf(stdout,
+                         "  seq=%llu site=%u frame=%u depth=%d a=0x%08X "
+                         "ra=0x%08X epc=0x%08X d=0x%08X\n",
+                         (unsigned long long)e->seq, e->site, e->frame,
+                         e->depth, e->a, e->b, e->c, e->d);
+        }
+    }
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
