@@ -10852,18 +10852,44 @@ namespace {
             /* Guest -> host: "I can (not) run the session's mods". */
             if (std::strncmp(buf, "MOTK5 MODOK\n", 12) == 0 &&
                 g_lnch_hosting_lan) {
+                /* Rate-limited reason trace for the THREE early exits below.
+                 * The trace further down was added because "no output" was
+                 * ambiguous — but it sits after these continues, so the one
+                 * case it cannot explain is a MODOK that never reaches it.
+                 * That is exactly what a host shows when the seat never goes
+                 * ready: 'LAN rx MOTK5 MODOK' every 2 s, nothing else, and a
+                 * guest resending forever because the echo never agrees. */
+                auto modok_drop = [](const char* why) {
+                    static uint32_t s_last_ms = 0;
+                    const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                    if (nowm - s_last_ms <= 3000u) return;
+                    s_last_ms = nowm;
+                    std::fprintf(stderr,
+                        "psxrecomp: LAN mods: MODOK DROPPED (%s) — seat stays "
+                        "not-ready and the guest will resend forever\n", why);
+                    std::fflush(stderr);
+                };
                 char* p = buf + 12;
                 char* nl = std::strchr(p, '\n');
-                if (!nl) continue;
+                if (!nl) { modok_drop("malformed: no newline after player id"); continue; }
                 *nl = '\0';
                 const std::string pid = p;
                 p = nl + 1;
                 nl = std::strchr(p, '\n');
-                if (!nl) continue;
+                if (!nl) { modok_drop("malformed: no newline after ok flag"); continue; }
                 *nl = '\0';
                 const int peer_ok = std::atoi(p) ? 1 : 0;
                 AeLanLobbyState st;
-                if (!ae_np_read_lan_state(&st)) continue;
+                if (!ae_np_read_lan_state(&st)) {
+                    /* The lobby state is the file ae_np_lan_file() writes next
+                     * to the CURRENT WORKING DIRECTORY, so a host launched
+                     * from a different cwd than the one that wrote it reads
+                     * nothing and silently rejects every peer's report. */
+                    modok_drop("ae_np_read_lan_state failed — no LAN lobby "
+                               "state (check netplay_lan_lobby.txt in the "
+                               "process working directory)");
+                    continue;
+                }
                 const int slot = ae_np_lan_find_slot_by_id(st, pid.c_str());
                 {
                     /* Unconditional (rate-limited) trace: "no output" was
