@@ -1519,6 +1519,26 @@ extern "C" int psx_mod_set_auto_skip_fmv(int enabled) {
     return 1;
 }
 
+extern "C" int psx_mod_set_bezel(const char* selection) {
+    /* The value reaches the filesystem in the loader below -- a bare name
+     * becomes <exe dir>/bezels/<name>.png, anything else is taken as a path --
+     * so bound it here rather than at the open(). Plugins are statically
+     * linked and trusted, so this rejects nonsense, not hostility. */
+    if (!selection || !*selection) {
+        std::fprintf(stderr, "psxrecomp: mod rejected empty bezel selection\n");
+        return 0;
+    }
+    if (std::strlen(selection) >= 256) {
+        std::fprintf(stderr,
+                     "psxrecomp: mod rejected over-long bezel selection\n");
+        return 0;
+    }
+    g_bezel_path = selection;
+    std::fprintf(stdout, "psxrecomp: mod selected bezel artwork \"%s\"\n",
+                 selection);
+    return 1;
+}
+
 extern "C" int psx_mod_set_load_acceleration(
     uint32_t wall_clock_multiplier, uint32_t release_frames) {
     /* Host pacing only changes how fast wall-clock time is fed to a load; every

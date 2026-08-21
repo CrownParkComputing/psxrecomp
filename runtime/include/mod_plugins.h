@@ -140,6 +140,19 @@ int psx_mod_set_frame_interpolation_blend(uint32_t blend_mode);
 int psx_mod_set_auto_skip_fmv(int enabled);
 
 /*
+ * Select the artwork tiled into the letterbox/pillarbox margins ([video]
+ * bezel). Accepts "off", "random", a bare name resolved against
+ * <exe dir>/bezels/<name>.png, or a path relative to the disc directory —
+ * the same vocabulary as the config key, so a game can move margin artwork
+ * out of game.toml and into its mod catalog the way widescreen and frame
+ * interpolation already are. Must be called from an activation plugin: the
+ * art is loaded once, right after the GL context is created. Margins are a
+ * property of the presented frame, so this draws only on the OpenGL
+ * renderer, and only when the game rect does not fill the window.
+ */
+int psx_mod_set_bezel(const char* selection);
+
+/*
  * Upper bounds for the two loading-speed knobs below. Both are generous on
  * purpose: games surface them to players as free-form integers, and neither
  * can corrupt guest state (see the notes on each setter). They exist to reject
