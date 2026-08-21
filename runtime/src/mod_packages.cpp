@@ -781,8 +781,21 @@ bool target_matches(const ModPackage& package, const std::string& game,
          * title carrying a copy of the same manifest. An empty target list
          * still matches nothing, so a malformed manifest fails loudly. */
         if (target.game_id != "*" && target.game_id != game) continue;
-        if (!target.exe_sha256.empty() && target.exe_sha256 != exe) continue;
-        if (!target.disc_sha256.empty() && target.disc_sha256 != disc) continue;
+        /* An UNKNOWN local hash is not a mismatch. A release install has no
+         * loose PS-X EXE next to it (bundles never ship disc content), so
+         * exe_sha256 is empty there — comparing a pin against "" rejected
+         * every image-pinned package on exactly the installs players use,
+         * while the same package applied fine in a dev checkout that happens
+         * to have the file. Skip a pin we cannot evaluate and let the
+         * expected-byte guard at patch time do the verifying, which is what
+         * mod_runtime_initialize's own comment says is the fallback. A pin
+         * we CAN evaluate is still enforced. */
+        if (!target.exe_sha256.empty() && !exe.empty() &&
+            target.exe_sha256 != exe)
+            continue;
+        if (!target.disc_sha256.empty() && !disc.empty() &&
+            target.disc_sha256 != disc)
+            continue;
         return true;
     }
     return false;
