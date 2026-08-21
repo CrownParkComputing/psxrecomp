@@ -632,6 +632,10 @@ void interrupts_cosim_dump(uint32_t *csv, int *inexc) {
 int      g_rfe_escape_pending = 0;
 int      g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
 uint32_t g_exception_real_epc = 0;
+/* dirty_ram_interp.c — async-RFE resume latch. File scope so the wholesale
+ * re-arm points (soft-return reboot, post-restore resync) can zero it with
+ * the other resume-PC latches, not just the delivery site that sets it. */
+extern uint32_t g_async_rfe_resume_pc;
 extern void psx_exception_longjmp(void);
 
 /* Called by the recompiled `rfe` opcode (after it pops the COP0 SR stack). When we
@@ -742,6 +746,11 @@ void interrupts_init(void) {
     g_exc_escape_reason = PSX_EXC_ESCAPE_NONE;
     g_rfe_escape_pending = 0;
     g_pending_exception_longjmp = 0;
+    /* Same ambient class: a latched async-RFE resume PC from the previous
+     * match is a PRE-REBOOT guest address. Carrying it across a soft-return
+     * lets the first sentinel reach of the new session resume at a dead
+     * timeline's PC — and it forks a cold peer, which starts at zero. */
+    g_async_rfe_resume_pc = 0;
     s_fast_maintenance = 0;
     {
         extern uint32_t g_dirty_safe_resume_pc;
@@ -794,6 +803,10 @@ void interrupts_resync_after_restore(void) {
     g_exc_escape_reason = PSX_EXC_ESCAPE_NONE;
     g_rfe_escape_pending = 0;
     g_pending_exception_longjmp = 0;
+    /* Not in the snap, and a resume TARGET rather than a discriminator: a
+     * pre-load latch would resume the restored timeline at an address from
+     * the abandoned one. Zeroed with the other resume-PC latches below. */
+    g_async_rfe_resume_pc = 0;
     s_compiled_interrupt_resume_pc = 0;
     s_last_interrupt_check_pc = 0;
     /* De-dupe key for dispatch_entry: a stale absolute cycle from the pre-load
@@ -1882,7 +1895,18 @@ irq_deliver_eval:
         same_thread_resume = 1;
         {
             extern int psx_scheduler_top_level_resume_active(void);
-            if (psx_scheduler_top_level_resume_active()) {
+            /* pc=0 means "the interrupted native frame is still on the host
+             * stack below us — return and it continues". That contract also
+             * breaks whenever dispatch has already collapsed to TOP LEVEL
+             * (depth 0): statically-baked overlay functions cross into AOT
+             * text via CPS returns, so the interrupted chain may hold no
+             * host frames at all, and a published 0 reaches the main loop
+             * as a bogus GUEST_EXIT (WipEout 3 ntsc120full8 static bake:
+             * deterministic "execution completed, PC=0" ~10 s into boot,
+             * ra=0x800D7FC0 epc=0x8015FAEC). Same remedy as the scheduler
+             * case: prefer the compiled interrupt resume PC. */
+            if (psx_scheduler_top_level_resume_active() ||
+                g_psx_dispatch_depth <= 0) {
                 uint32_t resume = s_compiled_interrupt_resume_pc;
                 if (resume == 0u)
                     resume = s_last_interrupt_check_pc;

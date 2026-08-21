@@ -2696,6 +2696,15 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         if (g_async_rfe_resume_pc != 0u) {
             g_async_rfe_fire_count++;
             cpu->pc = g_async_rfe_resume_pc;
+            /* CONSUME: a resume PC rescues exactly the async RFE it was
+             * latched for. The latch is set on every exception entry with a
+             * real EPC and is deliberately allowed to outlive its own
+             * exception (that IS the fix — the sentinel RFE arrives later),
+             * but leaving it armed made every subsequent sentinel reach
+             * resume at a stale, possibly unrelated PC instead of taking the
+             * loud pc=0 exit. A genuinely-needed PC is re-latched by the next
+             * real exception entry, so consuming here is self-healing. */
+            g_async_rfe_resume_pc = 0u;
             return 1;
         }
         return 1;
