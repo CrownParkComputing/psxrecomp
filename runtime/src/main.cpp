@@ -14744,6 +14744,27 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* A --disc override must land BEFORE the mod plan below, because that
+     * plan is applied AGAINST a disc: both mod_runtime_apply_link_spec (link
+     * follower) and mod_runtime_commit_for_netplay (netplay client) take
+     * resolved_disc and derive the patched image from it. The authoritative
+     * resolve_disc_for_runtime() call is much further down, so until now the
+     * mod plan saw the game.toml default instead of the disc actually being
+     * launched. That is invisible on a dev checkout — the default
+     * "disc/<name>.cue" resolves next to the repo and exists — and fatal in
+     * an install, where it does not: the PSX-Link follower died with
+     * "cannot apply the driver's mod plan: cannot open disc CUE:
+     * <install>/disc/...cue" while its parent had just handed it the correct
+     * absolute path on the command line. Mirrors the launcher-path override
+     * above; resolve_disc_for_runtime still runs later and still validates. */
+    if (disc_override_path && disc_override_path[0]) {
+        std::filesystem::path cli_disc = normalize_disc_path_for_launch(
+            std::filesystem::path(disc_override_path));
+        std::error_code cli_ec;
+        if (std::filesystem::exists(cli_disc, cli_ec))
+            resolved_disc = cli_disc;
+    }
+
     {
         /* Netplay: apply the host lobby mod plan (or clear when vanilla).
          * Do not re-resolve the local offline selection from disk.
