@@ -11099,6 +11099,41 @@ namespace {
                 g_lnch_lan_endpoint.clear();
                 g_lnch_remote_lan_state = {};
                 ae_np_lan_udp_close();
+                continue;
+            }
+
+            /* UNCLAIMED: every handler above `continue`s when it takes the
+             * message, so reaching here means no handler matched. The receipt
+             * trace at the top of this loop cannot show this — it prints the
+             * first line and stops at '\n' OR '\0', so a datagram that is
+             * missing its trailing newline (or carries CRLF, or is truncated)
+             * looks IDENTICAL there while every strncmp against "...\n" below
+             * declines it. That is invisible-by-construction: the host logs
+             * 'LAN rx MOTK5 MODOK' forever, no seat ever goes ready, seat
+             * moves never apply, and the guest resends once a second.
+             * Print the exact bytes so the wire format is not a guess. */
+            if (std::strncmp(buf, "MOTK", 4) == 0) {
+                static uint32_t s_last_unclaimed_ms = 0;
+                const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                if (nowm - s_last_unclaimed_ms > 3000u) {
+                    s_last_unclaimed_ms = nowm;
+                    char shown[64] = {0};
+                    int k = 0;
+                    for (int i = 0; i < n && k < (int)sizeof(shown) - 5; ++i) {
+                        const unsigned char c = (unsigned char)buf[i];
+                        if (c == '\n')      { shown[k++] = '\\'; shown[k++] = 'n'; }
+                        else if (c == '\r') { shown[k++] = '\\'; shown[k++] = 'r'; }
+                        else if (c < 32)    { shown[k++] = '?'; }
+                        else                { shown[k++] = (char)c; }
+                    }
+                    std::fprintf(stderr,
+                        "psxrecomp: LAN mods: UNCLAIMED datagram (%d bytes, "
+                        "hosting=%d): \"%s\" — no handler matched; if this is "
+                        "MODOK/SEATMOVE the peer's wire format disagrees with "
+                        "this build\n",
+                        n, g_lnch_hosting_lan ? 1 : 0, shown);
+                    std::fflush(stderr);
+                }
             }
         }
     }
