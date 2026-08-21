@@ -10517,10 +10517,26 @@ namespace {
                 const uint32_t nowm = (uint32_t)SDL_GetTicks64();
                 if (nowm - s_last_rx_ms > 2000u) {
                     s_last_rx_ms = nowm;
-                    char head[24] = {0};
-                    for (int i = 0; i < 20 && buf[i] && buf[i] != '\n'; ++i)
-                        head[i] = buf[i];
-                    std::fprintf(stdout, "psxrecomp: LAN rx '%s'\n", head);
+                    /* Show the BYTES, escaped, not just the first line: this
+                     * trace used to stop at '\n' OR '\0', so a datagram whose
+                     * trailing newline is missing/CRLF/truncated printed
+                     * identically to a well-formed one while every
+                     * strncmp(..., "...\n", N) below declined it — the host
+                     * then logs receipt forever with no handler ever running,
+                     * which is exactly how a seat stays not-ready and seat
+                     * moves silently do nothing. */
+                    char head[80] = {0};
+                    int hk = 0;
+                    for (int i = 0; i < n && hk < (int)sizeof(head) - 5; ++i) {
+                        const unsigned char c = (unsigned char)buf[i];
+                        if (c == '\n')      { head[hk++] = '\\'; head[hk++] = 'n'; }
+                        else if (c == '\r') { head[hk++] = '\\'; head[hk++] = 'r'; }
+                        else if (c < 32)    { head[hk++] = '?'; }
+                        else                { head[hk++] = (char)c; }
+                    }
+                    std::fprintf(stdout,
+                                 "psxrecomp: LAN rx (%d bytes) \"%s\"\n",
+                                 n, head);
                     std::fflush(stdout);
                 }
             }
@@ -10864,10 +10880,10 @@ namespace {
                     const uint32_t nowm = (uint32_t)SDL_GetTicks64();
                     if (nowm - s_last_ms <= 3000u) return;
                     s_last_ms = nowm;
-                    std::fprintf(stderr,
+                    std::fprintf(stdout,
                         "psxrecomp: LAN mods: MODOK DROPPED (%s) — seat stays "
                         "not-ready and the guest will resend forever\n", why);
-                    std::fflush(stderr);
+                    std::fflush(stdout);
                 };
                 char* p = buf + 12;
                 char* nl = std::strchr(p, '\n');
@@ -11126,13 +11142,13 @@ namespace {
                         else if (c < 32)    { shown[k++] = '?'; }
                         else                { shown[k++] = (char)c; }
                     }
-                    std::fprintf(stderr,
+                    std::fprintf(stdout,
                         "psxrecomp: LAN mods: UNCLAIMED datagram (%d bytes, "
                         "hosting=%d): \"%s\" — no handler matched; if this is "
                         "MODOK/SEATMOVE the peer's wire format disagrees with "
                         "this build\n",
                         n, g_lnch_hosting_lan ? 1 : 0, shown);
-                    std::fflush(stderr);
+                    std::fflush(stdout);
                 }
             }
         }
