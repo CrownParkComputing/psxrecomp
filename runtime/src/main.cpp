@@ -10534,9 +10534,17 @@ namespace {
                         else if (c < 32)    { head[hk++] = '?'; }
                         else                { head[hk++] = (char)c; }
                     }
+                    /* Evaluate the SAME predicate the handler below uses and
+                     * print it here. A well-formed datagram that still never
+                     * reaches any handler is otherwise indistinguishable from
+                     * one silently claimed earlier in the chain. */
+                    const int modok_match =
+                        std::strncmp(buf, "MOTK5 MODOK\n", 12) == 0 ? 1 : 0;
                     std::fprintf(stdout,
-                                 "psxrecomp: LAN rx (%d bytes) \"%s\"\n",
-                                 n, head);
+                                 "psxrecomp: LAN rx (%d bytes) \"%s\" "
+                                 "hosting=%d modok_match=%d\n",
+                                 n, head, g_lnch_hosting_lan ? 1 : 0,
+                                 modok_match);
                     std::fflush(stdout);
                 }
             }
@@ -10693,7 +10701,19 @@ namespace {
                 continue;
             }
 
-            if (!g_lnch_remote_lan) continue;
+            /* NOTE: the `!g_lnch_remote_lan` gate used to sit HERE, which made
+             * every host-side MOTK5 handler below unreachable on a host — the
+             * one machine that must run them. A host is not "remote LAN" (it
+             * joined nothing), so it took the continue and never reached
+             * SEATMOVE / SWAPREQ / SWAPANS / MODOK, all four of which
+             * explicitly test g_lnch_hosting_lan and are therefore host-only
+             * by construction. Symptoms: the host logged receipt of a
+             * well-formed 'MOTK5 MODOK' forever while no seat ever went ready
+             * (so mod compatibility was reported wrong), and players could not
+             * move or swap seats. The gate now sits just above the legacy
+             * MOTK1-4 UPDATE / KICK block, which is the only run of handlers
+             * that actually needs it: everything between here and there
+             * carries its own explicit host/client guard. */
 
             /* Guest -> host: move myself to a free seat. */
             if (std::strncmp(buf, "MOTK5 SEATMOVE\n", 15) == 0 &&
@@ -10868,6 +10888,19 @@ namespace {
             /* Guest -> host: "I can (not) run the session's mods". */
             if (std::strncmp(buf, "MOTK5 MODOK\n", 12) == 0 &&
                 g_lnch_hosting_lan) {
+                {   /* Entry probe: proves the branch was taken at all. The
+                     * host was logging receipt of a well-formed MODOK while
+                     * none of this handler's three traces ever appeared,
+                     * which no reading of the dispatch chain explains. */
+                    static uint32_t s_entry_ms = 0;
+                    const uint32_t nowm = (uint32_t)SDL_GetTicks64();
+                    if (nowm - s_entry_ms > 3000u) {
+                        s_entry_ms = nowm;
+                        std::fprintf(stdout,
+                            "psxrecomp: LAN mods: MODOK handler ENTERED\n");
+                        std::fflush(stdout);
+                    }
+                }
                 /* Rate-limited reason trace for the THREE early exits below.
                  * The trace further down was added because "no output" was
                  * ambiguous — but it sits after these continues, so the one
@@ -10955,6 +10988,11 @@ namespace {
                 ae_np_lan_send_update_to_peers(st);
                 continue;
             }
+
+            /* Client-only from here down: the legacy MOTK1-4 UPDATE handlers
+             * and KICK/ERR carry no host/client guard of their own and mutate
+             * g_lnch_remote_lan_state, so a host must not fall into them. */
+            if (!g_lnch_remote_lan) continue;
 
             if (std::strncmp(buf, "MOTK4 UPDATE\n", 13) == 0) {
                 AeLanLobbyState st = g_lnch_remote_lan_state;
