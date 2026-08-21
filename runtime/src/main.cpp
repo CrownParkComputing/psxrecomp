@@ -15894,6 +15894,9 @@ session_reboot:
              * tick 0). Empty spec => vanilla, and the follower then takes the
              * ordinary clear path. */
             static std::string link_mod_spec, link_mod_fp;
+            /* Static: child_argv holds bare pointers until execv(). */
+            static std::string resolved_disc_str_for_follower;
+            resolved_disc_str_for_follower = resolved_disc.string();
             static char env_mods[2048], env_mod_fp[128];
             link_mod_spec = PSXRecompV4::mod_runtime_link_spec_from_session();
             link_mod_fp = PSXRecompV4::mod_runtime_fingerprint();
@@ -15931,11 +15934,35 @@ session_reboot:
                 child_argv[an++] = (char *)"--bios";
                 child_argv[an++] = (char *)bios_path_str.c_str();
                 /* Same disc image: a client launched with a disc override
-                 * must not leave the follower on the game.toml default. */
-                if (!disc_path_str.empty()) {
+                 * must not leave the follower on the game.toml default.
+                 *
+                 * Pass the STOCK disc, never disc_path_str: that variable is
+                 * the mod-EFFECTIVE image (the private patched cache) as soon
+                 * as a package rewrites the disc, and the follower re-derives
+                 * its own patched image from the spec we hand it in
+                 * PSX_LINK_MODS — mod_runtime_apply_link_spec takes the stock
+                 * disc, exactly as the driver did. Handing it the already
+                 * patched image made it validate a modded disc against the
+                 * stock digests, fall back to the game.toml default, and die
+                 * with "cannot apply the driver's mod plan: cannot open disc
+                 * CUE: <install>/disc/...". PSX_LINK_MOD_FP still catches any
+                 * residual disagreement between the two derivations. */
+                const std::string& follower_disc =
+                    resolved_disc.empty() ? disc_path_str
+                                          : resolved_disc_str_for_follower;
+                if (!follower_disc.empty()) {
                     child_argv[an++] = (char *)"--disc";
-                    child_argv[an++] = (char *)disc_path_str.c_str();
+                    child_argv[an++] = (char *)follower_disc.c_str();
                 }
+                std::printf("psxrecomp: link pair follower disc -> %s%s\n",
+                            follower_disc.empty() ? "(none — follower will use "
+                                                    "the game.toml default)"
+                                                  : follower_disc.c_str(),
+                            (!follower_disc.empty() &&
+                             follower_disc != disc_path_str)
+                                ? "  (stock; follower re-derives the mod disc)"
+                                : "");
+                std::fflush(stdout);
                 child_argv[an] = NULL;
             }
             PsxLinkPairClientCfg pcfg;
