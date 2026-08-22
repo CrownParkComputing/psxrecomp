@@ -1,5 +1,5 @@
 diff --git a/src/common/log_channels.h b/src/common/log_channels.h
-index a1576e7..6dfdb45 100644
+index a1576e73..6dfdb45e 100644
 --- a/src/common/log_channels.h
 +++ b/src/common/log_channels.h
 @@ -47,6 +47,7 @@
@@ -11,7 +11,7 @@ index a1576e7..6dfdb45 100644
    X(ReShadeFXShader)                                                                                                   \
    X(Recompiler)                                                                                                        \
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index e2d0294..b290bd3 100644
+index e2d0294b..b290bd35 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -116,6 +116,8 @@ add_library(core
@@ -23,8 +23,67 @@ index e2d0294..b290bd3 100644
    save_state_version.h
    settings.cpp
    settings.h
+diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
+index c78acbf3..d991249e 100644
+--- a/src/core/cpu_core.cpp
++++ b/src/core/cpu_core.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "cpu_core.h"
++#include "psxrecomp_debug_server.h"
+ #include "bus.h"
+ #include "cpu_code_cache_private.h"
+ #include "cpu_core_private.h"
+@@ -3576,8 +3577,26 @@ bool CPU::ReadMemoryWord(VirtualMemoryAddress addr, u32* value)
+   return true;
+ }
+ 
++// Fold guest stores into the cross-emulator fingerprint.
++//
++// Hooked here rather than at the sb/sh/sw cases so swl/swr/sc are covered too --
++// every store instruction funnels through these three.
++//
++// The value is truncated to the WIDTH ACTUALLY WRITTEN before hashing, because
++// that is what psxrecomp's memory.c passes to fp_record_write (it hands over the
++// u8/u16/u32 it is about to store, zero-extended). Hashing the untruncated
++// register here would make every byte store disagree, and every frame would
++// then "diverge" for a reason that has nothing to do with the emulators.
++//
++// NOTE: this sees CPU stores only. DMA-written RAM does not pass through here.
++// Compare `wc` (write counts) between the two sides before trusting `wr` -- if
++// the counts do not track, the two are not observing the same set of writes and
++// the hashes are not comparable. See tools/fingerprint_diff.py.
+ bool CPU::WriteMemoryByte(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value & 0xFFu, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::Byte, addr, value);
+ 
+   GetMemoryWriteHandler(addr, MemoryAccessSize::Byte)(addr, value);
+@@ -3593,6 +3612,9 @@ bool CPU::WriteMemoryByte(VirtualMemoryAddress addr, u32 value)
+ 
+ bool CPU::WriteMemoryHalfWord(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value & 0xFFFFu, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::HalfWord, addr, value);
+ 
+   if (!DoAlignmentCheck<MemoryAccessType::Write, MemoryAccessSize::HalfWord>(addr))
+@@ -3611,6 +3633,9 @@ bool CPU::WriteMemoryHalfWord(VirtualMemoryAddress addr, u32 value)
+ 
+ bool CPU::WriteMemoryWord(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::Word, addr, value);
+ 
+   if (!DoAlignmentCheck<MemoryAccessType::Write, MemoryAccessSize::Word>(addr))
 diff --git a/src/core/gpu.h b/src/core/gpu.h
-index 975f8d5..05fa360 100644
+index 975f8d5d..05fa3600 100644
 --- a/src/core/gpu.h
 +++ b/src/core/gpu.h
 @@ -212,6 +212,19 @@ public:
@@ -49,10 +108,10 @@ index 975f8d5..05fa360 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 0000000..1fcc225
+index 00000000..a3e4c16f
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1222 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -67,7 +126,11 @@ index 0000000..1fcc225
 +#include "gpu.h"
 +#include "interrupt_controller.h"
 +#include "pad.h"
++#include "settings.h"
 +#include "system.h"
++#include "timing_event.h"
++
++#include <vector>
 +
 +#include "common/assert.h"
 +#include "common/log.h"
@@ -133,6 +196,114 @@ index 0000000..1fcc225
 +// ---------------------------------------------------------------------------
 +
 +static constexpr u32 FRAME_HISTORY_CAP = 36000; // ~10 min @ 60fps
++
++// ---------------------------------------------------------------------------
++// Per-frame write fingerprint -- the cross-emulator invariant
++// ---------------------------------------------------------------------------
++//
++// A rolling FNV-1a hash of every guest write since boot, snapshotted once per
++// frame. Comparing frame N's hash between two emulators answers "did the entire
++// write history up to frame N match", so the FIRST frame whose hash differs is
++// the frame execution forked -- which is usually many frames before anything is
++// visible on screen. That is the point: find the first divergence, not the
++// final visible bug.
++//
++// This is a byte-for-byte port of the fingerprint in psxrecomp's
++// debug_server.c. The constants, the classification, and the JSON field names
++// all have to match exactly or the two sides cannot be compared. Main RAM,
++// scratchpad, and MMIO stay in separate columns so a RAM-state fork can be told
++// apart from a device-interaction fork.
++static constexpr u32 FP_RING_CAP = 32768;
++static constexpr u64 FNV_OFFSET = 1469598103934665603ULL;
++static constexpr u64 FNV_PRIME = 1099511628211ULL;
++
++struct FpEntry
++{
++  u32 frame;
++  u64 wr_hash, pc_hash, wcount;
++  u64 mmio_hash, mmio_count;
++  u64 sp_hash, sp_count;
++  u64 cyc;
++};
++
++static bool s_fp_armed = false;
++static u64 s_fp_wr_hash = FNV_OFFSET;
++static u64 s_fp_pc_hash = FNV_OFFSET;
++static u64 s_fp_write_count = 0;
++static u64 s_fp_mmio_hash = FNV_OFFSET;
++static u64 s_fp_mmio_count = 0;
++static u64 s_fp_sp_hash = FNV_OFFSET;
++static u64 s_fp_sp_count = 0;
++static std::vector<FpEntry> s_fp_ring;
++static u32 s_fp_head = 0;
++static u64 s_fp_total = 0;
++
++static void fp_reset()
++{
++  s_fp_wr_hash = s_fp_pc_hash = s_fp_mmio_hash = s_fp_sp_hash = FNV_OFFSET;
++  s_fp_write_count = s_fp_mmio_count = s_fp_sp_count = 0;
++  s_fp_head = 0;
++  s_fp_total = 0;
++  if (s_fp_ring.empty())
++    s_fp_ring.resize(FP_RING_CAP);
++}
++
++bool PSXRecompDebug::FingerprintArmed()
++{
++  return s_fp_armed;
++}
++
++void PSXRecompDebug::RecordWrite(u32 addr, u32 value, u32 pc)
++{
++  const u32 phys = addr & 0x1FFFFFFFu;
++
++  if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) // scratchpad -- separate hash
++  {
++    u64 h = s_fp_sp_hash;
++    h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(pc)) * FNV_PRIME;
++    s_fp_sp_hash = h;
++    s_fp_sp_count++;
++    return;
++  }
++
++  if (phys >= Bus::g_ram_size) // MMIO / device registers -- separate hash
++  {
++    u64 h = s_fp_mmio_hash;
++    h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(pc)) * FNV_PRIME;
++    s_fp_mmio_hash = h;
++    s_fp_mmio_count++;
++    return;
++  }
++
++  u64 h = s_fp_wr_hash;
++  h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++  h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++  s_fp_wr_hash = h;
++  s_fp_pc_hash = (s_fp_pc_hash ^ static_cast<u64>(pc)) * FNV_PRIME;
++  s_fp_write_count++;
++}
++
++static void fp_snapshot(u32 frame)
++{
++  if (!s_fp_armed || s_fp_ring.empty())
++    return;
++  FpEntry& e = s_fp_ring[s_fp_head];
++  e.frame = frame;
++  e.wr_hash = s_fp_wr_hash;
++  e.pc_hash = s_fp_pc_hash;
++  e.wcount = s_fp_write_count;
++  e.mmio_hash = s_fp_mmio_hash;
++  e.mmio_count = s_fp_mmio_count;
++  e.sp_hash = s_fp_sp_hash;
++  e.sp_count = s_fp_sp_count;
++  e.cyc = static_cast<u64>(TimingEvents::GetGlobalTickCounter());
++  s_fp_head = (s_fp_head + 1) % FP_RING_CAP;
++  s_fp_total++;
++}
 +
 +// Snapshot of a RAM region stored per frame
 +static constexpr int RAM_SNAPSHOT_REGIONS = 4;
@@ -415,6 +586,60 @@ index 0000000..1fcc225
 +      g_gpu.GetDisplayVRAMWidth(), g_gpu.GetDisplayVRAMHeight(),
 +      g_gpu.GetDrawingAreaLeft(), g_gpu.GetDrawingAreaTop(),
 +      g_gpu.GetDrawingAreaRight(), g_gpu.GetDrawingAreaBottom()));
++  }
++  // ---- frame_fingerprint ----
++  // Same command name and same JSON field names as psxrecomp's, so
++  // tools/fingerprint_diff.py can point at either port without knowing which
++  // emulator answered. Field names are terse (wr/pc/wc/mmio/mc/sp/sc/cyc)
++  // because that side chose them; matching beats improving.
++  else if (std::strcmp(cmd, "frame_fingerprint") == 0)
++  {
++    u32 count = 1024, arm = 2, reset = 0;
++    json_get_u32(json, "count", &count);
++    json_get_u32(json, "arm", &arm);
++    json_get_u32(json, "reset", &reset);
++    const s32 flo = json_get_int(json, "frame_lo", -1);
++    const s32 fhi = json_get_int(json, "frame_hi", -1);
++
++    if (reset)
++      fp_reset();
++    if (arm <= 1)
++    {
++      const bool want = (arm == 1);
++      if (want && !s_fp_armed)
++        fp_reset(); // a fresh arm starts a fresh history, not a resumed one
++      s_fp_armed = want;
++    }
++
++    if (count < 1) count = 1;
++    if (count > FP_RING_CAP) count = FP_RING_CAP;
++    const u32 avail = (s_fp_total < FP_RING_CAP) ? static_cast<u32>(s_fp_total) : FP_RING_CAP;
++    const u32 start = (s_fp_total < FP_RING_CAP) ? 0 : s_fp_head;
++
++    // The store hook lives in the INTERPRETER's write path. A recompiler build
++    // inlines stores and never reaches it, so fingerprinting would silently
++    // record almost nothing and the comparison would report a bogus match.
++    // Report the mode rather than let a caller trust an empty hash.
++    const bool interp = (g_settings.cpu_execution_mode == CPUExecutionMode::Interpreter);
++    std::string resp = fmt::format(
++      R"({{"id":{},"ok":true,"armed":{},"interpreter":{},"total":{},"available":{},"entries":[)",
++      s_request_id, s_fp_armed ? "true" : "false", interp ? "true" : "false",
++      s_fp_total, avail);
++    u32 emitted = 0;
++    for (u32 i = 0; i < avail && emitted < count; i++)
++    {
++      const FpEntry& e = s_fp_ring[(start + i) % FP_RING_CAP];
++      if (flo >= 0 && static_cast<s32>(e.frame) < flo) continue;
++      if (fhi >= 0 && static_cast<s32>(e.frame) > fhi) continue;
++      fmt::format_to(std::back_inserter(resp),
++        R"({}{{"frame":{},"wr":"0x{:016x}","pc":"0x{:016x}","wc":{},)"
++        R"("mmio":"0x{:016x}","mc":{},"sp":"0x{:016x}","sc":{},"cyc":{}}})",
++        emitted ? "," : "", e.frame, e.wr_hash, e.pc_hash, e.wcount,
++        e.mmio_hash, e.mmio_count, e.sp_hash, e.sp_count, e.cyc);
++      emitted++;
++    }
++    resp += "]}";
++    SendJSON(resp);
 +  }
 +  // ---- pause ----
 +  else if (std::strcmp(cmd, "pause") == 0)
@@ -1014,6 +1239,9 @@ index 0000000..1fcc225
 +{
 +  s_frame_counter++;
 +
++  // Before anything else: the fingerprint describes the frame that just ran.
++  fp_snapshot(s_frame_counter);
++
 +  // ---- Record frame into ring buffer ----
 +  u32 idx = s_frame_counter % FRAME_HISTORY_CAP;
 +  FrameRecord& r = s_history[idx];
@@ -1108,10 +1336,10 @@ index 0000000..1fcc225
 +}
 diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
 new file mode 100644
-index 0000000..8aa466c
+index 00000000..8f9ba960
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,37 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371
 +// Same protocol as the PSXRecomp runner debug server.
@@ -1131,9 +1359,26 @@ index 0000000..8aa466c
 +/// the ring buffer, checks watchpoints, handles step-N logic.
 +void OnFrameDone();
 +
++/// Fold one guest write into the per-frame fingerprint. Called from the
++/// interpreter's store path in cpu_core.cpp.
++///
++/// This mirrors fp_record_write() in psxrecomp's debug_server.c byte for byte,
++/// including the FNV-1a constants and the decision to keep main RAM,
++/// scratchpad, and MMIO in SEPARATE hashes -- folding device-register churn
++/// into the RAM signal is what previously hid a real first divergence, because
++/// the RAM hash only ever sees the AFTERMATH of a device-interaction fork.
++///
++/// The two emulators must agree exactly or `frame_fingerprint` compares
++/// nothing. Do not "improve" the hash on one side.
++void RecordWrite(u32 addr, u32 value, u32 pc);
++
++/// True when a client has armed fingerprinting. The store hook checks this
++/// first so an unattached oracle pays almost nothing.
++bool FingerprintArmed();
++
 +} // namespace PSXRecompDebug
 diff --git a/src/core/system.cpp b/src/core/system.cpp
-index a36ad75..1d23daf 100644
+index a36ad755..1d23daf5 100644
 --- a/src/core/system.cpp
 +++ b/src/core/system.cpp
 @@ -102,6 +102,7 @@ LOG_CHANNEL(System);
@@ -1173,7 +1418,7 @@ index a36ad75..1d23daf 100644
    PollDiscordPresence();
  #endif
 diff --git a/src/duckstation-qt/CMakeLists.txt b/src/duckstation-qt/CMakeLists.txt
-index acb8e40..b7f7b8e 100644
+index acb8e40c..b7f7b8e3 100644
 --- a/src/duckstation-qt/CMakeLists.txt
 +++ b/src/duckstation-qt/CMakeLists.txt
 @@ -210,7 +210,7 @@ foreach(src ${SRCS})
