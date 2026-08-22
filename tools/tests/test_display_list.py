@@ -479,3 +479,52 @@ class TestVerdictRefusesLopsidedSamples(unittest.TestCase):
         b = self._stats([10, 40, 90, 150] * 200)
         v, _ = CP.verdict_of(a, b)
         self.assertEqual(v, "match")
+
+
+class TestColourShape(unittest.TestCase):
+    """Distinct-colour COUNT is the phase-independent colour measurement.
+
+    Every other colour comparison needs the two emulators on the same frame,
+    which nothing short of deterministic replay achieves. But a procedural
+    effect reuses a handful of colours across all its primitives, and that
+    stays true at every phase: an effect at a different moment has DIFFERENT
+    colours, not more of them. So an order-of-magnitude gap in how many
+    distinct colours a class carries is evidence about the computation, not
+    about when each side was sampled.
+    """
+
+    @staticmethod
+    def _prims(op, blend, colour_sets):
+        return [{"op": op, "blend": blend,
+                 "colors": " ".join(str(c) for c in cs)} for cs in colour_sets]
+
+    def test_a_reused_palette_reads_as_structured(self):
+        dark, bright = (7, 7, 7), (240, 77, 77)
+        p = self._prims("PolyG4+semi", "B+F",
+                        [[dark, bright, dark, bright]] * 64)
+        d = DL.colour_shape(p, "PolyG4+semi", "B+F")
+        self.assertEqual(d["prims"], 64)
+        self.assertEqual(d["distinct"], 2)
+        self.assertEqual(d["patterns"], 1)
+
+    def test_per_primitive_variation_reads_as_unstructured(self):
+        sets = [[(i, 0, 0), (155, 159, i), (i + 1, 0, 0), (150, 159, i)]
+                for i in range(64)]
+        d = DL.colour_shape(self._prims("PolyG4+semi", "B+F", sets),
+                            "PolyG4+semi", "B+F")
+        self.assertGreater(d["distinct"], 100)
+        self.assertEqual(d["patterns"], 64)
+
+    def test_the_filter_selects_only_the_named_class(self):
+        p = (self._prims("PolyG4+semi", "B+F", [[(1, 1, 1)] * 4]) +
+             self._prims("PolyFT4", "opaque", [[(9, 9, 9)] * 4]))
+        self.assertEqual(DL.colour_shape(p, "PolyG4+semi", "B+F")["prims"], 1)
+        self.assertEqual(DL.colour_shape(p, "PolyFT4", "opaque")["prims"], 1)
+        self.assertEqual(DL.colour_shape(p)["prims"], 2)
+
+    def test_an_absent_class_on_one_side_reports_nothing_rather_than_a_finding(self):
+        import io
+        nat = {"prims": self._prims("PolyG4+semi", "B+F", [[(1, 1, 1)] * 4])}
+        orc = {"prims": self._prims("PolyFT4", "opaque", [[(9, 9, 9)] * 4])}
+        self.assertIsNone(DL.compare_colours(nat, orc, "PolyG4+semi|B+F",
+                                             out=io.StringIO()))

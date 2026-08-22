@@ -32,6 +32,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import threading
 from collections import Counter
@@ -219,6 +220,60 @@ def frames_spanned(meta):
     return b - a
 
 
+def colour_shape(prims, op=None, blend=None):
+    """How much STRUCTURE a class's vertex colours have.
+
+    A procedurally generated effect reuses a handful of colours across all
+    its primitives -- a two-tone additive glow is literally two or three
+    distinct values repeated. So "how many distinct colours" is a shape
+    measurement, and it survives the thing that defeats every other colour
+    comparison: it does not need the two emulators to be on the same frame.
+    An effect at a different phase still has few distinct colours; an
+    effect whose colours are being computed wrongly does not.
+    """
+    sel = [p for p in prims
+           if (op is None or p["op"] == op)
+           and (blend is None or p["blend"] == blend)]
+    tuples, patterns = [], set()
+    for p in sel:
+        vals = [int(x) for x in re.findall(r"\d+", p.get("colors", ""))]
+        quad = [tuple(vals[i:i + 3]) for i in range(0, len(vals), 3)]
+        tuples += quad
+        patterns.add(tuple(quad))
+    return {"prims": len(sel), "vertex_colours": len(tuples),
+            "distinct": len(set(tuples)), "patterns": len(patterns),
+            "top": Counter(tuples).most_common(3)}
+
+
+def compare_colours(nat, orc, key, out=sys.stdout):
+    """Report colour structure for one class on both sides."""
+    op, _, blend = key.partition("|")
+    a = colour_shape(nat["prims"], op, blend)
+    b = colour_shape(orc["prims"], op, blend)
+    if not a["prims"] or not b["prims"]:
+        return None
+    print(f"\ncolour structure of {key}:", file=out)
+    for lbl, d in (("psx-runtime", a), ("oracle", b)):
+        print(f"  {lbl:<12} {d['prims']:>4} prims  "
+              f"{d['distinct']:>4} distinct colours  "
+              f"{d['patterns']:>4} distinct per-prim patterns", file=out)
+        print(f"               most common: "
+              + "  ".join(f"{t} x{k}" for t, k in d["top"]), file=out)
+    # An order-of-magnitude gap in distinct-colour count is not phase.
+    if a["distinct"] and b["distinct"]:
+        r = max(a["distinct"], b["distinct"]) / min(a["distinct"], b["distinct"])
+        if r >= 4.0:
+            worse = "psx-runtime" if a["distinct"] > b["distinct"] else "oracle"
+            print(f"\n  FINDING: {worse} produces {r:.0f}x more distinct "
+                  f"colours for the same {a['prims']} primitives. A "
+                  f"procedural effect reuses a few colours; this side is "
+                  f"not reusing them. That is a colour-COMPUTATION "
+                  f"divergence upstream of the renderer, not a phase "
+                  f"difference — phase changes which colours, not how "
+                  f"many.", file=out)
+    return {"native": a, "oracle": b}
+
+
 def compare(nat, orc, out=sys.stdout):
     """Class-count delta between two walks."""
     an = {c["key"]: c["count"] for c in nat["classes"]}
@@ -229,8 +284,31 @@ def compare(nat, orc, out=sys.stdout):
         a, b = an.get(k, 0), on.get(k, 0)
         mark = "" if a == b else ("  <-- only one side" if not a or not b else "")
         print(f"  {k:<26}{a:>9}{b:>9}{b - a:>+9}{mark}", file=out)
+    # Vertices first: if those differ the colour question is premature.
+    # Tolerate a report without per-primitive detail: an older file, or one
+    # written before `prims` was recorded, should still give a class delta
+    # rather than raise.
+    same_verts = 0
+    pairs = 0
+    for a, b in zip(nat.get("prims") or [], orc.get("prims") or []):
+        if a["op"] == b["op"] and a["blend"] == b["blend"]:
+            pairs += 1
+            if a.get("verts") == b.get("verts"):
+                same_verts += 1
+    if pairs:
+        print(f"\ngeometry: {same_verts}/{pairs} paired primitives have "
+              f"identical vertices", file=out)
+
+    shapes = {}
+    for k in keys:
+        if an.get(k) and on.get(k) and nat.get("prims") and orc.get("prims"):
+            r = compare_colours(nat, orc, k, out=out)
+            if r:
+                shapes[k] = r
     return {"classes": [{"key": k, "native": an.get(k, 0),
-                         "oracle": on.get(k, 0)} for k in keys]}
+                         "oracle": on.get(k, 0)} for k in keys],
+            "geometry_identical": same_verts, "geometry_pairs": pairs,
+            "colour_shape": shapes}
 
 
 def run_both(args):
