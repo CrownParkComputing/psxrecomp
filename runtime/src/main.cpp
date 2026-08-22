@@ -16487,17 +16487,6 @@ session_reboot:
         }
     }
 
-    /* Diagnostic: the guest published a null PC at the top level (abnormal). With
-     * PSX_EXIT_HALT set, halt-and-serve here instead of shutting down so the
-     * still-loaded overlays + full guest state are live-inspectable over TCP. */
-    { const char *e = std::getenv("PSX_EXIT_HALT");
-      if (e && e[0] && e[0] != '0') {
-          extern void psx_fatal_halt(const char *reason);
-          psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
-      }
-    }
-
-    std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
     /* The PC=0 top-level exit is an abnormal-boot class (see interrupts.c:
      * approximate exception-resume PCs severing the live native chain). The
      * registers at exit name the culprit without needing a debug-tools build:
@@ -16538,6 +16527,25 @@ session_reboot:
                          e->depth, e->a, e->b, e->c, e->d);
         }
     }
+
+    /* Diagnostic: the guest published a null PC at the top level (abnormal). With
+     * PSX_EXIT_HALT set, halt-and-serve here instead of shutting down so the
+     * still-loaded overlays + full guest state are live-inspectable over TCP.
+     *
+     * This gate MUST stay below the exit-regs / slice-diag / pc0-journal dumps
+     * above: psx_fatal_halt() never returns, so gating earlier meant the very
+     * artifact the halt exists to preserve (the journal naming the publishing
+     * site) was never printed. Flush first — the halt loop, or the operator
+     * killing a wedged process, must not strand the evidence in stdio buffers. */
+    std::fflush(stdout);
+    { const char *e = std::getenv("PSX_EXIT_HALT");
+      if (e && e[0] && e[0] != '0') {
+          extern void psx_fatal_halt(const char *reason);
+          psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
+      }
+    }
+
+    std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
