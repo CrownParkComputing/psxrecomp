@@ -27,6 +27,7 @@ That distinction is the whole point. "The colours are wrong" is not actionable;
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -63,7 +64,10 @@ def intpl_reference(ir0, ir, fc, shift, lm):
     return mac, out
 
 
-def check_intpl(entries, out=sys.stdout):
+GTE_KIND = "psx-gte-check"
+
+
+def check_intpl(entries, out=sys.stdout, doc=None):
     """Re-derive each record; report which (sf, lm) explains it, if any."""
     total = len(entries)
     explained = {}
@@ -92,6 +96,15 @@ def check_intpl(entries, out=sys.stdout):
     for (shift, lm), n in sorted(explained.items(), key=lambda kv: -kv[1]):
         print(f"  {n:>6}  reproduced exactly with sf={'1' if shift else '0'} "
               f"lm={int(lm)}", file=out)
+    if doc is not None:
+        doc["intpl_checked"] = total
+        doc["intpl_bad"] = len(bad)
+        doc["intpl_modes"] = [{"sf": 1 if sh else 0, "lm": int(lm), "count": n}
+                              for (sh, lm), n in explained.items()]
+        doc["verdict"] = "arithmetic-ok" if not bad else "arithmetic-diverges"
+        doc["bad"] = [{"seq": e["seq"], "frame": e["frame"], "ra": e["ra"],
+                       "ir0": e["ir0"], "in": e["in"], "fc": e["fc"],
+                       "mac": e["mac"], "out": e["out"]} for e in bad[:16]]
     if not bad:
         print("\nVERDICT: every recorded INTPL matches the hardware description.\n"
               "The GTE's interpolation arithmetic is NOT the bug. If colours are\n"
@@ -116,6 +129,26 @@ def check_intpl(entries, out=sys.stdout):
     return 1
 
 
+def _merge_stats(conn, doc):
+    """Attach recent per-frame GTE counters.
+
+    nintpl and nsat are the two that decide where to look next: nintpl=0 means
+    the depth-cue path is not merely correct but unused, and nsat=0 rules out
+    saturation in projection. Both are far more useful attached to the verdict
+    than sitting behind a separate command.
+    """
+    try:
+        rep = conn.cmd("gte_frame_stats", frames=60)
+    except DebugError:
+        return
+    fr = rep.get("frames", [])
+    doc["frames"] = [{k: int(v) for k, v in f.items()} for f in fr[:30]]
+    if fr:
+        doc["nintpl_total"] = sum(int(f.get("nintpl", 0)) for f in fr)
+        doc["nsat_total"] = sum(int(f.get("nsat", 0)) for f in fr)
+        doc["nproj_last"] = int(fr[0].get("nproj", 0))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -125,6 +158,7 @@ def main(argv=None):
     ap.add_argument("--count", type=int, default=512)
     ap.add_argument("--frame", type=int, default=-1)
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
     conn = DebugConn(args.host, args.port, args.timeout)
@@ -132,16 +166,32 @@ def main(argv=None):
         if args.what == "intpl":
             rep = conn.cmd("gte_intpl_dump", count=args.count, frame=args.frame)
             es = rep.get("entries", [])
+            doc = {"kind": GTE_KIND, "version": 1, "what": "intpl"}
             if not es:
-                print("no INTPL records — this game may not use INTPL at all, "
-                      "which is itself worth knowing: the colour path would then "
-                      "be NCDS/NCCS or a plain RGB write.", file=sys.stderr)
-                return 1
-            return check_intpl(es)
+                note = ("no INTPL records — this game does not use INTPL at "
+                        "all. The colour path is therefore NCDS/NCCS or a plain "
+                        "CPU write, not depth-cue interpolation.")
+                print(note, file=sys.stderr)
+                doc.update({"intpl_checked": 0, "intpl_bad": 0,
+                            "verdict": "not-used", "note": note,
+                            "intpl_modes": [], "bad": []})
+                rc = 1
+            else:
+                rc = check_intpl(es, doc=doc)
+            if args.json:
+                _merge_stats(conn, doc)
+                with open(args.json, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=1)
+            return rc
         if args.what == "stats":
             rep = conn.cmd("gte_frame_stats", frames=args.count)
             for f in rep.get("frames", [])[-20:]:
                 print("  " + "  ".join(f"{k}={v}" for k, v in f.items()))
+            if args.json:
+                doc = {"kind": GTE_KIND, "version": 1, "what": "stats"}
+                _merge_stats(conn, doc)
+                with open(args.json, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=1)
             return 0
         rep = conn.cmd("gte_latch_dump", count=min(args.count, 256))
         print(f"latched saturated projections: {rep.get('latch_total')}")

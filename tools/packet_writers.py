@@ -28,12 +28,15 @@ walk itself.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+WRITERS_KIND = "psx-packet-writers"
 
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_NATIVE_PORT, DebugConn, DebugError, decode_entries,
@@ -81,6 +84,7 @@ def main(argv=None):
     ap.add_argument("--watch", type=float, default=5.0,
                     help="seconds to let the trace collect")
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
     conn = DebugConn(args.host, args.port, args.timeout)
@@ -103,11 +107,17 @@ def main(argv=None):
     sel = [p for p in prims if p["kind"] == "poly" and p["op_name"] == op]
     if not sel:
         have = Counter(p["op_name"] for p in prims if p["kind"] == "poly")
-        print(f"no {op} in the current list. Present: "
-              f"{', '.join(f'{k} x{v}' for k, v in have.most_common(6))}",
-              file=sys.stderr)
-        print("\nThe effect has to be ON SCREEN for this to find its writers.",
-              file=sys.stderr)
+        msg = (f"no {op} in the current list — the effect has to be ON SCREEN "
+               f"for this to find its writers. Present: "
+               f"{', '.join(f'{k} x{v}' for k, v in have.most_common(6))}")
+        print(msg, file=sys.stderr)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump({"kind": WRITERS_KIND, "version": 1,
+                           "class": args.want, "absent": True, "note": msg,
+                           "present": [{"key": k, "count": v}
+                                       for k, v in have.most_common(12)],
+                           "writers": []}, f, indent=1)
         return 1
 
     roles = field_map(sel, args.want)
@@ -151,6 +161,23 @@ def main(argv=None):
     if top:
         print(f"\nWrites ONLY colour words: {', '.join(top[:6])}")
         print("Disassemble with:  python3 disasm_ram.py --pc " + top[0])
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump({
+                "kind": WRITERS_KIND, "version": 1, "class": args.want,
+                "absent": False,
+                "packets": len(sel),
+                "lo": f"0x{lo:08X}", "hi": f"0x{hi:08X}",
+                "colour_words": sum(1 for v in roles.values() if v == "colour"),
+                "vertex_words": sum(1 for v in roles.values() if v == "vertex"),
+                "writes": len(entries), "unmapped": unknown,
+                "writers": [{"pc": pc, "func": pcfunc.get(pc, ""),
+                             "colour": k["colour"], "vertex": k["vertex"],
+                             "uv": k["uv"],
+                             "colour_only": bool(k["colour"] and not k["vertex"])}
+                            for pc, k in ranked],
+            }, f, indent=1)
+        print(f"\nwrote {args.json}")
     return 0
 
 

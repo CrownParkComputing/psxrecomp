@@ -1,10 +1,39 @@
-"""Fetch 4KB at target RAM via TCP debug server and disassemble."""
-import sys, socket, json, time, struct
+"""Fetch RAM via the TCP debug server and disassemble MIPS around an address.
 
-HOST='127.0.0.1'
-PORT = int(sys.argv[1]) if len(sys.argv)>1 else 4370
-addr = int(sys.argv[2],16) if len(sys.argv)>2 else 0x00000C80
-length = int(sys.argv[3]) if len(sys.argv)>3 else 512
+    python3 disasm_ram.py --pc 0x80056FA8            # centred on a PC
+    python3 disasm_ram.py 4370 80056FA8 512          # legacy positional form
+
+--pc exists because the interesting address is almost always a STORE that the
+write trace named, and reading it needs the instructions BEFORE it (where the
+stored value was computed), not just after. --before defaults to half the
+window so the named instruction lands in the middle.
+"""
+import argparse, sys, socket, json, time, struct
+
+_legacy = len(sys.argv) > 1 and not sys.argv[1].startswith("-")
+if _legacy:
+    HOST = '127.0.0.1'
+    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 4370
+    addr = int(sys.argv[2], 16) if len(sys.argv) > 2 else 0x00000C80
+    length = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+else:
+    _ap = argparse.ArgumentParser(description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    _ap.add_argument("--host", default="127.0.0.1")
+    _ap.add_argument("--port", type=int, default=4370)
+    _ap.add_argument("--pc", required=True, help="address to centre on (hex ok)")
+    _ap.add_argument("--count", type=int, default=48,
+                     help="instructions to show")
+    _ap.add_argument("--before", type=int, default=-1,
+                     help="instructions of leading context (default: half)")
+    _a = _ap.parse_args()
+    HOST = _a.host
+    PORT = _a.port
+    _pc = int(_a.pc, 16) if _a.pc.lower().startswith("0x") else int(_a.pc, 16)
+    _before = _a.before if _a.before >= 0 else _a.count // 2
+    addr = max(0, _pc - _before * 4)
+    length = _a.count * 4
+    MARK = _pc
 
 def send(cmd, timeout=3.0):
     s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout); s.connect((HOST,PORT))
@@ -39,7 +68,8 @@ for i in range(0, len(data), 4):
     op=(w>>26)&0x3f
     rs=(w>>21)&0x1f; rt=(w>>16)&0x1f; rd=(w>>11)&0x1f; sh=(w>>6)&0x1f
     imm=w&0xffff; simm=imm-0x10000 if imm&0x8000 else imm
-    s = f'0x{pc:08X}: {w:08X}  '
+    mark = '>>' if (not _legacy and pc == MARK) else '  '
+    s = f'{mark} 0x{pc:08X}: {w:08X}  '
     if w==0: s += 'nop'
     elif op==0:
         fn=w&0x3f
