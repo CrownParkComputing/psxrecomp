@@ -952,6 +952,17 @@ def oracle_ping(port: int, timeout: float = 3.0) -> Optional[Dict[str, Any]]:
         s.close()
 
 
+def pid_alive(pid: int) -> bool:
+    """Is this process still around? Signal 0 checks without touching it."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def state(lay: Layout) -> Dict[str, str]:
     pin = load_pin()
     port = int(pin.get("oracle_port", 4371))
@@ -973,10 +984,28 @@ def state(lay: Layout) -> Dict[str, str]:
         patch = PATCH_DIR / pin["patch"]
         rc, _ = capture(["git", "apply", "--reverse", "--check", str(patch)], cwd=lay.src)
         out["patch"] = "applied" if rc == 0 else "not applied"
+    # "Running" must mean OUR oracle, not "something owns the port". The port is
+    # shared -- another emulator, a stale build, an unrelated service -- and a
+    # bare probe cannot tell whose it is. It once promoted an install that did
+    # not exist to "answering", which tells a GUI to offer Stop for something it
+    # never started. Ownership is the pidfile this tool writes when it starts
+    # one; anything else on the port is a conflict, reported separately.
+    ours = False
+    if lay.pidfile.is_file():
+        try:
+            ours = pid_alive(int(lay.pidfile.read_text().strip()))
+        except (OSError, ValueError):
+            ours = False
+    out["ours"] = "yes" if ours else "no"
     if port_open(port):
         rep = oracle_ping(port)
-        out["running"] = (f"yes — answering on {port}" if rep and rep.get("ok")
-                          else f"something on {port}, not answering as an oracle")
+        answering = bool(rep and rep.get("ok"))
+        if ours:
+            out["running"] = (f"yes — answering on {port}" if answering
+                              else f"yes — started by us, not answering on {port}")
+        else:
+            out["running"] = (f"foreign process answering on {port}" if answering
+                              else f"something on {port}, not answering as an oracle")
     return out
 
 
@@ -991,8 +1020,9 @@ def status_doc(lay: Layout) -> Dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             pass
     st = state(lay)
-    running = st["running"] != "no"
-    answering = st["running"].startswith("yes")
+    ours = st.get("ours") == "yes"
+    running = ours and st["running"] != "no"
+    answering = ours and st["running"].startswith("yes")
     doc.update({
         # Set AFTER the manifest merge: oracle.json carries its own `kind`
         # ("psxrecomp-duckstation-oracle") and would otherwise overwrite this
@@ -1018,9 +1048,21 @@ def status_doc(lay: Layout) -> Dict[str, Any]:
         "container_engine": container_engine(),
     })
     # One word for a status line, so a GUI does not re-derive the ladder.
-    if answering:
+    # `state` is the INSTALL ladder and nothing else: absent -> fetched ->
+    # built -> installed -> answering. A GUI picks its button off it, so it has
+    # to be monotonic in how far the install has got.
+    #
+    # A process answering the port is only OUR oracle if ours is installed. The
+    # port is shared and the probe cannot tell whose it is, so another emulator
+    # holding 4371 used to promote an ABSENT install to "answering" -- telling
+    # the GUI to offer Stop for something it never started, and making this
+    # suite pass or fail depending on what else happened to be running. That is
+    # a separate fact, so it gets a separate field.
+    installed = st["installed"] == "yes"
+    doc["port_conflict"] = bool(not ours and st["running"] != "no")
+    if answering and installed:
         doc["state"] = "answering"
-    elif running:
+    elif running and installed:
         doc["state"] = "port-busy"
     elif doc["installed"]:
         doc["state"] = "installed"

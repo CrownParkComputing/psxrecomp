@@ -276,3 +276,57 @@ class TestBiosDiscovery(EnvGuard):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForeignPortOwner(EnvGuard):
+    """A live process on 4371 must not promote an oracle that isn't installed.
+
+    The port is shared and the probe cannot tell whose it is. Before this, any
+    other emulator holding 4371 made an absent install report "answering",
+    which tells a GUI to offer Stop for something it never started -- and made
+    this suite fail intermittently depending on what else was running.
+    """
+
+    def test_absent_install_with_a_busy_port_is_not_answering(self):
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        real_state = DSO.state
+
+        def busy(lay):
+            st = real_state(lay)
+            # Something answers the port, but no pidfile of ours: a foreign
+            # process, which is the whole case under test.
+            st["running"] = "foreign process answering on 4371"
+            st["ours"] = "no"
+            return st
+
+        DSO.state = busy
+        try:
+            doc = DSO.status_doc(DSO.Layout())
+            self.assertEqual(doc["state"], "absent",
+                             "the ladder describes the install, not the port")
+            self.assertTrue(doc["port_conflict"],
+                            "but the conflict must still be reported")
+        finally:
+            DSO.state = real_state
+
+    def test_an_installed_oracle_that_answers_still_reports_answering(self):
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        lay = DSO.Layout()
+        lay.app.mkdir(parents=True)
+        (lay.app / DSO.exe_name()).write_text("")
+        real_state = DSO.state
+
+        def answering(l):
+            st = real_state(l)
+            st["running"] = "yes (answering)"
+            st["ours"] = "yes"       # started by this tool: pidfile alive
+            return st
+
+        DSO.state = answering
+        try:
+            doc = DSO.status_doc(lay)
+            self.assertEqual(doc["state"], "answering")
+            self.assertFalse(doc["port_conflict"],
+                             "our own oracle answering is not a conflict")
+        finally:
+            DSO.state = real_state
