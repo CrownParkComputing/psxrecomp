@@ -5231,6 +5231,8 @@ static int netplay_timing_on(void) {
 
 static void netplay_note_present(void);
 static void netplay_hold_last_present_tick(void);
+static void present_hold_tick(int force);
+static inline bool is_window_repaint_event(const SDL_Event &ev);
 
 static void netplay_note_present(void) {
     uint64_t now;
@@ -5534,6 +5536,14 @@ static void netplay_barrier_admit(int override) {
         if (!g_headless) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
+                /* A window that lost pixels must be repainted even when the guest
+                 * is producing no frames — a long load, a splash screen that draws
+                 * nothing, a debug park. While frames flow this is redundant (the
+                 * next present repairs it in ~16 ms); while they do not, it is the
+                 * only thing that answers the expose, and without it the occluder
+                 * leaves a smear that outlives it. Not part of the if/else chain
+                 * below: the event still gets whatever handling it already had. */
+                if (is_window_repaint_event(ev)) present_hold_tick(1);
                 if (ev.type == SDL_QUIT) {
                     netplay_soft_exit("sdl_window_close");
                     if (psx_return_to_lobby_requested()) return;
@@ -5674,9 +5684,23 @@ static void sample_headless_pad_into_sio(int override) {
  * non-~60Hz / unknown-refresh panels so vsync cannot run the sim fast.
  * Declared with the early video/mod globals. */
 
-/* §33/§35/§47: re-present last Live frame on a wall-clock cadence while guest
- * sim is frozen (short resim) or TipHold invent-cap stall (admit spin). */
-static void netplay_hold_last_present_tick(void) {
+/* Re-present the last frame.
+ *
+ * The window is only ever painted when the guest produces a frame, so any time
+ * frames stop — a long load, a splash screen that renders nothing, the debug
+ * server parking the runtime — the window has no way to repair damage. Another
+ * window slides over it, X11 drops those pixels, and nothing ever puts them
+ * back: the occluder leaves a smear that outlives it.
+ *
+ * `force` bypasses the once-per-frame-period throttle. Damage repair must
+ * repaint immediately; a periodic stall tick must not.
+ *
+ * Originally §33/§35/§47, netplay-only: re-present the last Live frame while
+ * guest sim is frozen (short resim) or TipHold invent-cap stall (admit spin).
+ * The same primitive fixes the general case, so it is no longer netplay's. */
+static unsigned s_hold_repaints = 0;
+
+static void present_hold_tick(int force) {
     static uint64_t s_hold_last_ms;
     uint64_t now = SDL_GetTicks64();
     uint32_t period = (uint32_t)(g_frame_period_ms + 0.5);
@@ -5689,13 +5713,28 @@ static void netplay_hold_last_present_tick(void) {
     if (g_gl_active)
         gl_renderer_set_interpolation_suspended(1);
 #endif
-    if (s_hold_last_ms != 0ull && now >= s_hold_last_ms &&
+    if (!force && s_hold_last_ms != 0ull && now >= s_hold_last_ms &&
         (uint32_t)(now - s_hold_last_ms) < period)
         return;
 #ifndef PSX_SDL_NO_RENDER
     if (g_gl_active) {
         did = gl_renderer_present_hold_last();
-    } else if (!g_vk_active && sdl_renderer && sdl_texture && s_sw_hold_valid) {
+    } else if (g_vk_active) {
+        /* Vulkan has no held-frame snapshot, but guest VRAM still holds the
+         * displayed image while the sim is stopped, so re-presenting the
+         * display region reproduces it. Blank would clear the smear but also
+         * throw away the frame, which is the thing worth keeping. */
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        if (!di.disabled && di.width > 0 && di.height > 0)
+            did = vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                           (int)di.width, (int)di.height,
+                                           g_video_aa ? 1 : 0, 0);
+        if (!did) {
+            vk_renderer_present_blank();
+            did = 1;
+        }
+    } else if (sdl_renderer && sdl_texture && s_sw_hold_valid) {
         SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
         SDL_RenderClear(sdl_renderer);
         SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src, &s_sw_hold_dst);
@@ -5707,7 +5746,55 @@ static void netplay_hold_last_present_tick(void) {
     if (did) {
         netplay_note_present();
         s_hold_last_ms = now ? now : 1ull;
+        ++s_hold_repaints;
     }
+}
+
+/* Repaints served from the held frame. Reported by the debug server so the
+ * repair path can be verified without a screen capture — "is the window being
+ * repainted while parked" is otherwise only answerable by looking at it, and
+ * screen grabs of a compositing WM lie often enough to be useless as evidence. */
+extern "C" unsigned psx_present_hold_repaints(void) { return s_hold_repaints; }
+
+/* Existing netplay stall callers keep their name and their throttled meaning. */
+static void netplay_hold_last_present_tick(void) { present_hold_tick(0); }
+
+/* True for the events that mean "your window lost pixels, paint them again".
+ * SDL3 promoted window events to top-level types; SDL_ENABLE_OLD_NAMES does not
+ * bring back SDL2's SDL_WINDOWEVENT + .window.event shape, so both spellings
+ * have to be written out. */
+static inline bool is_window_repaint_event(const SDL_Event &ev) {
+#if defined(PSX_SDL3)
+    return ev.type == SDL_EVENT_WINDOW_EXPOSED ||
+           ev.type == SDL_EVENT_WINDOW_RESTORED ||
+           ev.type == SDL_EVENT_WINDOW_SHOWN;
+#else
+    return ev.type == SDL_WINDOWEVENT &&
+           (ev.window.event == SDL_WINDOWEVENT_EXPOSED ||
+            ev.window.event == SDL_WINDOWEVENT_RESTORED ||
+            ev.window.event == SDL_WINDOWEVENT_SHOWN);
+#endif
+}
+
+/* Called from debug_server_wait_if_paused()'s park loop.
+ *
+ * While parked, the normal event pump is not running, so expose events would
+ * sit in the queue unhandled and the window would rot exactly as before — and
+ * the window manager would eventually decide the process is not responding.
+ * Pump here instead: honour a close request, repaint on damage, and drop the
+ * rest, since a parked guest has nowhere to put input anyway. */
+extern "C" void psx_debug_paused_present_tick(void) {
+    int repaint = 0;
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            psx_crash_trace_set_exit_origin("sdl_window_close_paused");
+            shutdown_runtime();
+            std::exit(0);
+        }
+        if (is_window_repaint_event(ev)) repaint = 1;
+    }
+    present_hold_tick(repaint);
 }
 
 /* §47/§51/§63 Layer 4: long Replay catch-up — wall-clock gate for a real VRAM
@@ -6294,6 +6381,14 @@ static void rewind_host_pause_loop(void) {
     while (psx_rewind_is_open()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* A window that lost pixels must be repainted even when the guest
+             * is producing no frames — a long load, a splash screen that draws
+             * nothing, a debug park. While frames flow this is redundant (the
+             * next present repairs it in ~16 ms); while they do not, it is the
+             * only thing that answers the expose, and without it the occluder
+             * leaves a smear that outlives it. Not part of the if/else chain
+             * below: the event still gets whatever handling it already had. */
+            if (is_window_repaint_event(ev)) present_hold_tick(1);
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -6332,6 +6427,14 @@ static void savestate_menu_host_pause_loop(void) {
     while (savestate_menu_open) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* A window that lost pixels must be repainted even when the guest
+             * is producing no frames — a long load, a splash screen that draws
+             * nothing, a debug park. While frames flow this is redundant (the
+             * next present repairs it in ~16 ms); while they do not, it is the
+             * only thing that answers the expose, and without it the occluder
+             * leaves a smear that outlives it. Not part of the if/else chain
+             * below: the event still gets whatever handling it already had. */
+            if (is_window_repaint_event(ev)) present_hold_tick(1);
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -6659,6 +6762,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* A window that lost pixels must be repainted even when the guest
+             * is producing no frames — a long load, a splash screen that draws
+             * nothing, a debug park. While frames flow this is redundant (the
+             * next present repairs it in ~16 ms); while they do not, it is the
+             * only thing that answers the expose, and without it the occluder
+             * leaves a smear that outlives it. Not part of the if/else chain
+             * below: the event still gets whatever handling it already had. */
+            if (is_window_repaint_event(ev)) present_hold_tick(1);
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");

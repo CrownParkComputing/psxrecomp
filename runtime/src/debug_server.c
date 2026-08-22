@@ -295,6 +295,16 @@ static CPUState *s_cpu = NULL;
 static volatile int s_paused     = 0;
 static int          s_step_count = 0;
 static uint32_t     s_run_to     = 0;
+/* Auto-resume guard. The first pause/step implementation wedged the runtime
+ * when a debug client dropped mid-pause: nothing was left to send `continue`,
+ * so the emulator sat in its wait loop forever and looked like a freeze. Every
+ * command received while parked pushes this deadline out; if the client goes
+ * away and stops talking, the runtime resumes on its own instead of hanging.
+ * 0 disables the guard (explicitly opting in to an indefinite park). */
+#define PAUSE_TIMEOUT_MS_DEFAULT (60u * 1000u)
+static uint32_t     s_pause_timeout_ms  = PAUSE_TIMEOUT_MS_DEFAULT;
+static uint32_t     s_pause_last_cmd_ms = 0;   /* SDL ticks; wrap-safe by subtraction */
+static int          s_pause_auto_resumed = 0;
 
 /* ---- Dirty-RAM one-shot break ---- */
 static volatile int s_dirty_break_active = 0;
@@ -8371,46 +8381,105 @@ static void handle_turbo_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d}", id, s_turbo_enabled);
 }
 
-/* pause / continue / step / run_to_frame: REMOVED.
+/* pause / continue / step / run_to_frame — DEBUG-SERVER ONLY.
  *
- * Per CLAUDE.md global rule #2 ("Never time/attach for observability —
- * always consume ring buffers"), pause/step is the wrong primitive for
- * observation. It produces synthesized snapshots ("what's state right
- * NOW") rather than reading the system's own continuously-recorded
- * history. Worse, it tempts the observer to think pause-step-read is
- * cheap; in this codebase it forced the runtime into a wait loop where
- * a dropped client connection looked like a freeze.
+ * These were removed once, for two reasons. The design objection stands and is
+ * worth restating: pause-step-read synthesizes "what is state right NOW"
+ * instead of reading the history this runtime already records continuously, and
+ * for observing what the GPU drew, gpu_frame_dump against the GP0 ring is both
+ * cheaper and able to reach backwards. Reach for the rings first.
  *
- * Replacements (already in the runtime):
- *   - fn_entry_dump / fn_entry_tail   for what code ran
- *   - wtrace_dump                     for what memory was written
- *   - gpu_frame_dump frame=N          for what GP0 commands were issued
- *   - mdec_trace                      for MDEC events
- *   - sio_trace / sio_pc_trace        for SIO history
- *   - frame_range / get_frame         for per-frame state snapshots
+ * They are back because holding a frame on screen while looking at it is a
+ * thing a person doing graphics work legitimately wants, and nothing in the
+ * ring API does that.
  *
- * Handlers below return an error explaining the migration. The state
- * variables (s_paused, s_step_count, s_run_to) are kept as zero so
- * freeze_check still reports them and any stale callsite that reads
- * them gets a benign value. */
-static void handle_pause(int id, const char *json) {
-    (void)json;
-    send_err(id, "pause is removed; query a ring buffer (fn_entry_tail, wtrace_dump, gpu_frame_dump, etc.) instead of synthesizing a snapshot");
+ * The practical failure that got them removed was a wedge: a client that
+ * dropped mid-pause left nobody to send `continue`, the runtime sat in its wait
+ * loop, and the 4-second starvation watchdog could not tell that apart from a
+ * real freeze. Both halves are fixed in debug_server_wait_if_paused() — the
+ * park loop keeps servicing commands and feeding the watchdog, and it
+ * auto-resumes if no command arrives for s_pause_timeout_us.
+ *
+ * PLAYERS CANNOT REACH THIS. The only call site that can set it is the debug
+ * server, and main.cpp's vblank hook lives inside #ifndef PSX_NO_DEBUG_TOOLS,
+ * so a Release build (PSX_DEBUG_TOOLS=OFF) contains no pause gate at all and
+ * s_paused is unreachable. Nothing is bound to a key, a pad button, or any
+ * recomp-ui control, and nothing here should ever be.
+ */
+
+/* Common bookkeeping for a command that parks the runtime. */
+static void pause_arm(int paused)
+{
+    s_paused = paused ? 1 : 0;
+    s_pause_auto_resumed = 0;
+    s_pause_last_cmd_ms = (uint32_t)SDL_GetTicks();
 }
 
-static void handle_continue(int id, const char *json) {
-    (void)json;
-    send_err(id, "continue is removed (pause is removed; nothing to resume)");
+static void handle_pause(int id, const char *json)
+{
+    /* {"cmd":"pause"[,"timeout_ms":N]} — N=0 parks indefinitely. */
+    const int t = json_get_int(json, "timeout_ms", -1);
+    if (t >= 0) s_pause_timeout_ms = (uint32_t)t;
+    pause_arm(1);
+    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":true,\"frame\":%llu,"
+             "\"timeout_ms\":%u}",
+             id, (unsigned long long)s_frame_count, s_pause_timeout_ms);
 }
 
-static void handle_step(int id, const char *json) {
+static void handle_continue(int id, const char *json)
+{
     (void)json;
-    send_err(id, "step is removed; query a ring buffer over the window of interest instead of advancing N frames synchronously");
+    s_step_count = 0;
+    s_run_to = 0;
+    pause_arm(0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":false,\"frame\":%llu}",
+             id, (unsigned long long)s_frame_count);
 }
 
-static void handle_run_to_frame(int id, const char *json) {
+static void handle_step(int id, const char *json)
+{
+    /* {"cmd":"step"[,"n":N]} — advance N frames, then park again. */
+    int n = json_get_int(json, "n", 1);
+    if (n < 1) n = 1;
+    if (n > 100000) n = 100000;
+    s_run_to = 0;
+    s_step_count = n;
+    pause_arm(0);          /* run; wait_if_paused re-parks after N vblanks */
+    send_fmt("{\"id\":%d,\"ok\":true,\"stepping\":%d,\"frame\":%llu}",
+             id, n, (unsigned long long)s_frame_count);
+}
+
+static void handle_run_to_frame(int id, const char *json)
+{
+    int target = json_get_int(json, "frame", -1);
+    if (target < 0) { send_err(id, "missing frame"); return; }
+    if ((uint64_t)target <= s_frame_count) {
+        send_err(id, "target frame already passed — the frame counter only goes "
+                     "forward; use gpu_frame_dump to read a past frame out of the "
+                     "GP0 ring instead");
+        return;
+    }
+    s_step_count = 0;
+    s_run_to = (uint32_t)target;
+    pause_arm(0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"run_to\":%u,\"frame\":%llu}",
+             id, s_run_to, (unsigned long long)s_frame_count);
+}
+
+/* {"cmd":"pause_state"} — what the park machinery is doing right now.
+ * `auto_resumed` is set when a park ended because the client stopped talking;
+ * a UI that shows a Pause button needs to know its pause was released. */
+static void handle_pause_state(int id, const char *json)
+{
     (void)json;
-    send_err(id, "run_to_frame is removed; use frame_range / read_frame_ram against the live frame ring buffer instead");
+    extern unsigned psx_present_hold_repaints(void);
+    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":%s,\"stepping\":%d,"
+             "\"run_to\":%u,\"frame\":%llu,\"timeout_ms\":%u,"
+             "\"auto_resumed\":%s,\"hold_repaints\":%u}",
+             id, s_paused ? "true" : "false", s_step_count, s_run_to,
+             (unsigned long long)s_frame_count, s_pause_timeout_ms,
+             s_pause_auto_resumed ? "true" : "false",
+             psx_present_hold_repaints());
 }
 
 static void handle_dirty_break_range(int id, const char *json)
@@ -8471,7 +8540,7 @@ static void handle_dirty_break_state(int id, const char *json)
              s_dirty_break_a0, s_dirty_break_a1,
              s_dirty_break_a2, s_dirty_break_a3,
              s_dirty_break_sp, s_dirty_break_frame,
-             "false"  /* paused field kept for protocol stability; pause was removed */);
+             s_paused ? "true" : "false");
 }
 
 /* ---- Ring buffer queries ---- */
@@ -13905,6 +13974,7 @@ static const CmdEntry s_commands[] = {
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },
+    { "pause_state",       handle_pause_state },
     { "continue",          handle_continue },
     { "step",              handle_step },
     { "run_to_frame",      handle_run_to_frame },
@@ -14582,6 +14652,10 @@ void debug_server_poll(void)
     if (req[0]) process_command(req);
     s_in_command = 0;
 
+    /* Any command at all proves a client is still there, so a park that is
+     * being actively watched never times out. Silence is what resumes it. */
+    if (s_paused) s_pause_last_cmd_ms = (uint32_t)SDL_GetTicks();
+
     SDL_LockMutex(s_io_mutex);
     /* Only deliver if the I/O thread is still waiting (it may have timed out and
      * moved on, in which case the response is discarded). */
@@ -14683,10 +14757,49 @@ void debug_server_record_frame(void)
 
 void debug_server_wait_if_paused(void)
 {
-    /* No-op: pause/step removed (see handle_pause). Kept exported so
-     * main.cpp's vblank callback continues to compile without
-     * conditional defines. s_paused is now permanently zero, so the
-     * old `while (s_paused)` loop would have been a no-op anyway. */
+    /* Deferred parks land here: `step` runs N vblanks, `run_to_frame` runs
+     * until the target. Evaluated before the loop so a step of 1 stops on the
+     * very next frame. */
+    if (!s_paused) {
+        if (s_step_count > 0) {
+            if (--s_step_count == 0) pause_arm(1);
+        } else if (s_run_to && s_frame_count >= (uint64_t)s_run_to) {
+            s_run_to = 0;
+            pause_arm(1);
+        }
+    }
+    if (!s_paused) return;
+
+    /* Park. Two rules make this safe, and they are the two that were missing
+     * the first time:
+     *
+     *   1. Keep calling debug_server_poll(). It is what delivers `continue`,
+     *      and it feeds the 4-second starvation watchdog — otherwise the
+     *      watchdog cannot tell a deliberate pause from a hung emulator and
+     *      kills the process.
+     *   2. Give up on our own. If no command arrives for s_pause_timeout_ms,
+     *      the client is gone and nobody is coming to resume us, so resume.
+     *      A debugger that crashed must not take the game down with it.
+     */
+    /* Keep the window alive while parked. Without this the frame we are
+     * holding on screen rots the moment anything crosses it: nothing presents,
+     * nothing pumps events, and the expose never gets answered. */
+    extern void psx_debug_paused_present_tick(void);
+
+    while (s_paused && s_io_running) {
+        psx_debug_paused_present_tick();
+        debug_server_poll();
+        if (s_pause_timeout_ms &&
+            (uint32_t)((uint32_t)SDL_GetTicks() - s_pause_last_cmd_ms)
+                > s_pause_timeout_ms) {
+            s_paused = 0;
+            s_step_count = 0;
+            s_run_to = 0;
+            s_pause_auto_resumed = 1;
+            break;
+        }
+        SDL_Delay(2);   /* ~500 polls/sec: responsive, and not a spin */
+    }
 }
 
 void debug_server_check_watchpoints(void)

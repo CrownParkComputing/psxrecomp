@@ -181,16 +181,29 @@ class DebugConn:
             "max_words": int(r.get("max_words", 12)),
         }
 
-    # pause / continue / step / run_to_frame were REMOVED from psx-runtime --
-    # runtime/src/debug_server.c registers them only as handlers that return an
-    # error, because pause-step-read synthesizes a snapshot instead of reading
-    # the history the runtime already records, and it once turned a dropped
-    # client into an apparent freeze. They still work on the DuckStation oracle,
-    # which is why these wrappers exist at all; against psx-runtime they raise
-    # with the server's own migration message.
+    # pause / continue / step / run_to_frame exist on both ends, but they are
+    # debug-server-only -- no key, button, or menu reaches them, so a shipped
+    # build cannot be frozen by them. psx-runtime also arms a timeout when it
+    # parks (see pause_arm in runtime/src/debug_server.c): if the client stops
+    # talking, it resumes on its own, because a debugger that dies must not
+    # leave the game stopped forever.
+    #
+    # Prefer ring_span() + capture() anyway when you want to look at a frame.
+    # Reaching backwards through recorded history beats freezing forwards, and
+    # it does not perturb the thing you are measuring. Pause is for the oracle,
+    # which records nothing, and for holding RAM still across a snapshot.
+
+    def pause(self) -> Dict[str, Any]:
+        """Park the emulator. Auto-resumes if this client goes quiet."""
+        return self.cmd("pause")
+
+    def resume(self) -> Dict[str, Any]:
+        return self.cmd("continue")
+
+    def step(self, frames: int = 1) -> Dict[str, Any]:
+        return self.cmd("step", frames=int(frames))
 
     def run_to_frame(self, frame: int) -> Dict[str, Any]:
-        """DuckStation only. Raises against psx-runtime, which removed it."""
         return self.cmd("run_to_frame", frame=int(frame))
 
     def screenshot(self, path: str) -> Dict[str, Any]:
@@ -611,6 +624,128 @@ def _union(a: Sequence[int], b: Sequence[int]) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# Frame signatures — comparing frames without needing function attribution
+# ---------------------------------------------------------------------------
+#
+# `func` attribution is worthless on a game that builds an ordering table and
+# DMAs it: no guest code is executing when the GP0 writes happen, so every
+# packet in the frame reports the same submit PC. Legend of Mana is one of
+# these — 1217 packets, one func, one ra, one pc.
+#
+# Two handles survive that, and both are already in the dump:
+#
+#   * (opcode, blend mode) — stable across frames, and it is what a rendering
+#     regression actually moves: a layer that loses its semi-transparency bit,
+#     a burst that doubles, geometry that escapes its box.
+#   * the packet's SOURCE ADDRESS in guest RAM. Packets for one effect are
+#     built into one contiguous array (LoM's additive burst lives at
+#     0x0010D05C..0x0010EC78, stride 0x1C), so a run of consecutive addresses
+#     identifies the effect even when the code that built it does not appear.
+#     That address is also what you hand to wtrace to find the builder.
+
+SIGNATURE_KIND = "psx-gpu-frame-signature"
+
+
+def signature_key(prim: Dict[str, Any]) -> str:
+    """Stable identity for a class of primitive within a frame."""
+    mode = STP_MODES.get(prim.get("stp", 0), "?") if prim.get("semi") else "opaque"
+    return f"{prim['op_name']}|{mode}"
+
+
+def frame_signature(dump: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce a frame to numbers that can be compared against another frame."""
+    keys: Dict[str, Any] = {}
+    drawing = semi = textured = 0
+    for p in dump.get("prims", []):
+        if p["kind"] not in ("poly", "rect", "line", "fill"):
+            continue
+        drawing += 1
+        if p.get("semi"):
+            semi += 1
+        if p.get("textured"):
+            textured += 1
+        k = signature_key(p)
+        rec = keys.setdefault(k, {"n": 0, "bbox": None, "cmax": 0, "csum": 0.0,
+                                  "cn": 0, "ots": set(), "src_lo": None,
+                                  "src_hi": None})
+        rec["n"] += 1
+        bb = prim_bbox(p)
+        if bb:
+            rec["bbox"] = bb if rec["bbox"] is None else _union(rec["bbox"], bb)
+        for c in p.get("colors") or []:
+            rec["cmax"] = max(rec["cmax"], max(c))
+            rec["csum"] += sum(c) / 3.0
+            rec["cn"] += 1
+        ot = p.get("ot", 0xFFFF)
+        if ot != 0xFFFF:
+            rec["ots"].add(ot)
+        try:
+            src = int(p.get("src", "0x0"), 16)
+        except ValueError:
+            src = 0
+        if src:
+            rec["src_lo"] = src if rec["src_lo"] is None else min(rec["src_lo"], src)
+            rec["src_hi"] = src if rec["src_hi"] is None else max(rec["src_hi"], src)
+    for rec in keys.values():
+        rec["cmean"] = round(rec["csum"] / rec["cn"], 1) if rec["cn"] else 0.0
+        rec["ots"] = sorted(rec["ots"])[:8]
+        del rec["csum"], rec["cn"]
+    return {
+        "kind": SIGNATURE_KIND,
+        "frame": dump.get("frame", 0),
+        "drawing": drawing,
+        "semi": semi,
+        "textured": textured,
+        "packets": dump.get("raw_count", 0),
+        "keys": keys,
+    }
+
+
+def _bbox_area(bb: Optional[Sequence[int]]) -> int:
+    if not bb:
+        return 0
+    return max(0, bb[2] - bb[0] + 1) * max(0, bb[3] - bb[1] + 1)
+
+
+def signature_delta(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """What moved between two frame signatures, and by how much.
+
+    `score` exists so a scan can rank frames: it weights the things a rendering
+    break actually does — primitives appearing or vanishing, and geometry
+    escaping the box it lived in — rather than the steady churn of an animation.
+    """
+    changes = []
+    score = 0.0
+    for k in sorted(set(a["keys"]) | set(b["keys"])):
+        ka = a["keys"].get(k)
+        kb = b["keys"].get(k)
+        na = ka["n"] if ka else 0
+        nb = kb["n"] if kb else 0
+        area_a = _bbox_area(ka["bbox"] if ka else None)
+        area_b = _bbox_area(kb["bbox"] if kb else None)
+        # Relative growth, so a burst going 1 -> 258 outranks 700 -> 760.
+        rel = abs(nb - na) / max(1.0, float(min(na, nb) or 1))
+        area_rel = abs(area_b - area_a) / max(1.0, float(min(area_a, area_b) or 1))
+        if na == nb and area_a == area_b:
+            continue
+        w = rel + 0.5 * area_rel
+        score += w
+        changes.append({
+            "key": k, "a": na, "b": nb, "delta": nb - na,
+            "bbox_a": ka["bbox"] if ka else None,
+            "bbox_b": kb["bbox"] if kb else None,
+            "area_a": area_a, "area_b": area_b,
+            "cmax_a": ka["cmax"] if ka else 0, "cmax_b": kb["cmax"] if kb else 0,
+            "src_a": f"0x{ka['src_lo']:08X}" if ka and ka["src_lo"] else None,
+            "src_b": f"0x{kb['src_lo']:08X}" if kb and kb["src_lo"] else None,
+            "weight": round(w, 3),
+        })
+    changes.sort(key=lambda c: -c["weight"])
+    return {"a": a["frame"], "b": b["frame"], "score": round(score, 3),
+            "changes": changes}
+
+
+# ---------------------------------------------------------------------------
 # Capture / dump I/O
 # ---------------------------------------------------------------------------
 
@@ -749,3 +884,223 @@ def draw_area(dump: Dict[str, Any]) -> Tuple[int, int, int, int]:
     if bb:
         return max(0, bb[0]), max(0, bb[1]), min(1024, bb[2] + 1), min(512, bb[3] + 1)
     return 0, 0, 320, 240
+
+
+# ---------------------------------------------------------------------------
+# Reading display lists out of guest RAM
+# ---------------------------------------------------------------------------
+#
+# A PSX game rarely pokes GP0 directly. It builds a linked list in RAM and
+# hands it to DMA channel 2, so the display list is a data structure in memory,
+# and reading it is a different act from watching commands go by. Two things
+# need that: the DuckStation oracle records no GP0 packets at all, so RAM is
+# the only place its display list exists; and for decompilation, the buffer a
+# routine fills is what tells you what the routine IS.
+
+RAM_SIZE = 2 * 1024 * 1024
+OT_END = 0xFFFFFF
+GPU_GP0_RING_MAX_WORDS = 12
+
+# Largest read_ram both ends actually answer. The oracle's cap is not the 65536
+# its handler advertises: DuckStation replies over a BufferedStreamSocket whose
+# send buffer does not hold a reply that big, and Write() copies only what fits
+# while SendJSON ignores the short count -- so the reply is truncated and the
+# read blocks forever waiting for a newline. Measured against a live oracle:
+# 16384 round-trips, 32768 stalls (and appears to take the emulator with it).
+# Our own runtime handles more, but 128 reads for 2 MB is fast on both, so one
+# number keeps the two paths identical.
+MAX_READ_RAM = 16384
+
+
+def read_ram_range(conn: "DebugConn", addr: int, length: int,
+                   chunk: int = MAX_READ_RAM) -> bytes:
+    """Read guest RAM in chunks, tolerating a peer that returns short."""
+    chunk = max(1, min(chunk, MAX_READ_RAM))
+    out = bytearray()
+    off = 0
+    while off < length:
+        n = min(chunk, length - off)
+        rep = conn.cmd("read_ram", addr=f"0x{addr + off:08X}", len=n)
+        hexs = rep.get("hex")
+        if hexs is None:
+            raise DebugError("read_ram replied without 'hex'")
+        blob = bytes.fromhex(hexs)
+        if not blob:
+            break
+        out += blob
+        off += len(blob)
+    return bytes(out)
+
+
+def snapshot_ram(conn: "DebugConn", size: int = RAM_SIZE) -> bytes:
+    """Whole of main RAM, so a list can be walked offline.
+
+    Walking node by node over the wire would be a round trip per node and a
+    display list runs to hundreds of them.
+    """
+    return read_ram_range(conn, 0x80000000, size)
+
+
+def walk_ordering_table(ram: bytes, root: int, max_nodes: int = 8192,
+                        max_words: int = GPU_GP0_RING_MAX_WORDS) -> List[Dict[str, Any]]:
+    """Follow an ordering table, returning entries shaped like gpu_frame_dump's.
+
+    Defensive by construction: a corrupt tag can point anywhere, and a cycle
+    would hang the walk, so nodes are bounded, revisits stop it, and an address
+    outside RAM ends it rather than raising.
+    """
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    addr = root & 0x1FFFFF
+    seq = 0
+    # Bound on nodes VISITED, not entries emitted. An ordering table is mostly
+    # empty link entries -- a 1024-entry OT chaining to 30 primitives is 1024
+    # nodes and 30 entries -- so bounding the emitted count would leave the
+    # traversal itself effectively unbounded.
+    visited = 0
+    while addr != OT_END and visited < max_nodes:
+        visited += 1
+        if addr in seen or addr + 4 > len(ram):
+            break
+        seen.add(addr)
+        tag = int.from_bytes(ram[addr:addr + 4], "little")
+        n_words = (tag >> 24) & 0xFF
+        nxt = tag & 0xFFFFFF
+        if n_words:
+            end = addr + 4 + n_words * 4
+            if end > len(ram):
+                break
+            words = [int.from_bytes(ram[addr + 4 + i * 4: addr + 8 + i * 4], "little")
+                     for i in range(n_words)]
+            op = (words[0] >> 24) & 0xFF
+            entries.append({
+                "seq": seq,
+                "op": f"0x{op:02X}",
+                "n": n_words,
+                # The payload address, matching what the GP0 ring records as the
+                # command header -- so the two sources are directly comparable.
+                "src": f"0x{addr + 4:08X}",
+                "ot": 0xFFFF,
+                "pc": "0x00000000",
+                "func": "0x00000000",
+                "ra": "0x00000000",
+                "w": [f"0x{w:08X}" for w in words[:max_words]],
+            })
+            seq += 1
+        addr = nxt & 0x1FFFFF if nxt != OT_END else OT_END
+    return entries
+
+
+def expected_words(op: int) -> Optional[int]:
+    """Payload length a GP0 opcode must have, or None if it is not one.
+
+    This is the filter that makes scanning for display lists work at all. A
+    2 MB RAM image contains half a million words, and "looks like a tag" alone
+    matches a large fraction of them; requiring the payload to also be a GP0
+    command of exactly the right length is what separates a real ordering-table
+    node from a coincidence.
+    """
+    kind = op_kind(op)
+    if kind == "poly":
+        return poly_words(op)
+    if kind == "rect":
+        return rect_words(op)
+    if kind == "line":
+        return None          # polylines are variable-length; do not seed on them
+    if kind in ("state", "env"):
+        return 1
+    return None
+
+
+def find_display_lists(ram: bytes, min_prims: int = 4, limit: int = 8,
+                       near: Optional[int] = None,
+                       max_nodes: int = 65536) -> List[Dict[str, Any]]:
+    """Find ordering-table chains by scanning RAM. Returns best-first.
+
+    Following DMA channel 2's MADR does NOT work for this, which is worth
+    stating plainly because it is the obvious thing to try. A linked-list DMA
+    advances MADR as it consumes the list and leaves it holding the terminator,
+    0xFFFFFF, once the transfer completes. Read between frames -- the only time
+    you can pause -- MADR names the end of the list, not its start. Masked into
+    2 MB that reads back as 0x1FFFFF, which looks like a plausible address and
+    is not one.
+
+    So the list is found by its own structure instead: nodes whose payload is a
+    real GP0 command of exactly the right length, chained, and not pointed at by
+    any other such node -- i.e. the head of a chain rather than its middle.
+    """
+    n = len(ram) - (len(ram) % 4)
+    words = memoryview(ram)[:n].cast("I")
+
+    nodes: Dict[int, int] = {}      # addr -> next addr (or OT_END)
+    pointed = set()
+    for i in range(len(words) - 1):
+        tag = words[i]
+        n_words = (tag >> 24) & 0xFF
+        if not n_words:
+            continue            # a link-only entry cannot seed a chain
+        nxt = tag & 0xFFFFFF
+        if nxt != OT_END and (nxt & 3 or nxt >= n):
+            continue
+        if i + 1 + n_words > len(words):
+            continue
+        want = expected_words(int(words[i + 1]) >> 24 & 0xFF)
+        if want is None or want != n_words:
+            continue
+        addr = i * 4
+        nodes[addr] = nxt
+        if nxt != OT_END:
+            pointed.add(nxt)
+
+    heads = [a for a in nodes if a not in pointed]
+    out: List[Dict[str, Any]] = []
+    for h in heads:
+        entries = walk_ordering_table(ram, h, max_nodes=max_nodes)
+        prims = [p for p in decode_entries(entries)
+                 if p["kind"] in ("poly", "rect", "line", "fill")]
+        if len(prims) < min_prims:
+            continue
+        addrs = [int(e["src"], 16) for e in entries]
+        out.append({
+            "root": h,
+            "nodes": len(entries),
+            "prims": len(prims),
+            "lo": min(addrs) if addrs else h,
+            "hi": max(addrs) if addrs else h,
+            "classes": sorted({p["op_name"] for p in prims}),
+        })
+
+    def score(c: Dict[str, Any]) -> Tuple[int, int]:
+        # A chain containing an address you already care about wins outright:
+        # the caller knows something the scan cannot.
+        hit = 1 if (near is not None and c["lo"] <= (near & 0x1FFFFF) <= c["hi"]) else 0
+        return (hit, c["prims"])
+
+    out.sort(key=score, reverse=True)
+    return out[:limit]
+
+
+def dma_gpu_list_root(conn: "DebugConn") -> Optional[int]:
+    """Channel 2's MADR. Almost never the root -- see find_display_lists.
+
+    Kept because it is occasionally right if you catch a transfer in flight, and
+    because knowing WHY it fails is worth more than not having it: a completed
+    linked-list DMA leaves MADR holding the 0xFFFFFF terminator, so between
+    frames this returns the end of the list. Returns None in that case rather
+    than handing back 0x1FFFFF as if it were an address.
+    """
+    try:
+        rep = conn.cmd("dma_state")
+    except DebugError:
+        return None
+    for ch in rep.get("channels", []) or []:
+        if ch.get("ch") == 2 or ch.get("name", "").lower().startswith("gpu"):
+            madr = ch.get("madr")
+            if isinstance(madr, str):
+                madr = int(madr, 16)
+            if not isinstance(madr, int):
+                return None
+            if (madr & 0xFFFFFF) == OT_END:
+                return None      # the transfer finished; this is the end marker
+            return madr & 0x1FFFFF
+    return None
