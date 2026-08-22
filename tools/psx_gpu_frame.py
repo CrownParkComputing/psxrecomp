@@ -925,6 +925,32 @@ GPU_GP0_RING_MAX_WORDS = 12
 MAX_READ_RAM = 16384
 
 
+# How often a PAUSED DuckStation oracle can answer.
+#
+# It pumps its debug socket from the emulation loop, so once parked the
+# only pump left is a Qt idle timer: 100 ms with a gamepad attached, and
+# 1000 ms without. A headless oracle on a machine with no pad is therefore
+# a ~1 Hz server, and anything polling it faster stacks up connections it
+# cannot accept -- which surfaces as "server closed without replying"
+# rather than as a timeout, so it does not read like a pacing problem.
+ORACLE_PAUSED_POLL_S = 1.5
+
+
+def oracle_resume(conn) -> bool:
+    """Get a paused oracle running again; True if it is running after.
+
+    Worth calling BEFORE arming anything, not just after. A tool that
+    parked the oracle and exited without resuming leaves every later run
+    talking to a 1 Hz server, and the symptom -- everything times out --
+    looks nothing like the cause.
+    """
+    try:
+        conn.cmd("continue")
+        return True
+    except DebugError:
+        return False
+
+
 def read_ram_range(conn: "DebugConn", addr: int, length: int,
                    chunk: int = MAX_READ_RAM) -> bytes:
     """Read guest RAM in chunks, tolerating a peer that returns short."""

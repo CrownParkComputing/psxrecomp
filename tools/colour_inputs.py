@@ -48,8 +48,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
-    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, DebugConn, DebugError,
-    read_ram_range,
+    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
+    DebugConn, DebugError, oracle_resume, read_ram_range,
 )
 
 KIND = "psx-colour-inputs"
@@ -57,16 +57,38 @@ SRC_OFFSET = -12          # lwr $t6,-12($s4): the source word's base
 DEFAULT_SPAN = 48         # enough to see the table around it
 
 
-def wait_for_hit(conn, pc, timeout):
-    """Arm a PC breakpoint on the oracle and wait for it to fire."""
-    conn.cmd("pc_hit_clear")
+def wait_for_hit(conn, pc, timeout, poll=ORACLE_PAUSED_POLL_S):
+    """Arm a PC breakpoint on the oracle and wait for it to fire.
+
+    Paced for a PAUSED oracle, not a running one. The breakpoint pauses
+    DuckStation when it fires, which drops its debug socket to the Qt idle
+    timer -- about 1 Hz with no gamepad attached. Polling every 100 ms then
+    stacks up connections it cannot accept, and the failure surfaces as
+    "server closed without replying", which does not read like a pacing
+    problem at all.
+
+    Resumes first, because a previous run that parked the oracle and exited
+    without resuming leaves it crippled for every attempt after it.
+    """
+    oracle_resume(conn)
+    for cmd in ("pc_hit_clear",):
+        try:
+            conn.cmd(cmd)
+        except DebugError:
+            pass                       # not fatal; the arm below is what matters
     conn.cmd("pc_break", addr=pc)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        rep = conn.cmd("pc_hit_last")
+        try:
+            rep = conn.cmd("pc_hit_last")
+        except DebugError:
+            # A hit parks the oracle mid-exchange, so one dropped reply here is
+            # expected rather than fatal.
+            time.sleep(poll)
+            continue
         if rep.get("valid"):
             return rep
-        time.sleep(0.1)
+        time.sleep(poll)
     return None
 
 
@@ -82,8 +104,10 @@ def main(argv=None):
                     help="register holding the source pointer")
     ap.add_argument("--scale-reg", default="s6")
     ap.add_argument("--span", type=int, default=DEFAULT_SPAN)
-    ap.add_argument("--wait", type=float, default=20.0)
-    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--wait", type=float, default=45.0,
+                    help="seconds to wait for the PC to be reached. "
+                         "A paused oracle answers about once a second, so this needs headroom.")
+    ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -130,10 +154,17 @@ def main(argv=None):
         doc["error"] = str(e)
         return _finish(doc, args, 2)
     finally:
+        # Clear the breakpoint AND resume. Leaving the oracle parked was the
+        # actual defect here: it exits at 1 Hz and every later run then fails
+        # in a way that points at the network rather than at this tool.
         try:
             ds.cmd("pc_unbreak", addr=pc)
         except DebugError:
             pass
+        if not oracle_resume(ds):
+            print("warning: could not resume the oracle — it may still be "
+                  "parked, which will make later runs time out. Stop and "
+                  "restart it from the Oracle tab.", file=sys.stderr)
 
     doc["native_bytes"] = a.hex()
     doc["oracle_bytes"] = b.hex()
