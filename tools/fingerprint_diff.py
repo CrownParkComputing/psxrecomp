@@ -45,8 +45,18 @@ COLUMNS = [("wr", "wc", "main RAM"), ("pc", None, "store-PC path"),
            ("mmio", "mc", "device registers"), ("sp", "sc", "scratchpad")]
 
 
+# Frames per request. One fingerprint row is ~150 bytes of JSON, and the
+# oracle replies over a socket whose buffer truncates anything much past
+# 16 KB -- at which point the read blocks forever waiting for a newline
+# that never comes. Asking for a whole 8192-frame ring in one call does
+# exactly that. Paging is not an optimisation here; it is the difference
+# between working and hanging.
+PAGE = 64
+
+
 def pull(conn, count, arm=None, reset=False):
-    kw = {"count": count}
+    """Control-only call: arm/reset, and report the ring header."""
+    kw = {"count": 1}
     if arm is not None:
         kw["arm"] = 1 if arm else 0
     if reset:
@@ -54,6 +64,59 @@ def pull(conn, count, arm=None, reset=False):
     rep = conn.cmd("frame_fingerprint", **kw)
     rows = {int(e["frame"]): e for e in rep.get("entries", [])}
     return rows, rep
+
+
+def pull_window(conn, lo, hi, page=PAGE):
+    """Every fingerprint row in [lo, hi], fetched a page at a time."""
+    rows = {}
+    f = lo
+    while f <= hi:
+        top = min(hi, f + page - 1)
+        rep = conn.cmd("frame_fingerprint", count=page,
+                       frame_lo=f, frame_hi=top)
+        got = rep.get("entries", [])
+        for e in got:
+            rows[int(e["frame"])] = e
+        f = top + 1
+    return rows
+
+
+def alignment_verdict(a, b, frames):
+    """Do equal frame numbers mean the same moment in the game?
+
+    Each emulator counts frames from its OWN boot, so overlapping frame
+    numbers prove nothing -- start one thirty seconds before the other and
+    both will happily report a frame 500 that are half a minute apart. A
+    diff across that reports a divergence at the first frame compared, every
+    time, and it looks exactly like a real finding.
+
+    The guest CYCLE counter is the honest key. Measured on a live pair, the
+    two agree on cycles-per-frame to about 0.3% (564480 vs 566204), so if
+    frame N carries wildly different cycle counts on the two sides they were
+    not booted together and nothing downstream is comparable.
+    """
+    pairs = [(int(a[f]["cyc"]), int(b[f]["cyc"])) for f in frames
+             if "cyc" in a[f] and "cyc" in b[f]]
+    if not pairs:
+        return None, "neither side reports a guest cycle count"
+    # Compare the SPAN, not the absolute value: a constant offset just means
+    # different boot instants, which run_to_frame can correct. A different
+    # slope means the two are not even running the same code.
+    offs = [x - y for x, y in pairs]
+    drift = max(offs) - min(offs)
+    span = max(p[0] for p in pairs) - min(p[0] for p in pairs)
+    if span <= 0:
+        return None, "only one frame in common — nothing to compare"
+    rel = drift / span
+    if rel > 0.05:
+        return False, (f"guest cycles drift {rel:.1%} across the window — "
+                       f"the two are not running in step")
+    if abs(offs[0]) > 10 * (span / max(1, len(pairs))):
+        return False, (f"frame numbers line up but guest cycles are "
+                       f"{offs[0]:+d} apart — the two were booted at "
+                       f"different times, so equal frame numbers are "
+                       f"different moments. Boot both together.")
+    return True, f"guest cycles track (drift {rel:.2%} over the window)"
 
 
 def coverage_verdict(a, b, frames):
@@ -85,7 +148,8 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--native-port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
-    ap.add_argument("--count", type=int, default=8192)
+    ap.add_argument("--count", type=int, default=600,
+                    help="how many recent frames to compare")
     ap.add_argument("--arm", action="store_true",
                     help="arm + reset the oracle's recorder, then exit")
     ap.add_argument("--timeout", type=float, default=60.0)
@@ -111,15 +175,32 @@ def main(argv=None):
         print("Let both run through the sequence, then re-run without --arm.")
         return 0
 
+    # Ask each side where it is, then page a common window out of both. A frame
+    # number means "frames since THIS emulator booted", so the window is chosen
+    # from whichever has seen fewer -- reaching past that on the other side
+    # would compare a frame against nothing.
     try:
-        na, _ = pull(native, args.count)
+        _, nrep = pull(native, 1)
+        nframe = native.frame()
     except DebugError as e:
         print(f"error: psx-runtime: {e}", file=sys.stderr)
         return 2
     try:
-        ob, orep = pull(oracle, args.count)
+        _, orep = pull(oracle, 1)
+        oframe = oracle.frame()
     except DebugError as e:
         print(f"error: oracle: {e}", file=sys.stderr)
+        return 2
+
+    top = min(nframe, oframe)
+    lo = max(0, top - args.count + 1)
+    print(f"psx-runtime at frame {nframe}, oracle at {oframe} — "
+          f"comparing {lo}..{top}")
+    try:
+        na = pull_window(native, lo, top)
+        ob = pull_window(oracle, lo, top)
+    except DebugError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
 
     if not orep.get("armed", False):
@@ -139,6 +220,14 @@ def main(argv=None):
               "own boots, so they must be started from the same point — or the "
               "oracle armed at a known frame — before this can align.",
               file=sys.stderr)
+        return 1
+
+    aligned, awhy = alignment_verdict(na, ob, frames)
+    print(f"alignment: {awhy}")
+    if aligned is False:
+        print("\nREFUSING to compare: equal frame numbers do not mean the same "
+              "moment, so any divergence reported would be an artefact of when "
+              "each emulator was started.", file=sys.stderr)
         return 1
 
     ok, why = coverage_verdict(na, ob, frames)

@@ -162,7 +162,20 @@ class DebugConn:
     # -- convenience wrappers used by the CLIs ------------------------------
 
     def frame(self) -> int:
-        return int(self.cmd("ping").get("frame", 0))
+        """Current frame number, from whichever command this peer answers.
+
+        NOT from `ping`. psx-runtime intercepts ping in a lock-free fast path
+        that never reaches the command dispatcher, so its reply carries only
+        {ok, pong, io_thread} -- no frame. Asking ping for a frame therefore
+        returned 0 for every native run, silently, and anything that aligned two
+        emulators by frame number was comparing against zero. The DuckStation
+        oracle does put a frame in its ping, which is what made the bug look
+        like an oracle-only quirk instead of a native-side blind spot.
+        """
+        r = self.raw("frame")
+        if r.get("ok") and "frame" in r:
+            return int(r["frame"])
+        return int(self.raw("ping").get("frame", 0))
 
     def ring_span(self) -> Dict[str, Any]:
         """Which frames the GP0 ring can still be asked for.

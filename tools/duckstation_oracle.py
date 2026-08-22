@@ -848,6 +848,18 @@ def cmd_install(args: argparse.Namespace) -> int:
             # directly so there is nothing to read back from a real surface.
             "Renderer": "Software",
         },
+        "CPU": {
+            # Interpreter, not the recompiler, and not for accuracy alone.
+            #
+            # The frame_fingerprint hook records guest stores from the
+            # INTERPRETER's write path (CPU::WriteMemoryByte/HalfWord/Word).
+            # The recompiler inlines stores and never reaches it, so a
+            # recompiler oracle records almost nothing and its fingerprint
+            # compares clean against anything -- a false "no divergence" is far
+            # worse than a slow reference. An oracle is a correctness baseline;
+            # it does not need to be fast.
+            "ExecutionMode": "Interpreter",
+        },
         "Audio": {"Backend": "Null"},
         "UI": {
             # This is the "don't show again" of the unofficial-build warning
