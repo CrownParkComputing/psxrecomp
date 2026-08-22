@@ -44,6 +44,7 @@ extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
+extern "C" int gpu_ws_precise_nclip_enabled(void) { return 0; }
 extern "C" void psx_ws_note_gte_project(int) {}
 extern "C" {
 uint64_t s_frame_count = 0;
