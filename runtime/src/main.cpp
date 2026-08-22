@@ -13281,6 +13281,7 @@ int main(int argc, char** argv) {
     g_mod_load_release_frames = -1;
     g_mod_disc_speed_divisor = -1;
     g_mod_disc_instant_rate = -1;
+    g_turbo_audio_sink_enabled = 0;
     psx_ram_reset_size_request();
     g_turbo_load_wall_multiplier = 0;
     g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
@@ -13297,6 +13298,11 @@ int main(int argc, char** argv) {
         g_turbo_loads_enabled = 1;
         g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
         g_turbo_load_release_frames = g_mod_load_release_frames;
+        /* Fast Loading advances the guest at a host rate greater than real
+         * time. Keep the canonical SPU/CD stream running, but discard the
+         * accelerated presentation-side audio until pacing resumes; otherwise
+         * the SDL bridge overflows and the load becomes observably unstable. */
+        g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
         if (g_turbo_load_wall_multiplier) {
             std::fprintf(stdout,
                 "psxrecomp: mod selected %dx load acceleration "
