@@ -38,8 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_NATIVE_PORT, STP_MODES, DebugConn, DebugError, decode_entries,
-    dma_gpu_list_root, read_ram_range, snapshot_ram,
-    walk_ordering_table,
+    dma_gpu_list_root, find_display_lists, snapshot_ram, walk_ordering_table,
 )
 
 LIST_KIND = "psx-display-list"

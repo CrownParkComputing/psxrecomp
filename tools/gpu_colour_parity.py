@@ -32,9 +32,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
-    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, STP_MODES, DebugConn,
-    DebugError, capture, decode_entries, dma_gpu_list_root, snapshot_ram,
-    walk_ordering_table,
+    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, RAM_SIZE, STP_MODES,
+    DebugConn, DebugError, capture, decode_entries, find_display_lists,
+    read_ram_range, snapshot_ram, walk_ordering_table,
 )
 
 PARITY_KIND = "psx-colour-parity"
@@ -73,43 +73,76 @@ def sample_native(conn, want, samples, gap):
     return cols, frames
 
 
-def sample_oracle(conn, want, samples, gap, addr=None):
-    """The oracle has no ring, so walk the ordering table out of RAM.
+def oracle_region(conn, lo, hi, pad=0x2000):
+    """Read just the span a display list occupies, placed at its real offset.
 
-    Each sample is taken with the emulator parked. The root pointer and the
-    list it points at must come from the same instant -- a game rebuilds its
-    ordering table every frame, and a walk that straddles a rebuild yields
-    colours from a display list that never existed. Those would land in the
-    distribution looking exactly like real data.
+    walk_ordering_table() indexes a full-RAM image, so a partial read has to
+    be dropped at the address it came from rather than handed over as a
+    standalone buffer. Reading 2 MB per sample would be 128 round trips each
+    (the oracle caps read_ram at 16 KB); the list itself is a few tens of KB.
+    """
+    lo = max(0, (lo - pad) & ~3)
+    hi = min(RAM_SIZE, hi + pad)
+    blob = read_ram_range(conn, 0x80000000 + lo, hi - lo)
+    ram = bytearray(RAM_SIZE)
+    ram[lo:lo + len(blob)] = blob
+    return bytes(ram)
+
+
+def sample_oracle(conn, want, samples, gap, addr=None):
+    """The oracle has no GP0 ring, so walk the ordering table out of RAM.
+
+    Two things this deliberately does NOT do.
+
+    It does not follow DMA channel 2. A finished linked-list transfer leaves
+    the 0xFFFFFF terminator in MADR, so between frames MADR names the end of
+    the list rather than its start. The list is found by scanning for its
+    structure instead (see find_display_lists).
+
+    It does not pause. DuckStation pumps its debug socket from the emulation
+    loop, so a paused oracle falls back to the Qt idle timer -- 1 Hz with no
+    gamepad attached -- and the reads cannot finish. Sampling a running
+    emulator can occasionally straddle a rebuild of the list; that shows up
+    as a short or unwalkable chain and is counted as a miss rather than
+    folded into the distribution.
     """
     cols, frames = [], []
     misses = 0
+    root, span = addr, None
     for _ in range(samples):
-        paused = False
         try:
-            try:
-                conn.cmd("pause")
-                paused = True
-            except DebugError:
-                pass          # unpaused sampling is worse, not useless
-            root = addr if addr is not None else dma_gpu_list_root(conn)
-            if root is None:
-                break
-            ram = snapshot_ram(conn)
+            if root is None or span is None:
+                # Locate the list once, then reuse it: a full snapshot plus a
+                # scan is expensive, re-walking a known root is not.
+                ram = snapshot_ram(conn)
+                cands = find_display_lists(ram, near=root)
+                if not cands:
+                    misses += 1
+                    time.sleep(gap)
+                    continue
+                best = cands[0]
+                root, span = best["root"], (best["lo"], best["hi"])
+            else:
+                ram = oracle_region(conn, span[0], span[1])
+
             prims = decode_entries(walk_ordering_table(ram, root))
+            if not prims:
+                # The list moved or was mid-rebuild. Re-scan next time.
+                root = span = None
+                misses += 1
+                time.sleep(gap)
+                continue
             frames.append(conn.frame())
             cols += colours_of(prims, want)
         except DebugError:
             misses += 1
-        finally:
-            if paused:
-                try:
-                    conn.resume()
-                except DebugError:
-                    pass
+            root = span = None
         time.sleep(gap)
     if misses:
-        print(f"  ({misses} oracle sample(s) failed to read)", file=sys.stderr)
+        print(f"  ({misses} of {samples} oracle sample(s) could not be walked)",
+              file=sys.stderr)
+    if root is not None:
+        print(f"  oracle display list at 0x{root:06X}", file=sys.stderr)
     return cols, frames
 
 
