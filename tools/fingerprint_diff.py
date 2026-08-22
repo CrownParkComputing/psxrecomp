@@ -136,6 +136,11 @@ def coverage_verdict(a, b, frames):
     if mid < 0.5 or mid > 2.0:
         return False, (f"write counts differ by {mid:.2f}x — the two are not "
                        f"observing the same set of writes (DMA coverage?)")
+    # 2.0 was too loose: a live pair sat at 1.98x -- the oracle's CPU-store hook
+    # not seeing DMA-written RAM -- and squeaked through as "comparable".
+    if mid < 0.67 or mid > 1.5:
+        return False, (f"write counts differ by {mid:.2f}x — the two are not "
+                       f"observing the same set of writes (DMA coverage?)")
     if hi / max(lo, 1e-9) > 4.0:
         return False, (f"write-count ratio drifts {lo:.2f}x..{hi:.2f}x across "
                        f"frames — coverage is not comparable")
@@ -241,6 +246,22 @@ def main(argv=None):
     print(f"\ncomparing frames {frames[0]}..{frames[-1]}")
     found = False
     for key, cnt, label in COLUMNS:
+        # Per-column coverage. The global check compares total write counts, so
+        # a column where one side records thousands and the other records ZERO
+        # sails straight through it -- and then reports a "first divergence"
+        # that is really "this emulator never watched this at all". Seen live:
+        # the oracle logged 0 scratchpad writes against psx-runtime's 6916.
+        if cnt:
+            ca = sum(int(na[f].get(cnt, 0)) for f in frames)
+            cb = sum(int(ob[f].get(cnt, 0)) for f in frames)
+            if (ca == 0) != (cb == 0):
+                blind = "oracle" if cb == 0 else "psx-runtime"
+                print(f"  {label:<18} NOT COMPARABLE — {blind} recorded no "
+                      f"writes here at all (other side: "
+                      f"{max(ca, cb)}). This column is a coverage hole, not a "
+                      f"divergence.")
+                continue
+
         first = None
         for f in frames:
             if na[f].get(key) != ob[f].get(key):
@@ -249,10 +270,21 @@ def main(argv=None):
         if first is None:
             print(f"  {label:<18} identical across all {len(frames)} frames")
             continue
+
+        # Divergence on the very first frame compared means the fork happened
+        # BEFORE the window, not at its edge. Naming that frame would point at
+        # an arbitrary boundary -- the frame the window happened to start on.
+        if first == frames[0]:
+            print(f"  {label:<18} already divergent at the START of the window "
+                  f"(frame {first}) — the fork is EARLIER. Widen with --count, "
+                  f"or restart both and compare from boot.")
+            found = True
+            continue
+
         found = True
-        prev = frames[frames.index(first) - 1] if frames.index(first) else None
-        print(f"  {label:<18} FIRST DIVERGENCE at frame {first}"
-              + (f" (last agreeing: {prev})" if prev is not None else ""))
+        prev = frames[frames.index(first) - 1]
+        print(f"  {label:<18} FIRST DIVERGENCE at frame {first} "
+              f"(last agreeing: {prev})")
         print(f"      psx-runtime {na[first].get(key)}"
               + (f"  writes={na[first].get(cnt)}" if cnt else ""))
         print(f"      oracle      {ob[first].get(key)}"
