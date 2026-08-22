@@ -157,13 +157,27 @@ def main(argv=None):
             conn.cmd("pause")
             stale = True
         else:
-            conn.cmd("step", n=max(1, args.frames))
-            # step parks itself after N vblanks; wait for it to come back.
-            for _ in range(200):
+            # Verify by FRAME NUMBER, not by the paused flag. `step` re-parks
+            # itself, and a poll can catch that flag set before any frame has
+            # actually run -- which yields a trace of nothing and a table that
+            # looks merely empty rather than wrong.
+            f_before = conn.frame()
+            want = max(1, args.frames)
+            conn.cmd("step", n=want)
+            for _ in range(400):
                 st = conn.raw("pause_state")
-                if st.get("ok") and st.get("paused"):
+                if st.get("ok") and st.get("paused") and conn.frame() > f_before:
                     break
                 time.sleep(0.05)
+            advanced = conn.frame() - f_before
+            if advanced <= 0:
+                print("error: the emulator did not advance a frame while "
+                      "stepping, so nothing was traced. Is the game actually "
+                      "running (not on a stalled screen)?", file=sys.stderr)
+                return 2
+            if advanced != want:
+                print(f"  note: asked for {want} frame(s), advanced {advanced}",
+                      file=sys.stderr)
             after = snapshot_ram(conn)
             again = field_map(
                 [p for p in decode_entries(walk_ordering_table(after, root))
@@ -186,6 +200,26 @@ def main(argv=None):
             pass
 
     entries = rep.get("entries", [])
+    if not entries:
+        msg = ("no writes were recorded in the traced window. The packets exist "
+               "(they were just walked), so either the buffer is rebuilt less "
+               "often than every frame — step more frames — or nothing wrote to "
+               "it during the step.")
+        print(f"error: {msg}", file=sys.stderr)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump({"kind": WRITERS_KIND, "version": 1,
+                           "class": args.want, "absent": False,
+                           "packets": len(sel), "writes": 0, "unmapped": 0,
+                           "no_writes": True, "note": msg,
+                           "lo": f"0x{lo:08X}", "hi": f"0x{hi:08X}",
+                           "colour_words": sum(1 for v in roles.values()
+                                               if v == "colour"),
+                           "vertex_words": sum(1 for v in roles.values()
+                                               if v == "vertex"),
+                           "writers": []}, f, indent=1)
+        return 1
+
     by_pc = defaultdict(Counter)
     unknown = 0
     for e in entries:

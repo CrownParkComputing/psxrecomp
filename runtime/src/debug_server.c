@@ -305,6 +305,9 @@ static uint32_t     s_run_to     = 0;
 static uint32_t     s_pause_timeout_ms  = PAUSE_TIMEOUT_MS_DEFAULT;
 static uint32_t     s_pause_last_cmd_ms = 0;   /* SDL ticks; wrap-safe by subtraction */
 static int          s_pause_auto_resumed = 0;
+/* Frame at which the step counter was last decremented; see
+ * debug_server_wait_if_paused(). */
+static uint64_t     s_step_last_frame = 0;
 
 /* ---- Dirty-RAM one-shot break ---- */
 static volatile int s_dirty_break_active = 0;
@@ -8444,7 +8447,8 @@ static void handle_step(int id, const char *json)
     if (n > 100000) n = 100000;
     s_run_to = 0;
     s_step_count = n;
-    pause_arm(0);          /* run; wait_if_paused re-parks after N vblanks */
+    s_step_last_frame = s_frame_count;   /* the frame we are leaving does not count */
+    pause_arm(0);          /* run; wait_if_paused re-parks after N frames */
     send_fmt("{\"id\":%d,\"ok\":true,\"stepping\":%d,\"frame\":%llu}",
              id, n, (unsigned long long)s_frame_count);
 }
@@ -14762,7 +14766,16 @@ void debug_server_wait_if_paused(void)
      * very next frame. */
     if (!s_paused) {
         if (s_step_count > 0) {
-            if (--s_step_count == 0) pause_arm(1);
+            /* Count FRAMES, not calls. This hook runs from three places -- the
+             * vblank path in main.cpp and two in dirty_ram_interp.c -- so a
+             * plain decrement drains the counter up to 3x per frame: `step 10`
+             * advanced 2 frames, and `step 1` could park before a single frame
+             * completed, which silently produced traces containing no writes at
+             * all. Only the first call within a given frame counts. */
+            if (s_frame_count != s_step_last_frame) {
+                s_step_last_frame = s_frame_count;
+                if (--s_step_count == 0) pause_arm(1);
+            }
         } else if (s_run_to && s_frame_count >= (uint64_t)s_run_to) {
             s_run_to = 0;
             pause_arm(1);
