@@ -2862,6 +2862,13 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
+    /* An explicit native guest rate is a simulation contract, not merely a
+     * request to match the panel.  In particular, PAL x2 must keep the
+     * wall-clock pacer as the authority: the observed 100-Hz swap path can
+     * miss presentation deadlines and then feed that debt back into guest
+     * progress.  Swap interval 0 lets the pacer enforce the exact target. */
+    if (g_mod_native_vblank_rate)
+        return 0;
     /* Wayland default: wall-clock pacer + swap interval 0 (same as PSX_VSYNC=0). */
     if (host_video_is_wayland() && !g_wayland_allow_vsync)
         return 0;
