@@ -81,25 +81,37 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--class", dest="want", default="PolyG4+semi|B+F")
-    ap.add_argument("--watch", type=float, default=5.0,
-                    help="seconds to let the trace collect")
+    ap.add_argument("--frames", type=int, default=1,
+                    help="frames to step while tracing. The packet buffer moves "
+                         "between frames, so a map built from one walk goes "
+                         "stale almost immediately — keep this small.")
+    ap.add_argument("--watch", type=float, default=0.0,
+                    help="legacy free-running trace, in seconds. Produces "
+                         "aliased attribution once the buffer moves; --frames "
+                         "is correct.")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
     conn = DebugConn(args.host, args.port, args.timeout)
     try:
+        # Park before walking. Everything below depends on the layout in `ram`
+        # still describing the buffer when the writes happen, and a walk of a
+        # running emulator is stale before it finishes.
         conn.cmd("pause")
-        try:
-            ram = snapshot_ram(conn)
-        finally:
-            conn.cmd("continue")
+        ram = snapshot_ram(conn)
         cands = find_display_lists(ram)
         if not cands:
+            conn.cmd("continue")
             print("no display list found", file=sys.stderr)
             return 1
-        prims = decode_entries(walk_ordering_table(ram, cands[0]["root"]))
+        root = cands[0]["root"]
+        prims = decode_entries(walk_ordering_table(ram, root))
     except DebugError as e:
+        try:
+            conn.cmd("continue")
+        except DebugError:
+            pass
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -127,15 +139,51 @@ def main(argv=None):
     print(f"  {sum(1 for v in roles.values() if v == 'colour')} colour words, "
           f"{sum(1 for v in roles.values() if v == 'vertex')} vertex words")
 
+    # Arm the trace while still parked, advance a bounded number of frames, then
+    # re-walk and confirm the layout did not move underneath us.
+    #
+    # A free-running trace cannot work here. The buffer is rebuilt at a
+    # different address most frames, so absolute addresses mapped from one walk
+    # describe a different field a frame later. That does not fail loudly -- it
+    # smears every instruction to roughly 50% colour and 50% vertex, which reads
+    # as "this code writes both" and is entirely an artefact.
+    stale = False
     try:
         conn.cmd("wtrace_reset")
         conn.cmd("wtrace_add", lo=f"0x{lo:08X}", hi=f"0x{hi:08X}")
-        time.sleep(args.watch)
+        if args.watch > 0:
+            conn.cmd("continue")
+            time.sleep(args.watch)
+            conn.cmd("pause")
+            stale = True
+        else:
+            conn.cmd("step", n=max(1, args.frames))
+            # step parks itself after N vblanks; wait for it to come back.
+            for _ in range(200):
+                st = conn.raw("pause_state")
+                if st.get("ok") and st.get("paused"):
+                    break
+                time.sleep(0.05)
+            after = snapshot_ram(conn)
+            again = field_map(
+                [p for p in decode_entries(walk_ordering_table(after, root))
+                 if p["kind"] == "poly" and p["op_name"] == op], args.want)
+            moved = sum(1 for a, r in roles.items() if again.get(a) != r)
+            if moved:
+                stale = True
+                print(f"  warning: {moved} of {len(roles)} field addresses "
+                      f"changed role between the two walks — the buffer moved "
+                      f"while tracing.", file=sys.stderr)
         rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo:08X}",
                        addr_hi=f"0x{hi:08X}", count=16000)
     except DebugError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    finally:
+        try:
+            conn.cmd("continue")
+        except DebugError:
+            pass
 
     entries = rep.get("entries", [])
     by_pc = defaultdict(Counter)
@@ -157,6 +205,20 @@ def main(argv=None):
     for pc, k in ranked[:14]:
         print(f"  {pc:<12}{pcfunc.get(pc,''):<12}{k['colour']:>8}"
               f"{k['vertex']:>8}{k['uv']:>5}")
+    # A store instruction writes ONE field. If most instructions come back near
+    # 50/50 the map went stale, and every row is an artefact -- say so instead
+    # of letting it read as "this code writes both".
+    mixed = [pc for pc, k in by_pc.items()
+             if k["colour"] >= 8 and k["vertex"] >= 8
+             and 0.6 <= k["colour"] / max(1, k["vertex"]) <= 1.67]
+    aliased = len(mixed) >= max(2, len(by_pc) // 2)
+    if aliased or stale:
+        print(f"\n  UNRELIABLE: {len(mixed)} of {len(by_pc)} instruction(s) "
+              f"split about evenly between colour and vertex words. A single "
+              f"store writes one field, so this is the packet buffer having "
+              f"moved during the trace, not code that writes both. Re-run with "
+              f"--frames 1 (the default) and no --watch.", file=sys.stderr)
+
     top = [pc for pc, k in ranked if k["colour"] and not k["vertex"]]
     if top:
         print(f"\nWrites ONLY colour words: {', '.join(top[:6])}")
@@ -171,6 +233,8 @@ def main(argv=None):
                 "colour_words": sum(1 for v in roles.values() if v == "colour"),
                 "vertex_words": sum(1 for v in roles.values() if v == "vertex"),
                 "writes": len(entries), "unmapped": unknown,
+                "aliased": bool(aliased or stale),
+                "mixed_writers": len(mixed),
                 "writers": [{"pc": pc, "func": pcfunc.get(pc, ""),
                              "colour": k["colour"], "vertex": k["vertex"],
                              "uv": k["uv"],
