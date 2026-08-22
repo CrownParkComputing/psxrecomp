@@ -451,3 +451,31 @@ class TestBothSidesReport(unittest.TestCase):
         # the oracle is read running and legitimately may.
         meta = {"paused": True, "frame_before": 100, "frame_after": 100}
         self.assertEqual(DL.frames_spanned(meta), 0)
+
+
+class TestVerdictRefusesLopsidedSamples(unittest.TestCase):
+    """An extreme sample imbalance is not a comparison.
+
+    Seen live: the oracle contributed 256 vertices (one frame of 64 quads) while
+    psx-runtime contributed 3328 (about thirteen frames). A snapshot of an
+    animating effect versus an average over its cycle differ by construction,
+    and the tool reported "differ" from exactly that.
+    """
+
+    @staticmethod
+    def _stats(values):
+        import io
+        return CP.describe([[v, v, v] for v in values], "x", out=io.StringIO())
+
+    def test_thirteen_to_one_is_refused(self):
+        a = self._stats([10, 40, 90, 150] * 832)
+        b = self._stats([10, 40, 90, 150] * 64)
+        v, why = CP.verdict_of(a, b)
+        self.assertIsNone(v, "must refuse, not decide")
+        self.assertIn("apart", why)
+
+    def test_a_mild_imbalance_still_decides(self):
+        a = self._stats([10, 40, 90, 150] * 300)
+        b = self._stats([10, 40, 90, 150] * 200)
+        v, _ = CP.verdict_of(a, b)
+        self.assertEqual(v, "match")

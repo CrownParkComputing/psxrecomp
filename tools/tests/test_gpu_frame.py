@@ -351,11 +351,13 @@ class TestDebugConn(unittest.TestCase):
         self.assertEqual(dump["frame"], 4242)
         self.assertEqual(dump["raw_count"], 1)
         self.assertIn("0x80050000", dump["funcs"])
-        # ping, ping, gpu_ring_stats (declined here), gpu_frame_dump -- four
-        # commands, and therefore four separate connections. The count is the
-        # assertion: a client reusing one socket would never get this far.
+        # frame() asks the `frame` command first and falls back to ping, so each
+        # frame() is two commands against a server that declines `frame`. Six
+        # commands, six separate connections. The count is the assertion: a
+        # client reusing one socket would never get this far.
         self.assertEqual([r["cmd"] for r in srv.requests],
-                         ["ping", "ping", "gpu_ring_stats", "gpu_frame_dump"])
+                         ["frame", "ping", "frame", "ping",
+                          "gpu_ring_stats", "gpu_frame_dump"])
 
     def test_error_replies_raise_with_the_server_message(self):
         srv = OneShotServer(lambda req: {"ok": False, "error": "missing frame"})
@@ -424,6 +426,11 @@ class TestDebugConn(unittest.TestCase):
         def handler(req):
             if req["cmd"] == "gpu_ring_stats":
                 return {"ok": False, "error": "unknown command"}
+            # Decline `frame` explicitly. The fallthrough below answers every
+            # command with a frame field, which would answer `frame` too and
+            # quietly rob this test of the ping fallback it exists to check.
+            if req["cmd"] == "frame":
+                return {"ok": False, "error": "unknown command"}
             if req["cmd"] == "ping":
                 return {"ok": True, "frame": 77}
             return {"ok": True, "frame": req.get("frame", 0), "count": 1,
@@ -477,3 +484,42 @@ class TestDebugConn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFrameNumberSource(unittest.TestCase):
+    """frame() must not ask ping.
+
+    psx-runtime answers ping from a lock-free fast path that never reaches the
+    command dispatcher, so its reply carries {ok, pong, io_thread} and no frame.
+    Asking ping for a frame therefore returned 0 for every native run, silently,
+    and anything aligning two emulators by frame number compared against zero.
+    The DuckStation oracle DOES put a frame in its ping, which is what made this
+    look like an oracle quirk rather than a native-side blind spot.
+    """
+
+    def test_prefers_the_frame_command(self):
+        srv = OneShotServer(lambda req: (
+            {"ok": True, "frame": 909} if req["cmd"] == "frame"
+            else {"ok": True, "pong": True, "io_thread": True}))
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        self.assertEqual(conn.frame(), 909)
+        self.assertEqual([r["cmd"] for r in srv.requests], ["frame"],
+                         "should not need ping at all")
+
+    def test_a_ping_without_a_frame_field_does_not_read_as_frame_zero(self):
+        # The exact native shape: ping answers, but carries no frame.
+        srv = OneShotServer(lambda req: (
+            {"ok": True, "frame": 4242} if req["cmd"] == "frame"
+            else {"ok": True, "pong": True, "io_thread": True}))
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        self.assertNotEqual(conn.frame(), 0)
+
+    def test_falls_back_to_ping_when_frame_is_unsupported(self):
+        srv = OneShotServer(lambda req: (
+            {"ok": False, "error": "unknown"} if req["cmd"] == "frame"
+            else {"ok": True, "frame": 77}))
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        self.assertEqual(conn.frame(), 77)

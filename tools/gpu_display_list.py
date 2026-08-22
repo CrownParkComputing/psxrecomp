@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, STP_MODES, DebugConn,
     DebugError, decode_entries, dma_gpu_list_root, find_display_lists,
-    snapshot_ram, walk_ordering_table,
+    read_ram_range, snapshot_ram, walk_ordering_table,
 )
 
 LIST_KIND = "psx-display-list"
@@ -171,6 +171,42 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
         root = cands[0]["root"]
         entries = walk_ordering_table(ram, root, max_nodes=max_nodes)
 
+    # ---- coherent re-read ------------------------------------------------
+    # The first pass found WHERE the list is; it may not be a coherent picture
+    # of it. A 2 MB snapshot of a running emulator takes ~128 reads, during
+    # which the game rebuilds the list underneath -- which is how the oracle
+    # came back with a whole frame of additive quads carrying just 4 distinct
+    # colour values, a torn read that looks like data.
+    #
+    # Now that the span is known, the re-read is a few KB, so it is affordable
+    # even at the 1 Hz the oracle drops to while parked. Park, re-read just the
+    # span, resume: a snapshot from ONE instant.
+    if not meta.get("paused") and entries:
+        addrs = [int(e["src"], 16) & 0x1FFFFF for e in entries]
+        lo, hi = min(min(addrs), root & 0x1FFFFF), max(addrs)
+        coherent = False
+        try:
+            conn.cmd("pause")
+            try:
+                f0 = conn.frame()
+                blob = read_ram_range(conn, 0x80000000 + (lo & ~3),
+                                      (hi - (lo & ~3)) + 0x400)
+                buf = bytearray(len(ram))
+                buf[lo & ~3:(lo & ~3) + len(blob)] = blob
+                again = walk_ordering_table(bytes(buf), root, max_nodes=max_nodes)
+                if len(again) >= len(entries) * 0.9:
+                    entries = again
+                    coherent = True
+                    meta["coherent_frame"] = f0
+            finally:
+                conn.cmd("continue")
+        except DebugError as e:
+            print(f"  [{label}] coherent re-read failed ({e}); using the "
+                  f"running snapshot", file=out)
+        meta["coherent"] = coherent
+    else:
+        meta["coherent"] = bool(meta.get("paused"))
+
     rep = report(decode_entries(entries), root, conn.port)
     rep["meta"] = meta
     return rep, meta
@@ -248,8 +284,13 @@ def run_both(args):
             rc = 1
             continue
         span = frames_spanned(meta)
-        note = "" if meta.get("paused") else (
-            f", advanced {span} frame(s) during the read" if span else "")
+        if meta.get("coherent"):
+            note = (" [coherent]" if meta.get("paused") else
+                    f" [coherent, re-read parked at frame "
+                    f"{meta.get('coherent_frame')}]")
+        else:
+            note = (f", advanced {span} frame(s) during the read — THIS WALK MAY "
+                    f"BE TORN" if span else "")
         print(f"  {label}: root {rep['root']}, {rep['nodes']} node(s), "
               f"{rep['drawing']} drawing{note}")
         if span and span > 2 and not meta.get("paused"):

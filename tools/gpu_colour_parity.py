@@ -207,7 +207,18 @@ def verdict_of(a, b, out=sys.stdout):
                                                           b["vertices"]))
     print(f"\n  distribution overlap {ov:.3f}   "
           f"sample ratio {ratio:.2f}x", file=out)
-    if ratio > 3.0:
+    # A note is not enough past a certain point. At 13x -- seen live, the oracle
+    # contributing a single frame of 64 quads against thirteen frames from the
+    # runtime -- one side is a snapshot of an ANIMATING effect and the other is
+    # an average over its cycle. Those two things differ by construction, and
+    # reporting "differ" from them says nothing about the emulators.
+    if ratio > 4.0:
+        return None, (
+            f"sample sizes are {ratio:.0f}x apart — one side contributed roughly "
+            f"a single frame of an animating effect while the other averaged over "
+            f"many. That is not a comparison. Raise --samples, or check the "
+            f"oracle's 'could not be walked' count.")
+    if ratio > 2.0:
         print("  note: sample sizes are lopsided; the overlap still holds "
               "(it is normalised) but peaks are not comparable.", file=out)
     if ov >= 0.85:
