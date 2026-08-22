@@ -73,10 +73,14 @@ class TestDisasm(unittest.TestCase):
     def test_nop_is_not_sll_zero(self):
         self.assertEqual(self.d(0), "nop")
 
-    def test_gte_ops_are_marked_not_mistaken_for_alu(self):
-        # cop2 carries the GTE opcode. Decoding it as something else would hide
-        # the very operations this investigation is trying to rule in or out.
-        self.assertTrue(self.d(0x12 << 26 | 0x0180001).startswith("cop2"))
+    def test_gte_ops_are_not_mistaken_for_alu(self):
+        # cop2 covers two different things: register moves (bit 25 clear) and
+        # GTE commands (bit 25 set). Decoding either as ordinary arithmetic
+        # would hide the operations this investigation exists to rule in or out.
+        move = 0x12 << 26 | 0x0180001            # bit 25 clear -> mfc2
+        self.assertTrue(self.d(move).startswith("mfc2"), self.d(move))
+        cmd = 0x4B400006                          # bit 25 set -> NCLIP
+        self.assertTrue(self.d(cmd).startswith("NCLIP"), self.d(cmd))
 
     def test_branch_target_is_pc_relative(self):
         w = enc_i(5, 4, 5, 2)          # bne $a0,$a1,+2
@@ -117,3 +121,50 @@ class TestDisasmAround(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnalignedAndCop2(unittest.TestCase):
+    """The instructions the colour path is actually built from.
+
+    Legend of Mana loads each vertex RGB with an LWL/LWR pair, stages it with
+    SWL/SWR, then scales it. Those four printed as "op22"/"op26"/"op2a"/"op2e"
+    — an instruction the reader cannot weigh, in the exact window under
+    investigation. GTE ops printed as a bare cop2 word had the same problem:
+    the whole question was whether the GTE was involved.
+    """
+
+    def d(self, w, pc=0x80068000):
+        return PW.disasm_one(w, pc)
+
+    def test_unaligned_loads_and_stores_are_named(self):
+        # Real words lifted from 0x80068450..0x80068460 in the trace.
+        self.assertEqual(self.d(0x8A8EFFF7), "lwl $t6,-9($s4)")
+        self.assertEqual(self.d(0x9A8EFFF4), "lwr $t6,-12($s4)")
+        self.assertEqual(self.d(0xABAE0043), "swl $t6,67($sp)")
+        self.assertEqual(self.d(0xBBAE0040), "swr $t6,64($sp)")
+
+    def test_the_canonical_pair_addresses_one_word(self):
+        # lwl at A+3 and lwr at A load the unaligned word at A. If the operand
+        # decode were off by one the two would look like unrelated accesses.
+        lwl, lwr = self.d(0x8A8EFFF7), self.d(0x9A8EFFF4)
+        self.assertIn("-9(", lwl)
+        self.assertIn("-12(", lwr)
+
+    def test_gte_commands_are_named_not_shown_as_raw_words(self):
+        self.assertTrue(self.d(0x4B400006).startswith("NCLIP"))
+
+    def test_gte_shift_and_limit_flags_are_shown(self):
+        # sf and lm change the result of every GTE colour op; a listing that
+        # hides them cannot be checked against the hardware description.
+        t = self.d(0x4B400006)
+        self.assertIn("sf=", t)
+        self.assertIn("lm=", t)
+
+    def test_cop2_loads_and_stores_name_a_gte_register(self):
+        # swc2 $c2r12,0($t0) — rt indexes a GTE register, not a GPR. Printing
+        # "$t4" there would send the reader after the wrong thing entirely.
+        self.assertEqual(self.d(0xE90C0000), "swc2 $c2r12,0($t0)")
+
+    def test_cop2_moves_are_distinguished_from_commands(self):
+        mtc2 = (0x12 << 26) | (0x04 << 21) | (8 << 16) | (9 << 11)
+        self.assertEqual(self.d(mtc2), "mtc2 $t0,$c2r9")

@@ -56,8 +56,22 @@ _SPECIAL = {0x00: "sll", 0x02: "srl", 0x03: "sra", 0x04: "sllv",
             0x26: "xor", 0x27: "nor", 0x2A: "slt", 0x2B: "sltu"}
 _IMM = {0x08: "addi", 0x09: "addiu", 0x0A: "slti", 0x0B: "sltiu",
         0x0C: "andi", 0x0D: "ori", 0x0E: "xori"}
-_MEM = {0x20: "lb", 0x21: "lh", 0x23: "lw", 0x24: "lbu", 0x25: "lhu",
-        0x28: "sb", 0x29: "sh", 0x2B: "sw"}
+# The unaligned forms matter here and were previously printed as "op22"/"op2a".
+# The code that builds packet colours uses them, and a recompiler getting
+# LWL/LWR/SWL/SWR wrong is a classic source of subtly corrupt bytes -- exactly
+# the failure being investigated. An instruction printed as "op2a" is one the
+# reader cannot weigh.
+_MEM = {0x20: "lb", 0x21: "lh", 0x22: "lwl", 0x23: "lw", 0x24: "lbu",
+        0x25: "lhu", 0x26: "lwr",
+        0x28: "sb", 0x29: "sh", 0x2A: "swl", 0x2B: "sw", 0x2E: "swr",
+        0x32: "lwc2", 0x3A: "swc2"}
+# GTE commands, so a cop2 op is named rather than shown as a bare word.
+_GTE = {0x01: "RTPS", 0x06: "NCLIP", 0x0C: "OP", 0x10: "DPCS", 0x11: "INTPL",
+        0x12: "MVMVA", 0x13: "NCDS", 0x14: "CDP", 0x16: "NCDT", 0x1B: "NCCS",
+        0x1C: "CC", 0x1E: "NCS", 0x20: "NCT", 0x28: "SQR", 0x29: "DCPL",
+        0x2A: "DPCT", 0x2D: "AVSZ3", 0x2E: "AVSZ4", 0x30: "RTPT",
+        0x3D: "GPF", 0x3E: "GPL", 0x3F: "NCCT"}
+_COP2_MOVE = {0x00: "mfc2", 0x02: "cfc2", 0x04: "mtc2", 0x06: "ctc2"}
 
 
 def disasm_one(w, pc):
@@ -82,7 +96,10 @@ def disasm_one(w, pc):
             return f"{n} {R(rd)}"
         return f"{n} {R(rd)},{R(rs)},{R(rt)}"
     if op in _MEM:
-        return f"{_MEM[op]} {R(rt)},{simm}({R(rs)})"
+        name = _MEM[op]
+        if op in (0x32, 0x3A):        # coprocessor-2 load/store: rt is a GTE reg
+            return f"{name} $c2r{rt},{simm}({R(rs)})"
+        return f"{name} {R(rt)},{simm}({R(rs)})"
     if op in _IMM:
         return f"{_IMM[op]} {R(rt)},{R(rs)},{simm}"
     if op == 0x0F:
@@ -94,6 +111,14 @@ def disasm_one(w, pc):
         return (f"{'j' if op == 2 else 'jal'} "
                 f"0x{(pc & 0xF0000000) | ((w & 0x3FFFFFF) << 2):08X}")
     if op == 0x12:
+        if w & (1 << 25):             # GTE command
+            fn = w & 0x3F
+            sf = "sf=1" if (w >> 19) & 1 else "sf=0"
+            lm = "lm=1" if (w >> 10) & 1 else "lm=0"
+            return f"{_GTE.get(fn, f'GTE?{fn:02X}')} ({sf} {lm})"
+        mv = _COP2_MOVE.get(rs)
+        if mv:
+            return f"{mv} {R(rt)},$c2r{rd}"
         return f"cop2 0x{w & 0x1FFFFFF:07X}"
     return f"op{op:02x}"
 
