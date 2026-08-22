@@ -146,20 +146,83 @@ def sample_oracle(conn, want, samples, gap, addr=None):
     return cols, frames
 
 
+HIST_BUCKETS = 16
+
+
+def histogram(flat):
+    """Normalised 16-bucket histogram of channel values.
+
+    Normalised because the two sides never sample the same number of
+    vertices, and every raw count then differs for a reason that has
+    nothing to do with the guest.
+    """
+    h = [0] * HIST_BUCKETS
+    for v in flat:
+        h[min(HIST_BUCKETS - 1, v * HIST_BUCKETS // 256)] += 1
+    total = sum(h) or 1
+    return [c / total for c in h]
+
+
+def overlap(a, b):
+    """Histogram intersection: sum of min() over normalised bins, 0..1.
+
+    1.0 means the two distributions are identical in shape; 0.0 means they
+    share nothing. This is the statistic the verdict rests on, because it
+    is invariant to BOTH animation phase and sample count -- the two things
+    that make a naive comparison lie.
+    """
+    return sum(min(x, y) for x, y in zip(a, b))
+
+
 def describe(cols, label, out=sys.stdout):
     if not cols:
         print(f"  {label}: no matching primitives sampled", file=out)
         return None
     flat = [v for c in cols for v in c]
-    peak = max(flat)
-    mean = statistics.mean(flat)
     srt = sorted(flat)
+    peak = srt[-1]
+    mean = statistics.mean(flat)
     p50 = srt[len(srt) // 2]
     p90 = srt[int(len(srt) * 0.9)]
     print(f"  {label:<14} {len(cols):>6} vertices   peak {peak:>3}   "
           f"mean {mean:>6.1f}   p50 {p50:>3}   p90 {p90:>3}", file=out)
     return {"vertices": len(cols), "peak": peak, "mean": round(mean, 2),
-            "p50": p50, "p90": p90}
+            "p50": p50, "p90": p90,
+            "hist": [round(x, 5) for x in histogram(flat)]}
+
+
+def verdict_of(a, b, out=sys.stdout):
+    """Compare two distributions, and say when the answer is not safe.
+
+    Deliberately NOT decided on `peak`. A peak is a maximum, so it grows
+    with the number of samples drawn; comparing 3008 vertices against 1024
+    on peak alone reported "differ" for two distributions whose medians and
+    p90s agreed. That was a wrong answer stated confidently, which is worse
+    than no answer.
+    """
+    if not a or not b:
+        return None, "one side sampled nothing"
+    ov = overlap(a["hist"], b["hist"])
+    ratio = max(a["vertices"], b["vertices"]) / max(1, min(a["vertices"],
+                                                          b["vertices"]))
+    print(f"\n  distribution overlap {ov:.3f}   "
+          f"sample ratio {ratio:.2f}x", file=out)
+    if ratio > 3.0:
+        print("  note: sample sizes are lopsided; the overlap still holds "
+              "(it is normalised) but peaks are not comparable.", file=out)
+    if ov >= 0.85:
+        return "match", (
+            "the colour distributions match. Both emulators build the same "
+            "colours, so a visible difference is NOT coming from vertex "
+            "colour — look at rasterisation or blending.")
+    if ov < 0.70:
+        return "differ", (
+            "the distributions genuinely differ in shape. The two are "
+            "building different colours, so the divergence is upstream of "
+            "the renderer.")
+    return "inconclusive", (
+        "the distributions are close but not clearly the same. Sample more "
+        "frames, and make sure both are showing the same effect.")
 
 
 def main(argv=None):
@@ -205,26 +268,21 @@ def main(argv=None):
     a = describe(ncols, "psx-runtime")
     b = describe(ocols, "oracle")
 
-    verdict = None
-    if a and b:
-        ratio = a["peak"] / max(1, b["peak"])
-        print()
-        if 0.8 <= ratio <= 1.25:
-            verdict = "match"
-            print("VERDICT: the colour distributions match. The game builds the "
-                  "same colours on both — a visible difference is NOT coming from "
-                  "vertex colour, so look at rasterisation or blending.")
-        else:
-            verdict = "differ"
-            print(f"VERDICT: the distributions differ (peak ratio {ratio:.2f}). "
-                  f"The two emulators are building different colours, so the "
-                  f"divergence is upstream of the renderer.")
+    verdict, why = verdict_of(a, b)
+    if verdict:
+        print(f"\nVERDICT ({verdict}): {why}")
         print("\nNote: this is phase-independent — it does not require the two to "
               "be on the same frame — but both must be showing the same EFFECT.")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"kind": PARITY_KIND, "version": 1, "class": want,
-                       "native": a, "oracle": b, "verdict": verdict}, f, indent=1)
+            doc = {"kind": PARITY_KIND, "version": 1, "class": want,
+                   "native": a, "oracle": b, "verdict": verdict}
+            if a and b:
+                doc["overlap"] = round(overlap(a["hist"], b["hist"]), 4)
+                doc["sample_ratio"] = round(
+                    max(a["vertices"], b["vertices"])
+                    / max(1, min(a["vertices"], b["vertices"])), 3)
+            json.dump(doc, f, indent=1)
         print(f"wrote {args.json}")
     return 0
 

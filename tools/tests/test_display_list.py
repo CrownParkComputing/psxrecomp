@@ -296,3 +296,127 @@ class TestColourParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOrderingTableCoverage(unittest.TestCase):
+    """The whole frame, not one bucket of it.
+
+    A real ordering table is an ARRAY of link-only entries, each chaining to a
+    run of primitives and then on to the next bucket. Skipping link entries when
+    building the graph makes every bucket's first primitive look like an
+    unpointed head, so the scan reports one bucket and calls it the display
+    list. That is not a cosmetic inaccuracy: the bucket it happens to pick can
+    omit the exact effect being investigated, and the output looks complete.
+    """
+
+    OT = 0x100000
+    A = 0x10D000      # bucket 0's primitives -- opaque textured quads
+    B = 0x10E000      # bucket 1's primitives -- the additive burst
+
+    def _ram(self, buckets=2, per=6):
+        ram = blank_ram()
+        starts = [self.A, self.B]
+        # Primitive runs. Bucket 1 uses the semi-transparent gouraud quads that
+        # stand in for the effect; bucket 0 uses opaque textured quads.
+        for b in range(buckets):
+            base = starts[b]
+            for i in range(per):
+                off = base + i * 0x28
+                nxt = base + (i + 1) * 0x28 if i < per - 1 else (
+                    self.OT + (b + 1) * 4 if b + 1 < buckets else GF.OT_END)
+                if b == 0:
+                    put(ram, off, tag(8, nxt),
+                        (0x2C << 24) | color(64, 64, 64), vert(10, 10), 0,
+                        vert(60, 10), 0, vert(10, 60), 0)
+                else:
+                    put(ram, off, tag(8, nxt),
+                        (0x3A << 24) | color(199, 40, 20), vert(0, 0),
+                        color(9, 9, 9), vert(40, 0),
+                        color(9, 9, 9), vert(0, 40),
+                        color(9, 9, 9), vert(40, 40))
+        # The OT array: each bucket links into its primitive run.
+        for b in range(buckets):
+            put(ram, self.OT + b * 4, tag(0, starts[b]))
+        return ram
+
+    def test_the_scan_covers_every_bucket_not_just_one(self):
+        ram = self._ram()
+        cands = GF.find_display_lists(bytes(ram))
+        self.assertTrue(cands, "found no chain at all")
+        best = cands[0]
+        prims = GF.decode_entries(
+            GF.walk_ordering_table(bytes(ram), best["root"]))
+        ops = {p["op_name"] for p in prims if p["kind"] == "poly"}
+        self.assertIn("PolyG4+semi", ops,
+                      "the additive bucket was dropped — this is the failure "
+                      "that silently hid the effect from the inspector")
+        self.assertIn("PolyFT4", ops, "the opaque bucket was dropped")
+        self.assertEqual(best["prims"], 12, "expected both buckets' primitives")
+
+    def test_the_best_candidate_is_the_table_head_not_a_bucket(self):
+        ram = self._ram()
+        best = GF.find_display_lists(bytes(ram))[0]
+        self.assertEqual(best["root"], self.OT,
+                         "should start at the ordering table, not mid-chain")
+
+    def test_zeroed_ram_still_yields_nothing(self):
+        # Admitting link entries to the graph must not make every zero word a
+        # node: a zero word reads as length 0 pointing at address 0.
+        self.assertEqual(GF.find_display_lists(bytes(blank_ram())), [])
+
+    def test_noise_does_not_manufacture_a_display_list(self):
+        import random
+        rnd = random.Random(11)
+        ram = blank_ram()
+        for a in range(0x40000, 0xC0000, 4):
+            struct.pack_into("<I", ram, a, rnd.getrandbits(32))
+        self.assertEqual(GF.find_display_lists(bytes(ram)), [])
+
+
+class TestColourVerdict(unittest.TestCase):
+    """The verdict must not rest on a statistic that scales with sample count.
+
+    Deciding on `peak` once reported "differ" for two distributions whose
+    medians and p90s agreed, purely because one side had drawn three times as
+    many samples and had therefore seen more of the tail. A maximum is the
+    worst possible choice here; histogram intersection over normalised bins is
+    invariant to both sample count and animation phase.
+    """
+
+    @staticmethod
+    def _stats(values):
+        cols = [[v, v, v] for v in values]
+        import io
+        return CP.describe(cols, "x", out=io.StringIO())
+
+    def test_same_shape_different_sample_count_is_not_a_difference(self):
+        base = [3, 5, 8, 13, 21, 40, 80, 144, 200]
+        a = self._stats(base * 300)     # many samples -> sees the tail
+        b = self._stats(base * 100)     # few samples -> same shape
+        v, _ = CP.verdict_of(a, b)
+        self.assertEqual(v, "match",
+                         "identical shapes must match regardless of sample count")
+
+    def test_genuinely_different_distributions_still_differ(self):
+        a = self._stats([200, 210, 220, 230] * 500)   # bright
+        b = self._stats([5, 8, 11, 14] * 500)         # dark
+        v, why = CP.verdict_of(a, b)
+        self.assertEqual(v, "differ", why)
+
+    def test_overlap_is_one_for_identical_and_zero_for_disjoint(self):
+        h = CP.histogram([10] * 100)
+        self.assertAlmostEqual(CP.overlap(h, h), 1.0, places=6)
+        self.assertAlmostEqual(CP.overlap(CP.histogram([5] * 50),
+                                          CP.histogram([250] * 50)), 0.0,
+                               places=6)
+
+    def test_histogram_is_normalised(self):
+        small = CP.histogram([100] * 10)
+        big = CP.histogram([100] * 10000)
+        self.assertEqual(small, big, "raw counts must not leak into the shape")
+
+    def test_one_empty_side_yields_no_verdict(self):
+        a = self._stats([10] * 50)
+        v, why = CP.verdict_of(a, None)
+        self.assertIsNone(v)
+        self.assertIn("sampled nothing", why)

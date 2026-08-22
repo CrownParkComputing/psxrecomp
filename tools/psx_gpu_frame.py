@@ -1032,27 +1032,47 @@ def find_display_lists(ram: bytes, min_prims: int = 4, limit: int = 8,
     n = len(ram) - (len(ram) % 4)
     words = memoryview(ram)[:n].cast("I")
 
-    nodes: Dict[int, int] = {}      # addr -> next addr (or OT_END)
+    # Two node kinds, and both matter.
+    #
+    # A PRIMITIVE node carries a GP0 packet, and its payload length must match
+    # the opcode exactly -- that check is what keeps a 2 MB scan from matching
+    # noise.
+    #
+    # A LINK node carries no payload; it is one bucket of the ordering table
+    # array. These were originally skipped, which was the bug: an OT bucket
+    # points INTO a primitive chain, so if links are left out of the graph every
+    # bucket's first primitive looks like an unpointed head. The scan then
+    # reports one bucket per chain -- a partial frame that can easily omit the
+    # very effect being investigated -- instead of the whole display list.
+    succ: Dict[int, int] = {}       # addr -> next addr (or OT_END)
+    prim_nodes = set()
     pointed = set()
     for i in range(len(words) - 1):
         tag = words[i]
         n_words = (tag >> 24) & 0xFF
-        if not n_words:
-            continue            # a link-only entry cannot seed a chain
         nxt = tag & 0xFFFFFF
         if nxt != OT_END and (nxt & 3 or nxt >= n):
             continue
-        if i + 1 + n_words > len(words):
-            continue
-        want = expected_words(int(words[i + 1]) >> 24 & 0xFF)
-        if want is None or want != n_words:
-            continue
-        addr = i * 4
-        nodes[addr] = nxt
+        if n_words:
+            if i + 1 + n_words > len(words):
+                continue
+            want = expected_words(int(words[i + 1]) >> 24 & 0xFF)
+            if want is None or want != n_words:
+                continue
+            prim_nodes.add(i * 4)
+        else:
+            # A link entry is only plausible if it points somewhere real.
+            # Without this every zeroed word in RAM claims to be a node
+            # pointing at address 0, and the graph drowns.
+            if nxt == OT_END or nxt == 0:
+                continue
+        succ[i * 4] = nxt
         if nxt != OT_END:
             pointed.add(nxt)
 
-    heads = [a for a in nodes if a not in pointed]
+    heads = [a for a in succ if a not in pointed]
+    # A head that reaches no primitive at all is noise; one that reaches some is
+    # a candidate. Walking from a LINK head is how the whole table gets covered.
     out: List[Dict[str, Any]] = []
     for h in heads:
         entries = walk_ordering_table(ram, h, max_nodes=max_nodes)
