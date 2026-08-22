@@ -448,7 +448,7 @@ std::string CodeGenerator::translate_lwl(uint32_t instr) {
         return fmt::format("(void)psx_lwl(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwl(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_lwr(uint32_t instr) {
@@ -468,7 +468,7 @@ std::string CodeGenerator::translate_lwr(uint32_t instr) {
         return fmt::format("(void)psx_lwr(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwr(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_swl(uint32_t instr) {
@@ -1959,7 +1959,22 @@ std::string CodeGenerator::translate_basic_block(
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            // If this is the successor half of a deferred load pair AND it is an
+            // LWL/LWR merging into that same register, hardware forwards the
+            // pending load into the merge (see set_lwlr_merge_forward). Point
+            // the merge operand at the deferred temporary before translating.
+            const uint32_t succ_op = instr >> 26;
+            const bool succ_is_lwlr = (succ_op == 0x22u || succ_op == 0x26u);
+            const bool forward_to_lwlr =
+                delayed_load_active && addr == delayed_load_addr + 4u &&
+                succ_is_lwlr && get_rt(instr) == delayed_load_dest;
+            if (forward_to_lwlr) {
+                set_lwlr_merge_forward(
+                    delayed_load_dest,
+                    fmt::format("psx_ldd_{:08X}", delayed_load_addr));
+            }
             std::string emitted = translate_instruction(addr, instr);
+            if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
             if (!delayed_load_active && load_dest > 0 && addr + 4u <= block.end_addr &&
@@ -1974,12 +1989,23 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    /* Assign into a function-scope temp. PGXP wraps loads in
-                     * `{{ ... }}`; declaring the temp inside that block left
-                     * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
+                    // Declare the temp in the pair block, not inline at the
+                    // load: with PGXP the load already sits in its own
+                    // `{ uint32_t _pgxa = ...; <load> PGXP_LOAD(...); }`
+                    // wrapper, so an inline declaration would go out of
+                    // scope before the writeback below.
                     emitted.replace(pos, lhs.size(), temp + " =");
-                    ss << config_.indent << "uint32_t " << temp << ";\n";
+                    // Point the PGXP hook at the temp: the writeback is
+                    // deferred, so the GPR still holds the pre-load value.
+                    const std::string pgxp_tail =
+                        fmt::format(", _pgxa, cpu->gpr[{}]);", load_dest);
+                    const size_t hook = emitted.rfind(pgxp_tail);
+                    if (hook != std::string::npos)
+                        emitted.replace(hook, pgxp_tail.size(),
+                                        fmt::format(", _pgxa, {});", temp));
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
+                    ss << config_.indent
+                       << fmt::format("    uint32_t {} = 0;\n", temp);
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
                     delayed_load_active = true;
@@ -1987,7 +2013,11 @@ std::string CodeGenerator::translate_basic_block(
             }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
-                if (writes_gpr(instr, delayed_load_dest)) {
+                if (forward_to_lwlr) {
+                    ss << config_.indent << fmt::format(
+                        "/* psx_ldd_{:08X} forwarded into the LWL/LWR merge above */\n",
+                        delayed_load_addr);
+                } else if (writes_gpr(instr, delayed_load_dest)) {
                     ss << config_.indent << fmt::format(
                         "(void)psx_ldd_{:08X};  /* successor write wins */\n",
                         delayed_load_addr);
@@ -2473,6 +2503,16 @@ std::string CodeGenerator::translate_basic_block(
         if (known_functions_.count(next_addr) > 0) {
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
+                              next_addr);
+        } else if (cps_enabled_) {
+            // Unit-edge fall-through with no known successor function (e.g. a
+            // partial overlay capture). Falling off the body would leave
+            // cpu->pc == 0 (the continuation-entry prologue cleared it), which
+            // the trampoline reads as a normal guest exit — a silent shutdown.
+            // Publish the PC so dispatch can route it instead.
+            ss << emit_interrupt_check(next_addr, config_.indent);
+            ss << config_.indent
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS fallthrough past unit edge */\n",
                               next_addr);
         } else {
             ss << emit_interrupt_check(next_addr, config_.indent);
