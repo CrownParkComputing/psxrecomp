@@ -40,8 +40,92 @@ WRITERS_KIND = "psx-packet-writers"
 
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_NATIVE_PORT, DebugConn, DebugError, decode_entries,
-    find_display_lists, snapshot_ram, walk_ordering_table,
+    find_display_lists, read_ram_range, snapshot_ram, walk_ordering_table,
 )
+
+
+_REG = ["zr", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"]
+_SPECIAL = {0x00: "sll", 0x02: "srl", 0x03: "sra", 0x04: "sllv",
+            0x06: "srlv", 0x07: "srav", 0x08: "jr", 0x09: "jalr",
+            0x10: "mfhi", 0x12: "mflo", 0x18: "mult", 0x19: "multu",
+            0x1A: "div", 0x1B: "divu", 0x20: "add", 0x21: "addu",
+            0x22: "sub", 0x23: "subu", 0x24: "and", 0x25: "or",
+            0x26: "xor", 0x27: "nor", 0x2A: "slt", 0x2B: "sltu"}
+_IMM = {0x08: "addi", 0x09: "addiu", 0x0A: "slti", 0x0B: "sltiu",
+        0x0C: "andi", 0x0D: "ori", 0x0E: "xori"}
+_MEM = {0x20: "lb", 0x21: "lh", 0x23: "lw", 0x24: "lbu", 0x25: "lhu",
+        0x28: "sb", 0x29: "sh", 0x2B: "sw"}
+
+
+def disasm_one(w, pc):
+    """One MIPS instruction, enough to read a store and its operands."""
+    if w == 0:
+        return "nop"
+    op = (w >> 26) & 0x3F
+    rs, rt, rd = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
+    sh, fn = (w >> 6) & 31, w & 0x3F
+    imm = w & 0xFFFF
+    simm = imm - 0x10000 if imm & 0x8000 else imm
+    R = lambda n: "$" + _REG[n]
+    if op == 0:
+        n = _SPECIAL.get(fn, f"spec{fn:02x}")
+        if fn in (0x00, 0x02, 0x03):
+            return f"{n} {R(rd)},{R(rt)},{sh}"
+        if fn == 0x08:
+            return f"jr {R(rs)}"
+        if fn in (0x18, 0x19, 0x1A, 0x1B):
+            return f"{n} {R(rs)},{R(rt)}"
+        if fn in (0x10, 0x12):
+            return f"{n} {R(rd)}"
+        return f"{n} {R(rd)},{R(rs)},{R(rt)}"
+    if op in _MEM:
+        return f"{_MEM[op]} {R(rt)},{simm}({R(rs)})"
+    if op in _IMM:
+        return f"{_IMM[op]} {R(rt)},{R(rs)},{simm}"
+    if op == 0x0F:
+        return f"lui {R(rt)},0x{imm:04X}"
+    if op in (4, 5):
+        return (f"{'beq' if op == 4 else 'bne'} {R(rs)},{R(rt)},"
+                f"0x{pc + 4 + (simm << 2):08X}")
+    if op in (2, 3):
+        return (f"{'j' if op == 2 else 'jal'} "
+                f"0x{(pc & 0xF0000000) | ((w & 0x3FFFFFF) << 2):08X}")
+    if op == 0x12:
+        return f"cop2 0x{w & 0x1FFFFFF:07X}"
+    return f"op{op:02x}"
+
+
+def disasm_around(conn, pc, before=10, count=20):
+    """Fetch and decode instructions around a PC.
+
+    Captured DURING the trace, while the emulator is already parked and
+    the right overlay is resident. These PCs live above the main EXE
+    (0x8003F000), so the code at a given address depends on which overlay
+    is loaded -- disassembling later, after the scene changed, would
+    decode whatever replaced it and look perfectly plausible.
+    """
+    # Mask to physical ONCE, up front. Mixing a virtual pc into the offset
+    # arithmetic and then comparing against a masked one means no line ever
+    # matches, and the listing comes back with nothing marked — which reads as
+    # "the instruction is not in this window" rather than as a bug.
+    phys = pc & 0x1FFFFFFF
+    start = max(0, phys - before * 4)
+    try:
+        blob = read_ram_range(conn, 0x80000000 | start, count * 4)
+    except DebugError:
+        return []
+    out = []
+    for i in range(0, len(blob) - 3, 4):
+        w = int.from_bytes(blob[i:i + 4], "little")
+        a = start + i
+        va = 0x80000000 | a
+        out.append({"pc": f"0x{va:08X}", "word": f"0x{w:08X}",
+                    "text": disasm_one(w, va),
+                    "is_target": a == phys})
+    return out
 
 
 def field_map(prims, want=None):
@@ -91,6 +175,10 @@ def main(argv=None):
                          "is correct.")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--no-disasm", dest="disasm", action="store_false",
+                    help="skip capturing code for colour-only writers")
+    ap.add_argument("--disasm-before", type=int, default=12)
+    ap.add_argument("--disasm-count", type=int, default=28)
     args = ap.parse_args(argv)
 
     conn = DebugConn(args.host, args.port, args.timeout)
@@ -190,6 +278,21 @@ def main(argv=None):
                       f"while tracing.", file=sys.stderr)
         rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo:08X}",
                        addr_hi=f"0x{hi:08X}", count=16000)
+        listings = {}
+        if args.disasm:
+            # Still parked here, which is the only safe moment: see
+            # disasm_around(). Which PCs matter is not known until the writes
+            # are tallied, so tally them now rather than after resuming.
+            tally = defaultdict(Counter)
+            for e in rep.get("entries", []):
+                r = roles.get(int(e["addr"], 16) & 0x1FFFFFFC)
+                if r:
+                    tally[e["pc"]][r] += 1
+            for pc, k in tally.items():
+                if k["colour"] and not k["vertex"]:
+                    listings[pc] = disasm_around(conn, int(pc, 16),
+                                                 before=args.disasm_before,
+                                                 count=args.disasm_count)
     except DebugError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -255,8 +358,15 @@ def main(argv=None):
 
     top = [pc for pc, k in ranked if k["colour"] and not k["vertex"]]
     if top:
-        print(f"\nWrites ONLY colour words: {', '.join(top[:6])}")
-        print("Disassemble with:  python3 disasm_ram.py --pc " + top[0])
+        print(f"\nWrites ONLY colour words: {', '.join(top[:8])}")
+        for pc in top[:3]:
+            rows = listings.get(pc) or []
+            if not rows:
+                continue
+            print(f"\n  --- {pc} ---")
+            for r in rows:
+                mark = ">>" if r["is_target"] else "  "
+                print(f"  {mark} {r['pc']}: {r['word']}  {r['text']}")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({
@@ -269,6 +379,7 @@ def main(argv=None):
                 "writes": len(entries), "unmapped": unknown,
                 "aliased": bool(aliased or stale),
                 "mixed_writers": len(mixed),
+                "listings": listings,
                 "writers": [{"pc": pc, "func": pcfunc.get(pc, ""),
                              "colour": k["colour"], "vertex": k["vertex"],
                              "uv": k["uv"],
