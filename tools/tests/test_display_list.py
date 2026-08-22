@@ -420,3 +420,34 @@ class TestColourVerdict(unittest.TestCase):
         v, why = CP.verdict_of(a, None)
         self.assertIsNone(v)
         self.assertIn("sampled nothing", why)
+
+
+class TestBothSidesReport(unittest.TestCase):
+    """The concurrent walk must not overstate what it managed to do."""
+
+    def test_compare_shows_classes_present_on_only_one_side(self):
+        import io
+        nat = {"classes": [{"key": "PolyG4+semi|B+F", "count": 144},
+                           {"key": "PolyFT4|opaque", "count": 584}]}
+        orc = {"classes": [{"key": "PolyFT4|opaque", "count": 584}]}
+        buf = io.StringIO()
+        res = DL.compare(nat, orc, out=buf)
+        text = buf.getvalue()
+        self.assertIn("only one side", text,
+                      "a class missing entirely from one emulator is the "
+                      "headline, not a row to scan past")
+        row = {c["key"]: c for c in res["classes"]}
+        self.assertEqual(row["PolyG4+semi|B+F"]["oracle"], 0)
+        self.assertEqual(row["PolyFT4|opaque"]["native"], 584)
+
+    def test_frames_spanned_reports_none_when_unknown(self):
+        self.assertIsNone(DL.frames_spanned({}))
+        self.assertIsNone(DL.frames_spanned({"frame_before": 5}))
+        self.assertEqual(DL.frames_spanned({"frame_before": 5,
+                                            "frame_after": 9}), 4)
+
+    def test_a_paused_side_spans_no_frames(self):
+        # psx-runtime is parked for its snapshot, so it should not report drift;
+        # the oracle is read running and legitimately may.
+        meta = {"paused": True, "frame_before": 100, "frame_after": 100}
+        self.assertEqual(DL.frames_spanned(meta), 0)

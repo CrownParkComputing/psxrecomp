@@ -29,16 +29,19 @@ list runs to hundreds of nodes, and a round trip each would be absurd.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
+import threading
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
-    DEFAULT_NATIVE_PORT, STP_MODES, DebugConn, DebugError, decode_entries,
-    dma_gpu_list_root, find_display_lists, snapshot_ram, walk_ordering_table,
+    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, STP_MODES, DebugConn,
+    DebugError, decode_entries, dma_gpu_list_root, find_display_lists,
+    snapshot_ram, walk_ordering_table,
 )
 
 LIST_KIND = "psx-display-list"
@@ -104,6 +107,175 @@ def summarise(prims, out=sys.stdout, limit=20):
             print(f"  {'':>4}  {'':<16} {'':<10} {'':<12} {cols}", file=out)
 
 
+def walk_side(conn, label, *, addr=None, near=None, pause=False,
+              from_dma=False, max_nodes=8192, candidates=6,
+              out=sys.stdout):
+    """Snapshot one emulator and walk its display list.
+
+    Returns (report, meta) or (None, meta) if nothing walkable was found.
+    `meta` always carries the frame numbers seen either side of the
+    snapshot, because a read of a RUNNING emulator takes long enough for
+    the game to rebuild the list underneath it -- and a walk that
+    straddled a rebuild should be visibly suspect rather than quietly
+    reported as fact.
+    """
+    meta = {"label": label, "paused": False,
+            "frame_before": None, "frame_after": None}
+    paused = False
+    try:
+        # Pause FIRST, then read the root, then snapshot: the root and the
+        # list it names have to come from the same instant.
+        if pause:
+            try:
+                conn.cmd("pause")
+                paused = meta["paused"] = True
+            except DebugError as e:
+                print(f"  [{label}] could not pause: {e}", file=out)
+        try:
+            meta["frame_before"] = conn.frame()
+        except DebugError:
+            pass
+
+        root = int(addr, 0) if isinstance(addr, str) else addr
+        if root is None and from_dma:
+            root = dma_gpu_list_root(conn)
+            if root is None:
+                print(f"  [{label}] DMA ch2 MADR holds the end-of-list "
+                      f"terminator, not a root. Scanning instead.", file=out)
+
+        ram = snapshot_ram(conn)
+        try:
+            meta["frame_after"] = conn.frame()
+        except DebugError:
+            pass
+    except DebugError as e:
+        meta["error"] = str(e)
+        return None, meta
+    finally:
+        if paused:
+            try:
+                conn.cmd("continue")
+            except DebugError:
+                pass
+
+    entries = walk_ordering_table(ram, root, max_nodes=max_nodes) if root else []
+    if not entries:
+        cands = find_display_lists(ram, near=near, limit=candidates)
+        if not cands:
+            meta["error"] = ("no display list found — if the game is on a "
+                             "menu or load screen it may have none")
+            return None, meta
+        meta["candidates"] = [
+            {"root": f"0x{c['root']:06X}", "nodes": c["nodes"],
+             "prims": c["prims"]} for c in cands]
+        root = cands[0]["root"]
+        entries = walk_ordering_table(ram, root, max_nodes=max_nodes)
+
+    rep = report(decode_entries(entries), root, conn.port)
+    rep["meta"] = meta
+    return rep, meta
+
+
+def frames_spanned(meta):
+    a, b = meta.get("frame_before"), meta.get("frame_after")
+    if a is None or b is None:
+        return None
+    return b - a
+
+
+def compare(nat, orc, out=sys.stdout):
+    """Class-count delta between two walks."""
+    an = {c["key"]: c["count"] for c in nat["classes"]}
+    on = {c["key"]: c["count"] for c in orc["classes"]}
+    keys = list(an) + [k for k in on if k not in an]
+    print(f"\n{'class':<28}{'runtime':>9}{'oracle':>9}{'delta':>9}", file=out)
+    for k in keys:
+        a, b = an.get(k, 0), on.get(k, 0)
+        mark = "" if a == b else ("  <-- only one side" if not a or not b else "")
+        print(f"  {k:<26}{a:>9}{b:>9}{b - a:>+9}{mark}", file=out)
+    return {"classes": [{"key": k, "native": an.get(k, 0),
+                         "oracle": on.get(k, 0)} for k in keys]}
+
+
+def run_both(args):
+    """Walk both emulators at once and compare.
+
+    Each side runs in its own thread with its own connection. DebugConn
+    opens a fresh socket per command and keeps no shared state, so the two
+    do not interfere.
+
+    The two sides are NOT treated symmetrically, and that is deliberate:
+    psx-runtime is parked for its snapshot (its park loop keeps serving
+    commands, so this is safe) while the oracle is read running, because
+    pausing DuckStation drops its debug socket to the Qt idle timer -- 1 Hz
+    with no gamepad attached -- and the read cannot finish.
+    """
+    out_dir = args.out_dir or "."
+    os.makedirs(out_dir, exist_ok=True)
+    near = int(args.near, 0) if args.near else None
+    results = {}
+    lock = threading.Lock()
+
+    def go(label, port, pause):
+        buf = io.StringIO()
+        conn = DebugConn(args.host, port, args.timeout)
+        rep, meta = walk_side(conn, label, addr=args.addr, near=near,
+                              pause=pause, from_dma=args.from_dma,
+                              max_nodes=args.max_nodes,
+                              candidates=args.candidates, out=buf)
+        with lock:
+            results[label] = (rep, meta, buf.getvalue())
+
+    threads = [
+        threading.Thread(target=go, args=("native", args.port, args.pause)),
+        threading.Thread(target=go, args=("oracle", args.ds_port, False)),
+    ]
+    print("walking both emulators concurrently …")
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    rc = 0
+    wrote = []
+    for label, fname in (("native", "dlist-native.json"),
+                         ("oracle", "dlist-oracle.json")):
+        rep, meta, log = results.get(label, (None, {}, ""))
+        if log:
+            sys.stdout.write(log)
+        if rep is None:
+            print(f"  {label}: {meta.get('error', 'failed')}", file=sys.stderr)
+            rc = 1
+            continue
+        span = frames_spanned(meta)
+        note = "" if meta.get("paused") else (
+            f", advanced {span} frame(s) during the read" if span else "")
+        print(f"  {label}: root {rep['root']}, {rep['nodes']} node(s), "
+              f"{rep['drawing']} drawing{note}")
+        if span and span > 2 and not meta.get("paused"):
+            print(f"    warning: {label} advanced {span} frames while being "
+                  f"read, so this walk may straddle a rebuild of the list.",
+                  file=sys.stderr)
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+            json.dump(rep, f, indent=1)
+        wrote.append(fname)
+
+    nat = results.get("native", (None,))[0]
+    orc = results.get("oracle", (None,))[0]
+    if nat and orc:
+        compare(nat, orc)
+        print("\nA delta only means something if both sides are at the same "
+              "point in the animation — an effect mid-cycle differs from "
+              "itself frame to frame.")
+    # Only claim what actually happened. Saying "wrote both" after a failed
+    # side leaves a stale file from an earlier run looking like fresh output.
+    if wrote:
+        print(f"\nwrote {', '.join(wrote)} to {out_dir}")
+    else:
+        print("\nnothing written — neither side could be walked", file=sys.stderr)
+    return rc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -122,6 +294,17 @@ def main(argv=None):
     ap.add_argument("--max-nodes", type=int, default=8192)
     ap.add_argument("--limit", type=int, default=20, help="primitives to print")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--both", action="store_true",
+                    help="walk psx-runtime AND the oracle concurrently, and "
+                         "compare. Concurrent rather than sequential because "
+                         "the two snapshots should land as close together in "
+                         "time as possible — the effect is animating, and every "
+                         "second between them is phase drift in the comparison.")
+    ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT,
+                    help="the oracle's port, for --both")
+    ap.add_argument("--out-dir", default=None,
+                    help="with --both, write dlist-native.json and "
+                         "dlist-oracle.json here")
     ap.add_argument("--pause", action="store_true",
                     help="park the emulator around the snapshot. Safe against "
                          "psx-runtime, which keeps serving while parked. NOT "
@@ -129,6 +312,9 @@ def main(argv=None):
                          "its socket to the idle poll timer (1 Hz with no "
                          "gamepad present), and a 2 MB read cannot finish.")
     args = ap.parse_args(argv)
+
+    if args.both:
+        return run_both(args)
 
     conn = DebugConn(args.host, args.port, args.timeout)
     paused = False
