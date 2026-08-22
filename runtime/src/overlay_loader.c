@@ -25,6 +25,7 @@ extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
 #  include <windows.h>
 #else
 #  include <unistd.h>
+#  include <dirent.h>   /* orphaned-cache tripwire in scan_cache_dir() */
 #endif
 
 #ifdef _WIN32
@@ -1939,6 +1940,64 @@ static void scan_cache_dir(void) {
              (unsigned)PSX_OVERLAY_FLAVOR);
     scan_one_cache_dir(dir, CACHE_TIER_TCC);
     abi_preflight_sweep(dir);
+
+    /* Orphaned-cache tripwire. The cache path embeds a content hash of the
+     * emitter sources, so a cache built before the last emitter change lives in
+     * a sibling directory this build will never open: the scan simply finds
+     * nothing, registers nothing, and every mod-patched region falls to the
+     * dirty-RAM interpreter at its 10-30x frame cost — silently, and looking
+     * exactly like "this machine is just slow". That cost days: a bundle with
+     * 443 shards tagged cg10_79105b41 running against a 7a17c3b1 runtime
+     * measured 13.1M interpreted dispatches over 3,623 frames at ~47 fps, with
+     * registered=0 the only evidence and no message saying why.
+     *
+     * If we indexed nothing, look for siblings and name the mismatch. This is a
+     * one-shot startup diagnostic on the operator's existing status stream, not
+     * a trace: a run that loads shards prints nothing extra. */
+    if (s_cache_idx_count == 0) {
+        char parent[768];
+        snprintf(parent, sizeof(parent), "%s/%s/gcc/%s",
+                 s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI);
+        char expect[128];
+        snprintf(expect, sizeof(expect), "cg%d_%08x_gc%08x_f%u",
+                 PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+                 (unsigned)s_config_hash, (unsigned)PSX_OVERLAY_FLAVOR);
+        int orphans = 0;
+#ifdef _WIN32
+        char pat[832];
+        snprintf(pat, sizeof(pat), "%s/cg*", parent);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (strcmp(fd.cFileName, expect) == 0) continue;
+                printf("psxrecomp: overlay cache ORPHANED — found '%s' but this "
+                       "build needs '%s'\n", fd.cFileName, expect);
+                orphans++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+#else
+        DIR *d = opendir(parent);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strncmp(e->d_name, "cg", 2) != 0) continue;
+                if (strcmp(e->d_name, expect) == 0) continue;
+                printf("psxrecomp: overlay cache ORPHANED — found '%s' but this "
+                       "build needs '%s'\n", e->d_name, expect);
+                orphans++;
+            }
+            closedir(d);
+        }
+#endif
+        if (orphans)
+            printf("psxrecomp: %d stale overlay cache tag(s) in %s — every "
+                   "mod-patched region will INTERPRET. Rebuild shards with the "
+                   "current emitter (overlay_autocompile_cmd).\n",
+                   orphans, parent);
+    }
 
     refresh_bios_resident_flags();
     rebuild_lazy_manifest_index();
