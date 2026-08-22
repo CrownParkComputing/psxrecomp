@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -125,14 +126,96 @@ def compare_images(pa, pb, out_path):
     }
 
 
-def gpu_state_delta(a, b):
+# The two servers name the same GPU facts differently. Comparing raw keys made
+# every field read "native=None", which looks like the runtime failing to report
+# its display state and is really just a vocabulary mismatch -- a difference
+# invented by the tool, printed under a heading that says the emulators differ.
+FIELD_ALIASES = {
+    "display_x":     ("display_x", "display_area_x"),
+    "display_y":     ("display_y", "display_area_y"),
+    "width":         ("width", "disp_w", "display_width"),
+    "height":        ("height", "disp_h", "display_height"),
+    "depth24":       ("depth24", "display_24bit"),
+    "display_enable": ("display_enable", "display_disable"),
+    "interlaced":    ("interlaced", "display_interlaced"),
+    "pal":           ("pal", "pal_mode"),
+}
+
+
+def canon(state):
+    """One vocabulary, so a delta means a real difference."""
     out = {}
-    for k in GPU_STATE_FIELDS:
-        if k in a or k in b:
-            av, bv = a.get(k), b.get(k)
-            if av != bv:
-                out[k] = {"native": av, "duckstation": bv}
+    for name, keys in FIELD_ALIASES.items():
+        for k in keys:
+            if k in state:
+                v = state[k]
+                # display_disable is the inverse of display_enable; folding them
+                # into one name without inverting would report every frame as a
+                # difference.
+                if k == "display_disable" and isinstance(v, (int, bool)):
+                    v = 0 if v else 1
+                out[name] = v
+                break
+    for k, v in state.items():
+        if k not in ("id", "ok") and not any(k in ks for ks in FIELD_ALIASES.values()):
+            out.setdefault(k, v)
     return out
+
+
+def gpu_state_delta(a, b):
+    ca, cb = canon(a), canon(b)
+    out = {}
+    for k in sorted(set(ca) | set(cb)):
+        av, bv = ca.get(k), cb.get(k)
+        if av != bv:
+            # Only ONE side knowing a field is not the two disagreeing about it.
+            out[k] = {"native": av, "duckstation": bv,
+                      "one_sided": (av is None) != (bv is None)}
+    return out
+
+
+def align_frames(native, ds, want, result, settle=400):
+    """Park both emulators on the same guest frame. True if it worked.
+
+    Forward-only by necessity: run_to_frame refuses a target already passed, and
+    there is no rewind command on either side. The target is therefore the
+    LATER of the two positions -- whichever emulator is behind steps up to it.
+
+    psx-runtime is parked for the whole operation, which is the point. Leaving
+    it running while DuckStation was steered guaranteed the two screenshots came
+    from different frames, and the old code then printed that as a warning to be
+    read past rather than a reason the comparison was void.
+    """
+    try:
+        native.cmd("pause")
+    except DebugError as e:
+        result["native_pause_error"] = str(e)
+        result["native_frame"], result["duckstation_frame"] = native.frame(), ds.frame()
+        return False
+
+    fa, fb = native.frame(), ds.frame()
+    target = want if want is not None else max(fa, fb)
+    result["target_frame"] = target
+
+    if fb < target:
+        try:
+            ds.run_to_frame(target)
+        except DebugError as e:
+            result["duckstation_drive_error"] = str(e)
+    if fa < target:
+        try:
+            native.cmd("step", n=int(target - fa))
+            for _ in range(settle):
+                st = native.raw("pause_state")
+                if st.get("paused") and native.frame() >= target:
+                    break
+                time.sleep(0.02)
+        except DebugError as e:
+            result["native_drive_error"] = str(e)
+
+    fa, fb = native.frame(), ds.frame()
+    result["native_frame"], result["duckstation_frame"] = fa, fb
+    return fa == fb
 
 
 def main(argv=None):
@@ -142,8 +225,9 @@ def main(argv=None):
     ap.add_argument("--native-port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--frame", type=int, default=None,
-                    help="target guest frame (default: wherever the native run "
-                         "already is). Only DuckStation is driven to it.")
+                    help="target guest frame. Default: whichever emulator is "
+                         "further ahead, since neither can rewind and both can "
+                         "step forward.")
     ap.add_argument("--out", default="analysis/frames/parity")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--start-oracle", action="store_true",
@@ -168,25 +252,28 @@ def main(argv=None):
     try:
         with DebugConn(args.host, args.native_port, args.timeout) as native, \
              DebugConn(args.host, args.ds_port, args.timeout) as ds:
-            # The native side is read where it is; only DuckStation is steered.
-            target = args.frame if args.frame is not None else native.frame()
-            result["target_frame"] = target
-            try:
-                ds.run_to_frame(target)
-            except DebugError as e:
-                result["duckstation_drive_error"] = str(e)
-                print(f"warning: could not drive DuckStation to frame {target}: {e}",
-                      file=sys.stderr)
-
-            fa, fb = native.frame(), ds.frame()
-            result["native_frame"] = fa
-            result["duckstation_frame"] = fb
-            if fa != fb:
+            # Align BOTH sides, not just DuckStation.
+            #
+            # This used to read the native frame, drive DuckStation at it, and
+            # shoot -- while the native run kept going, so the two images were
+            # always of different frames. It also failed outright whenever the
+            # oracle had already passed the target, because run_to_frame cannot
+            # go backwards.
+            #
+            # Neither emulator can rewind on demand, but both can move FORWARD:
+            # psx-runtime by stepping (pause/step are real again), DuckStation
+            # by run_to_frame. So the meeting point is whichever is further
+            # ahead, and the one behind catches up. Both are parked when the
+            # screenshots are taken.
+            aligned = align_frames(native, ds, args.frame, result)
+            fa, fb = result["native_frame"], result["duckstation_frame"]
+            if not aligned:
                 result["frame_mismatch"] = True
-                print(f"warning: frames differ (native {fa}, duckstation {fb}). "
-                      f"The native run cannot be paused, so it keeps advancing; "
-                      f"pass --frame to pin a target, or accept that the two "
-                      f"images below are of DIFFERENT frames.", file=sys.stderr)
+                print(f"warning: could not align (native {fa}, duckstation {fb}); "
+                      f"the images below are of DIFFERENT frames and a pixel "
+                      f"diff between them means nothing.", file=sys.stderr)
+            else:
+                print(f"aligned both at frame {fa}")
 
             pa = os.path.join(outdir, "native.png")
             pb = os.path.join(outdir, "duckstation.png")
@@ -210,7 +297,25 @@ def main(argv=None):
                 result["native_gp0_note"] = (
                     "no DuckStation counterpart: the oracle patch does not "
                     "implement gpu_frame_dump")
+
+            # Hand the game back. The park has a client-silence timeout and
+            # would resume itself eventually, but leaving someone's emulator
+            # frozen because a tool exited is not something to rely on a
+            # watchdog to undo.
+            try:
+                native.cmd("continue")
+            except DebugError:
+                pass
     except DebugError as e:
+        # align_frames() parks psx-runtime; if anything after that raised, the
+        # game is still parked and the tool is about to exit. The park has a
+        # client-silence timeout, but leaving someone's emulator frozen and
+        # relying on a watchdog to undo it is not acceptable behaviour.
+        try:
+            with DebugConn(args.host, args.native_port, 5.0) as n2:
+                n2.cmd("continue")
+        except DebugError:
+            pass
         print(f"error: {e}", file=sys.stderr)
         return 2
 

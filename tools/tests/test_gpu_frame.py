@@ -523,3 +523,44 @@ class TestFrameNumberSource(unittest.TestCase):
         self.addCleanup(srv.stop)
         conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
         self.assertEqual(conn.frame(), 77)
+
+
+class TestParityFieldNames(unittest.TestCase):
+    """The two servers name the same GPU facts differently.
+
+    Comparing raw keys made every row read "native=None", which looks like the
+    runtime failing to report its display state and is really a vocabulary
+    mismatch — a difference invented by the tool and then printed under a
+    heading saying the emulators differ. That is worse than reporting nothing.
+    """
+
+    def setUp(self):
+        self.P = _load("gpu_parity")
+
+    def test_the_same_display_config_produces_no_delta(self):
+        native = {"ok": True, "display_x": 1, "display_y": 8,
+                  "width": 319, "height": 224}
+        oracle = {"ok": True, "display_area_x": 1, "display_area_y": 8,
+                  "disp_w": 319, "disp_h": 224}
+        self.assertEqual(self.P.gpu_state_delta(native, oracle), {})
+
+    def test_a_real_difference_still_shows(self):
+        native = {"display_x": 1, "width": 320}
+        oracle = {"display_area_x": 1, "disp_w": 319}
+        d = self.P.gpu_state_delta(native, oracle)
+        self.assertIn("width", d)
+        self.assertEqual(d["width"]["native"], 320)
+        self.assertEqual(d["width"]["duckstation"], 319)
+        self.assertFalse(d["width"]["one_sided"])
+
+    def test_display_disable_is_inverted_not_just_renamed(self):
+        # One side reports "enabled", the other "disabled". Folding them onto
+        # one name without inverting reports every frame as a difference.
+        native = {"display_enable": 1}
+        oracle = {"display_disable": 0}
+        self.assertEqual(self.P.gpu_state_delta(native, oracle), {})
+
+    def test_a_field_only_one_side_reports_is_marked_one_sided(self):
+        d = self.P.gpu_state_delta({"depth24": 0}, {})
+        self.assertTrue(d["depth24"]["one_sided"],
+                        "only one side knowing a field is not disagreement")
