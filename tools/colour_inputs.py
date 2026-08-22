@@ -49,12 +49,52 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
-    DebugConn, DebugError, oracle_resume, read_ram_range,
+    DebugConn, DebugError, oracle_resume, read_ram_range, snapshot_ram,
 )
 
 KIND = "psx-colour-inputs"
 SRC_OFFSET = -12          # lwr $t6,-12($s4): the source word's base
 DEFAULT_SPAN = 48         # enough to see the table around it
+
+
+def looks_like_triplets(b, stride=4):
+    """Does this block look like packed RGB entries rather than 16-bit values?
+
+    A colour table here is RGB triplets on a 4-byte stride. An array of 16-bit
+    values has a zero in every odd byte, which is how the first version of this
+    tool was caught reading something that was not a colour table at all --
+    while confidently reporting the two emulators disagreed about one.
+    """
+    if len(b) < 8:
+        return False
+    odd_zero = sum(1 for i, x in enumerate(b) if i % 2 and x == 0)
+    if odd_zero >= (len(b) // 2) * 0.9:
+        return False                     # 16-bit array, not triplets
+    return True
+
+
+def find_table(ram, needle, min_len=12):
+    """Where does this exact byte run appear in a RAM image?
+
+    Address correspondence between the two emulators cannot be assumed: their
+    allocators land the same structures at different addresses (measured -- the
+    oracle's packet buffer at 0x10D9A0 against psx-runtime's 0x115078). Reading
+    the oracle's pointer on psx-runtime therefore reads unrelated memory, and
+    comparing it produces a difference that is entirely the tool's own doing.
+
+    So the table is FOUND rather than assumed: search for the bytes themselves.
+    """
+    if len(needle) < min_len:
+        return []
+    hits, at = [], 0
+    while True:
+        i = ram.find(needle, at)
+        if i < 0:
+            return hits
+        hits.append(i)
+        at = i + 4
+        if len(hits) >= 8:
+            return hits
 
 
 def wait_for_hit(conn, pc, timeout, poll=ORACLE_PAUSED_POLL_S):
@@ -146,9 +186,38 @@ def main(argv=None):
             doc["error"] = msg
             raise SystemExit(_finish(doc, args, 1))
 
-        print(f"reading {args.span} bytes at 0x{src:08X} from both …")
-        a = read_ram_range(native, 0x80000000 | src, args.span)
+        print(f"reading {args.span} bytes at 0x{src:08X} from the oracle …")
         b = read_ram_range(ds, 0x80000000 | src, args.span)
+        doc["oracle_bytes"] = b.hex()
+        doc["oracle_looks_like_table"] = looks_like_triplets(b)
+
+        # Locate the SAME table on psx-runtime rather than assuming the address
+        # carries over. It does not: the two allocators place the same
+        # structures at different addresses, so the oracle's pointer read on
+        # psx-runtime lands on unrelated memory.
+        print("searching psx-runtime's RAM for the same table …")
+        ram = snapshot_ram(native)
+        needle = b[:16]
+        hits = find_table(ram, needle)
+        doc["native_hits"] = [f"0x{h:08X}" for h in hits]
+        if not hits:
+            doc["verdict"] = "table-absent-on-native"
+            msg = ("psx-runtime's RAM does not contain this colour table "
+                   "ANYWHERE. The oracle's table is confirmed correct (its "
+                   "entries scaled by the recorded factor reproduce the colours "
+                   "in its own display list), so the data psx-runtime is "
+                   "scaling was never built the same way. The divergence is "
+                   "upstream of this routine, in whatever produces the table.")
+            print(f"\nVERDICT: {msg}")
+            doc["note"] = msg
+            return _finish(doc, args, 0)
+
+        native_addr = hits[0]
+        doc["native_source_addr"] = f"0x{native_addr:08X}"
+        doc["address_delta"] = native_addr - src
+        print(f"  found at 0x{native_addr:08X} "
+              f"(delta {native_addr - src:+d} from the oracle's)")
+        a = ram[native_addr:native_addr + args.span]
     except DebugError as e:
         print(f"error: {e}", file=sys.stderr)
         doc["error"] = str(e)
@@ -167,7 +236,6 @@ def main(argv=None):
                   "restart it from the Oracle tab.", file=sys.stderr)
 
     doc["native_bytes"] = a.hex()
-    doc["oracle_bytes"] = b.hex()
     same = a == b
     doc["source_identical"] = same
 
@@ -175,7 +243,8 @@ def main(argv=None):
     print(f"  oracle     : {b[:16].hex(' ')}")
     if same:
         doc["verdict"] = "source-matches"
-        print("\nVERDICT: the source RGB is IDENTICAL on both. The input to the "
+        print("\nVERDICT: the source RGB table is IDENTICAL on both (found on "
+              f"psx-runtime at {doc['native_source_addr']}). The input to the "
               "colour computation is fine, so the divergence is the scale "
               f"(${args.scale_reg}) or the arithmetic in this routine.")
     else:

@@ -117,3 +117,51 @@ class TestOracleResume(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAddressCorrespondence(unittest.TestCase):
+    """Addresses do not carry between the two emulators.
+
+    Measured: the oracle's packet buffer sat at 0x10D9A0 while psx-runtime's was
+    at 0x115078 — the same structures, different addresses. Reading the oracle's
+    pointer on psx-runtime therefore lands on unrelated memory, and comparing it
+    reports a difference the tool invented. The first version of this tool did
+    exactly that and called it "source-differs".
+    """
+
+    def test_a_16bit_array_is_not_mistaken_for_a_colour_table(self):
+        # The bytes actually read from psx-runtime at the oracle's address:
+        # 16-bit values, every odd byte zero. Not a colour table at all.
+        sixteen = bytes.fromhex("1b0038004d004e001b001d0038001d004e001f00")
+        self.assertFalse(CI.looks_like_triplets(sixteen))
+
+    def test_packed_rgb_entries_are_recognised(self):
+        # The oracle's real table: (248,80,80),(8,8,8),... on a 4-byte stride.
+        triplets = bytes.fromhex("f850500008080800f850503800000000")
+        self.assertTrue(CI.looks_like_triplets(triplets))
+
+    def test_the_table_is_found_by_content_not_by_address(self):
+        needle = bytes.fromhex("f850500008080800f850503800000000")
+        ram = bytearray(4096)
+        ram[0x800:0x800 + len(needle)] = needle
+        hits = CI.find_table(bytes(ram), needle)
+        self.assertEqual(hits, [0x800])
+
+    def test_absence_is_reported_as_absence_not_as_a_difference(self):
+        # If the table is nowhere in psx-runtime's RAM, that is a finding about
+        # the data — not a byte-level disagreement at some arbitrary address.
+        needle = bytes.fromhex("f85050000808080000000000")
+        self.assertEqual(CI.find_table(bytes(bytearray(4096)), needle), [])
+
+    def test_a_too_short_needle_is_refused(self):
+        # A handful of bytes matches everywhere in 2 MB; a match would mean
+        # nothing and the address it returned would be arbitrary.
+        ram = bytes(bytearray(4096))
+        self.assertEqual(CI.find_table(ram, b"\x00\x00\x00\x00"), [])
+
+    def test_multiple_hits_are_all_reported(self):
+        needle = bytes.fromhex("f850500008080800f850503800000000")
+        ram = bytearray(8192)
+        ram[0x100:0x100 + len(needle)] = needle
+        ram[0x900:0x900 + len(needle)] = needle
+        self.assertEqual(CI.find_table(bytes(ram), needle), [0x100, 0x900])
