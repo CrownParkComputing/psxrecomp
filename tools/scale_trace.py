@@ -105,13 +105,25 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
                 any_fired = True
             got = None
             if hit:
-                lead = max((x for x in hit
-                            if (int(x["pc"], 16) & 0x1FFFFFFF) <= (pc & 0x1FFFFFFF)),
-                           key=lambda x: int(x["pc"], 16), default=hit[0])
-                leader = int(lead["pc"], 16)
+                below = [x for x in hit
+                         if (int(x["pc"], 16) & 0x1FFFFFFF) <= (pc & 0x1FFFFFFF)]
+                ranked = sorted(below or hit, key=lambda x: -int(x["pc"], 16))
+                # Take a sample from whichever fired leader HAS one, nearest
+                # first. Insisting on the single nearest discarded frames where
+                # a leader fired and the recorded sample belonged to a
+                # different one — reported as "a leader fired but no register
+                # sample came with it", which is true of that leader and not of
+                # the frame.
+                by_pc = {}
                 for smp in rep.get("samples", []):
-                    if smp.get("pc") == lead["pc"] and smp.get("regs"):
-                        got = smp["regs"].get(reg)
+                    if smp.get("regs"):
+                        by_pc.setdefault(smp["pc"], smp["regs"])
+                for cand in ranked:
+                    regs = by_pc.get(cand["pc"])
+                    if regs and regs.get(reg):
+                        leader = int(cand["pc"], 16)
+                        got = regs.get(reg)
+                        break
             if got:
                 vals.append(int(got, 16))
                 frames.append(conn.frame())

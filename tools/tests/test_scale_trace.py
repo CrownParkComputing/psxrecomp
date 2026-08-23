@@ -354,3 +354,53 @@ class TestPerFrameFallback(unittest.TestCase):
         src = inspect.getsource(ST.sample_per_frame)
         self.assertIn("any_fired", src)
         self.assertIn("NO candidate fired", src)
+
+
+class TestAliasedDataIsNeverCalledPerFrame(unittest.TestCase):
+    """The one claim that must never be made from free-running samples.
+
+    A report came back with native_sampling "free-running-fallback" AND
+    granularity "native-measured-per-frame" — saying in the same document that
+    the data was aliased and that its steps were the animation increment. The
+    guard existed, but on a different branch than the one that fired.
+
+    Free-running samples land about ninety frames apart, so their differences
+    are aliasing. Presenting them as an increment invites exactly the wrong
+    conclusion: that our fade jumps by 44 when nothing measured that.
+    """
+
+    def test_every_per_frame_claim_checks_the_sampling_method(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        # Each place that sets a per-frame verdict must be guarded.
+        for marker in ('"native-measured-per-frame"', '"native-per-frame-only"'):
+            i = src.index(marker)
+            window = src[max(0, i - 400):i]
+            self.assertIn("free-running-fallback", window,
+                          f"{marker} is set without checking native_sampling")
+
+    def test_a_fallback_run_gets_its_own_granularity_label(self):
+        import inspect
+        self.assertIn('"native-aliased"', inspect.getsource(ST.main))
+
+
+class TestSampleSelection(unittest.TestCase):
+    """Take a register sample from whichever fired leader has one.
+
+    Insisting on the single nearest leader discarded frames where a leader
+    fired and the recorded sample belonged to a different one — reported as "a
+    leader fired but no register sample came with it", which is true of that
+    leader and false of the frame.
+    """
+
+    def test_it_prefers_the_nearest_leader_at_or_below_the_target(self):
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        self.assertIn("key=lambda x: -int(x[\"pc\"], 16)", src,
+                      "candidates must be ranked nearest-first")
+
+    def test_it_falls_through_to_another_leader_rather_than_giving_up(self):
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        self.assertIn("for cand in ranked:", src)
+        self.assertIn("break", src)
