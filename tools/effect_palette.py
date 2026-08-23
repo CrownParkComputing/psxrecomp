@@ -48,8 +48,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gpu_display_list import blend_of, walk_side  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
-    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
-    DebugConn, DebugError, OracleBreak, capture, oracle_resume,
+    DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT,
+    DebugConn, DebugError, capture, oracle_clear_breaks, oracle_resume,
 )
 
 KIND = "psx-effect-palette"
@@ -173,8 +173,8 @@ def verdict(nat, orc, colour_ratio=4.0, span_ratio=2.0):
                 "effect did not play inside the scanned window.")
     if not orc["samples_with_quads"]:
         return ("no-oracle-samples",
-                "the oracle never parked inside the effect, so nothing is "
-                "compared. This is not evidence that its list is clean.")
+                "no oracle read caught the effect, so nothing is compared. "
+                "This is not evidence that its list is clean.")
     dc_n, dc_o = nat["distinct_colours"], orc["distinct_colours"]
     sp_n, sp_o = nat["y_span"], orc["y_span"]
     colour_blowup = dc_o and (dc_n / max(dc_o, 1)) >= colour_ratio
@@ -225,38 +225,58 @@ def sample_native(conn, args, out=sys.stderr):
 
 
 def sample_oracle(conn, args, out=sys.stderr):
-    """Signatures from parked OT walks, parking on the effect's own code."""
-    sigs = []
+    """Signatures from RAM walks of a RUNNING oracle. Nothing is paused.
+
+    DuckStation must NOT be paused for this, and every attempt to park it
+    here has failed the same way. A paused DuckStation serves its debug
+    socket from a Qt idle timer at about 1 Hz, so a walk that needs many
+    round trips cannot finish; and a pc_break that re-fires on its next hit
+    re-pauses the moment anything resumes it, which wedges the emulator for
+    the user as well as for the tool.
+
+    None of it was necessary. The effect lasts seconds and the game rebuilds
+    its ordering table every frame, so reading the list repeatedly while it
+    runs catches the effect the same way psx-runtime's ring does -- by
+    sampling often, not by freezing time.
+    """
+    # Undo any wedging an earlier run left behind, before anything else.
+    oracle_resume(conn)
     try:
-        with OracleBreak(conn, args.pc) as brk:
-            if brk.cleared:
-                print(f"  cleared {brk.cleared} stale breakpoint(s) left by an "
-                      f"earlier run", file=out)
-            for _ in range(args.samples):
-                try:
-                    conn.raw("pc_hit_clear")
-                except DebugError:
-                    pass
-                oracle_resume(conn)
-                time.sleep(ORACLE_PAUSED_POLL_S)
-                try:
-                    hit = conn.cmd("pc_hit_last")
-                except DebugError:
-                    continue
-                if not hit.get("valid"):
-                    continue
-                with open(os.devnull, "w") as quiet:
-                    rep, _meta = walk_side(conn, "oracle", pause=False,
-                                           max_nodes=args.max_nodes, out=quiet)
-                if not rep:
-                    continue
-                sig = signature(rep.get("prims") or [])
-                if sig["quads"]:
-                    sigs.append(sig)
+        n = oracle_clear_breaks(conn)
+        if n:
+            print(f"  cleared {n} stale breakpoint(s) left by an earlier run",
+                  file=out)
     except DebugError as e:
-        print(f"  oracle: {e}", file=out)
-    print(f"  oracle: {len(sigs)} parked walks carried additive shaded quads",
-          file=out)
+        print(f"  WARNING: {e}", file=out)
+    oracle_resume(conn)
+
+    sigs = []
+    empty = 0
+    deadline = time.monotonic() + args.watch_secs
+    while time.monotonic() < deadline and len(sigs) < args.samples:
+        try:
+            with open(os.devnull, "w") as quiet:
+                rep, _meta = walk_side(conn, "oracle", pause=False,
+                                       max_nodes=args.max_nodes, out=quiet)
+        except DebugError as e:
+            print(f"  oracle read failed: {e}", file=out)
+            time.sleep(args.poll)
+            continue
+        if rep:
+            sig = signature(rep.get("prims") or [])
+            if sig["quads"]:
+                sigs.append(sig)
+                print(f"  oracle sample {len(sigs)}/{args.samples}: "
+                      f"{sig['quads']} quads, {sig['distinct_colours']} "
+                      f"colours, {sig['y_span']} line span", file=out)
+            else:
+                empty += 1
+        time.sleep(args.poll)
+
+    if not sigs:
+        print(f"  oracle: {empty} walks read, none held additive shaded "
+              f"quads -- the effect was not playing on DuckStation while "
+              f"this ran. Replay it there and try again.", file=out)
     return sigs
 
 
@@ -267,10 +287,11 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--timeout", type=float, default=60.0)
-    ap.add_argument("--pc", default="0x8006844C",
-                    help="a PC that only executes during the effect; the "
-                         "oracle is parked here to land inside the animation")
     ap.add_argument("--samples", type=int, default=8)
+    ap.add_argument("--watch-secs", type=float, default=90.0,
+                    help="how long to keep reading the running oracle")
+    ap.add_argument("--poll", type=float, default=0.4,
+                    help="seconds between oracle reads")
     ap.add_argument("--ring-frames", type=int, default=600,
                     help="how far back through psx-runtime's ring to look")
     ap.add_argument("--stride", type=int, default=4)
@@ -279,11 +300,11 @@ def main():
     ap.add_argument("--out", default="analysis/frames/effect_palette.json")
     args = ap.parse_args()
 
-    doc = {"kind": KIND, "version": 1, "pc": args.pc}
+    doc = {"kind": KIND, "version": 1}
     print("sampling psx-runtime's GP0 ring …", flush=True)
     nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
                              args)
-    print("parking the oracle inside the effect …", flush=True)
+    print("reading the running oracle (nothing is paused) …", flush=True)
     orc_sigs = sample_oracle(DebugConn(args.host, args.ds_port, args.timeout),
                              args)
 
