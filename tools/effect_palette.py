@@ -304,9 +304,9 @@ def verdict(nat, orc, colour_ratio=4.0):
 def sample_native(conn, args, out=sys.stderr):
     """Signatures from the GP0 ring: retrospective, nothing paused."""
     span = conn.ring_span()
-    frames = list(range(span["newest"], max(span["oldest"], span["newest"]
-                                            - args.ring_frames) - 1,
-                        -args.stride))
+    back = span["oldest"] if not args.ring_frames else max(
+        span["oldest"], span["newest"] - args.ring_frames)
+    frames = list(range(span["newest"], back - 1, -args.stride))
     sigs = []
     for fr in frames:
         try:
@@ -374,7 +374,13 @@ def sample_oracle(conn, args, out=sys.stderr):
                 # coherence check passes and the missing primitives look like
                 # primitives the game never drew. Re-read in full when the
                 # node count drops off, and stop trusting the cached root.
-                if rep and expect_nodes and \
+                #
+                # ONLY when windowing is in use. A full read whose node count
+                # dips is not truncated, it is a frame in which the game drew
+                # fewer primitives -- which during an animation is normal and
+                # frequent. Re-reading those wastes the read and reports them
+                # as short, and the count read as "frames being discarded".
+                if use_window and rep and expect_nodes and \
                         rep.get("nodes", 0) < expect_nodes * 0.9:
                     truncated += 1
                     root = None
@@ -482,12 +488,26 @@ def main():
     args = ap.parse_args()
 
     doc = {"kind": KIND, "version": 1}
-    print("sampling psx-runtime's GP0 ring …", flush=True)
-    nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
-                             args)
+    # The oracle is watched LIVE and psx-runtime is read retrospectively from
+    # its GP0 ring, so the order matters: sampling the ring first captures
+    # whatever happened BEFORE the user replayed anything. Watch the oracle
+    # first, then read the ring -- by then the effect has been played and is
+    # in it.
     print("reading the running oracle (nothing is paused) …", flush=True)
     orc_sigs = sample_oracle(DebugConn(args.host, args.ds_port, args.timeout),
                              args)
+    print("sampling psx-runtime's GP0 ring (after the replay) …", flush=True)
+    nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
+                             args)
+    if not nat_sigs:
+        # One retry with a wider reach: the ring holds several hundred frames,
+        # so a miss usually means the effect is further back than the default.
+        print("  nothing yet; sweeping the whole ring …", flush=True)
+        wide = argparse.Namespace(**vars(args))
+        wide.ring_frames = 0
+        wide.stride = max(1, args.stride // 2)
+        nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
+                                 wide)
 
     nat, orc = merge(nat_sigs), merge(orc_sigs)
     def _plain(g):

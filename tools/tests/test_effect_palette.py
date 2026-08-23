@@ -427,3 +427,28 @@ class SerialisationTest(unittest.TestCase):
                  for k, v in m["groups"].items()}
         json.dumps(plain)                      # must not raise
         self.assertEqual(plain["64x599"]["union_list"], [[1, 2, 3]])
+
+
+class SamplingOrderTest(unittest.TestCase):
+    """psx-runtime is read retrospectively; the oracle is watched live.
+
+    Sampling the ring FIRST captures whatever happened before the user
+    replayed anything, which is why a run came back '0 ring frames carried
+    additive shaded quads' while the oracle collected six.
+    """
+
+    SRC = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "effect_palette.py")).read()
+
+    def test_oracle_watched_before_the_ring_is_read(self):
+        main = self.SRC.split("def main(", 1)[1]
+        self.assertLess(main.index("reading the running oracle"),
+                        main.index("sampling psx-runtime's GP0 ring"))
+
+    def test_wide_retry_sweeps_the_whole_ring(self):
+        self.assertIn("wide.ring_frames = 0", self.SRC)
+
+    def test_truncation_guard_only_applies_when_windowing(self):
+        """A full read whose node count dips is a smaller frame, not a
+        truncated one -- normal and frequent during an animation."""
+        self.assertIn("if use_window and rep and expect_nodes", self.SRC)
