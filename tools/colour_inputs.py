@@ -94,6 +94,11 @@ def region_phase_dependence(conn, pc, lo, hi, first_scale, tries=12,
             "note": "the scale did not change within the sampling window"}
 
 
+def nd_preview(a, b):
+    """Differing byte count, for a message written before the real count."""
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
 def diff_clusters(a, b, base, gap=8, limit=12):
     """Where two buffers differ, coalesced into runs.
 
@@ -450,6 +455,27 @@ def main(argv=None):
                 if args.phase_test:
                     dep = region_phase_dependence(native, pc, lo, hi, nat_scale)
                     doc["phase_dependence"] = dep
+                    if not dep.get("tested"):
+                        # The scale never moved, so the question is OPEN. Falling
+                        # through to "region-differs" here would state as
+                        # established exactly what could not be checked — and
+                        # that a scale which refuses to move is itself worth
+                        # reporting, not a failed setup step.
+                        doc["verdict"] = "region-differs-phase-unknown"
+                        doc["note"] = (
+                            f"{nd_preview(ra_, rb_)} of {len(ra_)} bytes differ, "
+                            f"but psx-runtime's scale never left {nat_scale} "
+                            f"during the window, so it could not be established "
+                            f"whether this region moves with the animation. The "
+                            f"difference is therefore NOT established as real.\n\n"
+                            f"Worth noting on its own: the oracle's scale varies "
+                            f"run to run while psx-runtime's has read {nat_scale} "
+                            f"every time. If that holds, the modulation this "
+                            f"routine performs is not happening on psx-runtime "
+                            f"at all — and {nat_scale} == 128 is the value at "
+                            f"which x*scale>>7 leaves x unchanged.")
+                        print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
+                        return _finish(doc, args, 0)
                     if dep.get("phase_dependent"):
                         doc["verdict"] = "region-phase-dependent"
                         doc["note"] = (
