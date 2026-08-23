@@ -88,6 +88,62 @@ def verdict_of(n_colours, expect_max=8):
             f"it -- the fault is in whatever FILLS this table.")
 
 
+def _save(doc, args):
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(doc, f, indent=1)
+    print(f"\nreport: {args.out}")
+
+
+def _report(conn, args, doc, span, ptrs):
+    """Read the located table, decode it, and report."""
+    lo, hi = span
+    doc["span"] = [f"0x{lo:08X}", f"0x{hi:08X}"]
+    doc["pointer_values"] = [f"0x{v:08X}" for v in ptrs[:32]]
+    blob = read_ram_range(conn, lo & ~3, ((hi - lo) & ~3) + 64)
+    cols = colours_in(blob, lo & ~3, lo, hi)
+    doc["distinct_colours"] = len(cols)
+    doc["top_colours"] = [[list(c), n] for c, n in cols.most_common(12)]
+    print(f"\nsource span 0x{lo:08X}..0x{hi:08X}: {len(cols)} distinct "
+          f"colour word(s)")
+    for c, n in cols.most_common(10):
+        print(f"    {c}  x{n}")
+
+    v, why = verdict_of(len(cols))
+    doc["verdict"], doc["explanation"] = v, why
+    print(f"\nVERDICT: {v}\n{why}")
+
+    if args.trace and v == "source-is-varied":
+        print(f"\ntracing writes to the table …", flush=True)
+        try:
+            conn.cmd("wtrace_reset")
+            conn.cmd("wtrace_add", lo=f"0x{lo:08X}", hi=f"0x{hi:08X}")
+            f0 = conn.frame()
+            conn.cmd("step", n=2)
+            for _ in range(200):
+                st = conn.raw("pause_state")
+                if st.get("paused") and conn.frame() > f0:
+                    break
+                time.sleep(0.02)
+            rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo:08X}",
+                           addr_hi=f"0x{hi:08X}", count=8000)
+            by_pc = collections.Counter(e["pc"] for e in
+                                        rep.get("entries", []))
+            doc["writers"] = [[p, n] for p, n in by_pc.most_common(12)]
+            if by_pc:
+                print("  writers:")
+                for p, n in by_pc.most_common(12):
+                    print(f"    {p}  x{n}")
+            else:
+                print("  no writes in the traced window -- the table may "
+                      "be filled less often than every frame, or copied "
+                      "in by DMA rather than by CPU stores.")
+        except DebugError as e:
+            print(f"  trace failed: {e}", file=sys.stderr)
+    _save(doc, args)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -99,6 +155,12 @@ def main():
     ap.add_argument("--reg", default="s4")
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--frames", type=int, default=3)
+    ap.add_argument("--span", default=None, metavar="LO:HI",
+                    help="skip probing and read this range instead, e.g. "
+                         "0x800E260C:0x800E2664. Required for the oracle, "
+                         "which has pc_break but no pc_probe -- and "
+                         "unnecessary to probe there anyway, since the table "
+                         "address is the same in both emulators")
     ap.add_argument("--trace", action="store_true",
                     help="also trace which code writes the table (native only)")
     ap.add_argument("--wait-secs", type=float, default=120.0)
@@ -114,6 +176,12 @@ def main():
     span = None
     ptrs = []
     deadline = time.monotonic() + args.wait_secs
+    if args.span:
+        lo_s, _, hi_s = args.span.partition(":")
+        span = (int(lo_s, 0), int(hi_s, 0))
+        print(f"  reading 0x{span[0]:08X}..0x{span[1]:08X} (given, not probed)",
+              flush=True)
+        return _report(conn, args, doc, span, ptrs)
     try:
         conn.cmd("pause")
         for _ in range(args.frames):
@@ -137,51 +205,15 @@ def main():
         if span is None:
             print(f"\n${args.reg} was never captured -- the probe did not "
                   f"fire inside the effect. Replay it while this runs.")
+            if args.port != DEFAULT_NATIVE_PORT:
+                print(f"\nNOTE: the DuckStation oracle has pc_break but no "
+                      f"pc_probe, so it cannot be probed this way at all. "
+                      f"Pass --span LO:HI to read the table directly -- the "
+                      f"address is the same in both emulators, so use the "
+                      f"span psx-runtime reported.")
             return 1
 
-        lo, hi = span
-        doc["span"] = [f"0x{lo:08X}", f"0x{hi:08X}"]
-        doc["pointer_values"] = [f"0x{v:08X}" for v in ptrs[:32]]
-        blob = read_ram_range(conn, lo & ~3, ((hi - lo) & ~3) + 64)
-        cols = colours_in(blob, lo & ~3, lo, hi)
-        doc["distinct_colours"] = len(cols)
-        doc["top_colours"] = [[list(c), n] for c, n in cols.most_common(12)]
-        print(f"\nsource span 0x{lo:08X}..0x{hi:08X}: {len(cols)} distinct "
-              f"colour word(s)")
-        for c, n in cols.most_common(10):
-            print(f"    {c}  x{n}")
-
-        v, why = verdict_of(len(cols))
-        doc["verdict"], doc["explanation"] = v, why
-        print(f"\nVERDICT: {v}\n{why}")
-
-        if args.trace and v == "source-is-varied":
-            print(f"\ntracing writes to the table …", flush=True)
-            try:
-                conn.cmd("wtrace_reset")
-                conn.cmd("wtrace_add", lo=f"0x{lo:08X}", hi=f"0x{hi:08X}")
-                f0 = conn.frame()
-                conn.cmd("step", n=2)
-                for _ in range(200):
-                    st = conn.raw("pause_state")
-                    if st.get("paused") and conn.frame() > f0:
-                        break
-                    time.sleep(0.02)
-                rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo:08X}",
-                               addr_hi=f"0x{hi:08X}", count=8000)
-                by_pc = collections.Counter(e["pc"] for e in
-                                            rep.get("entries", []))
-                doc["writers"] = [[p, n] for p, n in by_pc.most_common(12)]
-                if by_pc:
-                    print("  writers:")
-                    for p, n in by_pc.most_common(12):
-                        print(f"    {p}  x{n}")
-                else:
-                    print("  no writes in the traced window -- the table may "
-                          "be filled less often than every frame, or copied "
-                          "in by DMA rather than by CPU stores.")
-            except DebugError as e:
-                print(f"  trace failed: {e}", file=sys.stderr)
+        return _report(conn, args, doc, span, ptrs)
     finally:
         try:
             conn.cmd("continue")
