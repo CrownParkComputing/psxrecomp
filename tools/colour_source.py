@@ -196,6 +196,14 @@ def main():
                          "which has pc_break but no pc_probe -- and "
                          "unnecessary to probe there anyway, since the table "
                          "address is the same in both emulators")
+    ap.add_argument("--diff-span", default=None, metavar="LO:HI",
+                    help="read this range from BOTH emulators and compare the "
+                         "bytes. Phase-independent when the table is static, "
+                         "which is what decides whether a differing $s4 means "
+                         "different DATA or just a different offset into the "
+                         "same repeating table")
+    ap.add_argument("--ds-port", type=int, default=4371,
+                    help="oracle port for --diff-span")
     ap.add_argument("--oracle-pointer", action="store_true",
                     help="read $s4 on the oracle via pc_break and report "
                          "which table it names, to compare with psx-runtime's")
@@ -214,6 +222,45 @@ def main():
     span = None
     ptrs = []
     deadline = time.monotonic() + args.wait_secs
+    if args.diff_span:
+        lo_s, _, hi_s = args.diff_span.partition(":")
+        lo, hi = int(lo_s, 0), int(hi_s, 0)
+        length = ((hi - lo) & ~3) + 64
+        sides = {}
+        for label, port in (("psx-runtime", DEFAULT_NATIVE_PORT),
+                            ("oracle", args.ds_port)):
+            try:
+                c = DebugConn(args.host, port, args.timeout)
+                sides[label] = read_ram_range(c, lo & ~3, length)
+            except DebugError as e:
+                print(f"  {label}: {e}", file=sys.stderr)
+        if len(sides) < 2:
+            print("\nneed both emulators running to compare")
+            return 1
+        a, b = sides["psx-runtime"], sides["oracle"]
+        n = min(len(a), len(b))
+        diffs = [i for i in range(n) if a[i] != b[i]]
+        doc["diff_span"] = [f"0x{lo:08X}", f"0x{hi:08X}"]
+        doc["bytes_differing"] = len(diffs)
+        print(f"\n0x{lo:08X}..0x{hi:08X}: {len(diffs)}/{n} bytes differ")
+        for label, blob in (("psx-runtime", a), ("oracle", b)):
+            cols = colours_in(blob, lo & ~3, lo, hi)
+            doc[f"colours_{label}"] = [[list(c), k]
+                                       for c, k in cols.most_common(8)]
+            print(f"  {label:12s} {len(cols)} distinct colour word(s): "
+                  f"{[list(c) for c, _ in cols.most_common(4)]}")
+        if diffs:
+            print(f"\nfirst differing offsets: "
+                  f"{[hex((lo & ~3) + d) for d in diffs[:8]]}")
+            print("\nThe two emulators hold DIFFERENT data at the same "
+                  "address. That is upstream of the colour routine entirely.")
+        else:
+            print("\nThe data is byte-identical, so a differing $s4 is a "
+                  "different OFFSET into the same table -- i.e. the two were "
+                  "sampled at different points of the effect, not a fault.")
+        _save(doc, args)
+        return 0
+
     if args.oracle_pointer:
         vals = oracle_pointer(conn, args.pc, args.reg)
         doc["oracle_pointer_values"] = [f"0x{v:08X}" for v in vals]
