@@ -31,6 +31,7 @@ TOOLS = [
     "psx_gpu_frame", "gpu_display_list", "gpu_colour_parity",
     "gpu_frame_scan", "gpu_frame_diff", "ram_parity", "fingerprint_diff",
     "packet_writers", "gte_check", "gpu_parity", "colour_inputs",
+    "lockstep_check",
 ]
 
 

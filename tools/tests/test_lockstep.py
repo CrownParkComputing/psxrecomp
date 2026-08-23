@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Reading a lockstep result, in particular when it has said nothing.
+
+"found: false" is produced by two completely different situations: the compiled
+code matched everywhere it was compared, and nothing was compared at all. The
+segment comparator skips whatever it cannot replay — interrupts, overflow,
+unhandled ops, conflicts — so a run that skipped everything is indistinguishable
+from a clean one unless the counters are read alongside the verdict.
+
+Reporting that as "no divergence" would be the worst kind of wrong: a pass that
+was never earned, on the one instrument that needs no frame alignment and no
+cross-emulator addresses to be trusted.
+"""
+
+import importlib.util
+import io
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+LS = _load("lockstep_check")
+
+
+def run(doc, func=False):
+    buf = io.StringIO()
+    v = LS.summarise(doc, func, out=buf)
+    return v, buf.getvalue()
+
+
+class TestVerdicts(unittest.TestCase):
+    def test_nothing_checked_is_inconclusive_not_clean(self):
+        v, txt = run({"found": 0, "blocks_checked": 0, "window": [10, 130]})
+        self.assertEqual(v, "inconclusive")
+        self.assertIn("NOT a clean result", txt)
+
+    def test_checked_and_quiet_is_clean(self):
+        v, txt = run({"found": 0, "blocks_checked": 4211, "window": [10, 130]})
+        self.assertEqual(v, "clean")
+        self.assertIn("4211", txt)
+
+    def test_more_skipped_than_checked_is_weak(self):
+        v, txt = run({"found": 0, "segments_checked": 40, "window": [0, 60],
+                      "skipped_irq": 30, "skipped_unhandled": 25}, func=True)
+        self.assertEqual(v, "weak")
+        self.assertIn("skipped", txt)
+
+    def test_a_divergence_reports_both_values(self):
+        v, txt = run({"found": 1, "kind": "write-val", "blocks_checked": 900,
+                      "window": [0, 120], "frame": 41230,
+                      "block": "0x80068440", "pc": "0x8006844C",
+                      "addr": "0x1F800264", "reg": -1,
+                      "interp_expected": "0x000000F8",
+                      "compiled_actual": "0x0000001B",
+                      "trace": ["W4:1F800264=000000F8"]})
+        self.assertEqual(v, "diverged")
+        self.assertIn("0x8006844C", txt)
+        self.assertIn("0x000000F8", txt)
+        self.assertIn("0x0000001B", txt)
+
+    def test_each_kind_is_explained_in_words(self):
+        # A bare "kind: read-addr" tells the reader nothing about where to look.
+        for k in ("reg", "hi", "lo", "write-val", "read-addr", "write-addr"):
+            self.assertIn(k, LS.MEANING, f"{k} has no explanation")
+
+    def test_comparator_limits_are_not_reported_as_bugs(self):
+        # path-cap and unsupported mean the comparison gave up, not that the
+        # compiled code is wrong. Reading them as findings sends you hunting
+        # a bug that was never claimed.
+        for k in ("path-cap", "unsupported"):
+            v, txt = run({"found": 1, "kind": k, "blocks_checked": 10,
+                          "window": [0, 5], "reg": -1})
+            self.assertIn("limit of the comparator", txt)
+
+    def test_the_window_is_always_shown(self):
+        _, txt = run({"found": 0, "blocks_checked": 5, "window": [77, 197]})
+        self.assertIn("77..197", txt)
+
+
+if __name__ == "__main__":
+    unittest.main()
