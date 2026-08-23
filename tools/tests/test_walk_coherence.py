@@ -44,15 +44,43 @@ class RecordingConn:
         return self.states[min(self.reads - 1, len(self.states) - 1)]
 
 
-class VerifyByRereadTest(unittest.TestCase):
-    def test_identical_reads_are_coherent(self):
-        stable = b"\xAA" * 64
-        conn = RecordingConn([stable, stable])
-        self.assertEqual(conn.read(), conn.read())
+class ListShapeTest(unittest.TestCase):
+    """Structure, not bytes.
 
-    def test_changed_reads_are_torn(self):
-        conn = RecordingConn([b"\xAA" * 64, b"\xBB" * 64])
-        self.assertNotEqual(conn.read(), conn.read())
+    Byte-identity was the obvious coherence check and it is exactly wrong:
+    while the effect plays the game rewrites the list every frame, so two
+    consecutive reads never match and every ANIMATED frame is discarded as
+    torn -- keeping only the frames without the animation in them. That is
+    what made a real run report '172 walks read, none held additive quads'
+    after the animation had been played several times.
+    """
+
+    def entries(self, ops):
+        return [{"op": op, "n_words": n} for op, n in ops]
+
+    def test_same_shape_when_only_data_changed(self):
+        a = self.entries([(0x38, 8), (0x30, 6)])
+        b = self.entries([(0x38, 8), (0x30, 6)])
+        self.assertEqual(gdl._list_shape(a), gdl._list_shape(b))
+
+    def test_differs_when_an_entry_is_lost(self):
+        a = self.entries([(0x38, 8), (0x30, 6)])
+        b = self.entries([(0x38, 8)])
+        self.assertNotEqual(gdl._list_shape(a), gdl._list_shape(b))
+
+    def test_differs_when_a_length_is_malformed(self):
+        """A torn read shows up as a word count that no longer fits its op."""
+        a = self.entries([(0x38, 8)])
+        b = self.entries([(0x38, 3)])
+        self.assertNotEqual(gdl._list_shape(a), gdl._list_shape(b))
+
+    def test_differs_when_an_opcode_changes(self):
+        a = self.entries([(0x38, 8)])
+        b = self.entries([(0x30, 8)])
+        self.assertNotEqual(gdl._list_shape(a), gdl._list_shape(b))
+
+    def test_empty_lists_compare_equal(self):
+        self.assertEqual(gdl._list_shape([]), gdl._list_shape([]))
 
     def test_walk_side_accepts_park_for_reread_flag(self):
         """The flag exists and defaults to parking for CLI callers."""
@@ -60,6 +88,14 @@ class VerifyByRereadTest(unittest.TestCase):
         sig = inspect.signature(gdl.walk_side)
         self.assertIn("park_for_reread", sig.parameters)
         self.assertTrue(sig.parameters["park_for_reread"].default)
+
+    def test_verify_branch_compares_shape_not_bytes(self):
+        """Guard against reintroducing the byte-identity check."""
+        src = inspect_source(gdl.walk_side)
+        verify = src.split("else:\n            # Verify by RE-READING", 1)[1]
+        verify = verify.split('meta["coherent"] = coherent', 1)[0]
+        self.assertIn("_list_shape", verify)
+        self.assertNotIn("if first == second:", verify)
 
     def test_non_parking_path_never_pauses(self):
         """With park_for_reread=False no pause/continue may be issued.

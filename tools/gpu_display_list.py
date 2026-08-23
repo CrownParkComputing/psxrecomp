@@ -108,6 +108,17 @@ def summarise(prims, out=sys.stdout, limit=20):
             print(f"  {'':>4}  {'':<16} {'':<10} {'':<12} {cols}", file=out)
 
 
+def _list_shape(entries):
+    """The structure of a walked list, ignoring the data inside it.
+
+    Two reads taken a moment apart during an animation legitimately differ in
+    vertex colours and positions; they must not differ in how many packets
+    there are or in each packet's opcode and length. That is what separates
+    "the game is drawing" from "we read while it was being rebuilt".
+    """
+    return [(e.get("op"), e.get("n_words")) for e in entries]
+
+
 def walk_side(conn, label, *, addr=None, near=None, pause=False,
               from_dma=False, max_nodes=8192, candidates=6, window=None,
               park_for_reread=True, out=sys.stdout):
@@ -218,19 +229,30 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
                 print(f"  [{label}] coherent re-read failed ({e}); using the "
                       f"running snapshot", file=out)
         else:
-            # Verify by RE-READING, not by pausing. Two back-to-back reads of
-            # the span that come back byte-identical cannot have been rebuilt
-            # in between, so the picture is from one instant -- without ever
-            # stopping the emulator. Parking for this is what made the oracle
-            # stutter through the animation it was supposed to be watching,
-            # and against DuckStation it also drops the socket to ~1 Hz.
+            # Verify by RE-READING, not by pausing -- but compare STRUCTURE,
+            # not bytes.
+            #
+            # Byte-identity was the obvious check and it is exactly wrong
+            # here: while the effect plays, the game rewrites the list every
+            # frame, so two consecutive reads never match and every animated
+            # frame gets discarded as torn. That filter keeps only the frames
+            # without the animation in them, which is the opposite of what
+            # this is for.
+            #
+            # A genuinely torn read is not merely different, it is malformed:
+            # packet word counts stop matching their opcodes and the walk
+            # loses entries. So require the two reads to agree on the SHAPE of
+            # the list -- entry count and the opcode/length of each entry --
+            # while letting the colours differ, since colours changing between
+            # two reads is the effect working, not corruption.
             try:
                 first = read_ram_range(conn, 0x80000000 + span_lo, span_len)
+                shape_a = _accept(first)
                 second = read_ram_range(conn, 0x80000000 + span_lo, span_len)
-                if first == second:
-                    got = _accept(first)
-                    if got is not None:
-                        entries, coherent = got, True
+                shape_b = _accept(second)
+                if shape_a is not None and shape_b is not None and \
+                        _list_shape(shape_a) == _list_shape(shape_b):
+                    entries, coherent = shape_a, True
                 else:
                     meta["torn"] = True
             except DebugError as e:
