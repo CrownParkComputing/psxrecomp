@@ -85,6 +85,12 @@ def main(argv=None):
                          "trace")
     ap.add_argument("--disasm", type=int, default=3,
                     help="how many top writers to disassemble")
+    ap.add_argument("--watch", type=float, default=0.0,
+                    help="seconds to trace FREE-RUNNING instead of stepping "
+                         "frames. Use this for data written at scene load "
+                         "rather than per frame -- stepping two frames during "
+                         "an effect cannot see a table that was filled before "
+                         "it started")
     ap.add_argument("--wait-secs", type=float, default=120.0,
                     help="wait this long for --expect-class to "
                          "appear; 0 disables the wait")
@@ -135,12 +141,29 @@ def main(argv=None):
         f0 = conn.frame()
         conn.cmd("wtrace_reset")
         conn.cmd("wtrace_add", lo=f"0x{lo:08X}", hi=f"0x{hi:08X}")
-        conn.cmd("step", n=max(1, args.frames))
-        for _ in range(400):
-            st = conn.raw("pause_state")
-            if st.get("paused") and conn.frame() > f0:
-                break
-            time.sleep(0.02)
+        if args.watch > 0:
+            # Free-running trace. A table that is STATIC while an effect plays
+            # is not written during it -- stepping a couple of frames there
+            # proves only that, and reads as "nothing writes this". The fill
+            # happens at scene load, so run and let the user walk into the
+            # scene with the trace already armed.
+            print(f"tracing free-running for {args.watch:.0f}s — enter the "
+                  f"scene NOW so the load is inside the window",
+                  file=sys.stderr, flush=True)
+            conn.cmd("continue")
+            time.sleep(args.watch)
+            conn.cmd("pause")
+            for _ in range(400):
+                if conn.raw("pause_state").get("paused"):
+                    break
+                time.sleep(0.02)
+        else:
+            conn.cmd("step", n=max(1, args.frames))
+            for _ in range(400):
+                st = conn.raw("pause_state")
+                if st.get("paused") and conn.frame() > f0:
+                    break
+                time.sleep(0.02)
         advanced = conn.frame() - f0
         doc["frames_advanced"] = advanced
         if advanced <= 0:
@@ -167,9 +190,18 @@ def main(argv=None):
 
     doc["writes"] = len(rows)
     if not rows:
-        msg = (f"nothing wrote to this range across {advanced} frame(s). Either "
-               f"it is written less often than that, or the code that fills it "
-               f"is not running.")
+        if args.watch > 0:
+            msg = (f"nothing wrote to this range in {args.watch:.0f}s of "
+                   f"free running ({advanced} frame(s)). If the scene was "
+                   f"loaded inside that window, the data did not arrive by a "
+                   f"CPU store at all -- a DMA fill that writes RAM directly "
+                   f"is not visible to this trace.")
+        else:
+            msg = (f"nothing wrote to this range across {advanced} frame(s). "
+                   f"That means it is STATIC over those frames -- useful in "
+                   f"itself -- not that nothing ever fills it. Data written "
+                   f"once at scene load needs --watch N with the trace armed "
+                   f"BEFORE entering the scene.")
         print(f"error: {msg}", file=sys.stderr)
         doc["error"] = msg
         return _finish(doc, args, 1)
