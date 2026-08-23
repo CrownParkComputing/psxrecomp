@@ -47,6 +47,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from probe_regs import probe_registers  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
     DebugConn, DebugError, oracle_resume, read_ram_range, snapshot_ram,
@@ -181,6 +182,8 @@ def main(argv=None):
                     help="seconds to wait for the PC to be reached. "
                          "A paused oracle answers about once a second, so this needs headroom.")
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--probe-wait", type=float, default=6.0,
+                    help="seconds to let psx-runtime's block probe collect")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -224,13 +227,67 @@ def main(argv=None):
         doc["oracle_bytes"] = b.hex()
         doc["oracle_looks_like_table"] = looks_like_triplets(b)
 
-        # Locate the SAME table on psx-runtime rather than assuming the address
-        # carries over. It does not: the two allocators place the same
-        # structures at different addresses, so the oracle's pointer read on
-        # psx-runtime lands on unrelated memory.
-        print("searching psx-runtime's RAM for the same table …")
+        # Ask psx-runtime where ITS table is, rather than inferring.
+        #
+        # Its probe fires at basic-block leaders, so the colour store's own
+        # address never matches one and the enclosing block has to be found by
+        # arming a spread. $s4 is callee-saved and set outside the loop, so its
+        # value at block entry is its value at the store.
+        #
+        # This is the direct answer. Everything below it is fallback for when
+        # the probe cannot fire -- and a fallback that compares by CONTENT,
+        # because addresses provably do not carry between the two emulators.
+        print("asking psx-runtime for its own $s4 …")
+        pr = probe_registers(native, pc, want=("s4", "s6"),
+                             wait=args.probe_wait)
+        doc["native_probe"] = {k: pr.get(k) for k in
+                               ("block_leader", "frame", "samples_seen",
+                                "error", "leader_after_target")}
+        nat_ptr = None
+        if pr.get("regs", {}).get("s4"):
+            nat_ptr = int(pr["regs"]["s4"], 16)
+            doc["native_regs"] = pr["regs"]
+            doc["native_source_addr"] = f"0x{(nat_ptr + SRC_OFFSET) & 0x1FFFFFFF:08X}"
+            print(f"  psx-runtime $s4=0x{nat_ptr:08X} "
+                  f"$s6={pr['regs'].get('s6')} "
+                  f"(block {pr.get('block_leader')})")
+        else:
+            print(f"  probe did not report $s4 ({pr.get('error', 'no reason')}); "
+                  f"falling back to searching RAM by content", file=sys.stderr)
+
+        print("reading psx-runtime's RAM …")
         ram = snapshot_ram(native)
         needle = b[:16]
+        if nat_ptr is not None:
+            # Compare the table psx-runtime's OWN code reads.
+            nsrc = (nat_ptr + SRC_OFFSET) & 0x1FFFFFFF
+            a = ram[nsrc:nsrc + args.span]
+            doc["native_bytes"] = a.hex()
+            doc["native_looks_like_table"] = looks_like_triplets(a)
+            doc["compared_by"] = "native-own-pointer"
+            doc["address_delta"] = nsrc - src
+            same = a == b
+            doc["source_identical"] = same
+            print(f"\n  psx-runtime @ {doc['native_source_addr']}: {a[:16].hex(' ')}")
+            print(f"  oracle      @ 0x{src:08X}: {b[:16].hex(' ')}")
+            if same:
+                doc["verdict"] = "source-matches"
+                print("\nVERDICT: both routines read the SAME table contents. "
+                      "The input is fine, so the divergence is the scale or the "
+                      "arithmetic — compare $s6: psx-runtime "
+                      f"{pr['regs'].get('s6')} against the oracle "
+                      f"0x{scale:08X}.")
+            else:
+                n = sum(1 for x, y in zip(a, b) if x != y)
+                doc["verdict"] = "source-differs"
+                doc["differing_bytes"] = n
+                print(f"\nVERDICT: the two routines read DIFFERENT table "
+                      f"contents ({n}/{min(len(a), len(b))} bytes differ). Each "
+                      f"is reading its own emulator's table, so this is a real "
+                      f"data divergence — the fault is upstream, in whatever "
+                      f"builds it.")
+            return _finish(doc, args, 0)
+
         hits = find_table(ram, needle)
         doc["native_hits"] = [f"0x{h:08X}" for h in hits]
         if not hits:

@@ -57,6 +57,59 @@ def candidates(pc, back, step, limit=MAX_PCS):
     return out
 
 
+def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
+                    samples=32, wait=6.0, out=sys.stderr):
+    """Registers at the block leader enclosing `pc`. Returns a dict.
+
+    Shared with colour_inputs so there is ONE implementation of "find the
+    enclosing block". Two copies of this would drift, and the failure would be
+    silent: both would return real register values, just from different blocks.
+    """
+    cands = candidates(pc, back, step)
+    res = {"pc": f"0x{pc:08X}",
+           "candidates": [f"0x{c:08X}" for c in cands]}
+    try:
+        conn.cmd("pc_probe_clear")
+        conn.cmd("pc_probe_arm", n=samples,
+                 pcs=",".join(f"0x{c:08X}" for c in cands))
+        time.sleep(wait)
+        rep = conn.cmd("pc_probe_dump")
+    except DebugError as e:
+        res["error"] = str(e)
+        return res
+    finally:
+        try:
+            conn.cmd("pc_probe_clear")
+        except DebugError:
+            pass
+
+    slots = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
+    res["fired"] = [{"pc": x["pc"], "count": int(x["count"])} for x in slots]
+    if not slots:
+        res["error"] = ("no candidate fired — all mid-block, or this code did "
+                        "not run. Widen the search or check the effect is on "
+                        "screen.")
+        return res
+
+    below = [x for x in slots
+             if (int(x["pc"], 16) & 0x1FFFFFFF) <= (pc & 0x1FFFFFFF)]
+    chosen = max(below, key=lambda x: int(x["pc"], 16)) if below else slots[0]
+    res["block_leader"] = chosen["pc"]
+    res["leader_after_target"] = not below
+
+    samples_here = [x for x in rep.get("samples", [])
+                    if x.get("pc") == chosen["pc"] and x.get("regs")]
+    res["samples_seen"] = len(samples_here)
+    if not samples_here:
+        res["error"] = f"{chosen['pc']} fired but captured no registers"
+        return res
+    last = samples_here[-1]["regs"]
+    res["frame"] = samples_here[-1].get("frame")
+    res["regs"] = {w: last.get(w) for w in want}
+    res["all_regs"] = last
+    return res
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
