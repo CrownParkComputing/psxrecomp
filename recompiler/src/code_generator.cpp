@@ -1868,8 +1868,7 @@ std::string CodeGenerator::translate_basic_block(
         if (!(insn_addr == block.start_addr || (insn_addr & 0xCu) == 0 ||
               extra_labels_.count(insn_addr))) return;
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format(
-            "psx_icache_fetch_generated(cpu, 0x{:08X}u);\n", insn_addr);
+        ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", insn_addr);
         ss << "#endif\n";
     };
     auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {

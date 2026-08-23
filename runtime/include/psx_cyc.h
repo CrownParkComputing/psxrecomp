@@ -61,49 +61,6 @@ extern "C" {
 #define PSX_CYC_NOINLINE      static
 #endif
 
-/* cpu_state.h and psx_icache.h intentionally include each other at their
- * completed-type seam. Repeat these compatible declarations here so the
- * generated inline helper is also valid while psx_icache.h is the outermost
- * include. */
-extern uint32_t g_psx_icache_tv[1024];
-extern int g_psx_icache_active;
-void psx_icache_fetch(CPUState* cpu, uint32_t addr);
-void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr);
-
-/* Generated code always supplies a literal instruction address. Keep the
- * steady tag hit in the generated function so the compiler folds the cache
- * index and avoids an out-of-line call at every block/line leader. Cold init,
- * disabled mode, ordinary lockstep replay, shadow replay, and true misses all
- * retain the existing shared implementation and its exact side effects. */
-PSX_CYC_ALWAYS_INLINE void psx_icache_fetch_generated(
-    CPUState* cpu, uint32_t addr) {
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-#if defined(PSX_OVERLAY_DLL_BUILD) && \
-    !defined(PSX_GENERATED_ICACHE_DIRECT_TEST)
-    /* Overlay DLLs do not own or import the runtime tag array. Preserve their
-     * ABI callback, which flushes pending overlay cycles before a host miss. */
-    psx_icache_fetch(cpu, addr);
-#else
-    int active;
-    if (g_ls_replay_active) {
-        psx_icache_fetch(cpu, addr);
-        return;
-    }
-    active = g_psx_icache_active;
-    if (active < 0) {
-        psx_icache_fetch(cpu, addr);
-        return;
-    }
-    if (!active) return;
-    if (g_psx_icache_tv[(addr & 0xFFCu) >> 2] == addr) return;
-    psx_icache_fetch_miss(cpu, addr);
-#endif
-#else
-    (void)cpu;
-    (void)addr;
-#endif
-}
-
 /* Load-charge batching (MotK VLC): cache the nearer of the next device
  * deadline or a 64-cycle soft publication limit once per batch. Generated
  * GCC/Clang blocks may defer to their IRQ edge; MMIO also flushes. Pipeline
