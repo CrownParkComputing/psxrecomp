@@ -33,7 +33,6 @@ def find_test_gcc():
     candidates = [
         os.environ.get('CC'),
         shutil.which('gcc'),
-        r'C:\msys64\mingw64\bin\gcc.exe' if os.name == 'nt' else None,
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):

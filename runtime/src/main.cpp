@@ -29,6 +29,7 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "code_provider.h"
+#include "dirty_ram_interp.h"
 extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
@@ -54,6 +55,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "psx_lobby_client.h"
 #include "spu.h"
 #include "audio_trace.h"
+#include "audio_wall_telemetry.h"
 #include "spu_shadow.h"
 
 /* Shared clock-domain bridge: band-limited polyphase resampler + P-only DRC.
@@ -479,6 +481,19 @@ static uint64_t s_fps_last_retired_cycles = 0;
 static uint64_t s_fps_last_cpu_native_cycles = 0;
 static uint64_t s_fps_last_spu_frames = 0;
 static uint64_t s_fps_last_cdda_sectors = 0;
+static uint64_t s_fps_last_audio_pumps = 0;
+static uint64_t s_fps_last_audio_backpressure = 0;
+static uint64_t s_fps_last_audio_underruns = 0;
+static uint64_t s_fps_last_audio_overflows = 0;
+static uint64_t s_fps_last_audio_callback_calls = 0;
+static uint64_t s_fps_last_audio_callback_starvations = 0;
+static uint64_t s_fps_last_audio_host_frames = 0;
+static uint64_t s_fps_last_text_watched_write_epochs = 0;
+static uint64_t s_fps_last_text_exact_revalidations = 0;
+static Uint64   s_fps_audio_origin_time = 0;
+static uint64_t s_fps_audio_origin_frame = 0;
+static uint64_t s_fps_audio_origin_spu_frames = 0;
+static uint64_t s_fps_audio_origin_host_frames = 0;
 static uint32_t s_fps_last_mdec_decodes = 0;
 static uint64_t s_fps_last_idle_skip_count = 0;
 static uint64_t s_fps_last_idle_skip_cycles = 0;
@@ -500,6 +515,8 @@ static int      s_d24_cutover_blank = 0;
 /* Savestate restore → audio pump: re-anchor last_cycles (declared early so
  * psx_frontend_on_savestate_loaded can set it). */
 static int      g_audio_cycle_resync = 0;
+
+static void audio_callback_reanchor_wall(void);
 
 static void smooth_60_reset(void) {
     g_smooth_60_state.previous_source.clear();
@@ -530,6 +547,7 @@ static void present_session_reset(void) {
     s_d24_saw_gap = 0;
     s_d24_cutover_blank = 0;
     sdl_audio_fadein_left = 0;
+    audio_callback_reanchor_wall();
     /* Soft-exit can leave deferred present / flush reentrancy armed; gpu_init
      * does not clear them. Rematch then no-ops every flush → black window. */
     gpu_vblank_clear_deferred_present();
@@ -1868,9 +1886,75 @@ extern "C" {
 int g_audio_host_rate = 44100;
 }
 
+/* Pull-callback wall health.  The SPU and CD counters below prove simulated
+ * device cadence; these atomics independently prove whether the host audio
+ * thread actually woke often enough to consume that audio in wall time.
+ * A gap is considered starvation when it exceeds the duration covered by the
+ * preceding callback plus 25 ms. */
+static std::atomic<uint64_t> s_audio_callback_calls{0};
+static std::atomic<uint64_t> s_audio_callback_frames{0};
+static std::atomic<uint64_t> s_audio_callback_frequency{0};
+static std::atomic<uint64_t> s_audio_callback_coverage_deadline_tick{0};
+static std::atomic<uint64_t> s_audio_callback_starvations{0};
+static std::atomic<uint64_t> s_audio_callback_window_max_uncovered_ticks{0};
+
+static void audio_callback_reanchor_wall(void)
+{
+    s_audio_callback_coverage_deadline_tick.store(0,
+                                                   std::memory_order_relaxed);
+    s_audio_callback_window_max_uncovered_ticks.store(
+        0, std::memory_order_relaxed);
+}
+
+static void audio_callback_note_wall(int frames)
+{
+    const uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t frequency = s_audio_callback_frequency.load(
+        std::memory_order_relaxed);
+    if (!frequency) {
+        frequency = SDL_GetPerformanceFrequency();
+        s_audio_callback_frequency.store(frequency, std::memory_order_relaxed);
+    }
+    s_audio_callback_calls.fetch_add(1, std::memory_order_relaxed);
+    if (frames > 0)
+        s_audio_callback_frames.fetch_add((uint64_t)frames,
+                                          std::memory_order_relaxed);
+
+    if (!frequency)
+        return;
+
+    const uint64_t host_rate = g_audio_host_rate > 0
+        ? (uint64_t)g_audio_host_rate : 44100u;
+    uint64_t deadline = s_audio_callback_coverage_deadline_tick.load(
+        std::memory_order_relaxed);
+    uint64_t uncovered = 0;
+    for (;;) {
+        const uint64_t next = psx_audio_callback_coverage_step(
+            deadline, now, frames > 0 ? (uint64_t)frames : 0u,
+            frequency, host_rate, &uncovered);
+        if (s_audio_callback_coverage_deadline_tick.compare_exchange_weak(
+                deadline, next, std::memory_order_relaxed,
+                std::memory_order_relaxed))
+            break;
+    }
+
+    uint64_t observed = s_audio_callback_window_max_uncovered_ticks.load(
+        std::memory_order_relaxed);
+    while (uncovered > observed &&
+           !s_audio_callback_window_max_uncovered_ticks.compare_exchange_weak(
+               observed, uncovered, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {}
+
+    /* Ignore ordinary callback scheduling jitter; this counts uncovered wall
+     * time beyond the audio already supplied to the device. */
+    if (uncovered > frequency / 40u) /* 25 ms */
+        s_audio_callback_starvations.fetch_add(1, std::memory_order_relaxed);
+}
+
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
+    audio_callback_note_wall(frames);
     rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
     /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
      * This callback is the tap's single writer while the bridge is active. */
@@ -2712,6 +2796,7 @@ static void shutdown_runtime(void) {
         psx_sdl_audio_close(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
+    audio_callback_reanchor_wall();
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
@@ -2729,6 +2814,7 @@ static void teardown_game_session_keep_lobby(void) {
         psx_sdl_audio_close(sdl_audio_device);
         sdl_audio_device = 0;
     }
+    audio_callback_reanchor_wall();
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
     if (g_vk_active) {
@@ -2955,7 +3041,9 @@ extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
         return sdl_audio_device != 0;
     }
     rab_stats st;
+    if (sdl_audio_device) psx_sdl_audio_lock(sdl_audio_device);
     rab_get_stats(&s_drc, &st);
+    if (sdl_audio_device) psx_sdl_audio_unlock(sdl_audio_device);
     *fill_ms = st.last_fill_ms;
     *target_ms = s_drc.cfg.target_ms;
     *underruns = st.underrun_events;
@@ -3361,6 +3449,7 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
         audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
         extern int g_audio_unmute_resync;
         g_audio_unmute_resync = 1;
+        audio_callback_reanchor_wall();
     }
     if (turbo_sink_active) {
         if (!sink_was_active) {
@@ -3379,6 +3468,7 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
         audio_trace_event(AUDIO_EV_UNMUTE,
                           (uint32_t)sdl_audio_fadein_left, 2);
         g_audio_unmute_resync = 1;
+        audio_callback_reanchor_wall();
     }
     s_audio_gate = AUDIO_GATE_NORMAL;
     sdl_audio_pump(false);
@@ -5997,6 +6087,39 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 cdrom_debug_snapshot(&cd);
                 s_fps_last_cdda_sectors = cd.cdda_sectors_played;
             }
+            {
+                AudioTraceHostStats host{};
+                audio_trace_get_host_stats(&host);
+                s_fps_last_audio_pumps = host.pump_calls;
+                s_fps_last_audio_backpressure = host.pump_skips;
+                double fill_ms = 0.0, target_ms = 0.0, correction = 0.0;
+                uint64_t underruns = 0, overflows = 0;
+                int legacy = 0, host_rate = 0;
+                (void)psx_audio_out_stats(
+                    &fill_ms, &target_ms, &underruns, &overflows, &correction,
+                    &legacy, &host_rate);
+                s_fps_last_audio_underruns = underruns;
+                s_fps_last_audio_overflows = overflows;
+                s_fps_last_audio_callback_calls =
+                    s_audio_callback_calls.load(std::memory_order_relaxed);
+                s_fps_last_audio_callback_starvations =
+                    s_audio_callback_starvations.load(std::memory_order_relaxed);
+                const bool callback_domain =
+                    !legacy && s_drc_ready && sdl_audio_device != 0;
+                s_fps_last_audio_host_frames = callback_domain
+                    ? s_audio_callback_frames.load(std::memory_order_relaxed)
+                    : audio_trace_tap_total(AUDIO_TAP_HOST);
+                s_fps_audio_origin_time = now;
+                s_fps_audio_origin_frame = s_frame_count;
+                s_fps_audio_origin_spu_frames = s_fps_last_spu_frames;
+                s_fps_audio_origin_host_frames = s_fps_last_audio_host_frames;
+                (void)s_audio_callback_window_max_uncovered_ticks.exchange(
+                    0, std::memory_order_relaxed);
+            }
+            s_fps_last_text_watched_write_epochs =
+                g_dirty_ram_text_watched_write_epochs;
+            s_fps_last_text_exact_revalidations =
+                g_dirty_ram_text_exact_revalidations;
             s_fps_last_mdec_decodes = mdec_get_decode_count();
             s_fps_last_idle_skip_count = g_idle_skip_count;
             s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
@@ -6032,6 +6155,84 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 mdec_decode_count - s_fps_last_mdec_decodes;
             const double effective_cdda_hz = native_delta
                 ? (double)cdda_delta * 33868800.0 / (double)native_delta : 0.0;
+            const double spu_wall_hz = psx_audio_wall_rate(spu_delta, seconds);
+            const double cdda_wall_sectors_s =
+                psx_audio_wall_rate(cdda_delta, seconds);
+            AudioTraceHostStats audio_host{};
+            audio_trace_get_host_stats(&audio_host);
+            const uint64_t audio_pump_delta = psx_audio_monotonic_delta(
+                audio_host.pump_calls, s_fps_last_audio_pumps);
+            const uint64_t audio_backpressure_delta = psx_audio_monotonic_delta(
+                audio_host.pump_skips, s_fps_last_audio_backpressure);
+            double audio_fill_ms = 0.0, audio_target_ms = 0.0;
+            double audio_correction = 0.0;
+            uint64_t audio_underruns = 0, audio_overflows = 0;
+            int audio_legacy = 0, audio_host_rate = 0;
+            const int audio_output_active = psx_audio_out_stats(
+                &audio_fill_ms, &audio_target_ms, &audio_underruns,
+                &audio_overflows, &audio_correction, &audio_legacy,
+                &audio_host_rate);
+            const uint64_t audio_underrun_delta = psx_audio_monotonic_delta(
+                audio_underruns, s_fps_last_audio_underruns);
+            const uint64_t audio_overflow_delta = psx_audio_monotonic_delta(
+                audio_overflows, s_fps_last_audio_overflows);
+            const uint64_t callback_calls =
+                s_audio_callback_calls.load(std::memory_order_relaxed);
+            const uint64_t callback_starvations =
+                s_audio_callback_starvations.load(std::memory_order_relaxed);
+            const uint64_t callback_call_delta = psx_audio_monotonic_delta(
+                callback_calls, s_fps_last_audio_callback_calls);
+            const uint64_t callback_starvation_delta = psx_audio_monotonic_delta(
+                callback_starvations, s_fps_last_audio_callback_starvations);
+            const uint64_t callback_max_uncovered_ticks =
+                s_audio_callback_window_max_uncovered_ticks.exchange(
+                    0, std::memory_order_relaxed);
+            const double callback_max_uncovered_ms = frequency
+                ? (double)callback_max_uncovered_ticks * 1000.0 /
+                    (double)frequency
+                : 0.0;
+            const bool callback_domain =
+                !audio_legacy && s_drc_ready && sdl_audio_device != 0;
+            const uint64_t audio_host_frames = callback_domain
+                ? s_audio_callback_frames.load(std::memory_order_relaxed)
+                : audio_trace_tap_total(AUDIO_TAP_HOST);
+            const uint64_t audio_host_delta = psx_audio_monotonic_delta(
+                audio_host_frames, s_fps_last_audio_host_frames);
+            const double audio_host_wall_hz =
+                audio_output_active
+                    ? psx_audio_wall_rate(audio_host_delta, seconds) : 0.0;
+            const uint64_t cumulative_spu_frames = psx_audio_monotonic_delta(
+                spu_info.render_frames, s_fps_audio_origin_spu_frames);
+            const uint64_t cumulative_video_frames = psx_audio_monotonic_delta(
+                s_frame_count, s_fps_audio_origin_frame);
+            const double av_sim_drift_ms = psx_audio_timeline_drift_ms(
+                cumulative_spu_frames, 44100.0, cumulative_video_frames,
+                target_vblank_hz);
+            const double audio_wall_elapsed =
+                frequency && now >= s_fps_audio_origin_time
+                    ? (double)(now - s_fps_audio_origin_time) /
+                        (double)frequency
+                    : 0.0;
+            const uint64_t cumulative_host_frames = psx_audio_monotonic_delta(
+                audio_host_frames, s_fps_audio_origin_host_frames);
+            const double audio_host_wall_drift_ms =
+                audio_output_active && audio_host_rate > 0
+                    ? psx_audio_wall_drift_ms(cumulative_host_frames,
+                                               (double)audio_host_rate,
+                                               audio_wall_elapsed)
+                    : 0.0;
+            const uint64_t text_watched_writes =
+                g_dirty_ram_text_watched_write_epochs >=
+                        s_fps_last_text_watched_write_epochs
+                    ? g_dirty_ram_text_watched_write_epochs -
+                        s_fps_last_text_watched_write_epochs
+                    : 0u;
+            const uint64_t text_exact_revalidations =
+                g_dirty_ram_text_exact_revalidations >=
+                        s_fps_last_text_exact_revalidations
+                    ? g_dirty_ram_text_exact_revalidations -
+                        s_fps_last_text_exact_revalidations
+                    : 0u;
             const uint64_t idle_count_delta =
                 g_idle_skip_count - s_fps_last_idle_skip_count;
             const uint64_t idle_cycles_delta =
@@ -6101,8 +6302,26 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              "cpu_requested=%u%% cpu_effective=%.3fx "
                              "retired=%llu cpu_native=%llu device_clock=%llu "
                              "spu_frames=%llu spu_effective=%.1fHz "
+                             "spu_effective_domain=sim_cycles "
+                             "spu_wall_hz=%.1f "
                              "cdda_playing=%u cdda_track=%d "
                              "cdda_sectors=%llu cdda_effective=%.2fHz "
+                             "cdda_effective_domain=sim_cycles "
+                             "cdda_wall_sectors_s=%.2f "
+                             "audio_output=%u audio_host_domain=%s "
+                             "audio_host_content=including_silence "
+                             "audio_host_frames=%llu audio_host_wall_hz=%.1f "
+                             "audio_fill_ms=%.1f audio_target_ms=%.1f "
+                             "audio_correction=%+.5f "
+                             "audio_pumps=%llu audio_backpressure=%llu "
+                             "audio_underruns=%llu audio_overflows=%llu "
+                             "audio_callback_calls=%llu "
+                             "audio_callback_starved=%llu "
+                             "audio_callback_uncovered_max_ms=%.1f "
+                             "av_sim_drift_ms=%+.2f "
+                             "audio_host_wall_drift_ms=%+.2f "
+                             "text_watched_writes=%llu "
+                             "text_exact_revalidations=%llu "
                              "mdec_decodes=%u "
                              "idle_skips=%llu idle_native=%llu carry=%u\n",
                              fps, speed, (unsigned long long)s_frame_count,
@@ -6112,10 +6331,30 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              (unsigned long long)native_delta,
                              (unsigned long long)spu_delta,
                              effective_spu_hz,
+                             spu_wall_hz,
                              (unsigned)cd_info.cdda_playing,
                              cd_info.cdda_track,
                              (unsigned long long)cdda_delta,
                              effective_cdda_hz,
+                             cdda_wall_sectors_s,
+                             (unsigned)(audio_output_active ? 1 : 0),
+                             !audio_output_active ? "none" :
+                                 (callback_domain ? "callback_consumed" :
+                                                    "enqueue_produced"),
+                             (unsigned long long)audio_host_delta,
+                             audio_host_wall_hz,
+                             audio_fill_ms, audio_target_ms, audio_correction,
+                             (unsigned long long)audio_pump_delta,
+                             (unsigned long long)audio_backpressure_delta,
+                             (unsigned long long)audio_underrun_delta,
+                             (unsigned long long)audio_overflow_delta,
+                             (unsigned long long)callback_call_delta,
+                             (unsigned long long)callback_starvation_delta,
+                             callback_max_uncovered_ms,
+                             av_sim_drift_ms,
+                             audio_host_wall_drift_ms,
+                             (unsigned long long)text_watched_writes,
+                             (unsigned long long)text_exact_revalidations,
                              (unsigned)mdec_decode_delta,
                              (unsigned long long)idle_count_delta,
                              (unsigned long long)idle_cycles_delta,
@@ -6129,6 +6368,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
             s_fps_last_spu_frames = spu_info.render_frames;
             s_fps_last_cdda_sectors = cd_info.cdda_sectors_played;
+            s_fps_last_audio_pumps = audio_host.pump_calls;
+            s_fps_last_audio_backpressure = audio_host.pump_skips;
+            s_fps_last_audio_underruns = audio_underruns;
+            s_fps_last_audio_overflows = audio_overflows;
+            s_fps_last_audio_callback_calls = callback_calls;
+            s_fps_last_audio_callback_starvations = callback_starvations;
+            s_fps_last_audio_host_frames = audio_host_frames;
+            s_fps_last_text_watched_write_epochs =
+                g_dirty_ram_text_watched_write_epochs;
+            s_fps_last_text_exact_revalidations =
+                g_dirty_ram_text_exact_revalidations;
             s_fps_last_mdec_decodes = mdec_decode_count;
             s_fps_last_idle_skip_count = g_idle_skip_count;
             s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
@@ -12841,6 +13091,9 @@ session_reboot:
             }
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
+            s_audio_callback_frequency.store(SDL_GetPerformanceFrequency(),
+                                              std::memory_order_relaxed);
+            audio_callback_reanchor_wall();
             (void)psx_sdl_audio_resume(sdl_audio_device);
         }
     }

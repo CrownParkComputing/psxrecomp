@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
-"""Recompiler codegen regression test: KUSEG-addressed games must dispatch.
+"""Exhaustively verify generated O(1) game dispatch and PS1 aliases.
 
-PS1 segments alias the same physical RAM. Most PS-X EXE headers carry KSEG
-addresses (0x8001xxxx), but a header may legally carry KUSEG ones instead
-(0x0001xxxx) -- Alien Resurrection (SLUS-00633) does, and it then executes with
-a KUSEG PC.
+The generated map is two-level and bounded: a 512-element 4 KiB page table,
+then one 1024-element instruction-word table for each populated page. Every
+lookup therefore uses a constant number of masks, bounds checks and loads; it
+does not compare/search as the number of compiled entries grows.
 
-The recompiler normalizes the dispatch table to KSEG keys. When the lookup
-compared raw values, a KUSEG PC could never match: 0x0001xxxx is always below
-0x8001xxxx, so the binary search collapsed to the start and returned no entry.
-Every dispatch fell through to the interpreter -- silently, because the
-text-image guard was never even reached (it reported zero blocks and zero
-mismatches while the whole game ran interpreted).
-
-This test synthesizes a KUSEG-addressed PS-EXE and asserts the emitted lookup
-compares 29-bit physical addresses, and that the table is ordered by that same
-key so the binary-search invariant holds.
-
-Usage:  python test_kuseg_dispatch_lookup.py [--recompiler <psxrecomp-game>]
-Exit 0 = PASS.
+By default this synthesizes a small KUSEG PS-X EXE and drives psxrecomp-game.
+``--dispatch-source`` instead verifies every entry in an existing generated
+dispatcher; the WipEout acceptance run exercises all 23,336 records.
 """
-import argparse, os, re, struct, subprocess, sys, tempfile
 
-LOAD = 0x00010000          # KUSEG: no KSEG bit, the case under test
+import argparse
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LOAD = 0x00010000
 PHYS_MASK = 0x1FFFFFFF
+RAM_SIZE = 2 * 1024 * 1024
+PAGE_COUNT = RAM_SIZE // 4096
+SLOTS_PER_PAGE = 4096 // 4
 
 
 def w(words):
@@ -31,13 +32,13 @@ def w(words):
 
 
 def make_psxexe(entry, load, data):
-    h = bytearray(2048)
-    h[0:8] = b"PS-X EXE"
-    struct.pack_into("<I", h, 0x10, entry)
-    struct.pack_into("<I", h, 0x18, load)
-    struct.pack_into("<I", h, 0x1C, len(data))
-    struct.pack_into("<I", h, 0x30, 0x801FFFF0)   # stack_base, as real headers carry
-    return bytes(h) + data
+    header = bytearray(2048)
+    header[0:8] = b"PS-X EXE"
+    struct.pack_into("<I", header, 0x10, entry)
+    struct.pack_into("<I", header, 0x18, load)
+    struct.pack_into("<I", header, 0x1C, len(data))
+    struct.pack_into("<I", header, 0x30, 0x801FFFF0)
+    return bytes(header) + data
 
 
 def jal(target):
@@ -45,78 +46,214 @@ def jal(target):
 
 
 def build_exe():
-    # func A @ LOAD: addiu sp,-8 ; jal B ; nop ; addiu sp,8 ; jr ra ; nop
-    # func B @ LOAD+0x20: jr ra ; nop
-    a = [0x27BDFFF8, jal(LOAD + 0x20), 0x00000000, 0x27BD0008, 0x03E00008, 0x00000000]
-    body = bytearray(w(a))
+    body = bytearray(w([
+        0x27BDFFF8, jal(LOAD + 0x20), 0x00000000,
+        0x27BD0008, 0x03E00008, 0x00000000,
+    ]))
     body += b"\x00" * (0x20 - len(body))
     body += w([0x03E00008, 0x00000000])
     return make_psxexe(LOAD, LOAD, bytes(body))
 
 
-def gen_dispatch(recompiler, tmp):
+def generate_dispatch(recompiler, tmp):
     psx = os.path.join(tmp, "t.psx")
     seeds = os.path.join(tmp, "seeds.txt")
     out = os.path.join(tmp, "out")
     os.makedirs(out, exist_ok=True)
-    with open(psx, "wb") as f:
-        f.write(build_exe())
-    with open(seeds, "w") as f:
-        f.write("0x%08X\n0x%08X\n" % (LOAD, LOAD + 0x20))
-    r = subprocess.run([recompiler, psx, "--seeds", seeds, "--out-dir", out],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise SystemExit("recompiler failed:\n" + (r.stderr or r.stdout))
-    disp = [f for f in os.listdir(out) if f.endswith("_dispatch.c")]
-    if not disp:
-        raise SystemExit("no _dispatch.c emitted in " + out)
-    with open(os.path.join(out, disp[0])) as f:
-        return f.read()
+    Path(psx).write_bytes(build_exe())
+    Path(seeds).write_text(
+        "0x%08X\n0x%08X\n" % (LOAD, LOAD + 0x20), encoding="utf-8")
+    result = subprocess.run(
+        [recompiler, psx, "--seeds", seeds, "--out-dir", out],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit("recompiler failed:\n" +
+                         (result.stderr or result.stdout))
+    dispatches = list(Path(out).glob("*_dispatch.c"))
+    if len(dispatches) != 1:
+        raise SystemExit(f"expected one _dispatch.c in {out}, got {len(dispatches)}")
+    return dispatches[0].read_text(encoding="utf-8")
+
+
+def parse_dispatch(source):
+    table = re.search(
+        r"static const PsxGameDispatchEntry k_psx_game_dispatch\[\] = \{"
+        r"(.*?)\n\};", source, re.DOTALL)
+    if not table:
+        raise AssertionError("dispatch record table not found")
+    keys = [
+        int(value, 16) & PHYS_MASK
+        for value in re.findall(r"\{0x([0-9A-Fa-f]{8})u,", table.group(1))
+    ]
+
+    pages = {}
+    page_pattern = re.compile(
+        r"static const PsxGameDispatchIndex "
+        r"k_psx_game_dispatch_page_([0-9A-Fa-f]{3})\[1024\] = \{"
+        r"(.*?)\n\};", re.DOTALL)
+    for match in page_pattern.finditer(source):
+        page = int(match.group(1), 16)
+        values = [int(value) for value in re.findall(r"(\d+)u", match.group(2))]
+        if len(values) != SLOTS_PER_PAGE:
+            raise AssertionError(
+                f"page {page:03X} has {len(values)} slots, expected 1024")
+        if page in pages:
+            raise AssertionError(f"duplicate generated page {page:03X}")
+        pages[page] = values
+
+    page_table = re.search(
+        r"k_psx_game_dispatch_pages\[\] = \{(.*?)\n\};",
+        source, re.DOTALL)
+    if not page_table:
+        raise AssertionError("dispatch page-pointer table not found")
+    pointers = re.findall(r"k_psx_game_dispatch_page_([0-9A-Fa-f]{3})|\b0\b",
+                          page_table.group(1))
+    # Alternation returns an empty capture for zero; retain positional count.
+    raw_tokens = re.findall(r"k_psx_game_dispatch_page_[0-9A-Fa-f]{3}|\b0\b",
+                            page_table.group(1))
+    if len(raw_tokens) != PAGE_COUNT:
+        raise AssertionError(
+            f"page table has {len(raw_tokens)} entries, expected {PAGE_COUNT}")
+    pointer_pages = {
+        index: int(token.rsplit("_", 1)[1], 16)
+        for index, token in enumerate(raw_tokens) if token != "0"
+    }
+    if any(index != page for index, page in pointer_pages.items()):
+        raise AssertionError("page-pointer table points at the wrong physical page")
+    if set(pointer_pages) != set(pages):
+        raise AssertionError("page-pointer table and emitted page arrays disagree")
+    return keys, pages
+
+
+def mapped_index(pages, addr):
+    phys = addr & PHYS_MASK
+    if phys >= RAM_SIZE or (phys & 3):
+        return None
+    page = pages.get(phys >> 12)
+    if page is None:
+        return None
+    encoded = page[(phys & 0xFFF) >> 2]
+    return None if encoded == 0 else encoded - 1
+
+
+def verify(source):
+    find = re.search(
+        r"static const PsxGameDispatchEntry\* psx_game_find_entry"
+        r"\(uint32_t addr\) \{(.*?)\n\}", source, re.DOTALL)
+    if not find:
+        raise AssertionError("psx_game_find_entry not found")
+    body = find.group(1)
+    required = (
+        "addr & 0x1FFFFFFFu",
+        "phys >= 0x200000u",
+        "(phys & 3u) != 0u",
+        "k_psx_game_dispatch_pages[phys >> 12]",
+        "page[(phys & 0xFFFu) >> 2]",
+        "encoded == 0u",
+        "encoded > PSX_GAME_DISPATCH_COUNT",
+        "entry->addr & 0x1FFFFFFFu",
+    )
+    for fragment in required:
+        if fragment not in body:
+            raise AssertionError(f"direct lookup missing guard: {fragment}")
+    if "while (" in body or "k_psx_game_dispatch[mid]" in body:
+        raise AssertionError("dispatch lookup regressed to entry-count search")
+
+    # The direct hit must also avoid the former per-entry range/page scan. The
+    # generated scalar fast gate reads the process-global mutation epoch; only
+    # a mismatch calls the exact clipped-range slow validator.
+    epoch_fragments = (
+        "uint64_t suffix_epoch;",
+        "uint64_t full_epoch;",
+        "const uint64_t epoch = g_dirty_ram_text_mutation_epoch;",
+        "validity->suffix_epoch == epoch",
+        "validity->full_epoch == epoch",
+        "dirty_ram_text_native_ok_ranges_from_epoch_cached(",
+        "dirty_ram_text_native_ok_ranges_epoch_cached(",
+    )
+    for fragment in epoch_fragments:
+        if fragment not in source:
+            raise AssertionError(f"epoch-qualified direct dispatch missing: {fragment}")
+
+    keys, pages = parse_dispatch(source)
+    if len(keys) < 2:
+        raise AssertionError(f"expected at least two dispatch entries, got {len(keys)}")
+    if len(keys) != len(set(keys)):
+        raise AssertionError("dispatch table contains colliding physical entries")
+
+    # Every record must occupy exactly its own direct slot, and each legal PS1
+    # segment alias must resolve to the identical record.
+    for index, key in enumerate(keys):
+        for alias in (key, key | 0x80000000, key | 0xA0000000):
+            actual = mapped_index(pages, alias)
+            if actual != index:
+                raise AssertionError(
+                    f"entry {index} key 0x{key:08X} alias 0x{alias:08X} "
+                    f"mapped to {actual}")
+
+    # Conversely, every nonzero generated slot must name the unique record
+    # whose physical key is that slot. This proves there are no phantom hits.
+    nonzero = 0
+    for page_number, slots in pages.items():
+        for slot, encoded in enumerate(slots):
+            phys = (page_number << 12) | (slot << 2)
+            if encoded == 0:
+                if mapped_index(pages, phys) is not None:
+                    raise AssertionError(f"empty slot 0x{phys:08X} produced a hit")
+                continue
+            nonzero += 1
+            if encoded > len(keys) or keys[encoded - 1] != phys:
+                raise AssertionError(
+                    f"slot 0x{phys:08X} has invalid record {encoded - 1}")
+    if nonzero != len(keys):
+        raise AssertionError(
+            f"map covers {nonzero} records, dispatch table has {len(keys)}")
+
+    # Exhaust the complete 2 MiB instruction address space, including all
+    # unpopulated pages: every one of its 524,288 aligned words is either the
+    # unique expected record or a fail-closed miss.
+    expected_by_phys = {key: index for index, key in enumerate(keys)}
+    misses = 0
+    for phys in range(0, RAM_SIZE, 4):
+        actual = mapped_index(pages, phys)
+        expected = expected_by_phys.get(phys)
+        if actual != expected:
+            raise AssertionError(
+                f"exhaustive word 0x{phys:08X}: expected {expected}, got {actual}")
+        if expected is None:
+            misses += 1
+    if mapped_index(pages, keys[0] + 1) is not None:
+        raise AssertionError("unaligned address did not fail closed")
+    if mapped_index(pages, RAM_SIZE) is not None:
+        raise AssertionError("out-of-RAM address did not fail closed")
+
+    return len(keys), len(pages), misses
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--recompiler",
-                    default=os.path.normpath(os.path.join(here, "..", "build",
-                                                          "psxrecomp-game")))
-    args = ap.parse_args()
-    if not os.path.isfile(args.recompiler):
-        raise SystemExit("recompiler not found: %s (build it first)" % args.recompiler)
+    here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--recompiler",
+        default=str((here / ".." / "build" / "psxrecomp-game").resolve()))
+    parser.add_argument("--dispatch-source", type=Path)
+    args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src = gen_dispatch(args.recompiler, tmp)
+    if args.dispatch_source:
+        source = args.dispatch_source.read_text(encoding="utf-8")
+    else:
+        if not os.path.isfile(args.recompiler):
+            raise SystemExit("recompiler not found: " + args.recompiler)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = generate_dispatch(args.recompiler, tmp)
 
-    m = re.search(r"static const PsxGameDispatchEntry\* psx_game_find_entry"
-                  r"\(uint32_t addr\) \{(.*?)\n\}", src, re.DOTALL)
-    if not m:
-        raise SystemExit("psx_game_find_entry not found in emitted dispatch")
-    body = m.group(1)
-
-    # The incoming PC must be reduced to a physical address before comparing.
-    if "0x1FFFFFFFu" not in body:
-        raise SystemExit(
-            "psx_game_find_entry does not mask to a physical address; a KUSEG "
-            "guest PC can never match KSEG-normalized table keys")
-    # ... and so must the stored key, otherwise the comparison is still mixed.
-    if not re.search(r"k_psx_game_dispatch\[mid\]\.addr\s*&\s*0x1FFFFFFFu", body):
-        raise SystemExit(
-            "psx_game_find_entry compares against an unmasked table key")
-
-    # The binary search requires the table to be ordered by the same key it
-    # compares. Parse the emitted entries and assert monotonic physical order.
-    tbl = re.search(r"k_psx_game_dispatch\[\] = \{(.*?)\n\};", src, re.DOTALL)
-    if not tbl:
-        raise SystemExit("dispatch table not found in emitted dispatch")
-    keys = [int(x, 16) & PHYS_MASK
-            for x in re.findall(r"\{0x([0-9A-Fa-f]{8})u,", tbl.group(1))]
-    if len(keys) < 2:
-        raise SystemExit("expected at least two dispatch entries, got %d" % len(keys))
-    if keys != sorted(keys):
-        raise SystemExit("dispatch table is not sorted by physical address; "
-                         "the masked binary search would miss entries")
-
-    print("KUSEG dispatch lookup test passed (%d entries, physical-keyed)" % len(keys))
+    try:
+        entries, pages, misses = verify(source)
+    except AssertionError as exc:
+        raise SystemExit(f"FAIL: {exc}") from exc
+    print(
+        f"direct dispatch lookup: ok ({entries} entries, {pages} pages, "
+        f"{misses} full-RAM misses; 3 aliases/entry)")
 
 
 if __name__ == "__main__":

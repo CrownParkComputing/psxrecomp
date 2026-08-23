@@ -34,74 +34,135 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
 }
 
 int main(void) {
-    uint8_t *ram = s_ram;
     const uint32_t ranges[] = {
         0x1000u, 8u,
         0x2000u, 8u,
     };
-    uint64_t suffix_cache[2] = {0, 0};
-    uint64_t full_cache[2] = {0, 0};
-    uint64_t before[2] = {0, 0};
-    uint64_t after[2] = {0, 0};
+    const uint32_t invalid_ranges[] = {0x0FFCu, 8u};
+    uint64_t suffix_epoch = 0u;
+    uint64_t full_epoch = 0u;
+    uint64_t compat_cache[2] = {0u, 0u};
+    uint64_t first_epoch;
+    uint64_t page_visits;
+    uint64_t validations;
+    uint64_t watched_writes;
 
     for (uint32_t i = 0; i < TEST_TEXT_LEN; i++)
         s_reference[i] = (uint8_t)(i * 37u + 11u);
-    memcpy(ram + TEST_TEXT_LO, s_reference, sizeof(s_reference));
+    memcpy(s_ram + TEST_TEXT_LO, s_reference, sizeof(s_reference));
     dirty_ram_text_cache_register(TEST_TEXT_LO, sizeof(s_reference));
+    first_epoch = dirty_ram_text_mutation_epoch();
+    assert(first_epoch != 0u);
 
-    assert(dirty_ram_text_native_ok_ranges_from_cached(
-        ranges, 2u, 0x2000u, suffix_cache));
-    assert(suffix_cache[0] != 0u);
-    assert(dirty_ram_text_native_ok_ranges_cached(ranges, 2u, full_cache));
-    assert(full_cache[0] == suffix_cache[0]);
+    /* The first suffix check validates exact bytes and arms only page 0x2000. */
+    dirty_ram_text_cache_test_reset_counters();
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(suffix_epoch == first_epoch);
+    assert(dirty_ram_text_cache_test_page_visits() == 1u);
+    assert(dirty_ram_text_cache_test_exact_validations() == 1u);
 
-    /* A write to the skipped prologue invalidates full-entry admission but not
-     * the clipped continuation whose exact fetched bytes begin at 0x2000. */
-    dirty_ram_text_note_range_write(0x1000u, 1u);
-    ram[0x1000u] ^= 0x5Au;
-    assert(dirty_ram_text_native_ok_ranges_from_cached(
-        ranges, 2u, 0x2000u, suffix_cache));
-    assert(!dirty_ram_text_native_ok_ranges_cached(ranges, 2u, full_cache));
-    assert(full_cache[0] == 0u && full_cache[1] == 0u);
+    /* Core performance contract: an unchanged positive entry is a single
+     * epoch compare. It performs neither a range/page walk nor byte compare. */
+    page_visits = dirty_ram_text_cache_test_page_visits();
+    validations = dirty_ram_text_cache_test_exact_validations();
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(dirty_ram_text_cache_test_page_visits() == page_visits);
+    assert(dirty_ram_text_cache_test_exact_validations() == validations);
 
-    dirty_ram_text_note_range_write(0x1000u, 1u);
-    ram[0x1000u] = s_reference[0];
-    assert(dirty_ram_text_native_ok_ranges_cached(ranges, 2u, full_cache));
-
-    assert(dirty_ram_text_range_generation_from(
-        ranges, 2u, 0x2000u, before));
-    /* Page 0x3000 is inside the registered image but outside both exact code
-     * ranges. Ordinary data writes there must not churn this function cache. */
+    /* A never-watched data page does not churn any positive entry. */
     dirty_ram_text_note_range_write(0x3000u, 1u);
-    ram[0x3000u] ^= 0xA5u;
-    assert(dirty_ram_text_range_generation_from(
-        ranges, 2u, 0x2000u, after));
-    assert(before[0] == after[0] && before[1] == after[1]);
+    s_ram[0x3000u] ^= 0xA5u;
+    assert(dirty_ram_text_mutation_epoch() == first_epoch);
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(dirty_ram_text_cache_test_page_visits() == page_visits);
+    assert(g_dirty_ram_text_watched_write_epochs == 0u);
 
-    /* A watched code-page mutation advances the qualifier and byte validation
-     * fails closed. Blessing the intentional live byte into the reference then
-     * permits a fresh positive cache entry. */
-    dirty_ram_text_note_range_write(0x2000u, 1u);
-    ram[0x2000u] ^= 0x3Cu;
-    assert(dirty_ram_text_range_generation_from(
-        ranges, 2u, 0x2000u, after));
-    assert(before[0] == after[0] && before[1] != after[1]);
-    assert(!dirty_ram_text_native_ok_ranges_from_cached(
-        ranges, 2u, 0x2000u, suffix_cache));
-    assert(suffix_cache[0] == 0u && suffix_cache[1] == 0u);
-    dirty_ram_text_note_range_write(0x2000u, 1u);
-    s_reference[0x2000u - TEST_TEXT_LO] = ram[0x2000u];
-    assert(dirty_ram_text_native_ok_ranges_from_cached(
-        ranges, 2u, 0x2000u, suffix_cache));
+    /* Full admission arms both exact code pages. A watched write rotates the
+     * global epoch, so every entry revalidates; clipped suffix bytes can still
+     * pass while full-entry bytes fail closed. */
+    assert(dirty_ram_text_native_ok_ranges_epoch_cached(
+        ranges, 2u, &full_epoch));
+    watched_writes = g_dirty_ram_text_watched_write_epochs;
+    dirty_ram_text_note_range_write(0x1000u, 0x1008u);
+    assert(g_dirty_ram_text_watched_write_epochs == watched_writes + 1u);
+    assert(dirty_ram_text_native_ok_ranges_epoch_cached(
+        ranges, 2u, &full_epoch));
+    first_epoch = dirty_ram_text_mutation_epoch();
+    watched_writes = g_dirty_ram_text_watched_write_epochs;
+    dirty_ram_text_note_range_write(0x1000u, 1u);
+    s_ram[0x1000u] ^= 0x5Au;
+    assert(dirty_ram_text_mutation_epoch() != first_epoch);
+    assert(g_dirty_ram_text_watched_write_epochs == watched_writes + 1u);
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(!dirty_ram_text_native_ok_ranges_epoch_cached(
+        ranges, 2u, &full_epoch));
+    assert(full_epoch == 0u);
 
-    /* Registering a replacement image rotates the epoch; no generated record
-     * may reuse a positive result from the prior image. */
-    before[0] = suffix_cache[0];
-    memcpy(s_reference, ram + TEST_TEXT_LO, sizeof(s_reference));
+    dirty_ram_text_note_range_write(0x1000u, 1u);
+    s_ram[0x1000u] = s_reference[0];
+    assert(dirty_ram_text_native_ok_ranges_epoch_cached(
+        ranges, 2u, &full_epoch));
+
+    /* A watched continuation mutation is byte-checked and rejected, then can
+     * be admitted only after both live and reference bytes agree again. */
+    dirty_ram_text_note_range_write(0x2000u, 1u);
+    s_ram[0x2000u] ^= 0x3Cu;
+    assert(!dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(suffix_epoch == 0u);
+    dirty_ram_text_note_range_write(0x2000u, 1u);
+    s_reference[0x2000u - TEST_TEXT_LO] = s_ram[0x2000u];
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+
+    /* Restore/image lifecycle changes cannot reuse prior positive admission. */
+    first_epoch = suffix_epoch;
+    dirty_ram_text_cache_reset(0);
+    assert(dirty_ram_text_mutation_epoch() != first_epoch);
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(suffix_epoch == dirty_ram_text_mutation_epoch());
+
+    first_epoch = suffix_epoch;
+    memcpy(s_reference, s_ram + TEST_TEXT_LO, sizeof(s_reference));
     dirty_ram_text_cache_register(TEST_TEXT_LO, sizeof(s_reference));
+    assert(dirty_ram_text_mutation_epoch() != first_epoch);
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+
+    /* Invalid range metadata never publishes an epoch. */
+    suffix_epoch = 0u;
+    assert(!dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        invalid_ranges, 1u, 0u, &suffix_epoch));
+    assert(suffix_epoch == 0u);
+
+    /* Existing generated dispatch sources retain their two-word ABI. */
     assert(dirty_ram_text_native_ok_ranges_from_cached(
-        ranges, 2u, 0x2000u, suffix_cache));
-    assert(suffix_cache[0] != before[0]);
+        ranges, 2u, 0x2000u, compat_cache));
+    assert(compat_cache[0] == dirty_ram_text_mutation_epoch());
+
+    /* Exhaustion is permanent and fail-closed: zero can match no positive
+     * cache. Byte-identical code remains runnable, but exact validation repeats
+     * on every dispatch and no cache epoch is published. */
+    suffix_epoch = dirty_ram_text_mutation_epoch();
+    dirty_ram_text_cache_test_set_epoch(UINT64_MAX);
+    watched_writes = g_dirty_ram_text_watched_write_epochs;
+    dirty_ram_text_note_range_write(0x2000u, 1u);
+    assert(dirty_ram_text_mutation_epoch() == 0u);
+    assert(g_dirty_ram_text_watched_write_epochs == watched_writes + 1u);
+    dirty_ram_text_cache_test_reset_counters();
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(suffix_epoch == 0u);
+    assert(dirty_ram_text_native_ok_ranges_from_epoch_cached(
+        ranges, 2u, 0x2000u, &suffix_epoch));
+    assert(dirty_ram_text_cache_test_exact_validations() == 2u);
+    dirty_ram_text_cache_reset(1);
+    assert(dirty_ram_text_mutation_epoch() == 0u);
 
     return 0;
 }

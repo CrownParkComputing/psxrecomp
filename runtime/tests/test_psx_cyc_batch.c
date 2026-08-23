@@ -331,6 +331,88 @@ int main(void) {
         g_psx_cyc_inline_fast = 0;
     }
 
+    /* v6 emitter runs preserve every instruction's ordered pipeline state but
+     * aggregate the common deferred charge with one native helper boundary. */
+    reset_clock(1000u);
+    {
+        static const uint32_t masks[] = {
+            (1u << 1) | (1u << 2),
+            (1u << 4),
+            (1u << 5) | (1u << 6)
+        };
+        CPUState run_cpu;
+        CPUState step_cpu;
+        uint32_t run_batch;
+        memset(&run_cpu, 0, sizeof(run_cpu));
+        run_cpu.read_absorb_which = 3u;
+        run_cpu.read_absorb[3] = 2u;
+        run_cpu.ld_which_t = 5u;
+        run_cpu.ld_absorb = 7u;
+        step_cpu = run_cpu;
+
+        psx_cyc_bb_defer_begin();
+        assert(psx_cyc_step_run_fast(&run_cpu, masks, 3u) == 1);
+        run_batch = g_psx_cyc_batch;
+        psx_cyc_bb_defer_end();
+
+        reset_clock(1000u);
+        psx_cyc_bb_defer_begin();
+        for (uint32_t i = 0u; i < 3u; ++i)
+            psx_cyc_step(&step_cpu, masks[i]);
+        assert(run_batch == g_psx_cyc_batch);
+        assert(memcmp(run_cpu.read_absorb, step_cpu.read_absorb,
+                      sizeof(run_cpu.read_absorb)) == 0);
+        assert(run_cpu.read_absorb_which == step_cpu.read_absorb_which);
+        assert(run_cpu.read_fudge == step_cpu.read_fudge);
+        assert(run_cpu.ld_absorb == step_cpu.ld_absorb);
+        assert(run_cpu.ld_which_t == step_cpu.ld_which_t);
+        psx_cyc_bb_defer_end();
+    }
+
+    /* Exceptional stepping declines the run before any mutation, allowing the
+     * emitter's cold calls to remain at their original instruction sites. */
+    reset_clock(1000u);
+    {
+        static const uint32_t masks[] = { 0u, 1u << 2 };
+        CPUState cpu;
+        CPUState before;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        before = cpu;
+        g_event_step_conservative = 1;
+        psx_cyc_bb_defer_begin();
+        assert(psx_cyc_step_run_fast(&cpu, masks, 2u) == 0);
+        assert(memcmp(&cpu, &before, sizeof(cpu)) == 0);
+        assert(g_psx_cyc_batch == 0u && psx_cycle_count == 0u);
+        psx_cyc_step_slow(&cpu, masks[0]);
+        assert(psx_cycle_count == 1u);
+        g_event_step_conservative = 0;
+        psx_cyc_bb_defer_end();
+    }
+
+    /* Capacity failure is also transactional: the slow site-by-site path owns
+     * publication and any device edge rather than observing a partial run. */
+    reset_clock(UINT64_MAX);
+    {
+        static const uint32_t masks[] = { 0u, 0u };
+        CPUState cpu;
+        CPUState before;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        before = cpu;
+        g_psx_cyc_bb_defer = 1;
+        g_psx_cyc_inline_fast = 1;
+        g_psx_cyc_batch = UINT32_MAX;
+        assert(psx_cyc_step_run_fast(&cpu, masks, 2u) == 0);
+        assert(memcmp(&cpu, &before, sizeof(cpu)) == 0);
+        assert(g_psx_cyc_batch == UINT32_MAX && psx_cycle_count == 0u);
+        g_psx_cyc_bb_defer = 0;
+        g_psx_cyc_inline_fast = 0;
+        g_psx_cyc_batch = 0u;
+    }
+
     /* Outside generated defer scope, one-cycle charges retain the ordinary
      * deadline-aware batching behavior. */
     reset_clock(5u);

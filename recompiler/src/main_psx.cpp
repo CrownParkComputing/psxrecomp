@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cerrno>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -82,7 +83,7 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 
 } // namespace
 
-int main(int argc, char** argv) {
+static int psxrecomp_main(int argc, char** argv) {
     const auto print_usage = [&]() {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
         fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
@@ -1463,8 +1464,9 @@ int main(int argc, char** argv) {
         ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges_from(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
-        ds << "extern int dirty_ram_text_native_ok_ranges_from_cached(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc, uint64_t cached_generation[2]);\n\n";
-        ds << "extern int dirty_ram_text_native_ok_ranges_cached(const uint32_t* lo_len_pairs, uint32_t count, uint64_t cached_generation[2]);\n\n";
+        ds << "extern uint64_t g_dirty_ram_text_mutation_epoch;\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges_from_epoch_cached(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc, uint64_t* cached_epoch);\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges_epoch_cached(const uint32_t* lo_len_pairs, uint32_t count, uint64_t* cached_epoch);\n\n";
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
@@ -1517,6 +1519,41 @@ int main(int argc, char** argv) {
                   [](const DispatchRecord& a, const DispatchRecord& b) {
                       return (a.addr & 0x1FFFFFFFu) < (b.addr & 0x1FFFFFFFu);
                   });
+
+        // Direct physical-PC index. Each populated 4 KiB page owns 1024
+        // instruction-word slots containing dispatch-table index + 1 (zero is
+        // a miss). WipEout SE has 23,336 entries on 172 pages, so this removes
+        // the per-dispatch binary search without paying for a dense 2 MiB map.
+        // Segment aliases naturally share one physical slot.
+        constexpr uint32_t kDispatchRamSize = 2u * 1024u * 1024u;
+        constexpr uint32_t kDispatchPageShift = 12u;
+        constexpr uint32_t kDispatchPageCount =
+            kDispatchRamSize >> kDispatchPageShift;
+        constexpr uint32_t kDispatchSlotsPerPage =
+            (1u << kDispatchPageShift) / 4u;
+        std::map<uint32_t, std::vector<uint32_t>> dispatch_pages;
+        for (uint32_t i = 0; i < records.size(); i++) {
+            const uint32_t phys = records[i].addr & 0x1FFFFFFFu;
+            if (phys >= kDispatchRamSize || (phys & 3u) != 0u) {
+                fmt::print(stderr,
+                           "FATAL: dispatch entry 0x{:08X} is outside aligned "
+                           "2 MiB main RAM\n",
+                           records[i].addr);
+                return 1;
+            }
+            const uint32_t page = phys >> kDispatchPageShift;
+            const uint32_t slot = (phys & ((1u << kDispatchPageShift) - 1u)) >> 2;
+            auto& slots = dispatch_pages[page];
+            if (slots.empty()) slots.resize(kDispatchSlotsPerPage, 0u);
+            if (slots[slot] != 0u) {
+                fmt::print(stderr,
+                           "FATAL: physical dispatch alias collision at "
+                           "0x{:08X} (records {} and {})\n",
+                           phys, slots[slot] - 1u, i);
+                return 1;
+            }
+            slots[slot] = i + 1u;
+        }
 
         // Attach the exact CFG instruction ranges from the manifest to every
         // dispatch owner. Mid-function alias wrappers have no separate F record,
@@ -1597,30 +1634,57 @@ int main(int argc, char** argv) {
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
+
+        const bool narrow_dispatch_index = records.size() <= 0xFFFFu;
+        ds << fmt::format("typedef {} PsxGameDispatchIndex;\n",
+                          narrow_dispatch_index ? "uint16_t" : "uint32_t");
+        for (const auto& [page, slots] : dispatch_pages) {
+            ds << fmt::format(
+                "static const PsxGameDispatchIndex "
+                "k_psx_game_dispatch_page_{:03X}[{}] = {{\n",
+                page, kDispatchSlotsPerPage);
+            for (uint32_t slot = 0; slot < kDispatchSlotsPerPage; slot++) {
+                if ((slot & 15u) == 0u) ds << "    ";
+                ds << slots[slot] << "u";
+                if (slot + 1u != kDispatchSlotsPerPage) ds << ", ";
+                if ((slot & 15u) == 15u) ds << "\n";
+            }
+            ds << "};\n";
+        }
+        ds << "static const PsxGameDispatchIndex* const "
+              "k_psx_game_dispatch_pages[] = {\n";
+        for (uint32_t page = 0; page < kDispatchPageCount; page++) {
+            if ((page & 7u) == 0u) ds << "    ";
+            if (dispatch_pages.count(page))
+                ds << fmt::format("k_psx_game_dispatch_page_{:03X}", page);
+            else
+                ds << "0";
+            if (page + 1u != kDispatchPageCount) ds << ", ";
+            if ((page & 7u) == 7u) ds << "\n";
+        }
+        ds << "};\n\n";
+
         ds << "typedef struct {\n";
-        ds << "    uint64_t suffix[2];\n";
-        ds << "    uint64_t full[2];\n";
+        ds << "    uint64_t suffix_epoch;\n";
+        ds << "    uint64_t full_epoch;\n";
         ds << "} PsxGameDispatchValidity;\n";
         ds << "static PsxGameDispatchValidity k_psx_game_validity[PSX_GAME_DISPATCH_COUNT];\n\n";
-        ds << "/* PS1 segments alias the same physical RAM. A game whose PS-X EXE\n";
-        ds << " * header carries KUSEG addresses (load address and entry PC without the\n";
-        ds << " * KSEG bit) executes with a KUSEG PC, while this table is keyed by the\n";
-        ds << " * recompiler's KSEG-normalized addresses. Comparing raw values made every\n";
-        ds << " * lookup fail for such a title: 0x0001xxxx is always below 0x8001xxxx, so\n";
-        ds << " * the search collapsed and returned no entry, silently routing all game\n";
-        ds << " * code to the interpreter. Compare the 29-bit physical address instead;\n";
-        ds << " * the table is sorted by the same masked key. */\n";
+        ds << "/* O(1) physical-PC lookup. KUSEG/KSEG0/KSEG1 aliases share the\n";
+        ds << " * same 29-bit key. Unaligned, out-of-RAM, empty-page and empty-slot\n";
+        ds << " * addresses fail closed without touching the dispatch table. */\n";
         ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
-        ds << "    const uint32_t want = addr & 0x1FFFFFFFu;\n";
-        ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
-        ds << "    while (lo < hi) {\n";
-        ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
-        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr & 0x1FFFFFFFu;\n";
-        ds << "        if (want < key) hi = mid;\n";
-        ds << "        else if (want > key) lo = mid + 1;\n";
-        ds << "        else return &k_psx_game_dispatch[mid];\n";
-        ds << "    }\n";
-        ds << "    return 0;\n";
+        ds << "    const uint32_t phys = addr & 0x1FFFFFFFu;\n";
+        ds << "    const PsxGameDispatchIndex* page;\n";
+        ds << "    uint32_t encoded;\n";
+        ds << "    const PsxGameDispatchEntry* entry;\n";
+        ds << fmt::format("    if (phys >= 0x{:X}u || (phys & 3u) != 0u) return 0;\n",
+                          kDispatchRamSize);
+        ds << "    page = k_psx_game_dispatch_pages[phys >> 12];\n";
+        ds << "    if (!page) return 0;\n";
+        ds << "    encoded = page[(phys & 0xFFFu) >> 2];\n";
+        ds << "    if (encoded == 0u || encoded > PSX_GAME_DISPATCH_COUNT) return 0;\n";
+        ds << "    entry = &k_psx_game_dispatch[encoded - 1u];\n";
+        ds << "    return ((entry->addr & 0x1FFFFFFFu) == phys) ? entry : 0;\n";
         ds << "}\n\n";
 
         ds << "static PsxGameDispatchValidity* psx_game_entry_validity(\n";
@@ -1628,31 +1692,46 @@ int main(int argc, char** argv) {
         ds << "    return &k_psx_game_validity[(uint32_t)(entry - k_psx_game_dispatch)];\n";
         ds << "}\n\n";
 
+        ds << "static int psx_game_entry_suffix_native_ok(\n";
+        ds << "        const PsxGameDispatchEntry* entry, uint32_t addr) {\n";
+        ds << "    PsxGameDispatchValidity* validity = psx_game_entry_validity(entry);\n";
+        ds << "    const uint64_t epoch = g_dirty_ram_text_mutation_epoch;\n";
+        ds << "    if (epoch != 0u && validity->suffix_epoch == epoch) return 1;\n";
+        ds << "    return dirty_ram_text_native_ok_ranges_from_epoch_cached(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count,\n";
+        ds << "        addr, &validity->suffix_epoch);\n";
+        ds << "}\n\n";
+
+        ds << "static int psx_game_entry_full_native_ok(\n";
+        ds << "        const PsxGameDispatchEntry* entry) {\n";
+        ds << "    PsxGameDispatchValidity* validity = psx_game_entry_validity(entry);\n";
+        ds << "    const uint64_t epoch = g_dirty_ram_text_mutation_epoch;\n";
+        ds << "    if (epoch != 0u && validity->full_epoch == epoch) return 1;\n";
+        ds << "    return dirty_ram_text_native_ok_ranges_epoch_cached(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count,\n";
+        ds << "        &validity->full_epoch);\n";
+        ds << "}\n\n";
+
         ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
         ds << "int psx_game_text_native_ok(uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
-        ds << "    return dirty_ram_text_native_ok_ranges_from_cached(\n";
-        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr,\n";
-        ds << "        psx_game_entry_validity(entry)->suffix);\n";
+        ds << "    return psx_game_entry_suffix_native_ok(entry, addr);\n";
         ds << "}\n\n";
 
         ds << "/* Full-range validity for straight-line interpreter-to-AOT handoff. */\n";
         ds << "int psx_game_text_native_ok_full(uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
-        ds << "    return dirty_ram_text_native_ok_ranges_cached(\n";
-        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count,\n";
-        ds << "        psx_game_entry_validity(entry)->full);\n";
+        ds << "    return psx_game_entry_full_native_ok(entry);\n";
         ds << "}\n\n";
 
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry) return 0;\n";
-        ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges_from_cached(\n";
-        ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr,\n";
-        ds << "            psx_game_entry_validity(entry)->suffix)) return 0;\n";
+        ds << "    if (entry->range_count == 0 ||\n";
+        ds << "        !psx_game_entry_suffix_native_ok(entry, addr)) return 0;\n";
         ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
         if (codegen.cps_enabled())
             ds << "    cpu->pc = entry->resume_pc;\n";
@@ -1706,4 +1785,15 @@ int main(int argc, char** argv) {
     }
 
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return psxrecomp_main(argc, argv);
+    } catch (const std::exception& e) {
+        fmt::print(stderr, "psxrecomp-game: FATAL: {}\n", e.what());
+    } catch (...) {
+        fmt::print(stderr, "psxrecomp-game: FATAL: unknown exception\n");
+    }
+    return 2;
 }

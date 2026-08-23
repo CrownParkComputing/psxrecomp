@@ -133,22 +133,27 @@ def main():
                 failures.append("target beyond analysis bound was emitted")
             if "phys < 0x00011000u" not in dispatch:
                 failures.append("dispatch text range did not use verified bound")
-            if "dirty_ram_text_native_ok_ranges_from_cached(" not in dispatch:
-                failures.append("exact static-range dispatch guard was lost")
+            if "dirty_ram_text_native_ok_ranges_from_epoch_cached(" not in dispatch:
+                failures.append("epoch-qualified exact static-range guard was lost")
             if "uint32_t count, uint32_t exec_pc" not in dispatch:
                 failures.append("dispatch guard does not accept a continuation PC")
-            if dispatch.count("entry->range_count, addr,") != 2:
-                failures.append("dispatch guards do not validate from their resume PC")
+            if dispatch.count("psx_game_entry_suffix_native_ok(entry, addr)") != 2:
+                failures.append("dispatch guards do not share suffix validation")
+            if "addr, &validity->suffix_epoch" not in dispatch:
+                failures.append("suffix validation lost its exact resume PC")
             if "int psx_game_text_native_ok_full(uint32_t addr)" not in dispatch:
                 failures.append("full-range straight-line handoff guard was not emitted")
-            if "dirty_ram_text_native_ok_ranges_cached(" not in dispatch:
-                failures.append("full-range handoff guard lost exact range validation")
-            if ("uint64_t suffix[2];" not in dispatch or
-                    "uint64_t full[2];" not in dispatch or
-                    "psx_game_entry_validity(entry)->suffix" not in dispatch or
-                    "psx_game_entry_validity(entry)->full" not in dispatch):
+            if "dirty_ram_text_native_ok_ranges_epoch_cached(" not in dispatch:
+                failures.append("full-range handoff guard lost epoch validation")
+            if ("uint64_t suffix_epoch;" not in dispatch or
+                    "uint64_t full_epoch;" not in dispatch or
+                    "validity->suffix_epoch == epoch" not in dispatch or
+                    "validity->full_epoch == epoch" not in dispatch):
                 failures.append(
                     "suffix-clipped and full-range validity do not have distinct caches")
+            if ("k_psx_game_dispatch_pages[phys >> 12]" not in dispatch or
+                    "page[(phys & 0xFFFu) >> 2]" not in dispatch):
+                failures.append("dispatch lookup is not direct/page-indexed")
             if "psx_native_bad_entry(" in full:
                 failures.append("reachable main image incorrectly used overlay codegen")
             if "=== Exact-Entry Function Analysis ===" not in output:

@@ -57,13 +57,31 @@ static _Atomic uint64_t s_event_head;
 static _Atomic uint32_t s_noted_frame;
 
 /* Host pump counters (single writer: the pump/render thread). */
-static uint64_t s_pump_calls;
-static uint64_t s_pump_skips;
-static uint64_t s_underruns;
-static uint32_t s_queue_hiwater;
-static uint32_t s_queue_lowater = 0xFFFFFFFFu;
-static uint64_t s_mute_events;
-static uint64_t s_unmute_events;
+static _Atomic uint64_t s_pump_calls;
+static _Atomic uint64_t s_pump_skips;
+static _Atomic uint64_t s_underruns;
+static _Atomic uint32_t s_queue_hiwater;
+static _Atomic uint32_t s_queue_lowater = 0xFFFFFFFFu;
+static _Atomic uint64_t s_mute_events;
+static _Atomic uint64_t s_unmute_events;
+
+static void atomic_max_u32(_Atomic uint32_t *value, uint32_t candidate)
+{
+    uint32_t observed = atomic_load_explicit(value, memory_order_relaxed);
+    while (candidate > observed &&
+           !atomic_compare_exchange_weak_explicit(
+               value, &observed, candidate,
+               memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+static void atomic_min_u32(_Atomic uint32_t *value, uint32_t candidate)
+{
+    uint32_t observed = atomic_load_explicit(value, memory_order_relaxed);
+    while (candidate < observed &&
+           !atomic_compare_exchange_weak_explicit(
+               value, &observed, candidate,
+               memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 void audio_trace_init(void)
 {
@@ -75,13 +93,13 @@ void audio_trace_init(void)
     }
     atomic_store(&s_event_head, 0);
     atomic_store(&s_noted_frame, 0);
-    s_pump_calls = 0;
-    s_pump_skips = 0;
-    s_underruns = 0;
-    s_queue_hiwater = 0;
-    s_queue_lowater = 0xFFFFFFFFu;
-    s_mute_events = 0;
-    s_unmute_events = 0;
+    atomic_store(&s_pump_calls, 0);
+    atomic_store(&s_pump_skips, 0);
+    atomic_store(&s_underruns, 0);
+    atomic_store(&s_queue_hiwater, 0);
+    atomic_store(&s_queue_lowater, 0xFFFFFFFFu);
+    atomic_store(&s_mute_events, 0);
+    atomic_store(&s_unmute_events, 0);
 }
 
 void audio_trace_note_frame(uint32_t frame)
@@ -128,14 +146,22 @@ void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
 
     switch (kind) {
     case AUDIO_EV_RENDER:
-        s_pump_calls++;
-        if (b > s_queue_hiwater) s_queue_hiwater = b;
-        if (b < s_queue_lowater) s_queue_lowater = b;
+        atomic_fetch_add_explicit(&s_pump_calls, 1, memory_order_relaxed);
+        atomic_max_u32(&s_queue_hiwater, b);
+        atomic_min_u32(&s_queue_lowater, b);
         break;
-    case AUDIO_EV_PUMP_SKIP: s_pump_skips++;  break;
-    case AUDIO_EV_UNDERRUN:  s_underruns++;   break;
-    case AUDIO_EV_MUTE:      s_mute_events++; break;
-    case AUDIO_EV_UNMUTE:    s_unmute_events++; break;
+    case AUDIO_EV_PUMP_SKIP:
+        atomic_fetch_add_explicit(&s_pump_skips, 1, memory_order_relaxed);
+        break;
+    case AUDIO_EV_UNDERRUN:
+        atomic_fetch_add_explicit(&s_underruns, 1, memory_order_relaxed);
+        break;
+    case AUDIO_EV_MUTE:
+        atomic_fetch_add_explicit(&s_mute_events, 1, memory_order_relaxed);
+        break;
+    case AUDIO_EV_UNMUTE:
+        atomic_fetch_add_explicit(&s_unmute_events, 1, memory_order_relaxed);
+        break;
     default: break;
     }
 }
@@ -151,15 +177,33 @@ void audio_trace_get_stats(AudioTraceStats *out)
         out->tap_audible[t] = s_taps[t].audible;
         out->tap_peak[t]    = s_taps[t].peak;
     }
-    out->pump_calls     = s_pump_calls;
-    out->pump_skips     = s_pump_skips;
-    out->underruns      = s_underruns;
-    out->queue_hiwater  = s_queue_hiwater;
-    out->queue_lowater  = s_queue_lowater == 0xFFFFFFFFu ? 0 : s_queue_lowater;
-    out->mute_events    = s_mute_events;
-    out->unmute_events  = s_unmute_events;
+    AudioTraceHostStats host;
+    audio_trace_get_host_stats(&host);
+    out->pump_calls     = host.pump_calls;
+    out->pump_skips     = host.pump_skips;
+    out->underruns      = host.underruns;
+    out->queue_hiwater  = host.queue_hiwater;
+    out->queue_lowater  = host.queue_lowater;
+    out->mute_events    = host.mute_events;
+    out->unmute_events  = host.unmute_events;
     out->events_total   = atomic_load_explicit(&s_event_head,
                                                memory_order_acquire);
+}
+
+void audio_trace_get_host_stats(AudioTraceHostStats *out)
+{
+    uint32_t low;
+    if (!out) return;
+    out->pump_calls = atomic_load_explicit(&s_pump_calls, memory_order_relaxed);
+    out->pump_skips = atomic_load_explicit(&s_pump_skips, memory_order_relaxed);
+    out->underruns = atomic_load_explicit(&s_underruns, memory_order_relaxed);
+    out->queue_hiwater = atomic_load_explicit(&s_queue_hiwater,
+                                               memory_order_relaxed);
+    low = atomic_load_explicit(&s_queue_lowater, memory_order_relaxed);
+    out->queue_lowater = low == 0xFFFFFFFFu ? 0 : low;
+    out->mute_events = atomic_load_explicit(&s_mute_events, memory_order_relaxed);
+    out->unmute_events = atomic_load_explicit(&s_unmute_events,
+                                               memory_order_relaxed);
 }
 
 uint64_t audio_trace_tap_total(int tap)

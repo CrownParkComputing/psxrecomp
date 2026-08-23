@@ -18,7 +18,6 @@ def find_gcc() -> str:
         os.environ.get("CC"),
         shutil.which("gcc"),
         shutil.which("cc"),
-        r"C:\msys64\mingw64\bin\gcc.exe" if os.name == "nt" else None,
     ]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).is_file():

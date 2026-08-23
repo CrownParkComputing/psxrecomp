@@ -47,6 +47,48 @@ static bool codegen_cycle_per_insn() {
     return true;
 }
 
+/* True when executing this instruction's generated C body cannot observe or
+ * mutate CPU timing state.  v6 may move later interlock-only work ahead of
+ * these bodies, while retaining the exact base/deps/LDS transition for every
+ * instruction.  Everything uncertain is a barrier; the barrier instruction
+ * itself may terminate a run because its own interlock still precedes it. */
+static bool timing_opcode_is_transparent(uint32_t instr) {
+    const uint32_t op = instr >> 26;
+    if (op == 0u) {
+        switch (instr & 0x3Fu) {
+        case 0x00u: /* SLL (including NOP) */
+        case 0x02u: /* SRL */
+        case 0x03u: /* SRA */
+        case 0x04u: /* SLLV */
+        case 0x06u: /* SRLV */
+        case 0x07u: /* SRAV */
+        case 0x21u: /* ADDU */
+        case 0x23u: /* SUBU */
+        case 0x24u: /* AND */
+        case 0x25u: /* OR */
+        case 0x26u: /* XOR */
+        case 0x27u: /* NOR */
+        case 0x2Au: /* SLT */
+        case 0x2Bu: /* SLTU */
+            return true;
+        default:
+            return false; /* control, trap, overflow, mul/div, HI/LO */
+        }
+    }
+    switch (op) {
+    case 0x09u: /* ADDIU */
+    case 0x0Au: /* SLTI */
+    case 0x0Bu: /* SLTIU */
+    case 0x0Cu: /* ANDI */
+    case 0x0Du: /* ORI */
+    case 0x0Eu: /* XORI */
+    case 0x0Fu: /* LUI */
+        return true;
+    default:
+        return false; /* loads/stores, coprocessors, control, exceptions */
+    }
+}
+
 /* The BIOS address model of the profile this game is built against
  * (main_psx.cpp resolves [recompiler] bios_config, default the SCPH1001
  * profile, and sets it before generation). A game artifact depends on a
@@ -803,7 +845,14 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     return keep_branch_if_wide("0 /* unknown branch condition: defaults to not-taken */");
 }
 
-std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
+std::string CodeGenerator::translate_instruction(
+    uint32_t addr, uint32_t instr, bool* timing_body_transparent) {
+    /* Fail closed. Product/widescreen replacements return early below and
+     * therefore remain timing barriers even when their nominal opcode is a
+     * plain ALU instruction. Only the ordinary translator tail publishes the
+     * effect contract after PGXP shadow hooks have been appended. Those hooks
+     * update precision provenance but neither read nor mutate CPU timing. */
+    if (timing_body_transparent) *timing_body_transparent = false;
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t funct = instr & 0x3F;
 
@@ -1670,6 +1719,8 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     PSXRecomp::append_pgxp_hooks(instr, code);
+    if (timing_body_transparent)
+        *timing_body_transparent = timing_opcode_is_transparent(instr);
     return config_.indent + code + comment;
 }
 
@@ -1777,12 +1828,28 @@ std::string CodeGenerator::translate_basic_block(
     // 0x20-0x26) are SKIPPED here — psx_cyc_load_* runs their full interlock inside
     // the body (and arms LDWhich=rt). The dep/res mask is a gen-time literal. This
     // replaces the old flat per-instruction psx_advance_cycles(1u).
-    auto emit_pre_timing = [&](uint32_t in, const std::string& indent) {
+    const std::string fast_run_guard =
+        "defined(PSX_GAME_GENERATED_FAST_CYC) && !defined(PSX_COSIM)";
+    auto emit_single_pre_timing = [&](uint32_t insn_addr, uint32_t in,
+                                      const std::string& indent) {
         uint32_t op = in >> 26;
         if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << fmt::format("#if {}\n", fast_run_guard);
+        ss << indent << "{\n";
+        ss << indent << fmt::format(
+            "    static const uint32_t _psx_cyc_run_{:08X}[] = {{ 0x{:X}u }};\n",
+            insn_addr, psx_cyc_dep_res_mask(in));
+        ss << indent << fmt::format(
+            "    if (!psx_cyc_step_run_fast(cpu, _psx_cyc_run_{:08X}, 1u))\n",
+            insn_addr);
+        ss << indent << fmt::format("        psx_cyc_step_slow(cpu, 0x{:X}u);\n",
+                                    psx_cyc_dep_res_mask(in));
+        ss << indent << "}\n";
+        ss << "#else\n";
         ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n",
                                     psx_cyc_dep_res_mask(in));
+        ss << "#endif\n";
         ss << "#endif\n";
     };
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
@@ -1898,6 +1965,13 @@ std::string CodeGenerator::translate_basic_block(
     uint32_t delayed_load_addr = 0u;
     uint32_t delayed_load_dest = 0u;
     bool delayed_load_active = false;
+    bool timing_run_active = false;
+    uint32_t timing_run_end = 0u;
+    uint32_t timing_run_start = 0u;
+    /* Lookahead must classify the body that will actually be emitted, not just
+     * its raw opcode: configured product replacements can turn ADDIU/OR/SLTI
+     * into runtime helper calls. Cache that one translation for normal emit. */
+    std::map<uint32_t, std::pair<std::string, bool>> timing_body_cache;
 
     while (addr <= block.end_addr) {
         auto instr_opt = exe_.read_word(addr);
@@ -1930,7 +2004,77 @@ std::string CodeGenerator::translate_basic_block(
 
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
-            if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            if (cycle_per_insn) {
+                const uint32_t op = instr >> 26;
+                const bool cpu_load = op >= 0x20u && op <= 0x26u;
+                if (!cpu_load &&
+                    (!timing_run_active || addr > timing_run_end)) {
+                    std::vector<uint32_t> masks;
+                    uint32_t scan = addr;
+                    while (scan <= block.end_addr &&
+                           !(exit_uses_delay_slot && scan == block.end_addr)) {
+                        auto scan_word = exe_.read_word(scan);
+                        if (!scan_word.has_value() ||
+                            ControlFlowAnalyzer::is_control_flow(*scan_word))
+                            break;
+                        const uint32_t scan_op = *scan_word >> 26;
+                        if (scan_op >= 0x20u && scan_op <= 0x26u) break;
+                        if (scan != addr &&
+                            (((scan & 0xCu) == 0u) || extra_labels_.count(scan)))
+                            break; /* fetch/entry must precede this step */
+                        auto [body_it, inserted] = timing_body_cache.try_emplace(
+                            scan, std::string(), false);
+                        if (inserted) {
+                            body_it->second.first = translate_instruction(
+                                scan, *scan_word, &body_it->second.second);
+                        }
+                        masks.push_back(psx_cyc_dep_res_mask(*scan_word));
+                        if (!body_it->second.second) break;
+                        if (scan > UINT32_MAX - 4u) break;
+                        scan += 4u;
+                    }
+                    if (masks.empty()) {
+                        emit_single_pre_timing(addr, instr, config_.indent);
+                    } else {
+                        timing_run_start = addr;
+                        timing_run_end = addr +
+                            static_cast<uint32_t>((masks.size() - 1u) * 4u);
+                        timing_run_active = true;
+                        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                        ss << fmt::format("#if {}\n", fast_run_guard);
+                        ss << config_.indent << fmt::format(
+                            "static const uint32_t _psx_cyc_run_{:08X}[] = {{",
+                            timing_run_start);
+                        for (uint32_t mask : masks)
+                            ss << fmt::format(" 0x{:X}u,", mask);
+                        ss << " };\n";
+                        ss << config_.indent << fmt::format(
+                            "int _psx_cyc_run_hit_{:08X} = "
+                            "psx_cyc_step_run_fast(cpu, _psx_cyc_run_{:08X}, {}u);\n",
+                            timing_run_start, timing_run_start, masks.size());
+                        ss << config_.indent << fmt::format(
+                            "if (!_psx_cyc_run_hit_{:08X}) "
+                            "psx_cyc_step_slow(cpu, 0x{:X}u);\n",
+                            timing_run_start, masks.front());
+                        ss << "#else\n";
+                        ss << config_.indent << fmt::format(
+                            "psx_cyc_step(cpu, 0x{:X}u);\n", masks.front());
+                        ss << "#endif\n#endif\n";
+                    }
+                } else if (!cpu_load) {
+                    const uint32_t mask = psx_cyc_dep_res_mask(instr);
+                    ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                    ss << fmt::format("#if {}\n", fast_run_guard);
+                    ss << config_.indent << fmt::format(
+                        "if (!_psx_cyc_run_hit_{:08X}) "
+                        "psx_cyc_step_slow(cpu, 0x{:X}u);\n",
+                        timing_run_start, mask);
+                    ss << "#else\n";
+                    ss << config_.indent << fmt::format(
+                        "psx_cyc_step(cpu, 0x{:X}u);\n", mask);
+                    ss << "#endif\n#endif\n";
+                }
+            }
             // If this is the successor half of a deferred load pair AND it is an
             // LWL/LWR merging into that same register, hardware forwards the
             // pending load into the merge (see set_lwlr_merge_forward). Point
@@ -1945,7 +2089,14 @@ std::string CodeGenerator::translate_basic_block(
                     delayed_load_dest,
                     fmt::format("psx_ldd_{:08X}", delayed_load_addr));
             }
-            std::string emitted = translate_instruction(addr, instr);
+            std::string emitted;
+            auto timing_body = timing_body_cache.find(addr);
+            if (timing_body != timing_body_cache.end()) {
+                emitted = std::move(timing_body->second.first);
+                timing_body_cache.erase(timing_body);
+            } else {
+                emitted = translate_instruction(addr, instr);
+            }
             if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
@@ -2183,7 +2334,9 @@ std::string CodeGenerator::translate_basic_block(
                 if (cycle_per_insn)
                     emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
-                    emit_pre_timing(block.exit_instr.instruction, config_.indent);
+                    emit_single_pre_timing(exit_branch_addr,
+                                           block.exit_instr.instruction,
+                                           config_.indent);
 
                 // Register-indirect targets are resolved at the jump instruction.
                 // The delay slot may overwrite the source register, so all JR/JALR
@@ -2272,7 +2425,9 @@ std::string CodeGenerator::translate_basic_block(
                             ss << config_.indent << "/* delay slot (always executes) */\n";
                             // Delay slot's own fetch + §1+deps+DO_LDS, before its body (skipped if a load).
                             if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
-                            if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
+                            if (cycle_per_insn)
+                                emit_single_pre_timing(delay_slot_addr, delay_instr,
+                                                       config_.indent);
                             ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
                             emit_cosim_instr(delay_slot_addr, config_.indent);
                         }

@@ -91,6 +91,20 @@ typedef struct {
     uint64_t events_total;
 } AudioTraceStats;
 
+/* Narrow, race-free view used by clock telemetry.  These counters are updated
+ * by the host pump and published atomically so a debug/reporting reader never
+ * has to sample the much larger PCM statistics structure just to observe
+ * delivery health. */
+typedef struct {
+    uint64_t pump_calls;
+    uint64_t pump_skips;
+    uint64_t underruns;
+    uint32_t queue_hiwater;
+    uint32_t queue_lowater;
+    uint64_t mute_events;
+    uint64_t unmute_events;
+} AudioTraceHostStats;
+
 void audio_trace_init(void);
 
 /* Record `frames` interleaved stereo s16 frames into tap `tap`. */
@@ -103,6 +117,7 @@ void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b);
 void audio_trace_note_frame(uint32_t frame);
 
 void     audio_trace_get_stats(AudioTraceStats *out);
+void     audio_trace_get_host_stats(AudioTraceHostStats *out);
 uint64_t audio_trace_tap_total(int tap);
 uint64_t audio_trace_events_total(void);
 

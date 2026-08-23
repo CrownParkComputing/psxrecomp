@@ -144,8 +144,8 @@ void     dirty_ram_text_guard_resync_after_restore(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
-/* Notify a direct/bulk RAM writer before or immediately after changing bytes.
- * Only overlapping pages already registered by exact generated ranges advance. */
+/* Notify a direct/bulk RAM writer before changing bytes. Only overlap with a
+ * page armed by an exact generated range advances the global mutation epoch. */
 void     dirty_ram_text_note_range_write(uint32_t phys, uint32_t len);
 /* Lifecycle for the generation qualifier. These accompany reference-image
  * registration and whole-RAM timeline changes; ordinary writers use note. */
@@ -158,19 +158,39 @@ int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                              uint32_t exec_pc);
 int      dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
                                         uint32_t count);
-/* Generated-dispatch cache qualification. Each cache is two uint64_t values:
- * {text-image epoch, monotonic generation sum for the exact clipped pages}.
- * Suffix and full-range callers must use distinct storage. */
+/* Generated-dispatch qualification. Positive admission is keyed by one global
+ * watched-text mutation epoch, making an unchanged entry O(1). Epoch zero is
+ * fail-closed after overflow. Suffix and full callers need distinct storage. */
+extern uint64_t g_dirty_ram_text_mutation_epoch;
+/* Churn evidence: watched writer notifications and exact slow-path checks.
+ * A hot mutable datum sharing an armed code page can raise both counters; the
+ * product benchmark must inspect their delta before promoting this policy. */
+extern uint64_t g_dirty_ram_text_watched_write_epochs;
+extern uint64_t g_dirty_ram_text_exact_revalidations;
+uint64_t dirty_ram_text_mutation_epoch(void);
 int      dirty_ram_text_range_generation_from(const uint32_t *lo_len_pairs,
                                              uint32_t count,
                                              uint32_t exec_pc,
                                              uint64_t out[2]);
+int      dirty_ram_text_native_ok_ranges_from_epoch_cached(
+            const uint32_t *lo_len_pairs, uint32_t count, uint32_t exec_pc,
+            uint64_t *cached_epoch);
+int      dirty_ram_text_native_ok_ranges_epoch_cached(
+            const uint32_t *lo_len_pairs, uint32_t count,
+            uint64_t *cached_epoch);
+/* Compatibility ABI for older generated dispatch sources. */
 int      dirty_ram_text_native_ok_ranges_from_cached(
             const uint32_t *lo_len_pairs, uint32_t count, uint32_t exec_pc,
             uint64_t cached_generation[2]);
 int      dirty_ram_text_native_ok_ranges_cached(
             const uint32_t *lo_len_pairs, uint32_t count,
             uint64_t cached_generation[2]);
+#ifdef PSX_DIRTY_TEXT_CACHE_TESTING
+void     dirty_ram_text_cache_test_set_epoch(uint64_t epoch);
+uint64_t dirty_ram_text_cache_test_page_visits(void);
+uint64_t dirty_ram_text_cache_test_exact_validations(void);
+void     dirty_ram_text_cache_test_reset_counters(void);
+#endif
 int      dirty_ram_text_image_registered(void);
 /* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
  * into the text reference image so it is not mistaken for self-modifying code. */

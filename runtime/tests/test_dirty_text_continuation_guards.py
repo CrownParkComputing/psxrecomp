@@ -11,6 +11,9 @@ def main() -> int:
     cache = (root / "runtime/src/dirty_text_generation_cache.c").read_text(
         encoding="utf-8")
     cosim = (root / "runtime/src/cosim_state.c").read_text(encoding="utf-8")
+    dma = (root / "runtime/src/dma.c").read_text(encoding="utf-8")
+    mods = (root / "runtime/src/mod_runtime.cpp").read_text(encoding="utf-8")
+    boot_state = (root / "runtime/src/boot_state.c").read_text(encoding="utf-8")
     interp = (root / "runtime/src/dirty_ram_interp.c").read_text(encoding="utf-8")
     compat = (root / "runtime/src/game_dispatch_compat.c").read_text(encoding="utf-8")
     runtime_cmake = (root / "runtime/runtime.cmake").read_text(encoding="utf-8")
@@ -33,27 +36,28 @@ def main() -> int:
     if "dirty_ram_text_native_ok_ranges_from(lo_len_pairs, count, 0u)" not in memory:
         raise AssertionError("legacy generated-code ABI is not preserved")
 
-    # Generated dispatch validity is page-qualified, not image-global: the
-    # PS-X EXE image also contains hot mutable data. Exact queried pages become
-    # watched before the qualifier is captured, and only overlapping writes
-    # advance their monotonic generations.
+    # Exact queried pages become watched before admission is published. A write
+    # to any watched page rotates one global epoch; unchanged dispatch reads
+    # that epoch directly and performs no range/page walk.
     for fragment in (
         "s_watch_bitmap[TEXT_BITMAP_WORDS]",
-        "s_page_generation[TEXT_PAGE_COUNT]",
-        "uint64_t s_image_epoch",
+        "uint64_t g_dirty_ram_text_mutation_epoch",
+        "g_dirty_ram_text_watched_write_epochs++",
+        "g_dirty_ram_text_exact_revalidations++",
+        "dirty_ram_text_advance_epoch()",
+        "dirty_ram_text_watch_ranges_from(",
         "dirty_ram_text_range_generation_from(",
-        "uint32_t *watch_word = &s_watch_bitmap[page >> 5];",
-        "if (!(*watch_word & bit)) *watch_word |= bit;",
-        "sum += s_page_generation[page];",
+        "s_watch_bitmap[page >> 5] |= bit;",
+        "if (epoch != 0u && *cached_epoch == epoch) return 1;",
+        "if (before == g_dirty_ram_text_mutation_epoch)",
     ):
         if fragment not in cache:
-            raise AssertionError(f"missing exact-range generation cache guard: {fragment}")
+            raise AssertionError(f"missing global epoch cache guard: {fragment}")
     if "g_dirty_ram_code_gen" in cache:
         raise AssertionError("exact text cache regressed to the global code epoch")
-    generation_start = cache.index("int dirty_ram_text_range_generation_from(")
-    generation_end = cache.index(
-        "int dirty_ram_text_native_ok_ranges_from_cached(", generation_start)
-    generation = cache[generation_start:generation_end]
+    watch_start = cache.index("static uint64_t dirty_ram_text_watch_ranges_from(")
+    watch_end = cache.index("uint64_t dirty_ram_text_mutation_epoch(", watch_start)
+    generation = cache[watch_start:watch_end]
     for fragment in (
         "if (phys + len <= at) continue;",
         "len -= at - phys;",
@@ -63,32 +67,35 @@ def main() -> int:
     ):
         if fragment not in generation:
             raise AssertionError(
-                f"page qualifier does not mirror continuation clipping: {fragment}")
+                f"page watch does not mirror continuation clipping: {fragment}")
 
     note_start = cache.index("void dirty_ram_text_note_range_write(")
     note_end = cache.index("int dirty_ram_text_range_generation_from(", note_start)
     note = cache[note_start:note_end]
-    if "s_page_generation[page]++" not in note:
-        raise AssertionError("overlapping text write does not advance its page")
-    if "s_image_epoch++" in note:
-        raise AssertionError("ordinary text write still invalidates every cached entry")
+    if "dirty_ram_text_advance_epoch();" not in note:
+        raise AssertionError("watched text write does not advance global epoch")
+    if "return;" not in note:
+        raise AssertionError("multi-page write can advance the epoch repeatedly")
     if memory.count("text_guard_note_write(phys,") != 3:
         raise AssertionError("one of the byte/half/word RAM store paths bypasses text guard")
 
     cached_start = cache.index(
-        "int dirty_ram_text_native_ok_ranges_from_cached(")
+        "int dirty_ram_text_native_ok_ranges_from_epoch_cached(")
     cached_end = cache.index(
-        "int dirty_ram_text_native_ok_ranges_cached(", cached_start)
+        "int dirty_ram_text_native_ok_ranges_epoch_cached(", cached_start)
     cached = cache[cached_start:cached_end]
     for fragment in (
-        "dirty_ram_text_range_generation_from(",
-        "cached_generation[0] == before[0]",
+        "*cached_epoch == epoch",
+        "dirty_ram_text_watch_ranges_from(",
         "dirty_ram_text_native_ok_ranges_from(",
-        "before[0] == after[0] && before[1] == after[1]",
-        "cached_generation[0] = cached_generation[1] = 0;",
+        "before == g_dirty_ram_text_mutation_epoch",
+        "*cached_epoch = 0u;",
     ):
         if fragment not in cached:
             raise AssertionError(f"missing qualified validation ordering: {fragment}")
+    if cached.index("dirty_ram_text_watch_ranges_from(") > cached.index(
+            "if (!dirty_ram_text_native_ok_ranges_from("):
+        raise AssertionError("exact pages are armed only after byte validation")
 
     text_write = memory[
         memory.index("static inline void text_guard_note_write("):
@@ -101,7 +108,14 @@ def main() -> int:
         memory.index("/* Force-interp mode", memory.index(
             "void dirty_ram_mark_executable_range("))]
     if "dirty_ram_text_note_range_write(phys, len);" not in mark:
-        raise AssertionError("bulk executable writes bypass exact-range generations")
+        raise AssertionError("bulk executable writes bypass watched-text epoch")
+    # CD DMA writes run through the CPU write chokepoint and additionally mark
+    # delivered code executable. Host-applied executable mod writes do likewise.
+    if "psx_write_word(addr, word);" not in dma or \
+            "dirty_ram_mark_executable_range(addr, 4);" not in dma:
+        raise AssertionError("CD DMA can mutate executable RAM without epoch notice")
+    if mods.count("dirty_ram_mark_executable_range(") < 3:
+        raise AssertionError("host executable patch paths bypass epoch notice")
     bless = memory[
         memory.index("void dirty_ram_text_bless("):
         memory.index("uint64_t dirty_ram_text_native_blocked", memory.index(
@@ -114,6 +128,8 @@ def main() -> int:
         memory.index("void overlay_watch_invalidate_after_ram_restore(")]
     if "dirty_ram_text_cache_reset(0);" not in restore:
         raise AssertionError("whole-RAM restore does not rotate text validity")
+    if "overlay_watch_invalidate_after_ram_restore();" not in boot_state:
+        raise AssertionError("savestate/rollback RAM restore bypasses text epoch reset")
     register = memory[
         memory.index("void dirty_ram_register_text_image("):
         memory.index("int dirty_ram_text_image_registered(")]

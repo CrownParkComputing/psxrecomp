@@ -35,7 +35,9 @@ if(BUILD_TESTING)
     add_test(NAME cause_ip2_combinational_test
              COMMAND cause_ip2_combinational_test)
 
-    add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
+    add_executable(psx_cyc_batch_test
+        tests/test_psx_cyc_batch.c
+        src/psx_cyc_runs.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE
         PSX_ENABLE_BLOCK_CYCLES=1
@@ -65,8 +67,17 @@ if(BUILD_TESTING)
         tests/test_dirty_text_generation_cache.c
         src/dirty_text_generation_cache.c)
     target_include_directories(dirty_text_generation_cache_test PRIVATE include)
+    target_compile_definitions(dirty_text_generation_cache_test PRIVATE
+        PSX_DIRTY_TEXT_CACHE_TESTING=1)
     add_test(NAME dirty_text_generation_cache_test
              COMMAND dirty_text_generation_cache_test)
+
+    add_executable(audio_wall_telemetry_test
+        tests/test_audio_wall_telemetry.c
+        src/audio_trace.c)
+    target_include_directories(audio_wall_telemetry_test PRIVATE include)
+    add_test(NAME audio_wall_telemetry_test
+             COMMAND audio_wall_telemetry_test)
 
     add_executable(psx_icache_fastpath_test
         tests/test_psx_icache_fastpath.c

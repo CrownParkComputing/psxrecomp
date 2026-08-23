@@ -283,6 +283,20 @@ PSX_CYC_ALWAYS_INLINE void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_lds(cpu);
 }
 
+/* Generated-game v6 timing runs.  The emitter groups only straight-line
+ * instructions whose C bodies cannot observe or mutate timing state, and
+ * splits at every fetch, load, label, and timing-sensitive body.  This helper
+ * still performs base/deps/LDS once per guest instruction, in order; it merely
+ * shares the native loop and charge bookkeeping across the run.
+ *
+ * A run is all-or-nothing.  Exceptional modes need device/replay observation
+ * at each original instruction boundary, so return 0 without touching CPU or
+ * clock state and let the emitted cold path call psx_cyc_step_slow at the
+ * original sites.  Capacity is qualified up front for the same reason. */
+void psx_cyc_step_slow(CPUState* cpu, uint32_t reg_mask);
+int psx_cyc_step_run_fast(CPUState* cpu, const uint32_t* reg_masks,
+                          uint32_t count);
+
 /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */
