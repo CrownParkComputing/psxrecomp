@@ -240,9 +240,14 @@ def main(argv=None):
         print("asking psx-runtime for its own $s4 …")
         pr = probe_registers(native, pc, want=("s4", "s6"),
                              wait=args.probe_wait)
-        doc["native_probe"] = {k: pr.get(k) for k in
+        # Omit absent keys rather than writing nulls. A consumer reading this
+        # with a typed accessor throws on null, and one that did took the
+        # Studio down; "missing" and "present but null" should not be different
+        # things for a report to express.
+        doc["native_probe"] = {k: pr[k] for k in
                                ("block_leader", "frame", "samples_seen",
-                                "error", "leader_after_target")}
+                                "error", "leader_after_target")
+                               if pr.get(k) is not None}
         nat_ptr = None
         if pr.get("regs", {}).get("s4"):
             nat_ptr = int(pr["regs"]["s4"], 16)

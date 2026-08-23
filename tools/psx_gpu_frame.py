@@ -61,6 +61,40 @@ class DebugError(RuntimeError):
     pass
 
 
+def _looks_complete(buf: bytes) -> bool:
+    """Is this a whole JSON document yet?
+
+    Brace counting rather than a parse attempt per chunk: a reply can be a
+    megabyte of hex, and re-parsing it on every 1 MB recv would dominate the
+    read. Quotes and escapes are tracked so a brace inside a string does not
+    count.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    seen = False
+    for c in buf:
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if c == 0x5C:      # backslash
+                esc = True
+            elif c == 0x22:    # quote
+                in_str = False
+            continue
+        if c == 0x22:
+            in_str = True
+        elif c == 0x7B:        # {
+            depth += 1
+            seen = True
+        elif c == 0x7D:        # }
+            depth -= 1
+            if seen and depth <= 0:
+                return True
+    return False
+
+
 class DebugConn:
     """JSON client for the runtime (and DuckStation) debug server.
 
@@ -142,10 +176,20 @@ class DebugConn:
                 if not chunk:
                     break
                 buf += chunk
-                # The server ends every reply with a newline and then closes.
-                # Stopping at the newline avoids waiting on the close for peers
-                # (DuckStation) that keep the socket around.
-                if buf.endswith(b"\n") or b"\n" in buf:
+                # Most replies are one line, and stopping at the newline avoids
+                # waiting on the close for peers (DuckStation) that keep the
+                # socket around.
+                #
+                # But not all of them are. pc_probe_dump builds its JSON with
+                # repeated send_line() calls -- header, one line per slot, one
+                # per sample -- so the first newline lands in the MIDDLE of the
+                # document. Reading one line there returns a truncated object
+                # that fails to parse, and the error ("malformed reply") points
+                # at the server rather than at this loop.
+                #
+                # So: stop at a newline only if what has arrived so far is a
+                # complete JSON document. Otherwise keep reading.
+                if b"\n" in buf and _looks_complete(buf):
                     break
         finally:
             sock.close()

@@ -213,3 +213,38 @@ class TestGraduatedMatch(unittest.TestCase):
     def test_nothing_present_reports_zero(self):
         k, hits = CI.graduated_find(bytes(bytearray(0x800)), b"\xf8\x50\x50\x11")
         self.assertEqual((k, hits), (0, []))
+
+
+class TestNoNullsInReports(unittest.TestCase):
+    """A report must not express "missing" as an explicit null.
+
+    A consumer reading these with a typed accessor throws on null rather than
+    falling back to a default, and one did: "block_leader": null, written for a
+    probe that had not fired, aborted the Studio outright. The two ways of
+    saying "this key has no value" should not behave differently.
+    """
+
+    def test_absent_probe_fields_are_omitted_not_nulled(self):
+        pr = {"error": "no candidate fired"}      # nothing else was learned
+        keys = ("block_leader", "frame", "samples_seen", "error",
+                "leader_after_target")
+        doc = {k: pr[k] for k in keys if pr.get(k) is not None}
+        self.assertEqual(doc, {"error": "no candidate fired"})
+        self.assertNotIn("block_leader", doc)
+
+    def test_present_fields_survive(self):
+        pr = {"block_leader": "0x8006842C", "frame": 9001, "samples_seen": 12}
+        keys = ("block_leader", "frame", "samples_seen", "error",
+                "leader_after_target")
+        doc = {k: pr[k] for k in keys if pr.get(k) is not None}
+        self.assertEqual(doc["block_leader"], "0x8006842C")
+        self.assertEqual(doc["samples_seen"], 12)
+
+    def test_a_false_value_is_kept_not_treated_as_missing(self):
+        # leader_after_target=False is a real answer; filtering on truthiness
+        # instead of "is not None" would silently drop it.
+        pr = {"leader_after_target": False}
+        doc = {k: pr[k] for k in ("leader_after_target",)
+               if pr.get(k) is not None}
+        self.assertIn("leader_after_target", doc)
+        self.assertIs(doc["leader_after_target"], False)
