@@ -46,6 +46,7 @@ NEUTRAL = 128
 
 
 def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
+    """Returns (values, reason-it-stopped-or-None)."""
     vals = []
     for _ in range(n):
         pr = probe_registers(conn, pc, want=(reg,), wait=1.2)
@@ -54,12 +55,19 @@ def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
             vals.append(int(v, 16))
         elif pr.get("error"):
             print(f"  psx-runtime: {pr['error']}", file=out)
-            break
+            return vals, pr["error"]
         time.sleep(gap)
-    return vals
+    return vals, None
 
 
 def sample_oracle(conn, pc, n, reg, out=sys.stderr):
+    """Returns (values, reason-it-stopped-or-None).
+
+    A side that produced nothing used to report as a bare null, which says
+    "no data" without saying whether the emulator was unreachable, never
+    reached the PC, or refused the breakpoint. Those need different responses,
+    and the reason is known here and nowhere else.
+    """
     vals = []
     oracle_resume(conn)
     for _ in range(n):
@@ -68,7 +76,7 @@ def sample_oracle(conn, pc, n, reg, out=sys.stderr):
             conn.cmd("pc_break", addr=pc)
         except DebugError as e:
             print(f"  oracle: {e}", file=out)
-            break
+            return vals, str(e)
         got = None
         for _ in range(20):
             time.sleep(ORACLE_PAUSED_POLL_S)
@@ -85,9 +93,14 @@ def sample_oracle(conn, pc, n, reg, out=sys.stderr):
             pass
         oracle_resume(conn)
         if got is None:
-            break
+            reason = (f"the oracle did not reach 0x{pc:08X} while sampling. "
+                      f"That PC is overlay code, so it only exists while the "
+                      f"right overlay is resident and the oracle has to be at "
+                      f"the same point in the game.")
+            print(f"  oracle: {reason}", file=out)
+            return vals, reason
         vals.append(int(got, 16))
-    return vals
+    return vals, None
 
 
 def describe(vals, label, out=sys.stdout):
@@ -124,18 +137,37 @@ def main(argv=None):
 
     n = DebugConn(args.host, args.native_port, args.timeout)
     o = DebugConn(args.host, args.ds_port, args.timeout)
-    nat = sample_native(n, pc, args.samples, args.gap, args.reg)
-    orc = sample_oracle(o, pc, max(3, args.samples // 3), args.reg)
+    nat, nat_why = sample_native(n, pc, args.samples, args.gap, args.reg)
+    orc, orc_why = sample_oracle(o, pc, max(3, args.samples // 3), args.reg)
 
     print()
     a = describe(nat, "psx-runtime")
     b = describe(orc, "oracle")
     doc["native"], doc["oracle"] = a, b
+    if nat_why:
+        doc["native_error"] = nat_why
+    if orc_why:
+        doc["oracle_error"] = orc_why
 
     if not a or not b:
         doc["verdict"] = "incomplete"
-        print("\nOne side produced no samples, so there is nothing to compare.",
-              file=sys.stderr)
+        missing = "the oracle" if not b else "psx-runtime"
+        why = (orc_why if not b else nat_why) or "no reason was reported"
+        print(f"\nINCOMPLETE: {missing} produced no samples — {why}", file=sys.stderr)
+        # A one-sided result is not a comparison, but the side that DID answer
+        # is still worth stating: it is what disproves or supports a hypothesis
+        # about that emulator on its own.
+        got = a or b
+        if got:
+            who = "psx-runtime" if a else "the oracle"
+            if got["constant"]:
+                print(f"\nStill worth recording: {who}'s ${args.reg} did not "
+                      f"move from {got['min']} across {got['samples']} samples.",
+                      file=sys.stderr)
+            else:
+                print(f"\nStill worth recording: {who}'s ${args.reg} DOES vary "
+                      f"({got['min']}..{got['max']}, values {got['values']}), so "
+                      f"it is not pinned.", file=sys.stderr)
         return _finish(doc, args, 1)
 
     if a["constant"] and not b["constant"]:

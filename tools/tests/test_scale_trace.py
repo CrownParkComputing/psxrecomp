@@ -95,3 +95,44 @@ class TestVerdictLogic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOneSidedResults(unittest.TestCase):
+    """A side that produced nothing must say WHY, and the other side still counts.
+
+    The first real run came back with oracle: null and verdict "incomplete",
+    which reports that there is no comparison without reporting whether the
+    emulator was unreachable, never reached the PC, or refused the breakpoint.
+    Those call for different responses and the reason is known at the point of
+    failure and nowhere else.
+
+    It also threw away the half that DID answer — and that half disproved a
+    hypothesis outright: psx-runtime's $s6 read 66, 72 and 128 across three
+    samples, so it is not pinned at the neutral value after all.
+    """
+
+    def d(self, vals):
+        return ST.describe(vals, "x", out=io.StringIO())
+
+    def test_a_varying_side_disproves_the_pinned_hypothesis(self):
+        got = self.d([66, 72, 128])
+        self.assertFalse(got["constant"])
+        self.assertFalse(got["neutral_only"])
+        self.assertEqual(got["distinct"], 3)
+
+    def test_three_identical_samples_would_have_supported_it(self):
+        # Which is what three separate single-sample runs looked like, and why
+        # sampling repeatedly is the difference between a pattern and an
+        # artefact of when each run happened to look.
+        got = self.d([128, 128, 128])
+        self.assertTrue(got["constant"])
+        self.assertTrue(got["neutral_only"])
+
+    def test_samplers_return_a_reason_alongside_the_values(self):
+        # Both return (values, reason) so an empty result can explain itself.
+        import inspect
+        for fn in (ST.sample_native, ST.sample_oracle):
+            src = inspect.getsource(fn)
+            self.assertIn("return vals", src)
+            self.assertIn("Returns (values", src,
+                          f"{fn.__name__} does not document the reason it returns")
