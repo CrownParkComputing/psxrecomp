@@ -316,14 +316,16 @@ def sample_oracle(conn, args, out=sys.stderr):
 
     sigs = []
     empty = 0
+    torn = 0
     root = None          # once known, read only the span around it
     deadline = time.monotonic() + args.watch_secs
     while time.monotonic() < deadline and len(sigs) < args.samples:
         try:
             with open(os.devnull, "w") as quiet:
-                rep, _meta = walk_side(conn, "oracle", pause=False,
-                                       addr=root, window=args.window,
-                                       max_nodes=args.max_nodes, out=quiet)
+                rep, meta = walk_side(conn, "oracle", pause=False,
+                                      addr=root, window=args.window,
+                                      park_for_reread=False,
+                                      max_nodes=args.max_nodes, out=quiet)
         except DebugError as e:
             print(f"  oracle read failed: {e}", file=out)
             time.sleep(args.poll)
@@ -332,6 +334,14 @@ def sample_oracle(conn, args, out=sys.stderr):
             # Remember where the list lives; the next read is a few KB rather
             # than 2 MB, which is what stops the oracle stuttering.
             root = rep.get("root") or root
+            if not meta.get("coherent"):
+                # A read taken while the game rebuilt the list shows up as a
+                # frame of quads carrying a handful of near-identical colour
+                # values -- which is exactly the finding under test. Torn
+                # samples must never reach the comparison.
+                torn += 1
+                time.sleep(args.poll)
+                continue
             sig = signature(rep.get("prims") or [])
             if sig["quads"]:
                 sigs.append(sig)
@@ -342,6 +352,9 @@ def sample_oracle(conn, args, out=sys.stderr):
                 empty += 1
         time.sleep(args.poll)
 
+    if torn:
+        print(f"  oracle: discarded {torn} torn read(s) taken while the game "
+              f"rebuilt the list", file=out)
     if not sigs:
         print(f"  oracle: {empty} walks read, none held additive shaded "
               f"quads -- the effect was not playing on DuckStation while "

@@ -110,7 +110,7 @@ def summarise(prims, out=sys.stdout, limit=20):
 
 def walk_side(conn, label, *, addr=None, near=None, pause=False,
               from_dma=False, max_nodes=8192, candidates=6, window=None,
-              out=sys.stdout):
+              park_for_reread=True, out=sys.stdout):
     """Snapshot one emulator and walk its display list.
 
     Returns (report, meta) or (None, meta) if nothing walkable was found.
@@ -192,25 +192,50 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
     if not meta.get("paused") and entries:
         addrs = [int(e["src"], 16) & 0x1FFFFF for e in entries]
         lo, hi = min(min(addrs), root & 0x1FFFFF), max(addrs)
+        span_lo = lo & ~3
+        span_len = (hi - span_lo) + 0x400
         coherent = False
-        try:
-            conn.cmd("pause")
+
+        def _accept(blob):
+            buf = bytearray(len(ram))
+            buf[span_lo:span_lo + len(blob)] = blob
+            again = walk_ordering_table(bytes(buf), root, max_nodes=max_nodes)
+            return again if len(again) >= len(entries) * 0.9 else None
+
+        if park_for_reread:
             try:
-                f0 = conn.frame()
-                blob = read_ram_range(conn, 0x80000000 + (lo & ~3),
-                                      (hi - (lo & ~3)) + 0x400)
-                buf = bytearray(len(ram))
-                buf[lo & ~3:(lo & ~3) + len(blob)] = blob
-                again = walk_ordering_table(bytes(buf), root, max_nodes=max_nodes)
-                if len(again) >= len(entries) * 0.9:
-                    entries = again
-                    coherent = True
-                    meta["coherent_frame"] = f0
-            finally:
-                conn.cmd("continue")
-        except DebugError as e:
-            print(f"  [{label}] coherent re-read failed ({e}); using the "
-                  f"running snapshot", file=out)
+                conn.cmd("pause")
+                try:
+                    f0 = conn.frame()
+                    got = _accept(read_ram_range(conn, 0x80000000 + span_lo,
+                                                 span_len))
+                    if got is not None:
+                        entries, coherent = got, True
+                        meta["coherent_frame"] = f0
+                finally:
+                    conn.cmd("continue")
+            except DebugError as e:
+                print(f"  [{label}] coherent re-read failed ({e}); using the "
+                      f"running snapshot", file=out)
+        else:
+            # Verify by RE-READING, not by pausing. Two back-to-back reads of
+            # the span that come back byte-identical cannot have been rebuilt
+            # in between, so the picture is from one instant -- without ever
+            # stopping the emulator. Parking for this is what made the oracle
+            # stutter through the animation it was supposed to be watching,
+            # and against DuckStation it also drops the socket to ~1 Hz.
+            try:
+                first = read_ram_range(conn, 0x80000000 + span_lo, span_len)
+                second = read_ram_range(conn, 0x80000000 + span_lo, span_len)
+                if first == second:
+                    got = _accept(first)
+                    if got is not None:
+                        entries, coherent = got, True
+                else:
+                    meta["torn"] = True
+            except DebugError as e:
+                print(f"  [{label}] verify re-read failed ({e}); using the "
+                      f"running snapshot", file=out)
         meta["coherent"] = coherent
     else:
         meta["coherent"] = bool(meta.get("paused"))
