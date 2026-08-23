@@ -814,6 +814,14 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     std::string code;
+    const auto unprovenanced_gpr_write = [&](uint32_t dst,
+                                              std::string statement) {
+        if (dst != 0) {
+            statement += fmt::format(" PGXP_GPR_WRITTEN({}u, {});",
+                                     dst, reg_name(dst));
+        }
+        return statement;
+    };
 
     // Full-word-guarded terrain-frustum half-angle constants. Scaling the
     // tangent is the geometric counterpart of widening the horizontal
@@ -839,10 +847,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         const uint32_t dst = get_rt(instr);
         const int32_t vanilla = (int16_t)(instr & 0xFFFFu);
-        return fmt::format(
+        return unprovenanced_gpr_write(dst, fmt::format(
             "{} = psx_ws_angle_widen({}u);"
             "  /* aspect-scaled terrain frustum half-angle */{}",
-            reg_name(dst), (uint32_t)vanilla, comment);
+            reg_name(dst), (uint32_t)vanilla, comment));
     }
 
     for (const auto& site : config_.ws_signed_x_bound_sites) {
@@ -855,9 +863,11 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             std::exit(1);
         }
         const int32_t vanilla = (int32_t)((instr & 0xFFFFu) << 16);
-        return fmt::format("{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
-                           "  /* typed native-wide signed X bound */{}",
-                           reg_name(get_rt(instr)), (uint32_t)vanilla, comment);
+        const uint32_t dst = get_rt(instr);
+        return unprovenanced_gpr_write(dst, fmt::format(
+            "{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
+            "  /* typed native-wide signed X bound */{}",
+            reg_name(dst), (uint32_t)vanilla, comment));
     }
 
     // Full-word-guarded, camera-horizontal model-participation cones. The
@@ -895,7 +905,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                                       uint32_t default_reg) {
             return site_reg == 0xFFFFFFFFu ? default_reg : site_reg;
         };
-        return fmt::format(
+        return unprovenanced_gpr_write(dst, fmt::format(
             "{} = psx_ws_aspect_cone_result(0x{:08X}u, ({}), {}, "
             "(int32_t)(int16_t){}, (int32_t)(int16_t){}, "
             "(int32_t)(int16_t){});"
@@ -908,7 +918,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             reg_name(effective_reg(
                 site.z_reg, config_.ws_aspect_cone.z_reg)),
             reg_name(effective_reg(
-                site.y_reg, config_.ws_aspect_cone.y_reg)), comment);
+                site.y_reg, config_.ws_aspect_cone.y_reg)), comment));
     }
 
     // Full-word-guarded object/model participation compares. At 4:3 the
@@ -948,10 +958,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                        addr, instr);
             std::exit(1);
         }
-        return fmt::format(
+        return unprovenanced_gpr_write(dst, fmt::format(
             "{} = psx_ws_cull_keep_result(({}), {}u);"
             "  /* ws maximal object/model participation */{}",
-            reg_name(dst), vanilla, site.result, comment);
+            reg_name(dst), vanilla, site.result, comment));
     }
 
     // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
@@ -972,9 +982,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             if (opcode == 0x00 && (funct == 0x21 || funct == 0x25)) {  // addu/or (move)
                 uint32_t rd = get_rd(instr), rs = get_rs(instr), rt = get_rt(instr);
                 uint32_t src = (rt == 0) ? rs : rt;
-                return fmt::format("{} = psx_ws_backdrop_value({}, {}, {});"
-                                   "  /* ws backdrop preload {} */{}",
-                                   reg_name(rd), reg_name(src), is_end, wcols, tag, comment);
+                return unprovenanced_gpr_write(rd, fmt::format(
+                    "{} = psx_ws_backdrop_value({}, {}, {});"
+                    "  /* ws backdrop preload {} */{}",
+                    reg_name(rd), reg_name(src), is_end, wcols, tag, comment));
             }
             if (opcode == 0x09 || opcode == 0x08) {  // addiu / addi
                 uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -982,9 +993,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 std::string orig = (rs == 0)
                     ? fmt::format("(uint32_t){}", (int)imm)
                     : fmt::format("(uint32_t)({} + {})", reg_name(rs), (int)imm);
-                return fmt::format("{} = psx_ws_backdrop_value({}, {}, {});"
-                                   "  /* ws backdrop preload {} */{}",
-                                   reg_name(rt), orig, is_end, wcols, tag, comment);
+                return unprovenanced_gpr_write(rt, fmt::format(
+                    "{} = psx_ws_backdrop_value({}, {}, {});"
+                    "  /* ws backdrop preload {} */{}",
+                    reg_name(rt), orig, is_end, wcols, tag, comment));
             }
             fmt::print(stderr, "ERROR: [widescreen.cull] auto_backdrop site 0x{:08X} "
                        "is not addu/or/addiu (opcode 0x{:02X} funct 0x{:02X})\n",
@@ -1012,9 +1024,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                           "(psx_ws_x_margin() > 0 ? psx_ws_x_margin() + {} : 0)",
                           config_.ws_cull_activation_guard_pixels)
                     : "psx_ws_x_margin()";
-            return fmt::format("{} = {} + ((int32_t){} + {});{}",
-                               reg_name(rt), reg_name(rs), imm, margin,
-                               comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = {} + ((int32_t){} + {});{}",
+                reg_name(rt), reg_name(rs), imm, margin, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] bias site 0x{:08X} is not "
                        "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1026,9 +1038,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
-            return fmt::format("{} = psx_ws_cull_vxrange({}, {});"
-                               "  /* ws cull masked-u16 X window */{}",
-                               reg_name(rt), reg_name(rs), (unsigned)imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_cull_vxrange({}, {});"
+                "  /* ws cull masked-u16 X window */{}",
+                reg_name(rt), reg_name(rs), (unsigned)imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] vxrange site 0x{:08X} is not "
                        "sltiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1040,16 +1053,18 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0A) {  // slti
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = ((int32_t){} < psx_ws_depth_bound({})) ? 1 : 0;"
-                               "  /* ws cull depth */{}",
-                               reg_name(rt), reg_name(rs), (int)imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = ((int32_t){} < psx_ws_depth_bound({})) ? 1 : 0;"
+                "  /* ws cull depth */{}",
+                reg_name(rt), reg_name(rs), (int)imm, comment));
         }
         if (opcode == 0x0B) {  // sltiu: MIPS sign-extends its immediate
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = ((uint32_t){} < (uint32_t)psx_ws_depth_bound({})) ? 1 : 0;"
-                               "  /* ws cull depth unsigned */{}",
-                               reg_name(rt), reg_name(rs), (int)imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = ((uint32_t){} < (uint32_t)psx_ws_depth_bound({})) ? 1 : 0;"
+                "  /* ws cull depth unsigned */{}",
+                reg_name(rt), reg_name(rs), (int)imm, comment));
         }
         if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] depth site 0x{:08X} is not "
@@ -1071,9 +1086,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 ? reg_name(rs)
                 : fmt::format("{} + {}", reg_name(rs), (int)offset);
             uint32_t mask = 1u << rs;
-            return fmt::format("{} = (uint32_t)psx_ws_plane_nx((int32_t)psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
-                               "  /* ws cull plane nx load */{}",
-                               reg_name(rt), laddr, rt, mask, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_plane_nx((int32_t)psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                "  /* ws cull plane nx load */{}",
+                reg_name(rt), laddr, rt, mask, comment));
         }
         if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] plane_nx site 0x{:08X} is not "
@@ -1095,9 +1111,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 ? reg_name(rs)
                 : fmt::format("{} + {}", reg_name(rs), (int)offset);
             uint32_t mask = 1u << rs;
-            return fmt::format("{} = psx_ws_xclip_bound(psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
-                               "  /* ws cull xclip bound load */{}",
-                               reg_name(rt), laddr, rt, mask, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_xclip_bound(psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                "  /* ws cull xclip bound load */{}",
+                reg_name(rt), laddr, rt, mask, comment));
         }
         if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] xclip_load site 0x{:08X} is not "
@@ -1116,9 +1133,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                           "(psx_ws_x_margin() > 0 ? psx_ws_x_margin() + {} : 0)",
                           config_.ws_cull_activation_guard_pixels)
                     : "psx_ws_x_margin()";
-            return fmt::format(
+            return unprovenanced_gpr_write(rt, fmt::format(
                 "{} = ({} < (uint32_t)((int32_t){} + 2*{})) ? 1 : 0;{}",
-                reg_name(rt), reg_name(rs), imm, margin, comment);
+                reg_name(rt), reg_name(rs), imm, margin, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] range site 0x{:08X} is not "
                        "sltiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1129,8 +1146,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_cull_a1_sites.count(addr)) {
         if (instr == 0x00000000u) {  // must be a nop we can safely repurpose
             // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
-            return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
-                               "  /* ws cull a1 bias */{}", comment);
+            return unprovenanced_gpr_write(5, fmt::format(
+                "cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
+                "  /* ws cull a1 bias */{}", comment));
         } else if (opcode == 0x00 && get_funct(instr) == 0x21) {
             // move rD,a1 (addu rD,a1,zero or addu rD,zero,a1): some Capcom
             // classifiers copy the caller-supplied horizontal margin
@@ -1138,9 +1156,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             // copied value; a1 itself and the vertical margin stay unchanged.
             uint32_t rs = get_rs(instr), rt = get_rt(instr), rd = get_rd(instr);
             if ((rs == 5 && rt == 0) || (rs == 0 && rt == 5))
-                return fmt::format("{} = cpu->gpr[5] + psx_ws_x_margin();"
-                                   "  /* ws cull copied a1 bias */{}",
-                                   reg_name(rd), comment);
+                return unprovenanced_gpr_write(rd, fmt::format(
+                    "{} = cpu->gpr[5] + psx_ws_x_margin();"
+                    "  /* ws cull copied a1 bias */{}",
+                    reg_name(rd), comment));
             if (!config_.overlay_mode) {
                 fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} "
                            "is addu but not move rD,a1 (0x{:08X})\n", addr, instr);
@@ -1157,9 +1176,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0B) {  // sltiu rt,rs,imm
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
-            return fmt::format("{} = psx_ws_cull_sltiu({}, {});"
-                               " /* ws explicit screen-x cull */{}",
-                               reg_name(rt), reg_name(rs), imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_cull_sltiu({}, {});"
+                " /* ws explicit screen-x cull */{}",
+                reg_name(rt), reg_name(rs), imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] screen_x site 0x{:08X} "
                        "is not sltiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1187,16 +1207,18 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 // It sign-extends SX and shifts by +margin (wide window
                 // -margin <= SX < imm+margin, both edges); at margin=0 it reduces
                 // bit-for-bit to the vanilla `SX <u imm` verdict (4:3 byte-identical).
-                return fmt::format("{} = psx_ws_cull_sltiu({}, {});"
-                                   "  /* ws auto screen-x cull (both edges) */{}",
-                                   reg_name(rt), reg_name(rs), (int)uimm, comment);
+                return unprovenanced_gpr_write(rt, fmt::format(
+                    "{} = psx_ws_cull_sltiu({}, {});"
+                    "  /* ws auto screen-x cull (both edges) */{}",
+                    reg_name(rt), reg_name(rs), (int)uimm, comment));
             }
             // Signed min/max funnel: `slti v, minSX, W` is the RIGHT edge only
             // (the paired left edge is the classified bltz — see
             // generate_branch_condition); widen by +margin.
-            return fmt::format("{} = psx_ws_cull_slti({}, {});"
-                               "  /* ws auto screen-x cull (right edge) */{}",
-                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_cull_slti({}, {});"
+                "  /* ws auto screen-x cull (right edge) */{}",
+                reg_name(rt), reg_name(rs), (int)uimm, comment));
         }
     }
     // Explicit signed lower-bound widen (`slti rt, sx, -W`). Unlike the
@@ -1206,9 +1228,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0A) {  // slti
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t uimm = get_imm16_u(instr);
-            return fmt::format("{} = psx_ws_cull_slti_lower({}, {});"
-                               "  /* ws cull slti lower site */{}",
-                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_cull_slti_lower({}, {});"
+                "  /* ws cull slti lower site */{}",
+                reg_name(rt), reg_name(rs), (int)uimm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] slti_lower site "
                        "0x{:08X} is not slti (opcode 0x{:02X})\n",
@@ -1222,9 +1245,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0A) {  // slti
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t uimm = get_imm16_u(instr);
-            return fmt::format("{} = psx_ws_cull_slti({}, {});"
-                               "  /* ws cull slti site (right edge) */{}",
-                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = psx_ws_cull_slti({}, {});"
+                "  /* ws cull slti site (right edge) */{}",
+                reg_name(rt), reg_name(rs), (int)uimm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] slti site 0x{:08X} is not "
                        "slti (opcode 0x{:02X})\n", addr, opcode);
@@ -1238,9 +1262,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_cull_negsub_sites.count(addr)) {
         if (opcode == 0x00 && funct == 0x23 && get_rs(instr) == 0) {
             uint32_t rt = get_rt(instr), rd = get_rd(instr);
-            return fmt::format("{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
-                               "  /* ws cull negsub */{}",
-                               reg_name(rd), reg_name(rt), comment);
+            return unprovenanced_gpr_write(rd, fmt::format(
+                "{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
+                "  /* ws cull negsub */{}",
+                reg_name(rd), reg_name(rt), comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] negsub site 0x{:08X} is not "
                        "subu rD,zero,rT (0x{:08X})\n", addr, instr);
@@ -1281,16 +1306,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x09 || opcode == 0x0D) {  // addiu / ori  (li rt,imm)
             uint32_t rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_cols({});{}",
-                               reg_name(rt), (int)imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_cols({});{}",
+                reg_name(rt), (int)imm, comment));
         } else if (opcode == 0x0A || opcode == 0x0B) {  // slti/sltiu rt,rs,imm (loop bound compare)
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
             if (opcode == 0x0A)  // signed variant
-                return fmt::format("{} = ((int32_t){} < psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
-                                   reg_name(rt), reg_name(rs), (int)imm, comment);
-            return fmt::format("{} = ({} < (uint32_t)psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
-                               reg_name(rt), reg_name(rs), (int)imm, comment);
+                return unprovenanced_gpr_write(rt, fmt::format(
+                    "{} = ((int32_t){} < psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment));
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = ({} < (uint32_t)psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
+                reg_name(rt), reg_name(rs), (int)imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] count_site 0x{:08X} is not "
                        "addiu/ori/slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1301,8 +1329,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0C) {  // andi rt,rs,imm  (start tile-column mask)
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_startcol((int)({} & 0x{:X}u), 0x{:X}u);{}",
-                               reg_name(rt), reg_name(rs), imm, imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_startcol((int)({} & 0x{:X}u), 0x{:X}u);{}",
+                reg_name(rt), reg_name(rs), imm, imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] startcol_site 0x{:08X} is not "
                        "andi (opcode 0x{:02X})\n", addr, opcode);
@@ -1312,14 +1341,16 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_bg2d_startx_site && addr == config_.ws_bg2d_startx_site) {
         if (opcode == 0x00 && (instr & 0x3F) == 0x03) {  // sra rd,rt,sa  (start screen-x)
             uint32_t rt = get_rt(instr), rd = get_rd(instr), sh = get_shamt(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_startx((int32_t){} >> {});{}",
-                               reg_name(rd), reg_name(rt), sh, comment);
+            return unprovenanced_gpr_write(rd, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_startx((int32_t){} >> {});{}",
+                reg_name(rd), reg_name(rt), sh, comment));
         } else if (opcode == 0x00 &&
                    (instr & 0x3F) == 0x23 && get_rs(instr) == 0) {
             // subu rd,zero,rt (MMX4's start screen-x = -(scrollX & 15))
             uint32_t rt = get_rt(instr), rd = get_rd(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_startx(-(int32_t){});{}",
-                               reg_name(rd), reg_name(rt), comment);
+            return unprovenanced_gpr_write(rd, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_startx(-(int32_t){});{}",
+                reg_name(rd), reg_name(rt), comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] startx_site 0x{:08X} is not "
                        "sra or subu-zero (instr 0x{:08X})\n", addr, instr);
@@ -1333,8 +1364,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x08 || opcode == 0x09) {  // addi / addiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_stream_left((int32_t){} + ({}));{}",
-                               reg_name(rt), reg_name(rs), imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_stream_left((int32_t){} + ({}));{}",
+                reg_name(rt), reg_name(rs), imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] stream_left_site 0x{:08X} is not "
                        "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1345,8 +1377,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x08 || opcode == 0x09) {  // addi / addiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_stream_right((int32_t){} + ({}));{}",
-                               reg_name(rt), reg_name(rs), imm, comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_stream_right((int32_t){} + ({}));{}",
+                reg_name(rt), reg_name(rs), imm, comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] stream_right_site 0x{:08X} is not "
                        "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1361,8 +1394,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_bg2d_bufbase_site && addr == config_.ws_bg2d_bufbase_site) {
         if (opcode == 0x00 && (instr & 0x3F) == 0x21) {  // addu rd,rs,rt  (BG buffer address)
             uint32_t rs = get_rs(instr), rt = get_rt(instr), rd = get_rd(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_bufbase((int)({} + {}));{}",
-                               reg_name(rd), reg_name(rs), reg_name(rt), comment);
+            return unprovenanced_gpr_write(rd, fmt::format(
+                "{} = (uint32_t)psx_ws_mmx6_bg_bufbase((int)({} + {}));{}",
+                reg_name(rd), reg_name(rs), reg_name(rt), comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] bufbase_site 0x{:08X} is not "
                        "addu (instr 0x{:08X})\n", addr, instr);
@@ -1372,8 +1406,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_bg2d_cap_site && addr == config_.ws_bg2d_cap_site) {
         if (opcode == 0x0A) {  // slti rt,rs,imm  (BG per-frame tile cap compare)
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_bg2d_undercap((int32_t){}, {});{}",
-                               reg_name(rt), reg_name(rs), (int16_t)(instr & 0xFFFFu), comment);
+            return unprovenanced_gpr_write(rt, fmt::format(
+                "{} = (uint32_t)psx_ws_bg2d_undercap((int32_t){}, {});{}",
+                reg_name(rt), reg_name(rs), (int16_t)(instr & 0xFFFFu), comment));
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] cap_site 0x{:08X} is not "
                        "slti (opcode 0x{:02X})\n", addr, opcode);
@@ -1423,8 +1458,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     uint32_t rs = get_rs(instr);
                     uint32_t rd = get_rd(instr);
                     code = fmt::format("{{ uint32_t _jt_{0:08X} = {1};  {2} = 0x{3:08X};  "
+                                       "PGXP_GPR_WRITTEN({4}u, {2});  "
                                        "cpu->pc = _jt_{0:08X}; }}  /* jalr */",
-                                       addr, reg_name(rs), reg_name(rd), addr + 8);
+                                       addr, reg_name(rs), reg_name(rd), addr + 8, rd);
                 }
                 break;
             case 0x0C:                                          // syscall
@@ -2166,12 +2202,17 @@ std::string CodeGenerator::translate_basic_block(
                     ss << config_.indent
                        << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
                                       addr + 8);
+                    ss << config_.indent
+                       << "PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
                 } else if (block.exit_instr.type == ControlFlowType::JumpLinkReg) {
                     uint32_t rd = get_rd(block.exit_instr.instruction);
                     if (rd != 0) {
                         ss << config_.indent
                            << fmt::format("{} = 0x{:08X}u;  /* jalr link before delay slot */\n",
                                           reg_name(rd), addr + 8);
+                        ss << config_.indent
+                           << fmt::format("PGXP_GPR_WRITTEN({}u, {});\n",
+                                          rd, reg_name(rd));
                     }
                 } else if (block.exit_instr.type == ControlFlowType::Branch) {
                     uint32_t branch_instr = block.exit_instr.instruction;
@@ -2181,6 +2222,8 @@ std::string CodeGenerator::translate_basic_block(
                         ss << config_.indent
                            << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* branch-and-link before delay slot */\n",
                                           addr + 8);
+                        ss << config_.indent
+                           << "PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
                     }
                 }
 

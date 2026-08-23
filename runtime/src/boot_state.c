@@ -374,12 +374,14 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     int ok;
 
     /* Establish one coherent machine boundary before serializing any section.
-     * A deferred CPU batch can cross a device deadline when published. Flushing
-     * only while writing BS_SEC_CLOCK would therefore pair pre-service CPU/RAM/
-     * IRQ/device sections with a post-service clock, producing a state that
-     * never existed. The later clock snapshot keeps its defensive flush, which
-     * is a no-op after this barrier. */
+     * A deferred CPU batch can cross a device deadline when published, and the
+     * resulting device service may raise IRQs or DMA into RAM. Servicing only
+     * while writing BS_SEC_CLOCK would therefore pair pre-service CPU/RAM/IRQ
+     * sections with a post-service clock and devices: a state that never
+     * existed. The later clock snapshot's defensive publication is a no-op
+     * because no guest cycles retire while this routine serializes. */
     psx_cyc_batch_flush();
+    psx_devices_service_to_now();
 
     memset(&h, 0, sizeof h);
     h.magic         = BOOT_STATE_MAGIC;
@@ -545,46 +547,139 @@ int boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
 
 /* ============================ LOAD ============================ */
 
+typedef struct BsStagedSection {
+    const uint8_t* data;
+    uint8_t* owned;
+    uint32_t len;
+} BsStagedSection;
+
+typedef struct BsStagedState {
+    BsStagedSection sec[BS_SEC_ICACHE + 1u];
+    double inflate_ms;
+} BsStagedState;
+
+typedef struct BsRollbackState {
+    CPUState cpu;
+    uint8_t* ram;
+    uint8_t spad[SPAD_SIZE];
+    uint32_t irq_stat;
+    uint32_t irq_mask;
+    uint32_t irq_cycles_since_vblank;
+    uint32_t irq_fraction;
+    uint16_t timer_counter[3];
+    uint32_t timer_mode[3];
+    uint16_t timer_target[3];
+    int32_t timer_irq_line[3];
+    uint32_t timer_frac[3];
+    PSXClockDomainSnapshot clock;
+    uint8_t* gpu;
+    uint32_t gpu_len;
+    uint8_t* vram;
+    uint8_t* spu;
+    uint32_t spu_len;
+    uint8_t* spuram;
+    uint32_t spuram_len;
+    uint8_t* cdrom;
+    uint32_t cdrom_len;
+    uint8_t* dma;
+    uint32_t dma_len;
+    uint8_t* sio;
+    uint32_t sio_len;
+    uint8_t* mdec;
+    uint32_t mdec_len;
+    uint32_t* dirty;
+    uint32_t dirty_count;
+    uint32_t icache[1024];
+    uint16_t* vram_mirror;
+    int vram_mirror_valid;
+    uint32_t last_vram_dirty_rows;
+    int last_vram_incremental;
+    uint64_t vram_dirty_mask[GPU_VRAM_DIRTY_H / 64u];
+} BsRollbackState;
+
+static int parse_cpu_section(const uint8_t* p, uint32_t len, CPUState* cpu) {
+    PstR r;
+    if (len != CPU_REGS_WIRE_BYTES) return 0;
+    pst_r_init(&r, p, len);
+    for (int i = 0; i < 32; i++)
+        if (!pst_r_u32(&r, &cpu->gpr[i])) return 0;
+    if (!pst_r_u32(&r, &cpu->pc) || !pst_r_u32(&r, &cpu->hi) ||
+        !pst_r_u32(&r, &cpu->lo))
+        return 0;
+    for (int i = 0; i < 32; i++)
+        if (!pst_r_u32(&r, &cpu->cop0[i])) return 0;
+    for (int i = 0; i < 32; i++)
+        if (!pst_r_u32(&r, &cpu->gte_data[i])) return 0;
+    for (int i = 0; i < 32; i++)
+        if (!pst_r_u32(&r, &cpu->gte_ctrl[i])) return 0;
+    if (!pst_r_u64(&r, &cpu->muldiv_ts_done) ||
+        !pst_r_u64(&r, &cpu->gte_ts_done) ||
+        !pst_r_bytes(&r, cpu->read_absorb, sizeof cpu->read_absorb) ||
+        !pst_r_u8(&r, &cpu->read_absorb_which) ||
+        !pst_r_u8(&r, &cpu->read_fudge) ||
+        !pst_r_u8(&r, &cpu->ld_which_t) ||
+        !pst_r_u32(&r, &cpu->ld_absorb)) return 0;
+    if (cpu->read_absorb_which > 0x20u || cpu->read_fudge > 0x20u ||
+        cpu->ld_which_t > 0x20u) return 0;
+    return r.p == r.end;
+}
+
+static int parse_clock_section(const uint8_t* p, uint32_t len,
+                               PSXClockDomainSnapshot* snap) {
+    PstR r;
+    if (len != 48u) return 0;
+    pst_r_init(&r, p, len);
+    return pst_r_u64(&r, &snap->native_cycle_count) &&
+           pst_r_u64(&r, &snap->cpu_retired_cycles) &&
+           pst_r_u64(&r, &snap->cpu_native_cycles) &&
+           pst_r_u32(&r, &snap->requested_percent) &&
+           pst_r_u32(&r, &snap->overclock_active) &&
+           pst_r_u32(&r, &snap->numerator) &&
+           pst_r_u32(&r, &snap->denominator) &&
+           pst_r_u32(&r, &snap->remainder) &&
+           pst_r_u32(&r, &snap->reserved_flags) && r.p == r.end;
+}
+
+static uint32_t boot_state_gcd_u32(uint32_t a, uint32_t b) {
+    while (b) {
+        uint32_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+/* Mirror psx_clock_domain_restore's fail-closed policy checks without calling
+ * it. In particular, a state from another overclock policy must be rejected
+ * before CPU/RAM/device state is touched. */
+static int clock_section_matches_runtime(const PSXClockDomainSnapshot* snap) {
+    uint32_t percent, common, numerator, denominator;
+    if (!snap || snap->requested_percent < 100u ||
+        snap->requested_percent > 6400u || snap->overclock_active > 1u ||
+        snap->reserved_flags != 0u)
+        return 0;
+    percent = snap->overclock_active ? snap->requested_percent : 100u;
+    common = boot_state_gcd_u32(100u, percent);
+    numerator = 100u / common;
+    denominator = percent / common;
+    if (snap->numerator != numerator || snap->denominator != denominator ||
+        snap->remainder >= denominator)
+        return 0;
+    return snap->requested_percent == psx_get_cpu_overclock() &&
+           percent == psx_get_effective_cpu_overclock() &&
+           numerator == g_psx_oc_numerator &&
+           denominator == g_psx_oc_denominator;
+}
+
 static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
                          CPUState* cpu, uint32_t entry_pc) {
     switch (tag) {
-    case BS_SEC_CPU: {
-        PstR r;
-        if (len != CPU_REGS_WIRE_BYTES) return 0;
-        pst_r_init(&r, p, len);
-        for (int i = 0; i < 32; i++)
-            if (!pst_r_u32(&r, &cpu->gpr[i])) return 0;
-        if (!pst_r_u32(&r, &cpu->pc) || !pst_r_u32(&r, &cpu->hi) ||
-            !pst_r_u32(&r, &cpu->lo))
-            return 0;
+    case BS_SEC_CPU:
         (void)entry_pc;
-        for (int i = 0; i < 32; i++)
-            if (!pst_r_u32(&r, &cpu->cop0[i])) return 0;
-        for (int i = 0; i < 32; i++)
-            if (!pst_r_u32(&r, &cpu->gte_data[i])) return 0;
-        for (int i = 0; i < 32; i++)
-            if (!pst_r_u32(&r, &cpu->gte_ctrl[i])) return 0;
-        if (!pst_r_u64(&r, &cpu->muldiv_ts_done) ||
-            !pst_r_u64(&r, &cpu->gte_ts_done) ||
-            !pst_r_bytes(&r, cpu->read_absorb, sizeof cpu->read_absorb) ||
-            !pst_r_u8(&r, &cpu->read_absorb_which) ||
-            !pst_r_u8(&r, &cpu->read_fudge) ||
-            !pst_r_u8(&r, &cpu->ld_which_t) ||
-            !pst_r_u32(&r, &cpu->ld_absorb)) return 0;
-        if (cpu->read_absorb_which > 0x20u || cpu->read_fudge > 0x20u ||
-            cpu->ld_which_t > 0x20u) return 0;
-        /* Architectural normalize + drop projection provenance. CPU timing
-         * pipeline state above is deterministic machine state and survives. */
-        gte_canonicalize_cpu_state(cpu);
-        return 1;
-    }
+        return parse_cpu_section(p, len, cpu);
     case BS_SEC_RAM:
         if (len != RAM_SIZE) return 0;
         memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
-        {
-            extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
-            psx_kernel_bless_note_range(0, RAM_SIZE);
-        }
         return 1;
     case BS_SEC_SPAD:
         if (len != SPAD_SIZE) return 0;
@@ -629,19 +724,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     }
     case BS_SEC_CLOCK: {
-        PstR r;
         PSXClockDomainSnapshot snap;
-        if (len != 48) return 0;
-        pst_r_init(&r, p, len);
-        if (!pst_r_u64(&r, &snap.native_cycle_count) ||
-            !pst_r_u64(&r, &snap.cpu_retired_cycles) ||
-            !pst_r_u64(&r, &snap.cpu_native_cycles) ||
-            !pst_r_u32(&r, &snap.requested_percent) ||
-            !pst_r_u32(&r, &snap.overclock_active) ||
-            !pst_r_u32(&r, &snap.numerator) ||
-            !pst_r_u32(&r, &snap.denominator) ||
-            !pst_r_u32(&r, &snap.remainder) ||
-            !pst_r_u32(&r, &snap.reserved_flags)) return 0;
+        if (!parse_clock_section(p, len, &snap)) return 0;
         return psx_clock_domain_restore(&snap);
     }
     case BS_SEC_GPU:
@@ -838,99 +922,341 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
     return 1;
 }
 
-int boot_state_load_buffer(const uint8_t* file, size_t file_len,
-                           uint32_t bios_checksum, uint32_t entry_pc,
-                           CPUState* cpu) {
+static void staged_state_free(BsStagedState* staged) {
+    if (!staged) return;
+    for (uint32_t tag = 1; tag <= BS_SEC_ICACHE; tag++) {
+        free(staged->sec[tag].owned);
+        staged->sec[tag].owned = NULL;
+        staged->sec[tag].data = NULL;
+        staged->sec[tag].len = 0;
+    }
+}
+
+static int staged_state_decode(const uint8_t* file, size_t file_len,
+                               const BootStateHeader* h,
+                               BsStagedState* staged) {
     const uint8_t* cur;
     const uint8_t* end;
-    BootStateHeader h;
-    char reject[256];
     const uint32_t required =
         (1u<<BS_SEC_CPU)|(1u<<BS_SEC_RAM)|(1u<<BS_SEC_SPAD)|(1u<<BS_SEC_IRQ)|
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
-        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY);
+        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY)|
+        (1u<<BS_SEC_ICACHE);
     uint32_t seen = 0;
-    int ok = 1;
-    const double t0 = boot_state_mono_ms();
-    double inflate_ms = 0.0;
-    double apply_ram_ms = 0.0;
-    double apply_vram_ms = 0.0;
-    double apply_spuram_ms = 0.0;
-    double apply_other_ms = 0.0;
+    uint64_t decoded_total = 0;
 
-    if (!boot_state_check_buffer(file, file_len, bios_checksum, entry_pc,
-                                 reject, sizeof(reject))) {
-        fprintf(stderr, "boot_state: reject — %s\n",
-                reject[0] ? reject : "unknown");
-        return 0;
-    }
-    if (!boot_state_parse_header(file, file_len, &h))
-        return 0;
-
+    memset(staged, 0, sizeof(*staged));
     cur = file + BOOT_STATE_HEADER_WIRE_BYTES;
     end = file + file_len;
-
-    for (uint32_t i = 0; ok && i < h.section_count; i++) {
+    if (h->section_count > BS_SEC_ICACHE)
+        return 0;
+    for (uint32_t i = 0; i < h->section_count; i++) {
         PstR sh;
         uint32_t tag = 0, pad = 0;
         uint64_t len = 0;
         const uint8_t* payload;
         uint8_t* inflated = NULL;
-        const uint8_t* apply_ptr;
-        uint32_t apply_len;
-        double t_sec;
+        const uint8_t* decoded;
+        uint32_t decoded_len;
 
-        if ((size_t)(end - cur) < 16u) { ok = 0; break; }
+        if ((size_t)(end - cur) < 16u) goto reject;
         pst_r_init(&sh, cur, 16);
-        if (!pst_r_u32(&sh, &tag) || !pst_r_u32(&sh, &pad) || !pst_r_u64(&sh, &len)) {
-            ok = 0; break;
-        }
+        if (!pst_r_u32(&sh, &tag) || !pst_r_u32(&sh, &pad) ||
+            !pst_r_u64(&sh, &len)) goto reject;
         cur += 16;
-        if (len > 64u * 1024u * 1024u || (uint64_t)(end - cur) < len) {
-            ok = 0; break;
-        }
+        if (tag == 0u || tag > BS_SEC_ICACHE || (seen & (1u << tag)))
+            goto reject;
+        seen |= 1u << tag;
+        if (len > 64u * 1024u * 1024u || (uint64_t)(end - cur) < len)
+            goto reject;
         payload = cur;
         cur += (size_t)len;
 
-        if (h.version >= 4u && pad == BOOT_STATE_SEC_ZLIB) {
+        if (pad == BOOT_STATE_SEC_ZLIB) {
             PstR lr;
             uint32_t raw_len = 0;
             uLong dest_len;
             double t_inf;
-            if (len < 4u) { ok = 0; break; }
+            if (len < 4u) goto reject;
             pst_r_init(&lr, payload, 4);
             if (!pst_r_u32(&lr, &raw_len) || raw_len == 0 ||
-                raw_len > 64u * 1024u * 1024u) {
-                ok = 0; break;
-            }
+                raw_len > 64u * 1024u * 1024u) goto reject;
+            if (decoded_total + raw_len > 64u * 1024u * 1024u)
+                goto reject;
             inflated = (uint8_t*)malloc(raw_len);
-            if (!inflated) { ok = 0; break; }
+            if (!inflated) goto reject;
             dest_len = (uLong)raw_len;
             t_inf = boot_state_mono_ms();
             if (uncompress(inflated, &dest_len, payload + 4,
                            (uLong)(len - 4u)) != Z_OK ||
                 dest_len != (uLong)raw_len) {
                 free(inflated);
-                ok = 0;
-                break;
+                goto reject;
             }
-            inflate_ms += boot_state_mono_ms() - t_inf;
-            apply_ptr = inflated;
-            apply_len = raw_len;
+            staged->inflate_ms += boot_state_mono_ms() - t_inf;
+            decoded = inflated;
+            decoded_len = raw_len;
         } else if (pad != 0u) {
-            /* v3 requires pad==0; v4 unknown/extra flags are a hard reject. */
-            ok = 0;
-            break;
+            goto reject;
         } else {
-            if (len > 0xffffffffu) { ok = 0; break; }
-            apply_ptr = payload;
-            apply_len = (uint32_t)len;
+            if (len > 0xffffffffu) goto reject;
+            if (decoded_total + len > 64u * 1024u * 1024u)
+                goto reject;
+            decoded = payload;
+            decoded_len = (uint32_t)len;
         }
+        decoded_total += decoded_len;
+        staged->sec[tag].data = decoded;
+        staged->sec[tag].owned = inflated;
+        staged->sec[tag].len = decoded_len;
+    }
+    if (cur != end || (seen & required) != required)
+        goto reject;
+    return 1;
 
-        t_sec = boot_state_mono_ms();
-        if (!apply_section(tag, apply_ptr, apply_len, cpu, entry_pc)) ok = 0;
-        else if (tag < 32) seen |= (1u << tag);
+reject:
+    staged_state_free(staged);
+    return 0;
+}
+
+static int staged_state_preflight(const BsStagedState* staged,
+                                  const CPUState* live_cpu,
+                                  CPUState* decoded_cpu) {
+    PstR r;
+    uint32_t st, mk, csv, fraction, base_rate, multiplier;
+    PSXClockDomainSnapshot clock;
+
+    *decoded_cpu = *live_cpu;
+    if (!parse_cpu_section(staged->sec[BS_SEC_CPU].data,
+                           staged->sec[BS_SEC_CPU].len, decoded_cpu))
+        return 0;
+    if (staged->sec[BS_SEC_RAM].len != RAM_SIZE ||
+        staged->sec[BS_SEC_SPAD].len != SPAD_SIZE ||
+        staged->sec[BS_SEC_TIMER].len != TIMER_REGS_WIRE_BYTES ||
+        staged->sec[BS_SEC_GPU].len != gpu_snapshot_bytes() ||
+        staged->sec[BS_SEC_VRAM].len != VRAM_SIZE ||
+        staged->sec[BS_SEC_SPU].len != spu_snapshot_bytes() ||
+        staged->sec[BS_SEC_SPURAM].len != spu_get_ram_bytes() ||
+        staged->sec[BS_SEC_CDROM].len != cdrom_snapshot_bytes() ||
+        staged->sec[BS_SEC_DMA].len != dma_snapshot_bytes() ||
+        staged->sec[BS_SEC_SIO].len != sio_snapshot_bytes() ||
+        staged->sec[BS_SEC_MDEC].len != mdec_snapshot_bytes() ||
+        (uint64_t)staged->sec[BS_SEC_DIRTY].len !=
+            (uint64_t)dirty_ram_get_bitmap_word_count() * 4u ||
+        staged->sec[BS_SEC_ICACHE].len != 1024u * 4u)
+        return 0;
+
+    if (staged->sec[BS_SEC_IRQ].len != 24u) return 0;
+    pst_r_init(&r, staged->sec[BS_SEC_IRQ].data,
+               staged->sec[BS_SEC_IRQ].len);
+    if (!pst_r_u32(&r, &st) || !pst_r_u32(&r, &mk) ||
+        !pst_r_u32(&r, &csv) || !pst_r_u32(&r, &fraction) ||
+        !pst_r_u32(&r, &base_rate) || !pst_r_u32(&r, &multiplier) ||
+        r.p != r.end)
+        return 0;
+    (void)st;
+    (void)mk;
+    (void)csv;
+    (void)fraction;
+    if (base_rate != interrupts_get_vblank_base_rate() ||
+        multiplier != interrupts_get_vblank_multiplier())
+        return 0;
+
+    if (!parse_clock_section(staged->sec[BS_SEC_CLOCK].data,
+                             staged->sec[BS_SEC_CLOCK].len, &clock) ||
+        !clock_section_matches_runtime(&clock))
+        return 0;
+    return 1;
+}
+
+static uint8_t* rollback_alloc(uint32_t len) {
+    return (uint8_t*)malloc(len ? len : 1u);
+}
+
+static void rollback_state_free(BsRollbackState* rollback) {
+    if (!rollback) return;
+    free(rollback->ram);
+    free(rollback->gpu);
+    free(rollback->vram);
+    free(rollback->spu);
+    free(rollback->spuram);
+    free(rollback->cdrom);
+    free(rollback->dma);
+    free(rollback->sio);
+    free(rollback->mdec);
+    free(rollback->dirty);
+    free(rollback->vram_mirror);
+    free(rollback);
+}
+
+static BsRollbackState* rollback_state_capture(const CPUState* cpu) {
+    BsRollbackState* rollback =
+        (BsRollbackState*)calloc(1, sizeof(BsRollbackState));
+    if (!rollback) return NULL;
+
+    rollback->gpu_len = gpu_snapshot_bytes();
+    rollback->spu_len = spu_snapshot_bytes();
+    rollback->spuram_len = spu_get_ram_bytes();
+    rollback->cdrom_len = cdrom_snapshot_bytes();
+    rollback->dma_len = dma_snapshot_bytes();
+    rollback->sio_len = sio_snapshot_bytes();
+    rollback->mdec_len = mdec_snapshot_bytes();
+    rollback->dirty_count = dirty_ram_get_bitmap_word_count();
+    rollback->vram_mirror_valid = s_vram_mirror_valid;
+
+    rollback->ram = rollback_alloc(RAM_SIZE);
+    rollback->gpu = rollback_alloc(rollback->gpu_len);
+    rollback->vram = rollback_alloc(VRAM_SIZE);
+    rollback->spu = rollback_alloc(rollback->spu_len);
+    rollback->spuram = rollback_alloc(rollback->spuram_len);
+    rollback->cdrom = rollback_alloc(rollback->cdrom_len);
+    rollback->dma = rollback_alloc(rollback->dma_len);
+    rollback->sio = rollback_alloc(rollback->sio_len);
+    rollback->mdec = rollback_alloc(rollback->mdec_len);
+    rollback->dirty = (uint32_t*)rollback_alloc(
+        rollback->dirty_count * (uint32_t)sizeof(uint32_t));
+    if (rollback->vram_mirror_valid)
+        rollback->vram_mirror = (uint16_t*)rollback_alloc(VRAM_SIZE);
+    if (!rollback->ram || !rollback->gpu || !rollback->vram ||
+        !rollback->spu || !rollback->spuram || !rollback->cdrom ||
+        !rollback->dma || !rollback->sio || !rollback->mdec ||
+        !rollback->dirty ||
+        (rollback->vram_mirror_valid && !rollback->vram_mirror)) {
+        rollback_state_free(rollback);
+        return NULL;
+    }
+
+    /* Load runs at a scheduler boundary. Snapshotting the clock establishes
+     * the same coherent publication boundary as save, before any live bytes
+     * are copied into the rollback image. */
+    psx_clock_domain_snapshot(&rollback->clock);
+    rollback->cpu = *cpu;
+    memcpy(rollback->ram, memory_get_ram_ptr(), RAM_SIZE);
+    memcpy(rollback->spad, memory_get_scratchpad_ptr(), SPAD_SIZE);
+    rollback->irq_stat = i_stat;
+    rollback->irq_mask = i_mask;
+    rollback->irq_cycles_since_vblank =
+        interrupts_get_cycles_since_vblank();
+    rollback->irq_fraction = interrupts_get_vblank_fraction();
+    timers_get_snapshot(rollback->timer_counter, rollback->timer_mode,
+                        rollback->timer_target, rollback->timer_irq_line,
+                        rollback->timer_frac);
+    gpu_snapshot_write(rollback->gpu);
+    gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H,
+                         (uint16_t*)rollback->vram);
+    spu_snapshot_write(rollback->spu);
+    memcpy(rollback->spuram, spu_get_ram_ptr(), rollback->spuram_len);
+    cdrom_snapshot_write(rollback->cdrom);
+    dma_snapshot_write(rollback->dma);
+    sio_snapshot_write(rollback->sio);
+    mdec_snapshot_write(rollback->mdec);
+    for (uint32_t i = 0; i < rollback->dirty_count; i++)
+        rollback->dirty[i] = dirty_ram_get_bitmap_word(i);
+    memcpy(rollback->icache, g_psx_icache_tv, sizeof rollback->icache);
+    rollback->last_vram_dirty_rows = s_last_vram_dirty_rows;
+    rollback->last_vram_incremental = s_last_vram_incremental;
+    memcpy(rollback->vram_dirty_mask, gpu_vram_dirty_mask(),
+           sizeof rollback->vram_dirty_mask);
+    if (rollback->vram_mirror_valid)
+        memcpy(rollback->vram_mirror, s_vram_mirror, VRAM_SIZE);
+    return rollback;
+}
+
+static int rollback_state_restore(const BsRollbackState* rollback,
+                                  CPUState* cpu) {
+    int ok = 1;
+    *cpu = rollback->cpu;
+    memcpy(memory_get_ram_ptr(), rollback->ram, RAM_SIZE);
+    memcpy(memory_get_scratchpad_ptr(), rollback->spad, SPAD_SIZE);
+    i_stat = rollback->irq_stat;
+    i_mask = rollback->irq_mask;
+    interrupts_set_vblank_fraction(rollback->irq_fraction);
+    interrupts_set_cycles_since_vblank(rollback->irq_cycles_since_vblank);
+    timers_set_snapshot(rollback->timer_counter, rollback->timer_mode,
+                        rollback->timer_target, rollback->timer_irq_line,
+                        rollback->timer_frac);
+    if (!psx_clock_domain_restore(&rollback->clock)) ok = 0;
+    if (!gpu_snapshot_read(rollback->gpu, rollback->gpu_len)) ok = 0;
+    gr_vram_transfer_in(0, 0, VRAM_W, VRAM_H,
+                        (const uint16_t*)rollback->vram);
+    if (!spu_snapshot_read(rollback->spu, rollback->spu_len)) ok = 0;
+    memcpy(spu_get_ram_ptr(), rollback->spuram, rollback->spuram_len);
+    if (!cdrom_snapshot_read(rollback->cdrom, rollback->cdrom_len)) ok = 0;
+    if (!dma_snapshot_read(rollback->dma, rollback->dma_len)) ok = 0;
+    if (!sio_snapshot_read(rollback->sio, rollback->sio_len)) ok = 0;
+    if (!mdec_snapshot_read(rollback->mdec, rollback->mdec_len)) ok = 0;
+    dirty_ram_set_bitmap_words(rollback->dirty, rollback->dirty_count);
+    memcpy(g_psx_icache_tv, rollback->icache, sizeof rollback->icache);
+    s_vram_mirror_valid = rollback->vram_mirror_valid;
+    s_last_vram_dirty_rows = rollback->last_vram_dirty_rows;
+    s_last_vram_incremental = rollback->last_vram_incremental;
+    if (rollback->vram_mirror_valid)
+        memcpy(s_vram_mirror, rollback->vram_mirror, VRAM_SIZE);
+    gpu_vram_dirty_clear();
+    if (gpu_vram_dirty_tracking()) {
+        for (uint32_t y = 0; y < GPU_VRAM_DIRTY_H; y++) {
+            if (rollback->vram_dirty_mask[y >> 6] &
+                ((uint64_t)1u << (y & 63u)))
+                gpu_vram_dirty_mark_row_impl(y);
+        }
+    }
+    return ok;
+}
+
+int boot_state_load_buffer_checked(const uint8_t* file, size_t file_len,
+                                   uint32_t bios_checksum, uint32_t entry_pc,
+                                   CPUState* cpu,
+                                   BootStateResumePcValidator resume_pc_ok) {
+    BootStateHeader h;
+    BsStagedState staged;
+    BsRollbackState* rollback = NULL;
+    CPUState decoded_cpu;
+    char reject[256];
+    int ok = 1;
+    const double t0 = boot_state_mono_ms();
+    double apply_ram_ms = 0.0;
+    double apply_vram_ms = 0.0;
+    double apply_spuram_ms = 0.0;
+    double apply_other_ms = 0.0;
+
+    reject[0] = '\0';
+    if (!cpu || !boot_state_check_buffer(file, file_len, bios_checksum,
+                                         entry_pc, reject, sizeof(reject))) {
+        fprintf(stderr, "boot_state: reject — %s\n",
+                reject[0] ? reject : "unknown");
+        return 0;
+    }
+    if (!boot_state_parse_header(file, file_len, &h) ||
+        !staged_state_decode(file, file_len, &h, &staged)) {
+        fprintf(stderr, "boot_state: reject — malformed section stream\n");
+        return 0;
+    }
+    if (!staged_state_preflight(&staged, cpu, &decoded_cpu)) {
+        fprintf(stderr, "boot_state: reject — section preflight failed\n");
+        staged_state_free(&staged);
+        return 0;
+    }
+    if (resume_pc_ok && !resume_pc_ok(decoded_cpu.pc)) {
+        fprintf(stderr, "boot_state: reject — resume pc=0x%08X\n",
+                (unsigned)decoded_cpu.pc);
+        staged_state_free(&staged);
+        return 0;
+    }
+
+    rollback = rollback_state_capture(cpu);
+    if (!rollback) {
+        staged_state_free(&staged);
+        return 0;
+    }
+
+    /* Apply in dependency order, independent of file ordering. The entire
+     * stream is already decoded and preflighted; a subsystem semantic failure
+     * below restores the exact pre-load machine image. */
+    for (uint32_t tag = BS_SEC_CPU; ok && tag <= BS_SEC_ICACHE; tag++) {
+        double t_sec = boot_state_mono_ms();
+        ok = apply_section(tag, staged.sec[tag].data, staged.sec[tag].len,
+                           cpu, entry_pc);
         {
             double dt = boot_state_mono_ms() - t_sec;
             if (tag == BS_SEC_RAM) apply_ram_ms += dt;
@@ -938,13 +1264,31 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             else if (tag == BS_SEC_SPURAM) apply_spuram_ms += dt;
             else apply_other_ms += dt;
         }
-        free(inflated);
     }
 
-    if (!ok || (seen & required) != required)
-        return 0;
+    /* Dispatchability can depend on restored overlay/RAM state. Re-check at
+     * the commit boundary; unlike the old savestate.c post-check, rejection
+     * here is still covered by the rollback image. */
+    if (ok && resume_pc_ok && !resume_pc_ok(cpu->pc)) {
+        fprintf(stderr, "boot_state: reject — restored resume pc=0x%08X\n",
+                (unsigned)cpu->pc);
+        ok = 0;
+    }
 
-    /* RAM was memcpy'd; force overlay revalidation before resume. */
+    if (!ok) {
+        if (!rollback_state_restore(rollback, cpu))
+            fprintf(stderr, "boot_state: FATAL — rollback restore failed\n");
+        rollback_state_free(rollback);
+        staged_state_free(&staged);
+        return 0;
+    }
+
+    /* CPU decoding and every rejection path above are side-effect-free with
+     * respect to the live precision timeline. Canonicalization deliberately
+     * happens only at commit: it normalizes restored GTE backing and drops
+     * host-only PGXP provenance from the abandoned timeline. */
+    gte_canonicalize_cpu_state(cpu);
+    psx_kernel_bless_note_range(0, RAM_SIZE);
     overlay_watch_invalidate_after_ram_restore();
 
     {
@@ -953,15 +1297,25 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
                 "savestate: load_timing read=0.0 inflate=%.1f "
                 "apply_ram=%.1f apply_vram=%.1f apply_spuram=%.1f "
                 "apply_other=%.1f total=%.1f ms (file=%zu)\n",
-                inflate_ms,
+                staged.inflate_ms,
                 apply_ram_ms, apply_vram_ms, apply_spuram_ms,
                 apply_other_ms, total_ms, file_len);
     }
+    rollback_state_free(rollback);
+    staged_state_free(&staged);
     return 1;
 }
 
-int boot_state_load(const char* path, uint32_t bios_checksum,
-                    uint32_t entry_pc, CPUState* cpu) {
+int boot_state_load_buffer(const uint8_t* file, size_t file_len,
+                           uint32_t bios_checksum, uint32_t entry_pc,
+                           CPUState* cpu) {
+    return boot_state_load_buffer_checked(file, file_len, bios_checksum,
+                                          entry_pc, cpu, NULL);
+}
+
+int boot_state_load_checked(const char* path, uint32_t bios_checksum,
+                            uint32_t entry_pc, CPUState* cpu,
+                            BootStateResumePcValidator resume_pc_ok) {
     FILE* f = fopen(path, "rb");
     long sz;
     uint8_t* file = NULL;
@@ -997,9 +1351,15 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
     (void)t0;
     (void)t_after_read;
 
-    ok = boot_state_load_buffer(file, file_len, bios_checksum, entry_pc, cpu);
+    ok = boot_state_load_buffer_checked(file, file_len, bios_checksum,
+                                        entry_pc, cpu, resume_pc_ok);
     free(file);
     return ok;
+}
+
+int boot_state_load(const char* path, uint32_t bios_checksum,
+                    uint32_t entry_pc, CPUState* cpu) {
+    return boot_state_load_checked(path, bios_checksum, entry_pc, cpu, NULL);
 }
 
 void boot_state_set_capture(const char* path, uint32_t bios_checksum,

@@ -61,6 +61,7 @@ std::string read_file(const std::filesystem::path& path) {
 
 struct RunResult {
     EmitStats stats;
+    std::string full;
     std::string dispatch;
 };
 
@@ -85,6 +86,7 @@ RunResult run_case(const char* name, const std::vector<uint32_t>& words,
     result.stats = FullFunctionEmitter::emit(
         rom, kBase, kBase + static_cast<uint32_t>(rom.size()) - 1u,
         discovery, "synthetic", out_dir.string(), stem);
+    result.full = read_file(out_dir / (stem + "_full.c"));
     result.dispatch = read_file(out_dir / (stem + "_dispatch.c"));
     std::filesystem::remove_all(out_dir);
     return result;
@@ -197,6 +199,27 @@ void complementary_lwl_lwr_stays_native() {
            "complementary LWL/LWR remains native");
 }
 
+void link_and_synthetic_writes_have_pgxp_barriers() {
+    const auto result = run_case(
+        "pgxp-gpr-barriers",
+        {
+            0x0FF00002u,  // jal 0xBFC00008
+            0x00000000u,  // delay-slot nop
+            0x03E00008u,  // jr ra
+            0x00000000u,  // delay-slot nop
+        },
+        {function_at(kBase, kBase + 12u, {kBase, kBase + 8u})});
+    const auto link = result.full.find("cpu->gpr[31] =");
+    const auto link_barrier = result.full.find(
+        "PGXP_GPR_WRITTEN(31u, cpu->gpr[31])", link);
+    expect(link != std::string::npos && link_barrier != std::string::npos &&
+               link < link_barrier,
+           "full emitter invalidates PGXP provenance after a link write");
+    expect(result.dispatch.find("PGXP_GPR_WRITTEN(8u, cpu->gpr[8])") !=
+               std::string::npos,
+           "full emitter invalidates PGXP provenance in its synthetic BIOS jump stub");
+}
+
 }  // namespace
 
 int main() {
@@ -221,6 +244,7 @@ int main() {
     fragment_split_load_falls_back();
     noncomplementary_lwl_falls_back();
     complementary_lwl_lwr_stays_native();
+    link_and_synthetic_writes_have_pgxp_barriers();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d full-function emitter test(s) failed\n", failures);

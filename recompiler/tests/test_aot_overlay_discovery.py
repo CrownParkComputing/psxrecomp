@@ -28,6 +28,19 @@ EXTRACT_SPEC.loader.exec_module(EXTRACT)
 LOAD = 0x80010000
 
 
+def find_test_gcc():
+    """Honor the selected toolchain before trying machine-local fallbacks."""
+    candidates = [
+        os.environ.get('CC'),
+        shutil.which('gcc'),
+        r'C:\msys64\mingw64\bin\gcc.exe' if os.name == 'nt' else None,
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def put(data, offset, word):
     struct.pack_into("<I", data, offset, word)
 
@@ -1435,8 +1448,8 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
             import _ctypes
             import ctypes
             import shutil
-            gcc = r'C:\msys64\mingw64\bin\gcc.exe'
-            assert os.path.isfile(gcc), "real loaded-DLL regression needs MinGW gcc"
+            gcc = find_test_gcc()
+            assert gcc, "real loaded-DLL regression needs MinGW gcc"
             with tempfile.TemporaryDirectory() as tmp:
                 # The actual host compiler must export the same 64-bit identity
                 # serialized in P; this catches width/decorated-name mistakes
@@ -2139,8 +2152,8 @@ def check_candidate_capacity_publication():
     if os.name == 'nt':
         # Exact pairs racing to distinct names may both commit: the namespace
         # lock makes the second writer observe the first pair's dedup identity.
-        gcc = r'C:\msys64\mingw64\bin\gcc.exe'
-        assert os.path.isfile(gcc)
+        gcc = find_test_gcc()
+        assert gcc
         with tempfile.TemporaryDirectory() as tmp:
             pair_id = 0x1020304050607080
             source = pathlib.Path(tmp) / 'capacity.c'
@@ -3037,9 +3050,7 @@ def check_tcc_runtime_define_parity():
 
 def check_real_batched_fragment_publication(recompiler):
     """A poorer same-byte pair stays intact while one richer supplement wins."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_test_gcc()
     if not gcc:
         return
 
@@ -3123,9 +3134,7 @@ def check_real_batched_fragment_publication(recompiler):
 
 def check_real_hosted_fragment_publication(recompiler):
     """Only exact cached-owner identity may authorize a hosted alias pair."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_test_gcc()
     if not gcc:
         return
     data = bytearray(0x100)
@@ -3275,9 +3284,7 @@ def check_real_hosted_fragment_publication(recompiler):
 
 def check_full_hosted_fixed_point(recompiler):
     """A clean two-variant CLI build must make its second run a true no-op."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_test_gcc()
     if not gcc:
         return
     host = LOAD
@@ -3387,9 +3394,7 @@ def check_full_hosted_fixed_point(recompiler):
 
 def check_full_candidate_cli_fastpath(recompiler):
     """An already-full single-tier cache must bypass every compile recipe."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_test_gcc()
     if not gcc:
         return
     with tempfile.TemporaryDirectory() as td:

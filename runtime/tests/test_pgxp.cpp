@@ -61,6 +61,7 @@ static uint32_t enc_cop2(uint32_t sub, uint32_t rt, uint32_t rd) {
 #define LUI(rt, imm) enc_i(0x0F, 0, rt, (uint16_t)(imm))
 #define SLL(rt, rd, sh) enc_r(0, rt, rd, sh, 0x00)
 #define SRA(rt, rd, sh) enc_r(0, rt, rd, sh, 0x03)
+#define AND(rs, rt, rd) enc_r(rs, rt, rd, 0, 0x24)
 #define OR(rs, rt, rd)  enc_r(rs, rt, rd, 0, 0x25)
 #define ADDU(rs, rt, rd) enc_r(rs, rt, rd, 0, 0x21)
 
@@ -127,6 +128,32 @@ int main(void) {
     psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, 0xDEADBEEFu);   /* r8 mutated */
     CHECK(lookup(ADDR_B, 0xDEADBEEFu, 0, 0, nullptr, nullptr, nullptr) ==
           PGXP_SRC_NATIVE);
+
+    /* --- same-value overwrite: value validation cannot detect provenance --- */
+    {
+        const uint32_t dst = ADDR_B + 0x40u;
+        produce_at(ADDR_A);
+        psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+        /* A synthetic/COP0/link write can reproduce the exact packed word but
+         * is still a new origin. It must not inherit the loaded sub-pixel XY. */
+        psx_pgxp_gpr_written(nullptr, 8, PACKED);
+        psx_pgxp_store(nullptr, SW(1, 8), dst, PACKED);
+        CHECK(lookup(dst, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+              PGXP_SRC_NATIVE);
+    }
+
+    /* --- destructive ALU alias: equal integer result still replaces shadow --- */
+    {
+        const uint32_t dst = ADDR_B + 0x80u;
+        produce_at(ADDR_A);
+        psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+        /* and r8,r8,r9 with r9=-1 leaves the architectural word unchanged.
+         * The hook receives pre-write sources, then clears r8 provenance. */
+        psx_pgxp_alu(nullptr, AND(8, 9, 8), PACKED, PACKED, 0xFFFFFFFFu);
+        psx_pgxp_store(nullptr, SW(1, 8), dst, PACKED);
+        CHECK(lookup(dst, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+              PGXP_SRC_NATIVE);
+    }
 
     /* --- MOVE idiom (memory mode, no cpu_mode needed) --- */
     produce_at(ADDR_A);

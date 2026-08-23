@@ -19,11 +19,9 @@ namespace PSXRecomp {
  *
  * NOT applied to LWC2/SWC2 — those emissions capture the raw loaded/stored
  * word themselves (a masked GTE register write must validate against the
- * word as loaded, not the register's masked value).
- *
- * Deliberately unhooked: AND/XOR/NOR/SLT-family and the exotic immediates —
- * they only ever DESTROY precision, and the engine's validate-on-read drops
- * their stale shadows without help. */
+ * word as loaded, not the register's masked value). Destructive ALU forms are
+ * still hooked: the runtime must replace stale destination provenance even
+ * when the resulting integer word is unchanged. */
 void append_pgxp_hooks(uint32_t instr, std::string& code);
 
 } // namespace PSXRecomp

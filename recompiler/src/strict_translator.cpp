@@ -521,8 +521,10 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
                 std::string link;
                 if (rd != 0) {
                     link = fmt::format(
-                        "cpu->gpr[{}] = 0x{:08X}u; /* link */ ",
-                        static_cast<int>(rd), d.address + 8);
+                        "cpu->gpr[{}] = 0x{:08X}u; /* link */ "
+                        "PGXP_GPR_WRITTEN({}u, cpu->gpr[{}]); ",
+                        static_cast<int>(rd), d.address + 8,
+                        static_cast<int>(rd), static_cast<int>(rd));
                 }
                 r.pre_delay_code = fmt::format(
                     "uint32_t psx_jt_{:08X} = cpu->gpr[{}]; {}",
@@ -730,6 +732,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         r.terminator_target = target;
         r.c_code = fmt::format(
             "cpu->gpr[31] = 0x{:08X}u; /* link $ra */ "
+            "PGXP_GPR_WRITTEN(31u, cpu->gpr[31]); "
             "cpu->pc = 0x{:08X}u; /* jal 0x{:08X} -- slice terminator (direct) */ return;",
             d.address + 8, target, target);
         r.comment = fmt::format("jal 0x{:08X}", target);

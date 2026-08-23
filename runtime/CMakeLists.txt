@@ -57,6 +57,14 @@ if(BUILD_TESTING)
         PSX_OVERLAY_DLL_BUILD=1)
     add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
 
+    add_executable(boot_state_transaction_test
+        tests/test_boot_state_transaction.c
+        src/boot_state.c)
+    target_include_directories(boot_state_transaction_test PRIVATE include)
+    psxrecomp_ensure_zlib()
+    target_link_libraries(boot_state_transaction_test PRIVATE ZLIB::ZLIB)
+    add_test(NAME boot_state_transaction_test COMMAND boot_state_transaction_test)
+
     add_executable(host_keymap_test
         tests/test_host_keymap.c
         src/host_keymap.c)

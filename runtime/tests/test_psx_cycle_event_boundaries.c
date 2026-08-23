@@ -21,6 +21,7 @@ uint64_t g_mmio_access_count = 0;
 static uint32_t s_cd_cycles_remaining = 5;
 static int s_cd_ready = 0;
 static uint32_t s_dma_ready_cycles = 0;
+static int s_mdec_recent = 0;
 
 void sio_advance(uint32_t cycles) { (void)cycles; }
 
@@ -57,7 +58,7 @@ uint32_t sio_cycles_to_irq(uint32_t mask) { (void)mask; return UINT32_MAX; }
 int psx_get_in_exception(void) { return 0; }
 int mdec_recently_active(uint32_t within_frames) {
     (void)within_frames;
-    return 0;
+    return s_mdec_recent;
 }
 
 void starvation_watchdog_check(void) {}
@@ -88,6 +89,33 @@ int main(void) {
                 "FAIL retroactive DMA credit: expected 1 boundary cycle got %u\n",
                 s_dma_ready_cycles);
         return 1;
+    }
+
+    /* Snapshotting must publish the scheduler's intentionally deferred quiet
+     * device interval. A clock at cycle 2 paired with CD state from cycle 0 is
+     * not a coherent save and cannot be repaired after load. */
+    {
+        PSXClockDomainSnapshot coherent;
+        s_cd_cycles_remaining = 5u;
+        s_cd_ready = 0;
+        s_dma_ready_cycles = 0u;
+        psx_cycles_reset_for_boot();
+        psx_set_cpu_overclock(100u);
+        psx_devices_service_to_now(); /* establish deadline at native cycle 0 */
+        psx_advance_cycles(2u);       /* clock advances; CD remains deferred */
+        if (s_cd_cycles_remaining != 5u) {
+            fprintf(stderr, "FAIL test did not establish deferred device gap\n");
+            return 1;
+        }
+        psx_clock_domain_snapshot(&coherent);
+        if (coherent.native_cycle_count != 2u ||
+            s_cd_cycles_remaining != 3u || s_cd_ready) {
+            fprintf(stderr,
+                    "FAIL snapshot was not device-coherent: cycle=%llu cd=%u ready=%d\n",
+                    (unsigned long long)coherent.native_cycle_count,
+                    s_cd_cycles_remaining, s_cd_ready);
+            return 1;
+        }
     }
 
     /* A 900% save/load must restore the CPU/native converter carry. Losing an
@@ -145,6 +173,9 @@ int main(void) {
         s_dma_ready_cycles = 0u;
         i_stat = 0u;
         i_mask = 0u;
+        /* The exact WipEout VBlank poll remains safe while an FMV is decoding;
+         * MDEC must not disable the title compactor and halve PALx2 playback. */
+        s_mdec_recent = 1;
         g_idle_skip_enabled = 1;
         psx_cycles_reset_for_boot();
         psx_set_cpu_overclock(900u);
@@ -174,6 +205,7 @@ int main(void) {
                     (unsigned long long)psx_cycle_count, s_cd_ready);
             return 1;
         }
+        s_mdec_recent = 0;
     }
 
     fprintf(stderr,

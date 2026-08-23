@@ -827,11 +827,14 @@ bool FullFunctionEmitter::emit_function(
             if (kind == "jal") {
                 out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
                                    relocate_ra(addr + 8));
+                out += "    PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
             } else if (kind == "jalr") {
                 uint8_t rd = (raw >> 11) & 0x1F;
                 if (rd != 0) {
                     out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;  /* jalr link before delay slot */\n",
                                        static_cast<int>(rd), relocate_ra(addr + 8));
+                    out += fmt::format("    PGXP_GPR_WRITTEN({}u, cpu->gpr[{}]);\n",
+                                       static_cast<int>(rd), static_cast<int>(rd));
                 }
             }
 
@@ -1085,6 +1088,7 @@ bool FullFunctionEmitter::emit_function(
                     uint32_t return_addr = relocate_ra(addr + 8);
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
                                        return_addr);
+                    out += "    PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
                     uint32_t ds_addr = addr + 4;
                     uint32_t base_phys = base_addr & 0x1FFFFFFFu;
                     uint32_t ds_phys = ds_addr & 0x1FFFFFFFu;
@@ -1141,6 +1145,8 @@ bool FullFunctionEmitter::emit_function(
                          * the in-block "jalr link before delay slot"). */
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;  /* jalr link before delay slot */\n",
                                            static_cast<int>(rd), return_addr);
+                        out += fmt::format("    PGXP_GPR_WRITTEN({}u, cpu->gpr[{}]);\n",
+                                           static_cast<int>(rd), static_cast<int>(rd));
                     }
                     uint32_t ds_addr = addr + 4;
                     uint32_t base_phys = base_addr & 0x1FFFFFFFu;
@@ -1352,11 +1358,13 @@ bool FullFunctionEmitter::emit_function(
                                            pb.terminator_addr);
                     }
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += "    PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
                     out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 } else {
                     out += "    { uint32_t _csp = cpu->gpr[29];\n";
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += "    PGXP_GPR_WRITTEN(31u, cpu->gpr[31]);\n";
                     // Regular call: always go through psx_dispatch (handles tail-call loop).
                     if (target == 0x00006380u) {
                         out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
@@ -1402,6 +1410,8 @@ bool FullFunctionEmitter::emit_function(
                     if (rd != 0) {
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
+                        out += fmt::format("    PGXP_GPR_WRITTEN({}u, cpu->gpr[{}]);\n",
+                                           static_cast<int>(rd), static_cast<int>(rd));
                     }
                     out += emit_irq_check_expr("_t");
                     out += "    cpu->pc = _t; return; }\n";
@@ -1410,6 +1420,8 @@ bool FullFunctionEmitter::emit_function(
                     if (rd != 0) {
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
+                        out += fmt::format("    PGXP_GPR_WRITTEN({}u, cpu->gpr[{}]);\n",
+                                           static_cast<int>(rd), static_cast<int>(rd));
                     }
                     out += emit_irq_check_expr(jalr_tgt);
                     out += fmt::format("    psx_dispatch(cpu, {});\n", jalr_tgt);
@@ -1987,6 +1999,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "#endif\n";
     out += "    cpu->gpr[8] = ((w0 & 0xFFFFu) << 16) +\n";
     out += "                  (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
+    out += "    PGXP_GPR_WRITTEN(8u, cpu->gpr[8]);\n";
     out += "    cpu->pc = cpu->gpr[8];\n";
     out += "    return 1;\n";
     out += "}\n\n";

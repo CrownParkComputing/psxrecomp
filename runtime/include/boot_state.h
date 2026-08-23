@@ -101,9 +101,13 @@ enum {
                               cache, so fetch-miss cycles differ per peer/retry
                               and IRQ delivery lands a few wait-loop iterations
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
-                              from identical baselines). Optional on load for
-                              old blobs (left untouched when absent).          */
+                              from identical baselines). Required by v6.       */
 };
+
+/* Optional scheduler gate used by user-facing save-state loads. It runs on the
+ * decoded CPU PC before apply and again at the transactional commit boundary;
+ * rejection at either point leaves the live machine unchanged. */
+typedef int (*BootStateResumePcValidator)(uint32_t pc);
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */
 int  boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
@@ -134,10 +138,19 @@ void boot_state_vram_mirror_reset(void);
 int  boot_state_load(const char* path, uint32_t bios_checksum,
                      uint32_t entry_pc, CPUState* cpu);
 
+int  boot_state_load_checked(const char* path, uint32_t bios_checksum,
+                             uint32_t entry_pc, CPUState* cpu,
+                             BootStateResumePcValidator resume_pc_ok);
+
 /* Same as boot_state_load, but from an already-buffered .pst image (netplay). */
 int  boot_state_load_buffer(const uint8_t* file, size_t file_len,
                             uint32_t bios_checksum, uint32_t entry_pc,
                             CPUState* cpu);
+
+int  boot_state_load_buffer_checked(const uint8_t* file, size_t file_len,
+                                    uint32_t bios_checksum, uint32_t entry_pc,
+                                    CPUState* cpu,
+                                    BootStateResumePcValidator resume_pc_ok);
 
 /* Header-only integrity check (no section inflate/apply). Returns 1 if this
  * build can load the image; 0 and fills reason (when non-NULL) on reject. */

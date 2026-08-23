@@ -292,5 +292,9 @@ void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr, uint32_t hi, uint32_t
 void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr) {
     if (g_cbs.pgxp && g_cbs.pgxp->cop2) g_cbs.pgxp->cop2(cpu, instr, value, addr);
 }
+void psx_pgxp_gpr_written(struct CPUState *cpu, uint32_t reg, uint32_t value) {
+    if (g_cbs.pgxp && g_cbs.pgxp->gpr_written)
+        g_cbs.pgxp->gpr_written(cpu, reg, value);
+}
 #endif /* PSX_PGXP */
 /* ----------------------------------------------------------------------- */

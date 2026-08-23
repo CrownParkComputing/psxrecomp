@@ -2374,6 +2374,7 @@ static void init_callbacks(void) {
                 psx_pgxp_alu,
                 psx_pgxp_muldiv,
                 psx_pgxp_cop2,
+                psx_pgxp_gpr_written,
             };
             s_callbacks.pgxp = &pgxp_hooks_table;
         }

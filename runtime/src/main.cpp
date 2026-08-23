@@ -479,6 +479,7 @@ static uint64_t s_fps_last_retired_cycles = 0;
 static uint64_t s_fps_last_cpu_native_cycles = 0;
 static uint64_t s_fps_last_spu_frames = 0;
 static uint64_t s_fps_last_cdda_sectors = 0;
+static uint32_t s_fps_last_mdec_decodes = 0;
 static uint64_t s_fps_last_idle_skip_count = 0;
 static uint64_t s_fps_last_idle_skip_cycles = 0;
 static std::string s_fps_base_title;
@@ -5996,6 +5997,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 cdrom_debug_snapshot(&cd);
                 s_fps_last_cdda_sectors = cd.cdda_sectors_played;
             }
+            s_fps_last_mdec_decodes = mdec_get_decode_count();
             s_fps_last_idle_skip_count = g_idle_skip_count;
             s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
             if (sdl_window && s_fps_base_title.empty()) {
@@ -6025,6 +6027,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             cdrom_debug_snapshot(&cd_info);
             const uint64_t cdda_delta =
                 cd_info.cdda_sectors_played - s_fps_last_cdda_sectors;
+            const uint32_t mdec_decode_count = mdec_get_decode_count();
+            const uint32_t mdec_decode_delta =
+                mdec_decode_count - s_fps_last_mdec_decodes;
             const double effective_cdda_hz = native_delta
                 ? (double)cdda_delta * 33868800.0 / (double)native_delta : 0.0;
             const uint64_t idle_count_delta =
@@ -6098,6 +6103,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              "spu_frames=%llu spu_effective=%.1fHz "
                              "cdda_playing=%u cdda_track=%d "
                              "cdda_sectors=%llu cdda_effective=%.2fHz "
+                             "mdec_decodes=%u "
                              "idle_skips=%llu idle_native=%llu carry=%u\n",
                              fps, speed, (unsigned long long)s_frame_count,
                              psx_get_cpu_overclock(), effective_cpu,
@@ -6110,6 +6116,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              cd_info.cdda_track,
                              (unsigned long long)cdda_delta,
                              effective_cdda_hz,
+                             (unsigned)mdec_decode_delta,
                              (unsigned long long)idle_count_delta,
                              (unsigned long long)idle_cycles_delta,
                              g_psx_oc_accum);
@@ -6122,6 +6129,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
             s_fps_last_spu_frames = spu_info.render_frames;
             s_fps_last_cdda_sectors = cd_info.cdda_sectors_played;
+            s_fps_last_mdec_decodes = mdec_decode_count;
             s_fps_last_idle_skip_count = g_idle_skip_count;
             s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
         }
@@ -12885,12 +12893,12 @@ session_reboot:
             g_host_refresh_hz = (double)dm.refresh_rate;
             if (host_refresh_matches_present_target()) {
                 std::printf("psxrecomp: sync-to-host-refresh: %.3f Hz CRTC on "
-                            "%d Hz panel (driver vsync eligible)\n",
-                            present_target_hz(), dm.refresh_rate);
+                            "%.3f Hz panel (driver vsync eligible)\n",
+                            present_target_hz(), (double)dm.refresh_rate);
             } else {
-                std::printf("psxrecomp: host panel %d Hz differs from %.6f Hz "
+                std::printf("psxrecomp: host panel %.3f Hz differs from %.6f Hz "
                             "CRTC; keeping exact %.6f ms wall pacing\n",
-                            dm.refresh_rate, present_target_hz(),
+                            (double)dm.refresh_rate, present_target_hz(),
                             g_frame_period_ms);
             }
         }

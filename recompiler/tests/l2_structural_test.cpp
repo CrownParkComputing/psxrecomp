@@ -140,7 +140,7 @@ static const Form kForms[] = {
 
     // AND $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x24), "and_v0_v1_a0",
-      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "&"}) },
+      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "&", "PGXP_ALU"}) },
 
     // OR $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x25), "or_v0_v1_a0",
@@ -148,19 +148,19 @@ static const Form kForms[] = {
 
     // XOR $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x26), "xor_v0_v1_a0",
-      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "^"}) },
+      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "^", "PGXP_ALU"}) },
 
     // NOR $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x27), "nor_v0_v1_a0",
-      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "~"}) },
+      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "~", "PGXP_ALU"}) },
 
     // SLT $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x2A), "slt_v0_v1_a0",
-      must_contain({"gpr[2]", "int32_t", "gpr[3]", "gpr[4]"}) },
+      must_contain({"gpr[2]", "int32_t", "gpr[3]", "gpr[4]", "PGXP_ALU"}) },
 
     // SLTU $v0, $v1, $a0
     { R_TYPE(V1, A0, V0, 0, 0x2B), "sltu_v0_v1_a0",
-      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "<"}) },
+      must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "<", "PGXP_ALU"}) },
 
     // JR $at: target must be snapshotted before its delay slot.
     { R_TYPE(1, 0, 0, 0, 0x08), "jr_at_latches_target",
@@ -183,6 +183,8 @@ static const Form kForms[] = {
           const auto link = r.pre_delay_code.find("cpu->gpr[1] = 0x00000008u");
           if (latch == std::string::npos || link == std::string::npos || latch > link)
               return fmt::format("target not latched before aliased link: {}", r.pre_delay_code);
+          if (!contains(r.pre_delay_code, "PGXP_GPR_WRITTEN(1u"))
+              return fmt::format("link write lacks PGXP barrier: {}", r.pre_delay_code);
           if (!contains(r.c_code, "cpu->pc = psx_jt_00000000"))
               return fmt::format("terminator does not use latched target: {}", r.c_code);
           return "";
@@ -231,7 +233,7 @@ static const Form kForms[] = {
 
     // ANDI $v0, $v1, 0xFF
     { I_TYPE(0x0C, V1, V0, 0xFF), "andi_v0_v1_ff",
-      must_contain({"gpr[2]", "gpr[3]", "0xFFu"}) },
+      must_contain({"gpr[2]", "gpr[3]", "0xFFu", "PGXP_ALU"}) },
 
     // ORI $v0, $v1, 0xFF
     { I_TYPE(0x0D, V1, V0, 0xFF), "ori_v0_v1_ff",
@@ -239,7 +241,7 @@ static const Form kForms[] = {
 
     // XORI $v0, $v1, 0xFF
     { I_TYPE(0x0E, V1, V0, 0xFF), "xori_v0_v1_ff",
-      must_contain({"gpr[2]", "gpr[3]", "0xFFu"}) },
+      must_contain({"gpr[2]", "gpr[3]", "0xFFu", "PGXP_ALU"}) },
 
     // LUI $v0, 0x8000
     { I_TYPE(0x0F, 0, V0, 0x8000), "lui_v0_8000",
@@ -247,11 +249,11 @@ static const Form kForms[] = {
 
     // SLTI $v0, $v1, 42
     { I_TYPE(0x0A, V1, V0, 42), "slti_v0_v1_42",
-      must_contain({"gpr[2]", "int32_t", "gpr[3]", "42"}) },
+      must_contain({"gpr[2]", "int32_t", "gpr[3]", "42", "PGXP_ALU"}) },
 
     // SLTIU $v0, $v1, 42
     { I_TYPE(0x0B, V1, V0, 42), "sltiu_v0_v1_42",
-      must_contain({"gpr[2]", "gpr[3]", "<"}) },
+      must_contain({"gpr[2]", "gpr[3]", "<", "PGXP_ALU"}) },
 
     // === Load/Store ===
     // LW $v0, 0($v1)
@@ -305,8 +307,13 @@ static const Form kForms[] = {
       check_code([](const std::string& c) -> std::string {
           if (!contains(c, "gpr[2]")) return "missing gpr[2]";
           if (!contains(c, "cop0[12]")) return "missing cop0[12]";
+          if (!contains(c, "PGXP_GPR_WRITTEN")) return "missing PGXP barrier";
           return "";
       })},
+
+    // CFC2 $v0, $12: control-register values have no positional provenance.
+    { I_TYPE(0x12, 0x02, V0, 12 << 11), "cfc2_v0_ctrl12",
+      must_contain({"gpr[2]", "gte_ctrl[12]", "PGXP_COP2"}) },
 
     // MTC0 $v1, $12  (write SR)
     { I_TYPE(0x10, 0x04, V1, 12 << 11), "mtc0_v1_sr",

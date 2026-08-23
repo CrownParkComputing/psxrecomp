@@ -1165,6 +1165,41 @@ void cfg_codegen_load_delay_test() {
           "CFG codegen preserves MIPS-I dependent load-delay value semantics");
 }
 
+void cfg_codegen_load_delay_overwrite_pgxp_test() {
+    constexpr uint32_t base = 0x80004590u;
+    constexpr uint32_t and_k0_k0_t0 =
+        (26u << 21) | (8u << 16) | (26u << 11) | 0x24u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = base;
+    exe.header.file_size = 20u;
+    append_word(exe.code_data, 0x8F5A4C38u); // lw k0,0x4c38(k0)
+    append_word(exe.code_data, and_k0_k0_t0); // same-value when t0 == -1
+    append_word(exe.code_data, 0xAC3A4C38u); // sw k0,0x4c38(at)
+    append_word(exe.code_data, 0x03E00008u); // jr ra
+    append_word(exe.code_data, 0x00000000u); // delay-slot nop
+
+    PSXRecomp::Function function{};
+    function.start_addr = base;
+    function.end_addr = base + 20u;
+    function.size = 20u;
+    function.name = "cfg_load_delay_overwrite_pgxp";
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator generator(exe);
+    const std::string code = generator.generate_function(function, cfg).full_code;
+
+    const size_t load_hook = code.find(
+        "PGXP_LOAD(0x8F5A4C38u, _pgxa, psx_ldd_80004590)");
+    const size_t alu_hook = code.find("PGXP_ALU(0x0348D024u");
+    const size_t discard = code.find(
+        "(void)psx_ldd_80004590;  /* successor write wins */");
+    check(load_hook != std::string::npos && alu_hook != std::string::npos &&
+          discard != std::string::npos && load_hook < alu_hook &&
+          alu_hook < discard,
+          "load-delay successor overwrite replaces pending PGXP provenance");
+}
+
 } // namespace
 
 int main() {
@@ -1180,6 +1215,7 @@ int main() {
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();
         cfg_codegen_load_delay_test();
+        cfg_codegen_load_delay_overwrite_pgxp_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

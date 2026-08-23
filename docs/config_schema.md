@@ -186,7 +186,10 @@ code asks the runtime how many otherwise-identical iterations can retire before
 the next device deadline and writes the compacted value through the same
 base/offset. The full instruction word is required, `rt` must be nonzero, and a
 main-image mismatch is fatal. The runtime helper remains inert at stock speed,
-during MDEC activity, exceptions, lockstep/cosim, and other precise modes.
+during exceptions, lockstep/cosim, and other precise modes. A title-specific
+site may compact while MDEC is active only because its full guarded loop has
+been proven to observe no state except a deadline-driven counter and its private
+timeout; one real iteration is always retained at the event boundary.
 
 ### Guarded widescreen participation comparisons
 

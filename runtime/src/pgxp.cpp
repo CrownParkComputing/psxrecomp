@@ -21,10 +21,11 @@
  * validation against the actual guest word it claims to describe. Anything
  * that writes guest state without a hook (DMA, memcpy loaders, un-hooked
  * instructions) simply leaves a stale shadow behind, and the next validation
- * drops it. We never model side effects — overwrite and validate only. The
- * one accepted hole (shared with the reference implementations): an untracked
- * writer storing the byte-identical word keeps the shadow alive, which is
- * harmless because the position it describes is still that word.
+ * drops it. We never model side effects — overwrite and validate only. Every
+ * known CPU destination write either installs new provenance or explicitly
+ * replaces the destination with a known-word/no-precision shadow. This is
+ * required even for a byte-identical overwrite: identical packed screen words
+ * can come from different sub-pixel positions.
  *
  * Everything here is host-only and visual-only: guest-visible state is never
  * read back from shadows, shadows are dropped on savestate/rewind, and the
@@ -191,6 +192,16 @@ static inline uint32_t f_rd(uint32_t i)    { return (i >> 11) & 31u; }
 static inline uint32_t f_shamt(uint32_t i) { return (i >> 6) & 31u; }
 static inline uint32_t f_funct(uint32_t i) { return i & 63u; }
 static inline int32_t  f_simm(uint32_t i)  { return (int32_t)(int16_t)(i & 0xFFFFu); }
+
+/* Architectural/synthetic register write for operations that do not produce
+ * useful PGXP provenance. Do not value-compare here: a byte-identical write is
+ * still a new provenance event and must not inherit the previous shadow. */
+extern "C" void psx_pgxp_gpr_written(struct CPUState *cpu, uint32_t reg,
+                                      uint32_t value) {
+    (void)cpu;
+    if (!g_pgxp_active || reg == 0 || reg >= 32) return;
+    pv_reset(&s_gpr[reg], value);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Memory-mode hooks: loads / stores                                          */

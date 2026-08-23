@@ -221,7 +221,8 @@ extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
                                               uint32_t *miss_unrecorded,
                                               uint32_t *miss_ambiguous);
 
-/* PGXP dataflow-shadowing hook macros (PGXP_LOAD/STORE/ALU/MULDIV/COP2).
+/* PGXP dataflow-shadowing hook macros
+ * (PGXP_LOAD/STORE/ALU/MULDIV/COP2/GPR_WRITTEN).
  * The emitter writes them unconditionally; they expand to real calls only
  * under -DPSX_PGXP=1 (the pgxp build variant) and to ((void)0) otherwise.
  * Pulled in here so every generated translation unit sees them. */

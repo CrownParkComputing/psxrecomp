@@ -24,11 +24,9 @@ inline int16_t get_imm16(uint32_t i) { return (int16_t)(i & 0xFFFF); }
  * the macros preprocess to ((void)0) and the optimizer erases the dead
  * capture locals, so base objects are unchanged; only a -DPSX_PGXP=1 TU pays.
  *
- * Deliberately unhooked: AND/XOR/NOR/SLT-family and the exotic immediates —
- * they only ever DESTROY precision, and the engine's validate-on-read drops
- * their stale shadows without help. The configured widescreen special sites
- * return early above translate_instruction's main dispatch and are likewise
- * unhooked (they are cull compares, not vertex moves; validation covers). */
+ * Destructive operations are hooked too. Their current runtime behavior is a
+ * destination reset, which is intentionally stronger than validate-on-read:
+ * an equal-value overwrite may have unrelated sub-pixel provenance. */
 void append_pgxp_hooks(uint32_t instr, std::string& code) {
     const uint32_t opcode = (instr >> 26) & 0x3F;
     const uint32_t rs = get_rs(instr);
@@ -75,7 +73,8 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
                 code, instr, reg_name(rs), reg_name(rt));
             return;
         case 0x20: case 0x21: case 0x22: case 0x23:  /* ADD(U)/SUB(U)         */
-        case 0x25:                                   /* OR                    */
+        case 0x24: case 0x25: case 0x26: case 0x27:  /* AND/OR/XOR/NOR        */
+        case 0x2A: case 0x2B:                        /* SLT / SLTU             */
             if (rd == 0) return;
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
@@ -93,6 +92,20 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
             reg_name(rs), code, instr, reg_name(rt),
             (uint32_t)(int32_t)offset);
         return;
+    case 0x0A: case 0x0B:                      /* SLTI / SLTIU                */
+        if (rt == 0) return;
+        code = fmt::format(
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
+            reg_name(rs), code, instr, reg_name(rt),
+            (uint32_t)(int32_t)offset);
+        return;
+    case 0x0C: case 0x0E:                      /* ANDI / XORI                 */
+        if (rt == 0) return;
+        code = fmt::format(
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
+            reg_name(rs), code, instr, reg_name(rt),
+            (uint32_t)(uint16_t)offset);
+        return;
     case 0x0D:                                 /* ORI                         */
         if (rt == 0) return;
         code = fmt::format(
@@ -105,9 +118,16 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
                            code, instr, reg_name(rt));
         return;
+    case 0x10:                                 /* COP0                        */
+        if (get_rs(instr) == 0x00 && rt != 0) {/* MFC0: no position source   */
+            code = fmt::format("{}\n    PGXP_GPR_WRITTEN({}u, {});",
+                               code, rt, reg_name(rt));
+        }
+        return;
     case 0x12: {                               /* COP2 register transfers     */
         const uint32_t cop_op = (instr >> 21) & 0x1F;
-        if ((cop_op == 0x00 && rt != 0) || cop_op == 0x04)  /* MFC2 / MTC2   */
+        if (((cop_op == 0x00 || cop_op == 0x02) && rt != 0) ||
+            cop_op == 0x04)                    /* MFC2/CFC2/MTC2              */
             code = fmt::format("{}\n    PGXP_COP2(0x{:08X}u, {}, 0u);",
                                code, instr, reg_name(rt));
         return;

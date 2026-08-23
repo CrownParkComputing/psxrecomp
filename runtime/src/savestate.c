@@ -755,8 +755,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         path[0] = '\0';
         if (s_load_blob && s_load_blob_len > 0) {
             const size_t blob_len = s_load_blob_len;
-            loaded = boot_state_load_buffer(s_load_blob, blob_len,
-                                            s_bios_checksum, s_entry_pc, cpu);
+            loaded = boot_state_load_buffer_checked(
+                s_load_blob, blob_len, s_bios_checksum, s_entry_pc, cpu,
+                savestate_resume_pc_ok);
             clear_load_blob();
             if (!loaded) {
                 fprintf(stderr,
@@ -766,7 +767,8 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 psx_frontend_on_savestate_notify(1, slot, 0);
             }
         } else if (savestate_slot_path(slot, path, sizeof(path))) {
-            loaded = boot_state_load(path, s_bios_checksum, s_entry_pc, cpu);
+            loaded = boot_state_load_checked(path, s_bios_checksum, s_entry_pc,
+                                             cpu, savestate_resume_pc_ok);
             if (!loaded) {
                 fprintf(stderr,
                         "savestate: LOAD FAILED slot %d %s\n",

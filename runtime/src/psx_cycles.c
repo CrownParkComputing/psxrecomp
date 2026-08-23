@@ -181,9 +181,13 @@ int      psx_in_device_service  = 0;         /* re-entrancy guard               
 
 void psx_clock_domain_snapshot(PSXClockDomainSnapshot *out) {
     if (!out) return;
-    /* A save is a publication barrier. The caller normally flushes first, but
-     * doing it here makes the API safe in isolation as well. */
+    /* A save is a full CPU/device publication barrier. Flushing the raw CPU
+     * batch alone is insufficient: the deadline scheduler may still have the
+     * devices intentionally lagging behind psx_cycle_count. Serialize only
+     * after replaying that quiet gap so the clock and device blobs describe
+     * one instant; restore then safely re-anchors at the captured timestamp. */
     psx_cyc_batch_flush();
+    psx_devices_service_to_now();
     out->native_cycle_count = psx_cycle_count;
     out->cpu_retired_cycles = psx_cpu_retired_cycles;
     out->cpu_native_cycles = psx_cpu_native_cycles;
@@ -603,15 +607,22 @@ uint32_t psx_idle_batch_countdown(uint32_t timeout_value) {
     (void)timeout_value;
     return 0u;
 #else
-    extern int mdec_recently_active(uint32_t within_frames);
     extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
     extern int psx_get_in_exception(void);
     if (!idle_skip_on() || psx_get_effective_cpu_overclock() <= 100u ||
-        mdec_recently_active(6u) || psx_get_in_exception() || g_psx_call_bail ||
+        psx_get_in_exception() || g_psx_call_bail ||
         g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
         psx_idle_countdown_reset();
         return 0u;
     }
+
+    /* Unlike the generic idle detector, this title-specific site is proven to
+     * observe only the VBlank counter and its private timeout. MDEC activity is
+     * therefore not a reason to disable it: CD/DMA/MDEC input progress remains
+     * bounded by the same native device deadline, and one real iteration is
+     * retained to observe the event. Disabling the compactor while MDEC was
+     * active made PALx2 FMV execute millions of inert poll iterations and fall
+     * to roughly half real-time despite a genuine 9x CPU clock. */
 
     /* The generated LW can leave raw work in either deferred tier. Publish it
      * before inspecting device deadlines: otherwise the projected skip can be
