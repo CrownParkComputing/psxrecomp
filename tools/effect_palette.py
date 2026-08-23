@@ -324,7 +324,10 @@ def sample_oracle(conn, args, out=sys.stderr):
     deadline = time.monotonic() + args.watch_secs
     while time.monotonic() < deadline and len(sigs) < args.samples:
         try:
-            use_window = args.window if root else None
+            # Windowing is off by default and unsafe in general: an
+            # ordering table chains to primitives anywhere in RAM, and this
+            # game's span 1.5 MB. Only honour it if explicitly asked for.
+            use_window = args.window if (root and args.window) else None
             with open(os.devnull, "w") as quiet:
                 rep, meta = walk_side(conn, "oracle", pause=False,
                                       addr=root, window=use_window,
@@ -413,9 +416,13 @@ def main():
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--watch-secs", type=float, default=90.0,
                     help="how long to keep reading the running oracle")
-    ap.add_argument("--window", type=lambda v: int(v, 0), default=0x20000,
+    ap.add_argument("--window", type=lambda v: int(v, 0), default=0,
                     help="bytes of RAM to re-read per oracle sample once the "
-                         "list is located (0 = always snapshot all 2 MB)")
+                         "list is located. DEFAULT 0 (always read all 2 MB): "
+                         "this game's list reaches primitives from 0x0363B0 "
+                         "to 0x1B23E0, so no fixed window around the root "
+                         "spans it, and a truncated walk looks exactly like a "
+                         "list with nothing in it")
     ap.add_argument("--poll", type=float, default=0.4,
                     help="seconds between oracle reads")
     ap.add_argument("--ring-frames", type=int, default=600,

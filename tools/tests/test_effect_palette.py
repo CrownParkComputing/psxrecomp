@@ -321,3 +321,33 @@ class OneSidedObjectTest(unittest.TestCase):
         bright = ep.merge([self.sig(64, 599, 3, peak=220)])
         self.assertEqual(dim["groups"][(64, 599)]["distinct_colours"],
                          bright["groups"][(64, 599)]["distinct_colours"])
+
+
+class WindowSafetyTest(unittest.TestCase):
+    """An ordering table chains to primitives anywhere in RAM.
+
+    This game's list reaches from 0x0363B0 to 0x1B23E0 -- 1.5 MB. A fixed
+    window around the root truncates the walk, truncates BOTH reads
+    identically so the coherence check passes, and the missing primitives are
+    indistinguishable from primitives the game never drew. Two consecutive
+    runs reported zero oracle samples of any object because of it.
+    """
+
+    def test_window_defaults_to_off(self):
+        import argparse
+        import contextlib
+        import io as _io
+        parser = None
+        # Re-parse the tool's own arguments to pin the shipped default.
+        src = _io.open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "effect_palette.py")).read()
+        self.assertIn('ap.add_argument("--window"', src)
+        window_decl = src.split('ap.add_argument("--window"', 1)[1]
+        window_decl = window_decl.split("ap.add_argument", 1)[0]
+        self.assertIn("default=0", window_decl)
+        del parser, argparse, contextlib
+
+    def test_span_of_a_real_list_exceeds_any_small_window(self):
+        """The measured span is the reason the default is off."""
+        lo, hi = 0x0363B0, 0x1B23E0
+        self.assertGreater(hi - lo, 0x100000)
