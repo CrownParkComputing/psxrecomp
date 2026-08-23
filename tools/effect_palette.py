@@ -317,20 +317,44 @@ def sample_oracle(conn, args, out=sys.stderr):
     sigs = []
     empty = 0
     torn = 0
+    truncated = 0
     root = None          # once known, read only the span around it
+    expect_nodes = 0     # what a FULL walk found; a windowed one must match
+    seen_classes = collections.Counter()
     deadline = time.monotonic() + args.watch_secs
     while time.monotonic() < deadline and len(sigs) < args.samples:
         try:
+            use_window = args.window if root else None
             with open(os.devnull, "w") as quiet:
                 rep, meta = walk_side(conn, "oracle", pause=False,
-                                      addr=root, window=args.window,
+                                      addr=root, window=use_window,
                                       park_for_reread=False,
                                       max_nodes=args.max_nodes, out=quiet)
+                # A window that does not reach the whole list truncates the
+                # walk, and it truncates BOTH reads identically -- so the
+                # coherence check passes and the missing primitives look like
+                # primitives the game never drew. Re-read in full when the
+                # node count drops off, and stop trusting the cached root.
+                if rep and expect_nodes and \
+                        rep.get("nodes", 0) < expect_nodes * 0.9:
+                    truncated += 1
+                    root = None
+                    rep, meta = walk_side(conn, "oracle", pause=False,
+                                          park_for_reread=False,
+                                          max_nodes=args.max_nodes, out=quiet)
         except DebugError as e:
             print(f"  oracle read failed: {e}", file=out)
             time.sleep(args.poll)
             continue
         if rep:
+            nodes = rep.get("nodes", 0)
+            if root is None:
+                # This walk read all of RAM, so its node count is the honest
+                # size of the list to hold later windowed walks against.
+                expect_nodes = max(expect_nodes, nodes)
+            for c in rep.get("classes") or []:
+                seen_classes[c["key"]] = max(seen_classes[c["key"]],
+                                             c["count"])
             # Remember where the list lives; the next read is a few KB rather
             # than 2 MB, which is what stops the oracle stuttering.
             root = rep.get("root") or root
@@ -355,10 +379,27 @@ def sample_oracle(conn, args, out=sys.stderr):
     if torn:
         print(f"  oracle: discarded {torn} torn read(s) taken while the game "
               f"rebuilt the list", file=out)
+    if truncated:
+        print(f"  oracle: {truncated} windowed read(s) came back short and "
+              f"were re-read in full", file=out)
     if not sigs:
+        # Say WHAT was walked. "None held additive shaded quads" is equally
+        # consistent with the effect not playing and with the walk reading the
+        # wrong thing, and those need different responses from the user.
         print(f"  oracle: {empty} walks read, none held additive shaded "
-              f"quads -- the effect was not playing on DuckStation while "
-              f"this ran. Replay it there and try again.", file=out)
+              f"quads.", file=out)
+        if seen_classes:
+            top = ", ".join(f"{k} x{v}" for k, v in
+                            seen_classes.most_common(8))
+            print(f"  oracle: the lists it DID walk contained: {top}",
+                  file=out)
+            print(f"  oracle: if that looks like the game's normal scene, the "
+                  f"effect was not playing on DuckStation while this ran; if "
+                  f"it looks sparse or wrong, the walk is reading the wrong "
+                  f"buffer.", file=out)
+        else:
+            print(f"  oracle: no list was walked at all -- nothing was read "
+                  f"to look at.", file=out)
     return sigs
 
 
