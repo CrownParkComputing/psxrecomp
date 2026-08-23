@@ -285,10 +285,14 @@ class OneShotServer:
     line, reply, close. Any client that assumes a persistent socket fails
     against this exactly the way it fails against the real runtime."""
 
-    def __init__(self, handler):
+    def __init__(self, handler, raw=None):
         import socket as _s
         import threading
         self.handler = handler
+        # `raw` sends exact bytes instead of a serialised handler result, so a
+        # reply spread over several lines can be reproduced verbatim — which is
+        # what pc_probe_dump actually does.
+        self.raw = raw
         self.requests = []
         self.sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
         self.sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
@@ -314,9 +318,12 @@ class OneShotServer:
                     buf += chunk
                 req = json.loads(buf.split(b"\n")[0].decode())
                 self.requests.append(req)
-                reply = self.handler(req)
-                reply.setdefault("id", req.get("id", 0))
-                c.sendall((json.dumps(reply) + "\n").encode())
+                if self.raw is not None:
+                    c.sendall(self.raw)
+                else:
+                    reply = self.handler(req)
+                    reply.setdefault("id", req.get("id", 0))
+                    c.sendall((json.dumps(reply) + "\n").encode())
             except Exception:
                 pass
             finally:
@@ -564,3 +571,57 @@ class TestParityFieldNames(unittest.TestCase):
         d = self.P.gpu_state_delta({"depth24": 0}, {})
         self.assertTrue(d["depth24"]["one_sided"],
                         "only one side knowing a field is not disagreement")
+
+
+class TestMultiLineReply(unittest.TestCase):
+    """One JSON object split across several lines must still be read whole.
+
+    pc_probe_dump builds its reply with repeated send_line() calls — header,
+    one line per slot, one per sample — so the first newline lands in the
+    MIDDLE of the document. Stopping there yields a fragment, and the error it
+    produces ("malformed reply") names the server rather than the reader, which
+    is how this survived a first fix: the read loop was corrected and the parse
+    was left splitting on the first newline, so nothing changed.
+    """
+
+    def test_a_document_spread_over_lines_parses(self):
+        body = ('{"id":1,"ok":true,"slots":[\n'
+                '{"pc":"0x0006844C","count":3},\n'
+                '{"pc":"0x0006842C","count":9}\n'
+                '],"samples":[\n'
+                '{"pc":"0x0006842C","regs":{"s4":"0x800E4C04"}}\n'
+                ']}\n')
+        srv = OneShotServer(None, raw=body.encode())
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        rep = conn.raw("pc_probe_dump")
+        self.assertTrue(rep["ok"])
+        self.assertEqual(len(rep["slots"]), 2)
+        self.assertEqual(rep["samples"][0]["regs"]["s4"], "0x800E4C04")
+
+    def test_a_single_line_reply_still_works(self):
+        srv = OneShotServer(lambda req: {"ok": True, "frame": 7})
+        self.addCleanup(srv.stop)
+        conn = GF.DebugConn("127.0.0.1", srv.port, timeout=5.0)
+        self.assertEqual(conn.raw("frame")["frame"], 7)
+
+
+class TestLooksComplete(unittest.TestCase):
+    def test_a_truncated_object_is_not_complete(self):
+        self.assertFalse(GF._looks_complete(b'{"ok":true,"slots":['))
+
+    def test_a_closed_object_is_complete(self):
+        self.assertTrue(GF._looks_complete(b'{"ok":true}'))
+
+    def test_a_brace_inside_a_string_does_not_count(self):
+        # Otherwise a reply containing "}" in a value would look finished early
+        # and be truncated at exactly the wrong place.
+        self.assertFalse(GF._looks_complete(b'{"note":"} not the end"'))
+        self.assertTrue(GF._looks_complete(b'{"note":"} not the end"}'))
+
+    def test_an_escaped_quote_does_not_end_the_string(self):
+        self.assertTrue(GF._looks_complete(b'{"a":"x\\"y"}'))
+
+    def test_nesting_is_tracked(self):
+        self.assertFalse(GF._looks_complete(b'{"a":{"b":1}'))
+        self.assertTrue(GF._looks_complete(b'{"a":{"b":1}}'))

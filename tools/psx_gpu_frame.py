@@ -196,9 +196,25 @@ class DebugConn:
 
         if not buf:
             raise DebugError(f"{name}: server closed without replying")
-        head = bytes(buf).split(b"\n", 1)[0]
+        # Parse the WHOLE buffer, not just the first line.
+        #
+        # Fixing the read loop to keep going until the document was complete and
+        # then still splitting on the first newline here left the bug exactly
+        # where it was: pc_probe_dump spreads one JSON object across several
+        # send_line() calls, so the first line is a fragment. JSON treats the
+        # embedded newlines as whitespace, so the joined buffer parses directly.
+        #
+        # The first line is kept as a fallback for a peer that sends more than
+        # one document down the same connection (an event followed by a reply,
+        # say), where the whole buffer would not parse but the first line does.
+        whole = bytes(buf).decode("utf-8", "replace")
         try:
-            return json.loads(head.decode("utf-8", "replace"))
+            return json.loads(whole)
+        except json.JSONDecodeError:
+            pass
+        head = whole.split("\n", 1)[0]
+        try:
+            return json.loads(head)
         except json.JSONDecodeError as e:
             raise DebugError(f"{name}: malformed reply ({e}); "
                              f"first 200 bytes: {head[:200]!r}") from e
@@ -1181,6 +1197,40 @@ def find_display_lists(ram: bytes, min_prims: int = 4, limit: int = 8,
 
     out.sort(key=score, reverse=True)
     return out[:limit]
+
+
+def class_on_screen(conn, op_name: str) -> Tuple[bool, Dict[str, int]]:
+    """Is this primitive class currently being drawn? Also returns what is.
+
+    Several tools depend on a routine actually RUNNING -- a write trace over its
+    packets, a block probe at one of its instructions -- and when it is not,
+    every one of them reports something that sounds like a different problem:
+    no writes recorded, no candidate fired, no table found. Checking first turns
+    all of those into one plain statement.
+    """
+    paused = False
+    try:
+        try:
+            conn.cmd("pause")
+            paused = True
+        except DebugError:
+            pass
+        ram = snapshot_ram(conn)
+    finally:
+        if paused:
+            try:
+                conn.cmd("continue")
+            except DebugError:
+                pass
+    cands = find_display_lists(ram)
+    if not cands:
+        return False, {}
+    prims = decode_entries(walk_ordering_table(ram, cands[0]["root"]))
+    counts: Dict[str, int] = {}
+    for p in prims:
+        if p["kind"] == "poly":
+            counts[p["op_name"]] = counts.get(p["op_name"], 0) + 1
+    return counts.get(op_name, 0) > 0, counts
 
 
 def dma_gpu_list_root(conn: "DebugConn") -> Optional[int]:

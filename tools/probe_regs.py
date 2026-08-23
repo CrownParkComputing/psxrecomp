@@ -35,7 +35,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from psx_gpu_frame import DEFAULT_NATIVE_PORT, DebugConn, DebugError  # noqa: E402
+from psx_gpu_frame import (  # noqa: E402
+    DEFAULT_NATIVE_PORT, DebugConn, DebugError, class_on_screen,
+)
 
 KIND = "psx-probe-regs"
 MAX_PCS = 16          # PC_PROBE_MAX_PCS in debug_server.c
@@ -58,7 +60,8 @@ def candidates(pc, back, step, limit=MAX_PCS):
 
 
 def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
-                    samples=32, wait=6.0, out=sys.stderr):
+                    samples=32, wait=6.0, expect_class=None,
+                    out=sys.stderr):
     """Registers at the block leader enclosing `pc`. Returns a dict.
 
     Shared with colour_inputs so there is ONE implementation of "find the
@@ -86,9 +89,21 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
     slots = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
     res["fired"] = [{"pc": x["pc"], "count": int(x["count"])} for x in slots]
     if not slots:
-        res["error"] = ("no candidate fired — all mid-block, or this code did "
-                        "not run. Widen the search or check the effect is on "
-                        "screen.")
+        # Two very different causes, and the message used to offer both. Ask.
+        if expect_class:
+            on, drawing = class_on_screen(conn, expect_class)
+            res["expect_class"] = expect_class
+            res["on_screen"] = on
+            if not on:
+                top = ", ".join(f"{k} x{v}" for k, v in
+                                sorted(drawing.items(), key=lambda kv: -kv[1])[:5])
+                res["error"] = (f"{expect_class} is not being drawn, so this "
+                                f"code never ran and no candidate could fire. "
+                                f"Currently drawing: {top or 'nothing'}.")
+                return res
+        res["error"] = ("no candidate fired, and the effect IS on screen — so "
+                        "none of these addresses is a basic-block leader. Widen "
+                        "--back or reduce --step.")
         return res
 
     below = [x for x in slots
@@ -124,6 +139,8 @@ def main(argv=None):
     ap.add_argument("--samples", type=int, default=32)
     ap.add_argument("--wait", type=float, default=6.0)
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--expect-class", default=None,
+                    help="primitive class this code draws (e.g. PolyG4+semi). If it is not on screen the code cannot have run, and that is reported instead of blaming block leaders.")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -134,69 +151,28 @@ def main(argv=None):
            "candidates": [f"0x{c:08X}" for c in cands]}
 
     conn = DebugConn(args.host, args.port, args.timeout)
-    try:
-        conn.cmd("pc_probe_clear")
-        conn.cmd("pc_probe_arm", n=args.samples,
-                 pcs=",".join(f"0x{c:08X}" for c in cands))
-        print(f"armed {len(cands)} candidate block leader(s) around 0x{pc:08X}; "
-              f"running {args.wait:.0f}s …")
-        time.sleep(args.wait)
-        rep = conn.cmd("pc_probe_dump")
-    except DebugError as e:
-        print(f"error: {e}", file=sys.stderr)
-        doc["error"] = str(e)
-        return _finish(doc, args, 2)
-    finally:
-        try:
-            conn.cmd("pc_probe_clear")
-        except DebugError:
-            pass
-
-    slots = [s for s in rep.get("slots", []) if int(s.get("count", 0)) > 0]
-    doc["fired"] = [{"pc": s["pc"], "count": int(s["count"])} for s in slots]
-    if not slots:
-        msg = (f"none of the {len(cands)} candidates fired. They are all "
-               f"mid-block, or this code did not run in the window. Widen "
-               f"--back, or make sure the effect is on screen.")
-        print(f"error: {msg}", file=sys.stderr)
-        doc["error"] = msg
+    res = probe_registers(conn, pc, want=want, back=args.back, step=args.step,
+                          samples=args.samples, wait=args.wait,
+                          expect_class=args.expect_class)
+    doc.update(res)
+    if res.get("error"):
+        print(f"error: {res['error']}", file=sys.stderr)
         return _finish(doc, args, 1)
 
-    print(f"\n{len(slots)} candidate(s) are real block leaders:")
-    for s in slots:
-        print(f"  {s['pc']}  hit {s['count']} time(s)")
-
-    # The enclosing block is the firing leader closest to the target from below.
-    below = [s for s in slots if (int(s["pc"], 16) & 0x1FFFFFFF) <= (pc & 0x1FFFFFFF)]
-    chosen = max(below, key=lambda s: int(s["pc"], 16)) if below else slots[0]
-    doc["block_leader"] = chosen["pc"]
-    if not below:
-        print("\nwarning: every firing leader is AFTER the target, so none of "
-              "them encloses it. The values below are from the wrong side of "
-              "the instruction.", file=sys.stderr)
-        doc["leader_after_target"] = True
-
-    samples = [s for s in rep.get("samples", [])
-               if s.get("pc") == chosen["pc"] and s.get("regs")]
-    doc["samples_seen"] = len(samples)
-    if not samples:
-        msg = (f"{chosen['pc']} fired but no register sample was captured. "
-               f"Raise --samples.")
-        print(f"error: {msg}", file=sys.stderr)
-        doc["error"] = msg
-        return _finish(doc, args, 1)
-
-    last = samples[-1]["regs"]
-    doc["regs"] = {w: last.get(w) for w in want}
-    doc["frame"] = samples[-1].get("frame")
-    print(f"\nblock leader {chosen['pc']}, {len(samples)} sample(s), "
-          f"frame {doc['frame']}")
+    print(f"\n{len(res.get('fired', []))} candidate(s) are real block leaders:")
+    for f in res.get("fired", []):
+        print(f"  {f['pc']}  hit {f['count']} time(s)")
+    if res.get("leader_after_target"):
+        print("\nwarning: every firing leader is AFTER the target, so none "
+              "encloses it. The values below are from the wrong side of the "
+              "instruction.", file=sys.stderr)
+    print(f"\nblock leader {res.get('block_leader')}, "
+          f"{res.get('samples_seen')} sample(s), frame {res.get('frame')}")
     for w in want:
         note = ("" if w in SAVED else
                 "   <- computed inside the block; this is its value at ENTRY, "
                 "not at the target instruction")
-        print(f"  ${w:<4} = {last.get(w, '?')}{note}")
-    doc["all_regs"] = last
+        print(f"  ${w:<4} = {res.get('regs', {}).get(w, '?')}{note}")
     return _finish(doc, args, 0)
 
 
