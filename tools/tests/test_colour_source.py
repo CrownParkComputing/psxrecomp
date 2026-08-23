@@ -67,3 +67,70 @@ class VerdictTest(unittest.TestCase):
     def test_boundary_is_inclusive(self):
         self.assertEqual(cs.verdict_of(8)[0], "source-is-uniform")
         self.assertEqual(cs.verdict_of(9)[0], "source-is-varied")
+
+
+class OraclePointerTest(unittest.TestCase):
+    """DuckStation has pc_break (all GPRs) but no pc_probe.
+
+    One hit is enough: the question is which table the pointer names, not how
+    it varies. The breakpoint must not survive -- a leaked one re-pauses the
+    emulator and outlives the tool that set it.
+    """
+
+    class Conn:
+        def __init__(self, vals):
+            self.vals = list(vals)
+            self.armed = set()
+            self.sent = []
+
+        def _d(self, name, **kw):
+            self.sent.append(name)
+            if name == "pc_break":
+                a = kw.get("addr")
+                if a in self.armed:
+                    return {"ok": False, "slot": -1}
+                self.armed.add(a)
+                return {"ok": True, "slot": 0}
+            if name == "pc_unbreak":
+                self.armed.discard(kw.get("addr"))
+                return {"ok": True}
+            if name == "pc_break_list":
+                return {"breaks": sorted(self.armed)}
+            if name == "pc_hit_last":
+                if not self.vals:
+                    return {"valid": False}
+                v = self.vals.pop(0)
+                return {"valid": True, "regs": {"s4": f"0x{v:08X}"}}
+            return {}
+
+        def cmd(self, n, **k):
+            return self._d(n, **k)
+
+        def raw(self, n, **k):
+            return self._d(n, **k)
+
+    def setUp(self):
+        import psx_gpu_frame
+        self.m = psx_gpu_frame
+        self._s = cs.time.sleep
+        cs.time.sleep = lambda *_: None
+        self._s2 = psx_gpu_frame.time.sleep
+        psx_gpu_frame.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        cs.time.sleep = self._s
+        self.m.time.sleep = self._s2
+
+    def test_collects_distinct_pointers(self):
+        c = self.Conn([0x800E2610, 0x800E2610, 0x800E2640])
+        vals = cs.oracle_pointer(c, "0x80068450", tries=3)
+        self.assertEqual(vals, [0x800E2610, 0x800E2640])
+
+    def test_breakpoint_never_leaks(self):
+        c = self.Conn([0x800E2610])
+        cs.oracle_pointer(c, "0x80068450", tries=2)
+        self.assertEqual(c.armed, set())
+
+    def test_no_hits_returns_empty_not_error(self):
+        c = self.Conn([])
+        self.assertEqual(cs.oracle_pointer(c, "0x80068450", tries=2), [])

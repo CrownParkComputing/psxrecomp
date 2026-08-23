@@ -36,7 +36,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psx_gpu_frame import (  # noqa: E402
-    DEFAULT_NATIVE_PORT, DebugConn, DebugError, read_ram_range,
+    DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S, DebugConn, DebugError,
+    OracleBreak, oracle_resume, read_ram_range,
 )
 from scale_within_frame import sample_one_frame  # noqa: E402
 
@@ -69,6 +70,40 @@ def colours_in(blob, base, lo, hi):
         w = int.from_bytes(blob[off:off + 4], "little")
         out[(w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF)] += 1
     return out
+
+
+def oracle_pointer(conn, pc, reg="s4", tries=12, out=sys.stderr):
+    """Read `reg` on the oracle by breaking on `pc`.
+
+    DuckStation has pc_break (which captures every GPR) but no pc_probe, so
+    it cannot be sampled the way psx-runtime is. One hit is enough here: the
+    question is only WHICH table the pointer names, not how it varies.
+
+    The breakpoint is removed and the emulator resumed on every exit path --
+    a leaked one keeps re-pausing it and outlives the tool that set it.
+    """
+    seen = []
+    try:
+        with OracleBreak(conn, pc):
+            for _ in range(tries):
+                try:
+                    conn.raw("pc_hit_clear")
+                except DebugError:
+                    pass
+                oracle_resume(conn)
+                time.sleep(ORACLE_PAUSED_POLL_S)
+                try:
+                    hit = conn.cmd("pc_hit_last")
+                except DebugError:
+                    continue
+                if not hit.get("valid"):
+                    continue
+                v = (hit.get("regs") or {}).get(reg)
+                if v:
+                    seen.append(int(v, 16))
+    except DebugError as e:
+        print(f"  oracle probe: {e}", file=out)
+    return sorted(set(seen))
 
 
 def verdict_of(n_colours, expect_max=8):
@@ -161,6 +196,9 @@ def main():
                          "which has pc_break but no pc_probe -- and "
                          "unnecessary to probe there anyway, since the table "
                          "address is the same in both emulators")
+    ap.add_argument("--oracle-pointer", action="store_true",
+                    help="read $s4 on the oracle via pc_break and report "
+                         "which table it names, to compare with psx-runtime's")
     ap.add_argument("--trace", action="store_true",
                     help="also trace which code writes the table (native only)")
     ap.add_argument("--wait-secs", type=float, default=120.0)
@@ -176,6 +214,25 @@ def main():
     span = None
     ptrs = []
     deadline = time.monotonic() + args.wait_secs
+    if args.oracle_pointer:
+        vals = oracle_pointer(conn, args.pc, args.reg)
+        doc["oracle_pointer_values"] = [f"0x{v:08X}" for v in vals]
+        if vals:
+            print(f"\noracle ${args.reg}: {len(vals)} distinct value(s) "
+                  f"0x{min(vals):08X}..0x{max(vals):08X}")
+            for v in vals[:12]:
+                print(f"    0x{v:08X}")
+            print(f"\npsx-runtime reported 0x800E260C..0x800E2664. Same range "
+                  f"means both read the same table, so the colours in the "
+                  f"packets cannot differ because of the source; a different "
+                  f"range means psx-runtime is reading the wrong table, and "
+                  f"THAT is the bug.")
+        else:
+            print(f"\nno ${args.reg} captured on the oracle -- the break "
+                  f"never fired inside the effect. Replay it while this runs.")
+        _save(doc, args)
+        return 0 if vals else 1
+
     if args.span:
         lo_s, _, hi_s = args.span.partition(":")
         span = (int(lo_s, 0), int(hi_s, 0))
