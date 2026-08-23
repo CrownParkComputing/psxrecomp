@@ -225,6 +225,37 @@ if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/b
   cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
 fi
 
+# Product runtime resources are generated/staged beside the executable by
+# CMake. They are intentionally copied from the build output, not from the
+# repository's development tree: the latter can contain retired packages and
+# other authoring leftovers. Never copy settings.toml, bios.cfg, disc.cfg,
+# saves, or other machine/user state into a portable release.
+if [[ -d "${EXE_DIR}/bezels" ]]; then
+  cp -a "${EXE_DIR}/bezels" "${STAGE}/"
+fi
+if [[ -d "${EXE_DIR}/mods/packages" ]]; then
+  mkdir -p "${STAGE}/mods"
+  if [[ -f "${EXE_DIR}/mods/state.toml" ]]; then
+    mkdir -p "${STAGE}/mods/packages"
+    # The build directory can retain disabled catalog entries from an older
+    # configure. The portable release should contain only packages named by
+    # the authoritative state file, so the launcher cannot show stale mods.
+    while IFS= read -r package_id; do
+      [[ -n "${package_id}" && -d "${EXE_DIR}/mods/packages/${package_id}" ]] || continue
+      cp -a "${EXE_DIR}/mods/packages/${package_id}" "${STAGE}/mods/packages/"
+    done < <(awk -F'"' '/^\[\[package\]\]/{in_pkg=1; next} in_pkg && /^id[[:space:]]*=/ {print $2; in_pkg=0}' "${EXE_DIR}/mods/state.toml")
+    cp -a "${EXE_DIR}/mods/state.toml" "${STAGE}/mods/"
+  else
+    cp -a "${EXE_DIR}/mods/packages" "${STAGE}/mods/"
+  fi
+  if [[ -f "${EXE_DIR}/mods/README.md" ]]; then
+    cp -a "${EXE_DIR}/mods/README.md" "${STAGE}/mods/"
+  fi
+fi
+if [[ -f "${EXE_DIR}/game_options.toml" ]]; then
+  cp -a "${EXE_DIR}/game_options.toml" "${STAGE}/"
+fi
+
 copy_proj() {
   local rel="$1"
   if [[ -e "${ROOT}/${rel}" ]]; then
@@ -339,8 +370,13 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
   cd "${STAGE}"
   if command -v zip >/dev/null 2>&1; then
     zip -r -q "${DIST}/${ZIP_NAME}" .
+  elif command -v tar >/dev/null 2>&1; then
+    # Windows installations commonly have bsdtar but no zip.exe.  Its
+    # archive-format auto-detection keeps the published artifact a normal
+    # .zip without requiring an installer or an extra SDK package.
+    tar -a -c -f "${DIST}/${ZIP_NAME}" .
   else
-    echo "error: zip not found" >&2
+    echo "error: neither zip nor tar is available" >&2
     exit 1
   fi
 )
