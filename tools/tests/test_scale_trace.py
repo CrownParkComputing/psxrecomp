@@ -219,3 +219,59 @@ class TestMinimumSamplesForAVerdict(unittest.TestCase):
         self.assertEqual(d["max_step"], 4)
         self.assertEqual(d["distinct"], 5)
         self.assertFalse(d["constant"])
+
+
+class TestSamplingOrder(unittest.TestCase):
+    """Both sides must be watched during the SAME pass.
+
+    Reported from a live session: psx-runtime visibly parked while the oracle
+    ran on untouched, then the oracle reported no samples. That is exactly what
+    sequential sampling produces — psx-runtime is sampled to completion first
+    and the oracle asked afterwards, by which time the effect has finished on
+    that side and the breakpoint can never fire. Replaying the animation does
+    not help, because the two halves of the run are minutes apart.
+    """
+
+    def test_both_samplers_run_on_threads(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn("threading.Thread", src)
+        self.assertIn("nt.start()", src)
+        self.assertIn("ot.start()", src)
+        # Started before either is joined, or they are still sequential.
+        self.assertLess(src.index("ot.start()"), src.index("nt.join()"))
+
+    def test_a_thread_failure_becomes_a_reason_not_a_crash(self):
+        src = __import__("inspect").getsource(ST.main)
+        self.assertIn("except DebugError", src)
+
+
+class TestPerFrameOrder(unittest.TestCase):
+    """arm -> STEP -> read. In that order, or nothing is ever captured.
+
+    probe_registers arms the probe and then sleeps waiting for it to fire. On a
+    paused emulator no code executes, so the block leader is never reached and
+    every sample after the first comes back empty — which turned a 24-sample
+    run into one sample, and then a verdict was drawn from it.
+    """
+
+    def test_the_step_happens_between_arming_and_reading(self):
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        arm = src.index("pc_probe_arm")
+        step = src.index('"step"')
+        dump = src.index("pc_probe_dump")
+        self.assertLess(arm, step, "arming must precede the step")
+        self.assertLess(step, dump, "the step must precede the read")
+
+    def test_it_does_not_delegate_to_the_sleeping_prober(self):
+        # probe_registers is fine on a RUNNING emulator and useless on a paused
+        # one; per-frame sampling pauses by design.
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        self.assertNotIn("probe_registers(", src)
+
+    def test_a_frame_that_misses_the_block_resets_the_cached_leader(self):
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        self.assertIn("leader = None", src)

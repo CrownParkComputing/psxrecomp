@@ -31,6 +31,7 @@ import json
 import os
 import statistics
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,46 +49,77 @@ NEUTRAL = 128
 def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
     """Sample the register on CONSECUTIVE frames, by stepping.
 
-    This is the measurement that actually answers "does the fade sweep or
-    jump", and it needs one emulator rather than two.
+    The order is arm -> STEP -> read, and it has to be. probe_registers arms the
+    probe and then SLEEPS waiting for it to fire, which works on a running
+    emulator and never on a paused one: no code executes, so the block leader is
+    never reached and every sample after the first comes back empty. That is why
+    a 24-sample run produced one.
 
-    Free-running samples are taken about 1.5s apart -- ninety frames -- so the
-    difference between consecutive readings is aliasing, not the animation
-    increment. A fade stepping by 2 per frame sampled every ninety frames looks
-    like arbitrary jumps, which is exactly what psx-runtime's 48/94/128 could
-    be. Stepping one frame between reads removes the confound entirely: the
-    deltas ARE the increment.
+    Sampling this way needs one emulator rather than two, which is the property
+    every measurement that has worked here shares: no frame alignment, no
+    matching buffer half, no shared phase. Free-running samples land about
+    ninety frames apart, so their differences are aliasing; these deltas are the
+    real animation increment.
     """
-    vals = []
-    leader = None
+    from probe_regs import search_windows
+
+    vals, frames = [], []
     try:
         conn.cmd("pause")
     except DebugError as e:
         return vals, f"could not pause: {e}"
+
+    leader = None
+    misses = 0
     try:
         for _ in range(n):
-            pr = probe_registers(conn, pc, want=(reg,), wait=0.8, leader=leader)
-            leader = pr.get("block_leader") or leader
-            v = pr.get("regs", {}).get(reg)
-            if v:
-                vals.append(int(v, 16))
+            cands = ([leader] if leader
+                     else [c for w in search_windows(pc, 0x400) for c in w][:16])
+            try:
+                conn.cmd("pc_probe_clear")
+                conn.cmd("pc_probe_arm", n=8,
+                         pcs=",".join(f"0x{c:08X}" for c in cands))
+                f0 = conn.frame()
+                conn.cmd("step", n=1)          # <- the block executes HERE
+                for _ in range(150):
+                    st = conn.raw("pause_state")
+                    if st.get("paused") and conn.frame() > f0:
+                        break
+                    time.sleep(0.02)
+                rep = conn.cmd("pc_probe_dump")
+            except DebugError as e:
+                return vals, str(e)
+
+            hit = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
+            got = None
+            if hit:
+                lead = max((x for x in hit
+                            if (int(x["pc"], 16) & 0x1FFFFFFF) <= (pc & 0x1FFFFFFF)),
+                           key=lambda x: int(x["pc"], 16), default=hit[0])
+                leader = int(lead["pc"], 16)
+                for smp in rep.get("samples", []):
+                    if smp.get("pc") == lead["pc"] and smp.get("regs"):
+                        got = smp["regs"].get(reg)
+            if got:
+                vals.append(int(got, 16))
+                frames.append(conn.frame())
             else:
-                leader = None
-            f0 = conn.frame()
-            conn.cmd("step", n=1)
-            for _ in range(150):
-                st = conn.raw("pause_state")
-                if st.get("paused") and conn.frame() > f0:
-                    break
-                time.sleep(0.02)
-    except DebugError as e:
-        return vals, str(e)
+                misses += 1
+                leader = None      # re-sweep next frame
     finally:
         try:
+            conn.cmd("pc_probe_clear")
             conn.cmd("continue")
         except DebugError:
             pass
-    return vals, (None if vals else "no samples were captured")
+
+    if not vals:
+        return vals, (f"the block was not reached on any of {n} stepped "
+                      f"frame(s) — is the effect actually drawing?")
+    if misses:
+        print(f"  psx-runtime: {misses} of {n} frame(s) did not reach the block",
+              file=out)
+    return vals, None
 
 
 def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
@@ -209,13 +241,42 @@ def main(argv=None):
 
     n = DebugConn(args.host, args.native_port, args.timeout)
     o = DebugConn(args.host, args.ds_port, args.timeout)
+    # Sample BOTH AT ONCE.
+    #
+    # Sequentially, psx-runtime was sampled to completion first and the oracle
+    # asked afterwards -- by which time the effect had finished on that side and
+    # the breakpoint could never fire. Replaying the animation does not help
+    # either, because the two halves of the run are minutes apart. Both sides
+    # have to be watched during the SAME pass.
+    #
+    # It also explains the reported behaviour exactly: psx-runtime visibly
+    # parked (it is being stepped) while the oracle ran on untouched, then
+    # reported no samples.
+    res = {}
+
+    def go(key, fn, *a):
+        try:
+            res[key] = fn(*a)
+        except DebugError as e:
+            res[key] = ([], str(e))
+
     if args.per_frame:
         print("  psx-runtime: stepping one frame between reads, so the deltas "
               "are the real per-frame increment")
-        nat, nat_why = sample_per_frame(n, pc, args.samples, args.reg)
+        nt = threading.Thread(target=go, args=("nat", sample_per_frame, n, pc,
+                                               args.samples, args.reg))
     else:
-        nat, nat_why = sample_native(n, pc, args.samples, args.gap, args.reg)
-    orc, orc_why = sample_oracle(o, pc, max(3, args.samples // 3), args.reg)
+        nt = threading.Thread(target=go, args=("nat", sample_native, n, pc,
+                                               args.samples, args.gap, args.reg))
+    ot = threading.Thread(target=go, args=("orc", sample_oracle, o, pc,
+                                           max(3, args.samples // 3), args.reg))
+    print("  sampling both sides concurrently — keep the effect running on BOTH")
+    nt.start()
+    ot.start()
+    nt.join()
+    ot.join()
+    nat, nat_why = res.get("nat", ([], "psx-runtime sampling did not run"))
+    orc, orc_why = res.get("orc", ([], "oracle sampling did not run"))
 
     print()
     a = describe(nat, "psx-runtime")
