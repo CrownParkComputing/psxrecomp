@@ -1829,7 +1829,8 @@ std::string CodeGenerator::translate_basic_block(
     // the body (and arms LDWhich=rt). The dep/res mask is a gen-time literal. This
     // replaces the old flat per-instruction psx_advance_cycles(1u).
     const std::string fast_run_guard =
-        "defined(PSX_GAME_GENERATED_FAST_CYC) && !defined(PSX_COSIM)";
+        "defined(PSX_GAME_GENERATED_FAST_CYC) && "
+        "defined(PSX_GAME_GENERATED_TIMING_RUNS) && !defined(PSX_COSIM)";
     auto emit_single_pre_timing = [&](uint32_t insn_addr, uint32_t in,
                                       const std::string& indent) {
         uint32_t op = in >> 26;

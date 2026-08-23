@@ -123,6 +123,8 @@ def main():
         failures.append("timing run did not resume after configured helper barrier")
     if "!defined(PSX_COSIM)" not in source:
         failures.append("COSIM did not retain instruction-site timing steps")
+    if "defined(PSX_GAME_GENERATED_TIMING_RUNS)" not in source:
+        failures.append("timing-run A/B gate was not emitted")
     if "psx_cyc_step_slow(cpu," not in source:
         failures.append("exceptional modes lost instruction-boundary fallback")
     if failures:

@@ -61,6 +61,14 @@ else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
+# Experimental generated-game timing-run aggregation. Keep this independently
+# switchable from the proven forced-inline timing path so a product can A/B the
+# shared run helper without changing generated code, device semantics, or the
+# rest of the runtime. OFF is the conservative default until a source-matched
+# benchmark demonstrates a repeatable throughput win.
+option(PSX_GAME_TIMING_RUNS
+    "Aggregate transparent generated-game timing steps into shared runs" OFF)
+
 # PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
 #
 # A default MinGW build dynamically imports three NON-system DLLs —
@@ -869,6 +877,11 @@ function(psxrecomp_add_runtime_target target)
             set_property(SOURCE "${_full_src}" APPEND PROPERTY
                 COMPILE_DEFINITIONS
                     "$<$<CONFIG:Release>:PSX_GAME_GENERATED_FAST_CYC=1>")
+            if(PSX_GAME_TIMING_RUNS)
+                set_property(SOURCE "${_full_src}" APPEND PROPERTY
+                    COMPILE_DEFINITIONS
+                        "$<$<CONFIG:Release>:PSX_GAME_GENERATED_TIMING_RUNS=1>")
+            endif()
             list(APPEND generated_sources "${_full_src}")
             list(APPEND _game_generated_check "${_full_src}")
         endforeach()
