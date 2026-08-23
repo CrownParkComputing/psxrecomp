@@ -1302,25 +1302,37 @@ function(psxrecomp_add_runtime_target target)
     # own POST_BUILD copy so a title may still override an id if it ever needs
     # to; copy_directory merges rather than replacing the tree.
     if(EXISTS "${PSXRECOMP_ROOT}/mods/builtin/packages")
+        # Clear first: copy_directory MERGES, so a mod deleted from source
+        # would otherwise survive in the build output forever and keep
+        # appearing on the Mods page (and inflate release catalog assertions).
+        # Scoped to mods/packages, not mods/: state.toml is launcher-owned user
+        # state and must survive a rebuild.
+        set(_psx_builtin_mod_copy_commands "")
+        if(DEFINED PSX_BUILTIN_MOD_ALLOWLIST AND NOT
+           "${PSX_BUILTIN_MOD_ALLOWLIST}" STREQUAL "")
+            foreach(_psx_builtin_mod IN LISTS PSX_BUILTIN_MOD_ALLOWLIST)
+                if(NOT EXISTS "${PSXRECOMP_ROOT}/mods/builtin/packages/${_psx_builtin_mod}")
+                    message(FATAL_ERROR
+                        "PSX_BUILTIN_MOD_ALLOWLIST names missing package: ${_psx_builtin_mod}")
+                endif()
+                list(APPEND _psx_builtin_mod_copy_commands
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${PSXRECOMP_ROOT}/mods/builtin/packages/${_psx_builtin_mod}"
+                        "$<TARGET_FILE_DIR:${target}>/mods/packages/${_psx_builtin_mod}")
+            endforeach()
+        else()
+            list(APPEND _psx_builtin_mod_copy_commands
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${PSXRECOMP_ROOT}/mods/builtin"
+                    "$<TARGET_FILE_DIR:${target}>/mods")
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD
-            # Clear first: copy_directory MERGES, so a mod deleted from source
-            # would otherwise survive in the build output forever and keep
-            # appearing on the Mods page (and inflate the release packagers'
-            # catalog assertions). This runs before the game's own staging, so
-            # both catalogs land on a clean slate.
-            #
-            # Scoped to mods/packages, NOT mods/: both catalogs own only a
-            # packages/ subtree, while mods/state.toml is USER STATE written at
-            # runtime (which mods are enabled, with which options). Wiping the
-            # whole tree silently disabled every enabled mod on every rebuild,
-            # repeatedly misread as the mods themselves regressing.
             COMMAND ${CMAKE_COMMAND} -E rm -rf
                 "$<TARGET_FILE_DIR:${target}>/mods/packages"
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${PSXRECOMP_ROOT}/mods/builtin"
-                "$<TARGET_FILE_DIR:${target}>/mods"
+            ${_psx_builtin_mod_copy_commands}
             COMMENT "Staging framework-owned mod catalog"
             VERBATIM)
+        unset(_psx_builtin_mod_copy_commands)
     endif()
     endif()
 
