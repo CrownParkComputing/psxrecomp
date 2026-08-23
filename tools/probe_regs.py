@@ -59,6 +59,20 @@ def candidates(pc, back, step, limit=MAX_PCS):
     return out
 
 
+def plausible_pointer(v):
+    """Could this register value be a RAM pointer?
+
+    Zero is the value an uncaptured register has, and it sails through every
+    later step: 0 - 12 masks to 0x1FFFFFF4, which is a real-looking address
+    that reads as garbage. A register that was never captured must be rejected
+    here, not turned into a plausible-looking result downstream.
+    """
+    if v is None:
+        return False
+    phys = v & 0x1FFFFFFF
+    return 0 < phys < 0x200000
+
+
 def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
                     samples=32, wait=6.0, expect_class=None,
                     out=sys.stderr):
@@ -122,6 +136,19 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
     res["frame"] = samples_here[-1].get("frame")
     res["regs"] = {w: last.get(w) for w in want}
     res["all_regs"] = last
+
+    # $sp is never zero in running code. All-zero registers mean the capture did
+    # not happen, not that the guest held zeros, and saying nothing here lets a
+    # zero pointer become an address several steps later.
+    try:
+        sp = int(last.get("sp", "0x0"), 16)
+    except (TypeError, ValueError):
+        sp = 0
+    if sp == 0 and all(int(v, 16) == 0 for v in last.values() if v):
+        res["error"] = ("every register read back as zero, including $sp, which "
+                        "cannot happen in running code — the capture did not "
+                        "take. Is this runtime built with the GPR probe?")
+        res["capture_empty"] = True
     return res
 
 

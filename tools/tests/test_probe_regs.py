@@ -75,3 +75,36 @@ class TestSavedRegisterClassification(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPointerPlausibility(unittest.TestCase):
+    """A register that was never captured must not become an address.
+
+    Seen live: every register came back 0x00000000 because the engine emitted
+    the GPR array without ever filling it. Zero then flowed downstream — 0 minus
+    the load offset masks to 0x1FFFFFF4, a real-looking address — and the run
+    reported a difference between the oracle's table and unmapped memory, with
+    "0 differing bytes" and "not identical" in the same document.
+    """
+
+    def test_zero_is_not_a_pointer(self):
+        self.assertFalse(PR.plausible_pointer(0))
+
+    def test_the_masked_underflow_is_not_a_pointer(self):
+        # (0 - 12) & 0x1FFFFFFF, the exact value that got through.
+        self.assertFalse(PR.plausible_pointer(0x1FFFFFF4))
+
+    def test_a_real_ram_pointer_passes(self):
+        self.assertTrue(PR.plausible_pointer(0x800E4C04))
+        self.assertTrue(PR.plausible_pointer(0x000E4C04))
+
+    def test_an_address_past_ram_is_rejected(self):
+        self.assertFalse(PR.plausible_pointer(0x00200000))
+
+    def test_none_is_rejected(self):
+        self.assertFalse(PR.plausible_pointer(None))
+
+    def test_scratchpad_is_not_treated_as_main_ram(self):
+        # $sp legitimately points into scratchpad, but a colour TABLE does not
+        # live there; accepting it would compare against the wrong region.
+        self.assertFalse(PR.plausible_pointer(0x1F800234))

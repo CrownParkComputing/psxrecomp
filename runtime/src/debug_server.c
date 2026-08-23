@@ -2695,6 +2695,11 @@ static inline void pc_probe_observe(uint32_t block_leader_phys)
                 sm->depth = depth;
                 sm->ot_base = ot_base;
                 sm->ot_index = ot_index;
+                /* The whole point of the extension: without this the gpr array
+                 * is emitted as 32 zeros, which reads as "every register was
+                 * zero" rather than "nothing was captured". $sp is never 0 in
+                 * running code, so that is the tell. */
+                for (int g = 0; g < 32; g++) sm->gpr[g] = cpu->gpr[g];
             }
         }
         return;

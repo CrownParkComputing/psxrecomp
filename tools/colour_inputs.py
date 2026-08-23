@@ -47,7 +47,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from probe_regs import probe_registers  # noqa: E402
+from probe_regs import plausible_pointer, probe_registers  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
     DebugConn, DebugError, oracle_resume, read_ram_range, snapshot_ram,
@@ -249,8 +249,19 @@ def main(argv=None):
                                 "error", "leader_after_target")
                                if pr.get(k) is not None}
         nat_ptr = None
-        if pr.get("regs", {}).get("s4"):
-            nat_ptr = int(pr["regs"]["s4"], 16)
+        raw_s4 = pr.get("regs", {}).get("s4")
+        s4_val = int(raw_s4, 16) if raw_s4 else None
+        if raw_s4 and not plausible_pointer(s4_val):
+            # Refuse it here. Zero minus the load offset masks to 0x1FFFFFF4,
+            # which looks like an address and is not one; the run then reports a
+            # difference between the oracle's table and unmapped memory.
+            print(f"  psx-runtime $s4 = {raw_s4} is not a RAM pointer; the "
+                  f"capture did not take. Falling back to the content search.",
+                  file=sys.stderr)
+            doc["native_s4_rejected"] = raw_s4
+            raw_s4 = None
+        if raw_s4:
+            nat_ptr = s4_val
             doc["native_regs"] = pr["regs"]
             doc["native_source_addr"] = f"0x{(nat_ptr + SRC_OFFSET) & 0x1FFFFFFF:08X}"
             print(f"  psx-runtime $s4=0x{nat_ptr:08X} "
@@ -271,6 +282,17 @@ def main(argv=None):
             doc["native_looks_like_table"] = looks_like_triplets(a)
             doc["compared_by"] = "native-own-pointer"
             doc["address_delta"] = nsrc - src
+            # Guard the comparison itself: a short read makes zip() compare
+            # nothing, which reported 0 differing bytes AND "not identical" in
+            # the same document.
+            if len(a) != len(b):
+                doc["verdict"] = "unreadable"
+                doc["note"] = (f"read {len(a)} bytes from psx-runtime against "
+                               f"{len(b)} from the oracle — the addresses are "
+                               f"not both mapped, so there is nothing to "
+                               f"compare.")
+                print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
+                return _finish(doc, args, 1)
             same = a == b
             doc["source_identical"] = same
             print(f"\n  psx-runtime @ {doc['native_source_addr']}: {a[:16].hex(' ')}")
