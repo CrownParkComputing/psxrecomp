@@ -464,6 +464,9 @@ if(BUILD_TESTING)
         add_test(NAME pgxp_destructive_write_coverage_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_destructive_write_coverage.py)
+        add_test(NAME savestate_status_protocol_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_savestate_status_protocol.py)
     endif()
 
     # DISABLED, not de-registered. It links and runs, but 147 of its 309 checks
