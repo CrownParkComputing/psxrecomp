@@ -1111,7 +1111,7 @@ static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
  * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
  * the boundary, and treat anything out of range as the default. */
 static inline int launcher_fmv_filter_to_cfg(int ls_value) {
-    if (ls_value < 1 || ls_value > RECOMP_LAUNCHER_FMV_FILTER_COUNT)
+    if (ls_value < 1 || ls_value > PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
         return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
     return ls_value - 1;
 }
