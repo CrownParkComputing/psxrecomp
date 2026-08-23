@@ -108,3 +108,39 @@ class TestPointerPlausibility(unittest.TestCase):
         # $sp legitimately points into scratchpad, but a colour TABLE does not
         # live there; accepting it would compare against the wrong region.
         self.assertFalse(PR.plausible_pointer(0x1F800234))
+
+
+class TestAdaptiveSearch(unittest.TestCase):
+    """One fixed window is a guess about where the enclosing block starts.
+
+    Measured: step 0x10 over 0x100 found a leader for 0x8006844C and none at all
+    for 0x800684C0 — two colour writers sixteen bytes of code apart. The failure
+    message was accurate and useless: "none of these is a basic-block leader"
+    tells the operator nothing they can act on.
+    """
+
+    def test_windows_start_at_the_target_and_walk_backwards(self):
+        w = PR.search_windows(0x800684C0, max_back=0x100)
+        self.assertEqual(w[0][0], 0x800684C0)
+        self.assertLess(w[1][0], w[0][0])
+
+    def test_candidates_are_every_instruction_not_every_fourth(self):
+        # Any instruction can be a block leader, so a coarse step can step over
+        # the only address that would have fired.
+        w = PR.search_windows(0x800684C0, max_back=0x100)
+        self.assertEqual(w[0][0] - w[0][1], 4)
+
+    def test_windows_do_not_overlap_or_leave_gaps(self):
+        w = PR.search_windows(0x80068000, max_back=0x200)
+        for a, b in zip(w, w[1:]):
+            self.assertEqual(a[-1] - b[0], 4,
+                             "consecutive windows must be contiguous — a gap "
+                             "can hide the one leader that would have fired")
+
+    def test_the_slot_limit_is_respected_per_window(self):
+        for win in PR.search_windows(0x80068000, max_back=0x400):
+            self.assertLessEqual(len(win), PR.MAX_PCS)
+
+    def test_the_search_is_bounded(self):
+        w = PR.search_windows(0x80068000, max_back=0x100)
+        self.assertLessEqual(len(w), 0x100 // (PR.MAX_PCS * 4) + 1)

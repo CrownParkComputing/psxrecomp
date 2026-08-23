@@ -73,6 +73,28 @@ def plausible_pointer(v):
     return 0 < phys < 0x200000
 
 
+def search_windows(pc, max_back=0x400, slots=MAX_PCS):
+    """Successive candidate sets to try, nearest the target first.
+
+    A single fixed window is a guess about where the enclosing block starts, and
+    a wrong guess reports "none of these is a block leader" — true, and useless.
+    Measured: step 0x10 over 0x100 found a leader for 0x8006844C and none at all
+    for 0x800684C0, sixteen bytes of code apart.
+
+    So sweep instead: 4-byte steps immediately before the target (every
+    instruction is a possible leader), then further back in equal windows. Fine
+    granularity first, because the enclosing block usually starts close.
+    """
+    span = slots * 4
+    out = []
+    off = 0
+    while off < max_back:
+        base = pc - off
+        out.append([base - i * 4 for i in range(slots)])
+        off += span
+    return out
+
+
 def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
                     samples=32, wait=6.0, expect_class=None,
                     out=sys.stderr):
@@ -82,25 +104,34 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
     enclosing block". Two copies of this would drift, and the failure would be
     silent: both would return real register values, just from different blocks.
     """
-    cands = candidates(pc, back, step)
-    res = {"pc": f"0x{pc:08X}",
-           "candidates": [f"0x{c:08X}" for c in cands]}
-    try:
-        conn.cmd("pc_probe_clear")
-        conn.cmd("pc_probe_arm", n=samples,
-                 pcs=",".join(f"0x{c:08X}" for c in cands))
-        time.sleep(wait)
-        rep = conn.cmd("pc_probe_dump")
-    except DebugError as e:
-        res["error"] = str(e)
-        return res
-    finally:
+    res = {"pc": f"0x{pc:08X}"}
+    slots = []
+    rep = {}
+    tried = 0
+    # Sweep backwards until something fires. One window is a guess about where
+    # the block starts; a wrong guess reports "not a block leader", which is
+    # true and tells the operator nothing they can act on.
+    for cands in search_windows(pc, max_back=max(back, 0x400)):
+        tried += 1
+        res["candidates"] = [f"0x{c:08X}" for c in cands]
         try:
             conn.cmd("pc_probe_clear")
-        except DebugError:
-            pass
-
-    slots = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
+            conn.cmd("pc_probe_arm", n=samples,
+                     pcs=",".join(f"0x{c:08X}" for c in cands))
+            time.sleep(wait)
+            rep = conn.cmd("pc_probe_dump")
+        except DebugError as e:
+            res["error"] = str(e)
+            return res
+        finally:
+            try:
+                conn.cmd("pc_probe_clear")
+            except DebugError:
+                pass
+        slots = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
+        if slots:
+            break
+    res["windows_tried"] = tried
     res["fired"] = [{"pc": x["pc"], "count": int(x["count"])} for x in slots]
     if not slots:
         # Two very different causes, and the message used to offer both. Ask.
@@ -115,9 +146,10 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
                                 f"code never ran and no candidate could fire. "
                                 f"Currently drawing: {top or 'nothing'}.")
                 return res
-        res["error"] = ("no candidate fired, and the effect IS on screen — so "
-                        "none of these addresses is a basic-block leader. Widen "
-                        "--back or reduce --step.")
+        res["error"] = (f"no basic-block leader found within "
+                        f"0x{tried * MAX_PCS * 4:X} bytes before 0x{pc:08X}, "
+                        f"across {tried} window(s), and the effect IS on "
+                        f"screen. Raise --back.")
         return res
 
     below = [x for x in slots
