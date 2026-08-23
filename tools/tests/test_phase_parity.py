@@ -158,3 +158,58 @@ class BreakpointLeakTest(unittest.TestCase):
         # been sent, whichever module actually issued it.
         self.assertIn("continue", conn.sent,
                       "oracle left paused when arming failed")
+
+
+class ClearBreaksTest(unittest.TestCase):
+    """Removal must be verified against pc_break_list, not assumed.
+
+    A paused oracle serves its socket at about 1 Hz, so an unbreak can time
+    out; swallowing that is how a breakpoint outlives the tool that set it.
+    """
+
+    def setUp(self):
+        import psx_gpu_frame
+        self.mod = psx_gpu_frame
+        self._sleep = psx_gpu_frame.time.sleep
+        psx_gpu_frame.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        self.mod.time.sleep = self._sleep
+
+    def test_retries_until_list_is_empty(self):
+        class Flaky(FakeConn):
+            """Ignores the first unbreak, as a timed-out one would."""
+
+            def __init__(self, phases):
+                FakeConn.__init__(self, phases)
+                self.ignored = 0
+
+            def _dispatch(self, name, **kw):
+                if name == "pc_unbreak" and self.ignored < 1:
+                    self.ignored += 1
+                    self.sent.append(name)
+                    return {"ok": False}
+                return FakeConn._dispatch(self, name, **kw)
+
+        conn = Flaky([])
+        conn.armed.add("0x8006844C")
+        self.mod.oracle_clear_breaks(conn)
+        self.assertEqual(conn.armed, set())
+
+    def test_raises_when_it_cannot_clear(self):
+        class Stuck(FakeConn):
+            def _dispatch(self, name, **kw):
+                if name == "pc_unbreak":
+                    self.sent.append(name)
+                    return {"ok": False}
+                return FakeConn._dispatch(self, name, **kw)
+
+        conn = Stuck([])
+        conn.armed.add("0x8006844C")
+        with self.assertRaises(self.mod.DebugError) as cm:
+            self.mod.oracle_clear_breaks(conn, tries=2)
+        self.assertIn("restart DuckStation", str(cm.exception))
+
+    def test_no_breaks_is_a_no_op(self):
+        conn = FakeConn([])
+        self.assertEqual(self.mod.oracle_clear_breaks(conn), 0)

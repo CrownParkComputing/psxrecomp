@@ -124,3 +124,48 @@ class VerdictTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrimShapeTest(unittest.TestCase):
+    """The ring dump and gpu_display_list's report() spell prims differently.
+
+    Indexing the string shape as if it were the list shape is a crash, not a
+    wrong answer -- which is exactly what it did against a live oracle.
+    """
+
+    def test_parses_string_verts(self):
+        v = ep.parse_verts("(10,68) (20,667) (-30,100)")
+        self.assertEqual(v, [(10, 68), (20, 667), (-30, 100)])
+
+    def test_parses_list_verts(self):
+        self.assertEqual(ep.parse_verts([[1, 2], [3, 4]]), [(1, 2), (3, 4)])
+
+    def test_parses_string_colors(self):
+        c = ep.parse_colors("(117, 0, 0) (17, 0, 180)")
+        self.assertEqual(c, [(117, 0, 0), (17, 0, 180)])
+
+    def test_parses_list_colors(self):
+        self.assertEqual(ep.parse_colors([[1, 2, 3]]), [(1, 2, 3)])
+
+    def test_empty_and_none_are_empty(self):
+        for bad in (None, "", [], "no tuples here"):
+            self.assertEqual(ep.parse_verts(bad), [])
+            self.assertEqual(ep.parse_colors(bad), [])
+
+    def test_string_shape_quad_not_dropped_by_length_check(self):
+        """A 3-char string must not pass a 'has 3 vertices' test."""
+        q = {"op": "PolyG4+semi", "blend": "B+F", "verts": "(1,2)",
+             "colors": "(1, 2, 3)"}
+        self.assertEqual(ep.additive_shaded_quads([q]), [])
+
+    def test_signature_identical_across_shapes(self):
+        as_list = {"op_name": "PolyG4+semi", "blend": "B+F", "stp": 1,
+                   "semi": True, "kind": "poly",
+                   "verts": [[10, 68], [20, 667], [30, 100], [40, 120]],
+                   "colors": [[117, 0, 0], [17, 0, 180], [5, 5, 5], [5, 5, 5]]}
+        as_str = {"op": "PolyG4+semi", "blend": "B+F", "kind": "poly",
+                  "verts": "(10,68) (20,667) (30,100) (40,120)",
+                  "colors": "(117, 0, 0) (17, 0, 180) (5, 5, 5) (5, 5, 5)"}
+        a, b = ep.signature([as_list]), ep.signature([as_str])
+        for k in ("quads", "distinct_colours", "saturated_colours", "y_span"):
+            self.assertEqual(a[k], b[k], k)

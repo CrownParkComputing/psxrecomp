@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import re
 import os
 import sys
 import time
@@ -54,6 +55,44 @@ from psx_gpu_frame import (  # noqa: E402
 KIND = "psx-effect-palette"
 
 SATURATION = 80     # max-min channel spread that counts as "saturated"
+
+
+VERT_RE = re.compile(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
+
+
+def parse_verts(v):
+    """Vertices as a list of (x, y), from either prim shape.
+
+    The GP0 ring dump carries verts as [[x, y], ...]; gpu_display_list's
+    report() formats them as the string "(x,y) (x,y) ...". A tool that reads
+    both sides has to accept both, and indexing the string shape as if it
+    were the list shape is a crash, not a wrong answer -- which is what it
+    did.
+    """
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [(int(a), int(b)) for a, b in VERT_RE.findall(v)]
+    out = []
+    for item in v:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            out.append((int(item[0]), int(item[1])))
+    return out
+
+
+def parse_colors(c):
+    """Vertex colours as a list of (r, g, b), from either prim shape."""
+    if not c:
+        return []
+    if isinstance(c, str):
+        return [tuple(int(x) for x in m.split(","))
+                for m in re.findall(r"\(([^)]*)\)", c)
+                if len(m.split(",")) == 3]
+    out = []
+    for item in c:
+        if isinstance(item, (list, tuple)) and len(item) >= 3:
+            out.append(tuple(int(x) for x in item[:3]))
+    return out
 
 
 def additive_shaded_quads(prims):
@@ -72,7 +111,7 @@ def additive_shaded_quads(prims):
         blend = p.get("blend") or blend_of(p)
         if blend not in ("B+F",):
             continue
-        if len(p.get("verts") or []) < 3:
+        if len(parse_verts(p.get("verts"))) < 3:
             continue
         out.append(p)
     return out
@@ -84,9 +123,9 @@ def signature(prims):
     colours = collections.Counter()
     ys = []
     for q in quads:
-        for c in q.get("colors") or []:
-            colours[tuple(c)] += 1
-        for v in q["verts"]:
+        for c in parse_colors(q.get("colors")):
+            colours[c] += 1
+        for v in parse_verts(q.get("verts")):
             ys.append(v[1])
     sat = [c for c in colours if max(c) - min(c) > SATURATION]
     return {

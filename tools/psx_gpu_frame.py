@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -1027,7 +1028,7 @@ def oracle_break_list(conn) -> list:
     return out
 
 
-def oracle_clear_breaks(conn) -> int:
+def oracle_clear_breaks(conn, tries: int = 6) -> int:
     """Remove every execute breakpoint the oracle holds. Returns how many.
 
     Stale breakpoints are not inert. DuckStation's AddBreakpointWithCallback
@@ -1036,14 +1037,32 @@ def oracle_clear_breaks(conn) -> int:
     the emulator. Resuming then re-pauses immediately, which is exactly the
     "oracle gets paused and never unpaused" symptom, and it survives across
     tool invocations because it lives in the oracle, not in the tool.
+
+    Removal is VERIFIED against pc_break_list rather than assumed, and
+    retried: a paused oracle serves its socket from a Qt idle timer at about
+    1 Hz, so an unbreak can simply time out. Swallowing that failure is how a
+    breakpoint outlives the tool that set it.
     """
     n = 0
-    for addr in oracle_break_list(conn):
-        try:
-            conn.raw("pc_unbreak", addr=f"0x{addr:08X}")
-            n += 1
-        except DebugError:
-            pass
+    for _ in range(max(1, tries)):
+        remaining = oracle_break_list(conn)
+        if not remaining:
+            return n
+        for addr in remaining:
+            try:
+                conn.raw("pc_unbreak", addr=f"0x{addr:08X}")
+                n += 1
+            except DebugError:
+                pass
+        # A paused oracle answers slowly; give it room before re-checking.
+        oracle_resume(conn)
+        time.sleep(0.2)
+    left = oracle_break_list(conn)
+    if left:
+        raise DebugError(
+            "could not remove oracle breakpoint(s) at "
+            + ", ".join(f"0x{a:08X}" for a in left)
+            + ". They will keep pausing it; restart DuckStation to clear them.")
     return n
 
 
@@ -1098,10 +1117,12 @@ class OracleBreak:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # Verify, do not assume. This runs on the exception path too, which is
+        # exactly when a swallowed failure leaves the emulator wedged.
         try:
-            self.conn.raw("pc_unbreak", addr=self.addr)
-        except DebugError:
-            pass
+            oracle_clear_breaks(self.conn)
+        except DebugError as e:
+            print(f"WARNING: {e}", file=sys.stderr)
         oracle_resume(self.conn)
         return False
 
