@@ -81,3 +81,37 @@ class TestSummary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnwrittenRegion(unittest.TestCase):
+    """A count short by 258 is a symptom; a byte range is somewhere to look.
+
+    Measured on a single capture: the oracle built PolyG3+semi|B+F across
+    0x10D0AC..0x10FD48 while psx-runtime used only 0x10D05C..0x10DCC0. The
+    region above what psx-runtime touches is where those primitives would have
+    been, and tracing its writers is the next concrete step — not another
+    comparison.
+    """
+
+    def test_the_region_starts_where_the_runtime_stops(self):
+        buf = io.StringIO()
+        rows = CC.summarise({"PolyG3+semi|B+F": [32]},
+                            {"PolyG3+semi|B+F": [290]},
+                            out=buf,
+                            nat_spans={"PolyG3+semi|B+F": (0x10D05C, 0x10DCC0)},
+                            orc_spans={"PolyG3+semi|B+F": (0x10D0AC, 0x10FD48)})
+        r = rows[0]
+        self.assertEqual(r["native_span"], (0x10D05C, 0x10DCC0))
+        self.assertEqual(r["oracle_span"], (0x10D0AC, 0x10FD48))
+
+    def test_spans_are_optional(self):
+        # Older reports and partial runs must not break the summary.
+        rows = CC.summarise({"X": [1]}, {"X": [2]}, out=io.StringIO())
+        self.assertIsNone(rows[0]["native_span"])
+
+    def test_a_class_the_runtime_never_builds_has_no_native_span(self):
+        rows = CC.summarise({}, {"PolyFT4+semi|B+F": [30]}, out=io.StringIO(),
+                            nat_spans={},
+                            orc_spans={"PolyFT4+semi|B+F": (0x10E000, 0x10F000)})
+        self.assertIsNone(rows[0]["native_span"])
+        self.assertEqual(rows[0]["oracle_span"], (0x10E000, 0x10F000))

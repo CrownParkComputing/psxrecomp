@@ -51,6 +51,7 @@ def census(conn, samples, gap, out=sys.stderr):
     """Per-class counts over `samples` captures. Returns {class: [counts]}."""
     oracle_resume(conn)
     seen = defaultdict(list)
+    spans = {}
     root = span = None
     misses = 0
     for _ in range(samples):
@@ -82,21 +83,38 @@ def census(conn, samples, gap, out=sys.stderr):
                 time.sleep(gap)
                 continue
             counts = defaultdict(int)
+            lo_hi = {}
             for p in prims:
                 if p["kind"] in ("poly", "rect", "line", "fill"):
-                    counts[prim_class(p)] += 1
+                    k = prim_class(p)
+                    counts[k] += 1
+                    if p.get("src"):
+                        a = int(p["src"], 16) & 0x1FFFFFFF
+                        cur = lo_hi.get(k)
+                        lo_hi[k] = (min(cur[0], a), max(cur[1], a)) if cur else (a, a)
             for k in set(seen) | set(counts):
                 seen[k].append(counts.get(k, 0))
+            # Track WHERE each class is built, not just how many.
+            #
+            # A class that is short by 258 primitives is one thing; knowing the
+            # oracle builds them in a byte range psx-runtime never touches is
+            # what turns that into somewhere to look. Measured on a single
+            # capture: the oracle used 0x10D0AC..0x10FD48 for this class and
+            # psx-runtime only 0x10D05C..0x10DCC0.
+            for k, (a, b) in lo_hi.items():
+                cur = spans.get(k)
+                spans[k] = (min(cur[0], a), max(cur[1], b)) if cur else (a, b)
         except DebugError:
             root = span = None
             misses += 1
         time.sleep(gap)
     if misses:
         print(f"  ({misses} of {samples} captures could not be walked)", file=out)
-    return dict(seen)
+    return dict(seen), spans
 
 
-def summarise(nat, orc, out=sys.stdout, ratio=3.0, floor=20):
+def summarise(nat, orc, out=sys.stdout, ratio=3.0, floor=20,
+              nat_spans=None, orc_spans=None):
     keys = sorted(set(nat) | set(orc))
     rows = []
     for k in keys:
@@ -105,7 +123,9 @@ def summarise(nat, orc, out=sys.stdout, ratio=3.0, floor=20):
                      "native_max": max(a) if a else 0,
                      "oracle_max": max(b) if b else 0,
                      "native_med": sorted(a)[len(a) // 2] if a else 0,
-                     "oracle_med": sorted(b)[len(b) // 2] if b else 0})
+                     "oracle_med": sorted(b)[len(b) // 2] if b else 0,
+                     "native_span": (nat_spans or {}).get(k),
+                     "oracle_span": (orc_spans or {}).get(k)})
     rows.sort(key=lambda r: -(r["oracle_max"] - r["native_max"]))
 
     print(f"\n  {'class':<26}{'runtime max':>12}{'oracle max':>12}{'gap':>8}",
@@ -140,7 +160,7 @@ def main(argv=None):
 
     def go(key, conn):
         try:
-            res[key] = census(conn, args.samples, args.gap)
+            res[key], res[key + "_spans"] = census(conn, args.samples, args.gap)
         except DebugError as e:
             res[key] = {}
             res[key + "_err"] = str(e)
@@ -162,13 +182,31 @@ def main(argv=None):
         print(f"error: {doc['error']}", file=sys.stderr)
         return _finish(doc, args, 1)
 
-    rows = summarise(nat, orc)
+    rows = summarise(nat, orc,
+                     nat_spans=res.get("nat_spans"),
+                     orc_spans=res.get("orc_spans"))
     doc["classes"] = rows
     absent = [r for r in rows
               if r["oracle_max"] >= 20 and r["native_max"] * 3 < r["oracle_max"]]
     doc["absent_on_native"] = [r["key"] for r in absent]
     if absent:
         total = sum(r["oracle_max"] - r["native_max"] for r in absent)
+        for r in absent:
+            ns, os_ = r.get("native_span"), r.get("oracle_span")
+            if ns and os_:
+                r["unwritten_region"] = [f"0x{max(ns[1], os_[0]):08X}",
+                                         f"0x{os_[1]:08X}"]
+                print(f"\n  {r['key']}: the oracle builds these across "
+                      f"0x{os_[0]:08X}..0x{os_[1]:08X}; psx-runtime only uses "
+                      f"0x{ns[0]:08X}..0x{ns[1]:08X}. Trace the writers of "
+                      f"{r['unwritten_region'][0]}..{r['unwritten_region'][1]} "
+                      f"on psx-runtime — if nothing writes there, that is where "
+                      f"the primitives are lost.", file=sys.stdout)
+            elif os_:
+                r["unwritten_region"] = [f"0x{os_[0]:08X}", f"0x{os_[1]:08X}"]
+                print(f"\n  {r['key']}: the oracle builds these across "
+                      f"0x{os_[0]:08X}..0x{os_[1]:08X}; psx-runtime builds none "
+                      f"at all.", file=sys.stdout)
         print(f"\nFINDING: psx-runtime never draws {total} primitive(s) the "
               f"oracle does, across {args.samples} captures spanning the "
               f"effect: {', '.join(r['key'] for r in absent)}.\n"
