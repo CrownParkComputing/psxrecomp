@@ -354,6 +354,13 @@ def sample_oracle(conn, args, out=sys.stderr):
     torn = 0
     truncated = 0
     other = collections.Counter()
+    ram_span = None
+    if args.ram_span and args.ram_span != "all":
+        a, _, b = args.ram_span.partition(":")
+        ram_span = (int(a, 0), int(b, 0))
+        kb = (ram_span[1] - ram_span[0]) // 1024
+        print(f"  reading only 0x{ram_span[0]:06X}..0x{ram_span[1]:06X} "
+              f"({kb} KB) per sample instead of 2 MB", file=out)
     root = None          # once known, read only the span around it
     expect_nodes = 0     # what a FULL walk found; a windowed one must match
     seen_classes = collections.Counter()
@@ -367,6 +374,7 @@ def sample_oracle(conn, args, out=sys.stderr):
             with open(os.devnull, "w") as quiet:
                 rep, meta = walk_side(conn, "oracle", pause=False,
                                       addr=root, window=use_window,
+                                      ram_span=ram_span,
                                       park_for_reread=False,
                                       max_nodes=args.max_nodes, out=quiet)
                 # A window that does not reach the whole list truncates the
@@ -470,6 +478,15 @@ def main():
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--watch-secs", type=float, default=90.0,
                     help="how long to keep reading the running oracle")
+    ap.add_argument("--ram-span", default="0x00100000:0x00140000",
+                    metavar="LO:HI",
+                    help="read only this RAM region per oracle sample. The "
+                         "packet buffers (~0x0010Dxxx / 0x00115xxx) and the "
+                         "ordering tables (~0x129xxx / 0x131xxx) both sit "
+                         "inside the default, so the effect's quads are all "
+                         "there -- and it is ~16 reads rather than 128, which "
+                         "is the difference between a handful of samples per "
+                         "animation and dozens. 'all' reads the full 2 MB.")
     ap.add_argument("--window", type=lambda v: int(v, 0), default=0,
                     help="bytes of RAM to re-read per oracle sample once the "
                          "list is located. DEFAULT 0 (always read all 2 MB): "

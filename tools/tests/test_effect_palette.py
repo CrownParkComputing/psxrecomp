@@ -452,3 +452,38 @@ class SamplingOrderTest(unittest.TestCase):
         """A full read whose node count dips is a smaller frame, not a
         truncated one -- normal and frequent during an animation."""
         self.assertIn("if use_window and rep and expect_nodes", self.SRC)
+
+
+class RamSpanTest(unittest.TestCase):
+    """Reading 2 MB per sample is why a whole animation yielded one capture.
+
+    128 socket round trips per sample takes seconds; the effect is over in a
+    handful. The packet buffers and ordering tables both sit inside a 256 KB
+    region, so scoping the read to it is ~16 chunks and the sample rate goes
+    up roughly eightfold.
+    """
+
+    SRC = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "effect_palette.py")).read()
+
+    def test_default_span_covers_both_packet_buffers(self):
+        lo, hi = 0x00100000, 0x00140000
+        for addr in (0x0010D078, 0x0010D974, 0x00115078, 0x00115954):
+            self.assertTrue(lo <= addr <= hi, hex(addr))
+
+    def test_default_span_covers_both_ordering_tables(self):
+        lo, hi = 0x00100000, 0x00140000
+        for addr in (0x129898, 0x1316D8):
+            self.assertTrue(lo <= addr <= hi, hex(addr))
+
+    def test_default_span_is_much_smaller_than_ram(self):
+        self.assertLess(0x00140000 - 0x00100000, 0x200000 // 4)
+
+    def test_span_is_configurable_and_can_be_disabled(self):
+        self.assertIn('--ram-span', self.SRC)
+        self.assertIn("'all' reads the full 2 MB", self.SRC.replace('"', "'"))
+
+    def test_walk_side_accepts_ram_span(self):
+        import inspect
+        import gpu_display_list as gdl
+        self.assertIn("ram_span", inspect.signature(gdl.walk_side).parameters)

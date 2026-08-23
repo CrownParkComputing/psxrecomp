@@ -121,7 +121,7 @@ def _list_shape(entries):
 
 def walk_side(conn, label, *, addr=None, near=None, pause=False,
               from_dma=False, max_nodes=8192, candidates=6, window=None,
-              park_for_reread=True, out=sys.stdout):
+              ram_span=None, park_for_reread=True, out=sys.stdout):
     """Snapshot one emulator and walk its display list.
 
     Returns (report, meta) or (None, meta) if nothing walkable was found.
@@ -158,7 +158,18 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
         # With the root already known, read only the span around it. The full
         # 2 MB snapshot is ~128 round trips, and against the oracle those run
         # on the emulator thread -- repeated sampling makes it look frozen.
-        if root is not None and window:
+        if ram_span:
+            # An explicit region, not a root-relative window. The ordering
+            # table and the packet buffers sit in known, separate places
+            # (packets ~0x0010Dxxx / 0x00115xxx, tables ~0x129xxx / 0x131xxx),
+            # so one span covering both reads ~16 chunks instead of 128.
+            # Primitives outside it are simply not seen -- fine when the
+            # caller filters to a class that lives inside it, and the reason
+            # this is opt-in rather than a default.
+            rl, rh = ram_span
+            ram = snapshot_ram_window(conn, rl & 0x1FFFFF,
+                                      (rh - rl) & 0x1FFFFF)
+        elif root is not None and window:
             ram = snapshot_ram_window(conn, max(0, (root & 0x1FFFFF) - 0x2000),
                                       window)
         else:
