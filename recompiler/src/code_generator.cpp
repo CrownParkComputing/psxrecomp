@@ -1997,8 +1997,12 @@ std::string CodeGenerator::translate_basic_block(
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
                     /* Assign into a function-scope temp. PGXP wraps loads in
                      * `{{ ... }}`; declaring the temp inside that block left
-                     * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
+                    * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
                     emitted.replace(pos, lhs.size(), temp + " =");
+                    const size_t hook = emitted.find("PGXP_LOAD(");
+                    if (hook != std::string::npos)
+                        emitted.replace(hook, std::string("PGXP_LOAD").size(),
+                                       "PGXP_LOAD_DELAYED");
                     ss << config_.indent << "uint32_t " << temp << ";\n";
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
                     delayed_load_addr = addr;
@@ -2008,13 +2012,23 @@ std::string CodeGenerator::translate_basic_block(
             }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
-                if (writes_gpr(instr, delayed_load_dest)) {
+                const int successor_load_dest = simple_load_dest(instr);
+                const bool successor_replaces_pending =
+                    successor_load_dest == static_cast<int>(delayed_load_dest) &&
+                    ((instr >> 21) & 31u) == delayed_load_dest;
+                if (writes_gpr(instr, delayed_load_dest) && !successor_replaces_pending) {
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_CANCEL({}u);  /* successor write wins */\n",
+                        delayed_load_dest);
                     ss << config_.indent << fmt::format(
                         "(void)psx_ldd_{:08X};  /* successor write wins */\n",
                         delayed_load_addr);
                 } else {
                     ss << config_.indent << fmt::format(
                         "cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
+                        delayed_load_dest, delayed_load_addr);
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_COMMIT({}u, psx_ldd_{:08X});\n",
                         delayed_load_dest, delayed_load_addr);
                 }
                 ss << config_.indent << "}\n";
