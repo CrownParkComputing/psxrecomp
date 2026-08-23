@@ -191,6 +191,30 @@ class ParkGuard:
         return False
 
 
+# The game alternates between two packet buffers this far apart. Measured
+# from the capture: roots 0x0010Dxxx and 0x00115xxx.
+BUFFER_STRIDE = 0x8000
+
+
+def fold_to_walked(addr, lo, hi):
+    """Map a write address onto the buffer copy that was actually walked.
+
+    A write to the other copy describes the same field, so folding it back is
+    what lets one walk explain writes from either frame.
+
+    The two copies are BUFFER_STRIDE apart by ADDITION, not by a toggled bit:
+    0x0010D078 and 0x00115078 differ by 0x8000, but XOR-ing 0x8000 gives
+    0x00105078 because the add carries out of bit 15. Using XOR here folds
+    real writes onto addresses that do not exist.
+    """
+    if lo <= addr <= hi:
+        return addr
+    for alt in (addr - BUFFER_STRIDE, addr + BUFFER_STRIDE):
+        if lo <= alt <= hi:
+            return alt
+    return None
+
+
 def field_map(prims, want=None):
     """addr -> 'colour' | 'vertex', derived from each packet's real layout.
 
@@ -228,7 +252,7 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--class", dest="want", default="PolyG4+semi|B+F")
-    ap.add_argument("--frames", type=int, default=1,
+    ap.add_argument("--frames", type=int, default=2,
                     help="frames to step while tracing. The packet buffer moves "
                          "between frames, so a map built from one walk goes "
                          "stale almost immediately — keep this small.")
@@ -324,10 +348,24 @@ def _parked_main(conn, args, park):
     # describe a different field a frame later. That does not fail loudly -- it
     # smears every instruction to roughly 50% colour and 50% vertex, which reads
     # as "this code writes both" and is entirely an artefact.
+    # The packet buffer is DOUBLE BUFFERED: the game alternates between two
+    # copies exactly BUFFER_STRIDE apart, so the fields walked this frame are
+    # written to the other copy next frame. Tracing only the walked range sees
+    # nothing at all on alternate frames -- which is the "no writes were
+    # recorded" dead end -- and stepping one frame hits the wrong copy about
+    # half the time. Cover both, and step an even number of frames so the
+    # walked copy is definitely rebuilt at least once.
+    alt_lo, alt_hi = lo + BUFFER_STRIDE, hi + BUFFER_STRIDE
+    if lo >= BUFFER_STRIDE:
+        # Cover the copy on EITHER side; which one the walk landed on is not
+        # known here, and arming only the higher one misses half the frames.
+        alt_lo = lo - BUFFER_STRIDE
     stale = False
     try:
         conn.cmd("wtrace_reset")
         conn.cmd("wtrace_add", lo=f"0x{lo:08X}", hi=f"0x{hi:08X}")
+        conn.cmd("wtrace_add", lo=f"0x{lo - BUFFER_STRIDE:08X}",
+                 hi=f"0x{hi + BUFFER_STRIDE:08X}")
         if args.watch > 0:
             conn.cmd("continue")
             time.sleep(args.watch)
@@ -339,7 +377,9 @@ def _parked_main(conn, args, park):
             # actually run -- which yields a trace of nothing and a table that
             # looks merely empty rather than wrong.
             f_before = conn.frame()
-            want = max(1, args.frames)
+            # An even count guarantees the walked copy is rebuilt, whichever
+            # half of the double buffer the walk happened to land on.
+            want = max(2, args.frames + (args.frames & 1))
             conn.cmd("step", n=want)
             for _ in range(400):
                 st = conn.raw("pause_state")
@@ -359,14 +399,24 @@ def _parked_main(conn, args, park):
             again = field_map(
                 [p for p in decode_entries(walk_ordering_table(after, root))
                  if p["kind"] == "poly" and p["op_name"] == op], args.want)
-            moved = sum(1 for a, r in roles.items() if again.get(a) != r)
+            # A walk landing on the OTHER copy of the double buffer is
+            # expected, not corruption: the same fields simply sit
+            # BUFFER_STRIDE away. Compare against the folded layout so a
+            # normal buffer swap is not reported as the map going stale.
+            folded = {}
+            for a, r in again.items():
+                w = fold_to_walked(a, lo, hi)
+                if w is not None:
+                    folded[w] = r
+            moved = sum(1 for a, r in roles.items() if folded.get(a) != r)
             if moved:
                 stale = True
                 print(f"  warning: {moved} of {len(roles)} field addresses "
-                      f"changed role between the two walks — the buffer moved "
-                      f"while tracing.", file=sys.stderr)
-        rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo:08X}",
-                       addr_hi=f"0x{hi:08X}", count=16000)
+                      f"changed role between the two walks, even after "
+                      f"folding the double buffer — the layout really did "
+                      f"move.", file=sys.stderr)
+        rep = conn.cmd("wtrace_dump", addr_lo=f"0x{lo - BUFFER_STRIDE:08X}",
+                       addr_hi=f"0x{hi + BUFFER_STRIDE:08X}", count=16000)
         listings = {}
         if args.disasm:
             # Still parked here, which is the only safe moment: see
@@ -374,7 +424,8 @@ def _parked_main(conn, args, park):
             # are tallied, so tally them now rather than after resuming.
             tally = defaultdict(Counter)
             for e in rep.get("entries", []):
-                r = roles.get(int(e["addr"], 16) & 0x1FFFFFFC)
+                a = fold_to_walked(int(e["addr"], 16) & 0x1FFFFFFC, lo, hi)
+                r = roles.get(a) if a is not None else None
                 if r:
                     tally[e["pc"]][r] += 1
             for pc, k in tally.items():
