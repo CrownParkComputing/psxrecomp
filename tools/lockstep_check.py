@@ -60,6 +60,27 @@ MEANING = {
 SKIPS = ("skipped_irq", "skipped_overflow", "skipped_unhandled",
          "skipped_conflict", "skipped_disabled")
 
+# What a dominant skip reason means for the operator. The distinction that
+# matters is between "this mode cannot cover this game" and "something is
+# wrong": a bare count of 74,111 does not say which, and the two call for
+# opposite responses.
+SKIP_MEANING = {
+    "skipped_irq":
+        "segments containing an interrupt cannot be replayed. In an "
+        "interrupt-heavy game that is most of them, and it is a property of "
+        "SEGMENT granularity rather than a fault. Use block granularity, which "
+        "does not have this limitation.",
+    "skipped_overflow":
+        "the recorded operation trace ran out of room. Shorten the window.",
+    "skipped_unhandled":
+        "these segments contain operations the replayer does not implement, so "
+        "they are outside what this comparison can check at all.",
+    "skipped_conflict":
+        "overlapping recordings; usually harmless in small numbers.",
+    "skipped_disabled":
+        "the comparator was switched off for these segments.",
+}
+
 
 def summarise(d, func_mode, out=sys.stdout):
     checked = d.get("segments_checked" if func_mode else "blocks_checked", 0)
@@ -68,9 +89,15 @@ def summarise(d, func_mode, out=sys.stdout):
     print(f"window frames {lo}..{hi}, {checked} {unit}(s) checked", file=out)
 
     skipped = {k: d.get(k, 0) for k in SKIPS if d.get(k)}
+    total_skipped = sum(skipped.values())
     if skipped:
         print("  skipped: " + ", ".join(f"{k[8:]}={v}" for k, v in skipped.items()),
               file=out)
+        top = max(skipped, key=skipped.get)
+        if total_skipped and skipped[top] >= total_skipped * 0.6:
+            print(f"  mostly {top[8:]} ({100 * skipped[top] // total_skipped}%): "
+                  f"{SKIP_MEANING.get(top, '')}", file=out)
+        d["dominant_skip"] = top
 
     if not d.get("found"):
         if not checked:
@@ -79,10 +106,15 @@ def summarise(d, func_mode, out=sys.stdout):
                   "the frame window, or confirm the comparator is enabled in "
                   "this build.", file=out)
             return "inconclusive"
-        if skipped and sum(skipped.values()) >= checked:
-            print(f"\nWEAK: {sum(skipped.values())} {unit}(s) were skipped "
-                  f"against {checked} checked. Coverage is thin enough that a "
-                  f"divergence could easily sit in what was skipped.", file=out)
+        if skipped and total_skipped >= checked:
+            print(f"\nWEAK: {total_skipped} {unit}(s) were skipped against "
+                  f"{checked} checked — {total_skipped / max(1, checked):.1f}x "
+                  f"more skipped than compared. A divergence could easily sit "
+                  f"in what was skipped, so this is not evidence of anything.",
+                  file=out)
+            if d.get("dominant_skip") == "skipped_irq" and func_mode:
+                print("Run it again at BLOCK granularity: blocks do not skip "
+                      "interrupts, and cover far more of the code.", file=out)
             return "weak"
         print(f"\nNo divergence across {checked} {unit}(s). The compiled code "
               f"matched the interpreter everywhere it was compared.\n"
