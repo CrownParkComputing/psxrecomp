@@ -514,8 +514,12 @@ def main():
     orc_sigs = sample_oracle(DebugConn(args.host, args.ds_port, args.timeout),
                              args)
     print("sampling psx-runtime's GP0 ring (after the replay) …", flush=True)
-    nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
-                             args)
+    try:
+        nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
+                                 args)
+    except DebugError as e:
+        print(f"  psx-runtime unavailable: {e}", file=sys.stderr)
+        nat_sigs = []
     if not nat_sigs:
         # One retry with a wider reach: the ring holds several hundred frames,
         # so a miss usually means the effect is further back than the default.
@@ -523,8 +527,12 @@ def main():
         wide = argparse.Namespace(**vars(args))
         wide.ring_frames = 0
         wide.stride = max(1, args.stride // 2)
-        nat_sigs = sample_native(DebugConn(args.host, args.port, args.timeout),
-                                 wide)
+        try:
+            nat_sigs = sample_native(
+                DebugConn(args.host, args.port, args.timeout), wide)
+        except DebugError as e:
+            print(f"  psx-runtime unavailable: {e}", file=sys.stderr)
+            nat_sigs = []
 
     nat, orc = merge(nat_sigs), merge(orc_sigs)
     def _plain(g):

@@ -138,3 +138,32 @@ def inspect_source(fn):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopedReadTest(unittest.TestCase):
+    """A scoped read must not be re-read to 'verify' it.
+
+    Three second-read tests were tried and each rejected every frame in which
+    the list changed -- byte identity, list shape, then node count. During an
+    animation that is every frame; the last discarded 147 of 147 reads while
+    the walked lists plainly contained the quads being looked for.
+    """
+
+    SRC = None
+
+    def setUp(self):
+        import inspect
+        self.SRC = inspect.getsource(gdl.walk_side)
+
+    def test_scoped_span_short_circuits_the_recheck(self):
+        self.assertIn("if ram_span and entries:", self.SRC)
+        branch = self.SRC.split("if ram_span and entries:", 1)[1]
+        branch = branch.split("elif", 1)[0]
+        self.assertIn('meta["coherent"] = True', branch)
+        self.assertNotIn("read_ram_range(", branch)
+
+    def test_unscoped_path_still_checks(self):
+        self.assertIn("elif not meta.get(\"paused\") and entries:", self.SRC)
+
+    def test_coherence_reason_is_recorded(self):
+        self.assertIn("scoped-single-read", self.SRC)

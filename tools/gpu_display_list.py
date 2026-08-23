@@ -211,7 +211,16 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
     # Now that the span is known, the re-read is a few KB, so it is affordable
     # even at the 1 Hz the oracle drops to while parked. Park, re-read just the
     # span, resume: a snapshot from ONE instant.
-    if not meta.get("paused") and entries:
+    if ram_span and entries:
+        # An explicitly scoped read is already coherent enough: 256 KB is ~16
+        # chunks, comparable to a single frame, so the snapshot IS the
+        # picture. Re-reading to check it is what destroys it -- three
+        # different second-read tests (byte identity, list shape, node count)
+        # each rejected every frame in which the list changed, and during an
+        # animation that is every frame. The last one discarded 147 of 147.
+        meta["coherent"] = True
+        meta["coherence"] = "scoped-single-read"
+    elif not meta.get("paused") and entries:
         addrs = [int(e["src"], 16) & 0x1FFFFF for e in entries]
         lo, hi = min(min(addrs), root & 0x1FFFFF), max(addrs)
         span_lo = lo & ~3
