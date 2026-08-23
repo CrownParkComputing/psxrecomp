@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, STP_MODES, DebugConn,
     DebugError, decode_entries, dma_gpu_list_root, find_display_lists,
-    read_ram_range, snapshot_ram, walk_ordering_table,
+    read_ram_range, snapshot_ram, snapshot_ram_window, walk_ordering_table,
 )
 
 LIST_KIND = "psx-display-list"
@@ -109,7 +109,7 @@ def summarise(prims, out=sys.stdout, limit=20):
 
 
 def walk_side(conn, label, *, addr=None, near=None, pause=False,
-              from_dma=False, max_nodes=8192, candidates=6,
+              from_dma=False, max_nodes=8192, candidates=6, window=None,
               out=sys.stdout):
     """Snapshot one emulator and walk its display list.
 
@@ -144,7 +144,14 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
                 print(f"  [{label}] DMA ch2 MADR holds the end-of-list "
                       f"terminator, not a root. Scanning instead.", file=out)
 
-        ram = snapshot_ram(conn)
+        # With the root already known, read only the span around it. The full
+        # 2 MB snapshot is ~128 round trips, and against the oracle those run
+        # on the emulator thread -- repeated sampling makes it look frozen.
+        if root is not None and window:
+            ram = snapshot_ram_window(conn, max(0, (root & 0x1FFFFF) - 0x2000),
+                                      window)
+        else:
+            ram = snapshot_ram(conn)
         try:
             meta["frame_after"] = conn.frame()
         except DebugError:

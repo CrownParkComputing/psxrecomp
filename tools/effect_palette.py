@@ -208,6 +208,24 @@ def verdict(nat, orc, colour_ratio=4.0):
         return ("no-oracle-samples",
                 "no oracle read caught the effect, so nothing is compared. "
                 "This is not evidence that its list is clean.", None)
+    # The biggest object either side saw is the effect. If only ONE side
+    # sampled it, there is nothing to compare -- falling back to a smaller
+    # object and reporting agreement from it is how this tool once answered
+    # "signatures-agree" using the placement glow while the effect object was
+    # missing from psx-runtime entirely.
+    everything = set(nat["groups"]) | set(orc["groups"])
+    if everything:
+        biggest = max(everything, key=lambda k: k[0] * max(k[1], 1))
+        if biggest not in nat["groups"] or biggest not in orc["groups"]:
+            missing = "psx-runtime" if biggest not in nat["groups"] else "the oracle"
+            return ("effect-object-one-sided",
+                    f"the effect object ({biggest[0]} quads spanning "
+                    f"{biggest[1]} lines) was sampled only on "
+                    f"{'the oracle' if missing == 'psx-runtime' else 'psx-runtime'}"
+                    f"; {missing} never saw it, so there is nothing to compare. "
+                    f"Replay the effect on BOTH emulators while this runs. "
+                    f"Smaller objects present on both sides are NOT a "
+                    f"substitute -- they are a different thing.", None)
     shared = common_groups(nat, orc)
     if not shared:
         return ("no-common-object",
@@ -298,17 +316,22 @@ def sample_oracle(conn, args, out=sys.stderr):
 
     sigs = []
     empty = 0
+    root = None          # once known, read only the span around it
     deadline = time.monotonic() + args.watch_secs
     while time.monotonic() < deadline and len(sigs) < args.samples:
         try:
             with open(os.devnull, "w") as quiet:
                 rep, _meta = walk_side(conn, "oracle", pause=False,
+                                       addr=root, window=args.window,
                                        max_nodes=args.max_nodes, out=quiet)
         except DebugError as e:
             print(f"  oracle read failed: {e}", file=out)
             time.sleep(args.poll)
             continue
         if rep:
+            # Remember where the list lives; the next read is a few KB rather
+            # than 2 MB, which is what stops the oracle stuttering.
+            root = rep.get("root") or root
             sig = signature(rep.get("prims") or [])
             if sig["quads"]:
                 sigs.append(sig)
@@ -336,6 +359,9 @@ def main():
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--watch-secs", type=float, default=90.0,
                     help="how long to keep reading the running oracle")
+    ap.add_argument("--window", type=lambda v: int(v, 0), default=0x20000,
+                    help="bytes of RAM to re-read per oracle sample once the "
+                         "list is located (0 = always snapshot all 2 MB)")
     ap.add_argument("--poll", type=float, default=0.4,
                     help="seconds between oracle reads")
     ap.add_argument("--ring-frames", type=int, default=600,

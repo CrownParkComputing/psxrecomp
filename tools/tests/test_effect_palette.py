@@ -205,12 +205,17 @@ class GroupingTest(unittest.TestCase):
         self.assertEqual(m["groups"][(64, 599)]["samples"], 2)
 
     def test_only_shared_objects_compared(self):
+        """Disjoint objects are a gap in the evidence, not a difference.
+
+        Reported as effect-object-one-sided: the biggest object either side
+        saw is the effect, and it was seen by only one of them.
+        """
         nat = ep.merge([self.sig(64, 599, 153)])
         orc = ep.merge([self.sig(144, 155, 5)])
         v, why, k = ep.verdict(nat, orc)
-        self.assertEqual(v, "no-common-object")
+        self.assertEqual(v, "effect-object-one-sided")
         self.assertIsNone(k)
-        self.assertIn("never sampled the same object", why)
+        self.assertIn("nothing to compare", why)
 
     def test_effect_object_drives_the_verdict(self):
         """The real data: 153 vs 3 on the effect, 4 vs 5 on the placement glow."""
@@ -277,3 +282,42 @@ class FadeFloorTest(unittest.TestCase):
         orc = ep.merge([self.sig(64, 599, 3, 8)])
         _, why, _ = ep.verdict(nat, orc)
         self.assertNotIn("fade never", why)
+
+
+class OneSidedObjectTest(unittest.TestCase):
+    """A smaller object present on both sides is not a substitute for the
+    effect object being missing on one of them."""
+
+    def sig(self, quads, span, colours, peak=100):
+        return {"quads": quads, "y_span": span, "distinct_colours": colours,
+                "saturated_colours": 0, "peak_channel": peak,
+                "top_colours": []}
+
+    def test_refuses_when_effect_object_missing_from_native(self):
+        """The exact run that wrongly reported signatures-agree."""
+        nat = ep.merge([self.sig(144, 155, 5)])
+        orc = ep.merge([self.sig(64, 599, 3), self.sig(144, 155, 5)])
+        v, why, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "effect-object-one-sided")
+        self.assertIsNone(k)
+        self.assertIn("psx-runtime never saw it", why)
+
+    def test_refuses_when_effect_object_missing_from_oracle(self):
+        nat = ep.merge([self.sig(64, 599, 153), self.sig(144, 155, 5)])
+        orc = ep.merge([self.sig(144, 155, 5)])
+        v, _, _ = ep.verdict(nat, orc)
+        self.assertEqual(v, "effect-object-one-sided")
+
+    def test_compares_when_both_saw_the_effect(self):
+        nat = ep.merge([self.sig(64, 599, 153), self.sig(144, 155, 5)])
+        orc = ep.merge([self.sig(64, 599, 3), self.sig(144, 155, 5)])
+        v, _, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "native-builds-different-geometry")
+        self.assertEqual(k, (64, 599))
+
+    def test_colour_count_is_independent_of_brightness(self):
+        """The oracle showed 3 colours at peak 3 AND at peak 220."""
+        dim = ep.merge([self.sig(64, 599, 3, peak=3)])
+        bright = ep.merge([self.sig(64, 599, 3, peak=220)])
+        self.assertEqual(dim["groups"][(64, 599)]["distinct_colours"],
+                         bright["groups"][(64, 599)]["distinct_colours"])

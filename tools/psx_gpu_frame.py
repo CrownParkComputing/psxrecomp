@@ -1156,6 +1156,25 @@ def snapshot_ram(conn: "DebugConn", size: int = RAM_SIZE) -> bytes:
     return read_ram_range(conn, 0x80000000, size)
 
 
+def snapshot_ram_window(conn: "DebugConn", base: int, length: int,
+                        size: int = RAM_SIZE) -> bytes:
+    """A RAM image with only [base, base+length) populated.
+
+    Walking an ordering table touches only the list's own span, so snapshotting
+    the whole 2 MB to reach something already located is ~128 round trips for
+    nothing. Against DuckStation those reads are serviced on the emulator
+    thread, so a caller that samples repeatedly makes the emulator appear to
+    freeze even though nothing is paused.
+    """
+    buf = bytearray(size)
+    base &= 0x1FFFFF
+    length = max(0, min(length, size - base))
+    if length:
+        data = read_ram_range(conn, 0x80000000 + base, length)
+        buf[base:base + len(data)] = data
+    return bytes(buf)
+
+
 def walk_ordering_table(ram: bytes, root: int, max_nodes: int = 8192,
                         max_words: int = GPU_GP0_RING_MAX_WORDS) -> List[Dict[str, Any]]:
     """Follow an ordering table, returning entries shaped like gpu_frame_dump's.
