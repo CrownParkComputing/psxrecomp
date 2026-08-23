@@ -495,7 +495,8 @@ def main(argv=None):
                 print(f"\n  Step sizes are comparable "
                       f"(psx-runtime max {a['max_step']}, oracle max "
                       f"{b['max_step']}), so the fade granularity matches too.")
-        elif args.per_frame and a["samples"] >= 5:
+        elif (args.per_frame and a["samples"] >= 5
+              and doc.get("native_sampling") != "free-running-fallback"):
             doc["granularity"] = "native-measured-per-frame"
             print(f"\n  psx-runtime, sampled on CONSECUTIVE frames, moves in "
                   f"steps of up to {a['max_step']} (median "
@@ -504,6 +505,18 @@ def main(argv=None):
                   f"step is an upper bound only — but a per-frame increment "
                   f"this large is a coarse fade regardless of what the oracle "
                   f"does.")
+        elif doc.get("native_sampling") == "free-running-fallback":
+            # The claim that must never be made from aliased data: these steps
+            # are an artefact of sampling ~90 frames apart, not the animation
+            # increment. It was made anyway, because the guard sat on a
+            # different branch than the one that fired.
+            doc["granularity"] = "native-aliased"
+            print(f"\n  psx-runtime's numbers came from the free-running "
+                  f"fallback, so its steps (median {a['median_step']}, max "
+                  f"{a['max_step']}) are ALIASED — samples about ninety frames "
+                  f"apart — and are NOT an animation increment. The oracle's "
+                  f"are not frame-adjacent either. Nothing here compares HOW "
+                  f"either one moves.")
         else:
             doc["granularity"] = "too-few-samples"
             print(f"\n  Too few samples ({a['samples']} vs {b['samples']}) to "
