@@ -128,10 +128,12 @@ def signature(prims):
         for v in parse_verts(q.get("verts")):
             ys.append(v[1])
     sat = [c for c in colours if max(c) - min(c) > SATURATION]
+    peak = max((max(c) for c in colours), default=0)
     return {
         "quads": len(quads),
         "distinct_colours": len(colours),
         "saturated_colours": len(sat),
+        "peak_channel": peak,
         "y_span": (max(ys) - min(ys)) if ys else 0,
         "top_colours": [list(c) for c, _ in colours.most_common(6)],
     }
@@ -163,11 +165,18 @@ def merge(sigs):
         k = group_key(sig)
         g = groups.setdefault(k, {"quads": k[0], "y_span": k[1],
                                   "distinct_colours": 0,
-                                  "saturated_colours": 0, "samples": 0})
+                                  "saturated_colours": 0, "samples": 0,
+                                  "peak_max": 0, "peak_min": None})
         g["distinct_colours"] = max(g["distinct_colours"],
                                     sig["distinct_colours"])
         g["saturated_colours"] = max(g["saturated_colours"],
                                      sig["saturated_colours"])
+        peak = sig.get("peak_channel", 0)
+        g["peak_max"] = max(g["peak_max"], peak)
+        # The DIMMEST sample is the load-bearing one: the effect is a fade, so
+        # the question is not how bright it gets but whether it ever goes out.
+        g["peak_min"] = peak if g["peak_min"] is None else min(g["peak_min"],
+                                                               peak)
         g["samples"] += 1
     return {"groups": groups, "samples": len(sigs),
             "samples_with_quads": len(live)}
@@ -211,12 +220,20 @@ def verdict(nat, orc, colour_ratio=4.0):
         n, o = nat["groups"][k], orc["groups"][k]
         dn, do = n["distinct_colours"], o["distinct_colours"]
         if dn / max(do, 1) >= colour_ratio:
+            extra = ""
+            if n["peak_min"] is not None and o["peak_min"] is not None:
+                extra = (f" Across samples psx-runtime's dimmest frame of this "
+                         f"object still peaks at {n['peak_min']} while the "
+                         f"oracle's reaches {o['peak_min']}: the fade never "
+                         f"goes out here, which is what leaves the mesh "
+                         f"visible as hard-edged quads."
+                         if n["peak_min"] > 4 * max(o["peak_min"], 1) else "")
             return ("native-builds-different-geometry",
                     f"on the same object ({k[0]} quads spanning {k[1]} lines), "
                     f"psx-runtime builds {dn} distinct vertex colours against "
                     f"the oracle's {do}. The display list already differs, so "
                     f"the fault is upstream of the renderer -- in the code "
-                    f"that computes this effect's colours.", k)
+                    f"that computes this effect's colours." + extra, k)
         if do / max(dn, 1) >= colour_ratio:
             return ("oracle-builds-more",
                     f"on {k[0]} quads/{k[1]} lines the ORACLE builds {do} "
@@ -347,7 +364,7 @@ def main():
         doc["compared_object"] = {"quads": which[0], "y_span": which[1]}
 
     print(f"\n{'object':>16}  {'side':<12}{'colours':>9}{'saturated':>11}"
-          f"{'samples':>9}")
+          f"{'dimmest':>9}{'peak':>7}{'samples':>9}")
     seen = sorted(set(nat["groups"]) | set(orc["groups"]),
                   key=lambda k: -(k[0] * max(k[1], 1)))
     for k in seen:
@@ -355,10 +372,12 @@ def main():
         for side, m in (("psx-runtime", nat), ("oracle", orc)):
             g = m["groups"].get(k)
             if not g:
-                print(f"{label:>16}  {side:<12}{'-':>9}{'-':>11}{0:>9}")
+                print(f"{label:>16}  {side:<12}{'-':>9}{'-':>11}{'-':>9}"
+                      f"{'-':>7}{0:>9}")
             else:
                 print(f"{label:>16}  {side:<12}{g['distinct_colours']:>9}"
-                      f"{g['saturated_colours']:>11}{g['samples']:>9}")
+                      f"{g['saturated_colours']:>11}{g['peak_min']:>9}"
+                      f"{g['peak_max']:>7}{g['samples']:>9}")
     print(f"\nVERDICT: {v}\n{why}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

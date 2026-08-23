@@ -228,3 +228,52 @@ class GroupingTest(unittest.TestCase):
         v, _, k = ep.verdict(nat, orc)
         self.assertEqual(v, "signatures-agree")
         self.assertEqual(k, (144, 155))
+
+
+class FadeFloorTest(unittest.TestCase):
+    """The effect is a fade, so the load-bearing number is not how bright it
+    gets but whether it ever goes out."""
+
+    def sig(self, quads, span, colours, peak):
+        return {"quads": quads, "y_span": span, "distinct_colours": colours,
+                "saturated_colours": 0, "peak_channel": peak,
+                "top_colours": []}
+
+    def test_peak_channel_measured(self):
+        s = ep.signature([{"op_name": "PolyG4+semi", "blend": "B+F", "stp": 1,
+                           "semi": True, "kind": "poly",
+                           "verts": [[0, 0], [1, 1], [2, 2], [3, 3]],
+                           "colors": [[248, 136, 8], [24, 0, 0],
+                                      [0, 0, 0], [0, 0, 0]]}])
+        self.assertEqual(s["peak_channel"], 248)
+
+    def test_dimmest_sample_tracked_not_just_brightest(self):
+        m = ep.merge([self.sig(64, 599, 153, 248),
+                      self.sig(64, 599, 151, 155),
+                      self.sig(64, 599, 153, 201)])
+        g = m["groups"][(64, 599)]
+        self.assertEqual(g["peak_min"], 155)
+        self.assertEqual(g["peak_max"], 248)
+
+    def test_single_sample_has_equal_floor_and_peak(self):
+        m = ep.merge([self.sig(64, 599, 3, 3)])
+        g = m["groups"][(64, 599)]
+        self.assertEqual(g["peak_min"], 3)
+        self.assertEqual(g["peak_max"], 3)
+
+    def test_verdict_names_the_fade_floor(self):
+        """The real numbers: native never dims below 155, the oracle reaches 3."""
+        nat = ep.merge([self.sig(64, 599, 153, 248),
+                        self.sig(64, 599, 151, 155)])
+        orc = ep.merge([self.sig(64, 599, 3, 3)])
+        v, why, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "native-builds-different-geometry")
+        self.assertIn("155", why)
+        self.assertIn("fade never", why)
+
+    def test_no_fade_claim_when_floors_are_close(self):
+        """Do not assert a fade fault the numbers do not support."""
+        nat = ep.merge([self.sig(64, 599, 153, 12)])
+        orc = ep.merge([self.sig(64, 599, 3, 8)])
+        _, why, _ = ep.verdict(nat, orc)
+        self.assertNotIn("fade never", why)
