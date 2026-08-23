@@ -36,6 +36,7 @@
 #include "event_ring.h"
 #include "lockstep.h"
 #include "psx_cycles.h"
+#include "psx_vblank_clock.h"
 #include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,11 +178,109 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
 
 /* Dispatch counter for vblank scheduling. */
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
-#define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
-#define VBLANK_DEFER_STALE_CYCLES (VBLANK_CYCLES * 10ull)
+#define PSX_CPU_HZ      33868800u
+static uint32_t s_vblank_base_rate = PSX_VBLANK_RATE_NTSC;
+static uint32_t s_vblank_multiplier = 1u;
+static uint32_t s_vblank_rate = PSX_VBLANK_RATE_NTSC;
+static PSXVBlankClock s_vblank_clock = {
+    PSX_VBLANK_CYCLES_NTSC, 0u, 1u, 0u, PSX_VBLANK_CYCLES_NTSC
+};
+static uint64_t s_vblank_rate_numerator = PSX_VBLANK_RATE_NTSC;
+static uint32_t s_vblank_rate_denominator = 1u;
+static uint32_t cycles_since_vblank;  /* native cycles into the live CRTC frame */
+#define VBLANK_CYCLES s_vblank_clock.current_cycles
+#define VBLANK_DEFER_STALE_CYCLES ((uint64_t)VBLANK_CYCLES * 10ull)
+
+static int vblank_rate_valid(uint32_t frames_per_second) {
+    return frames_per_second >= 1u && frames_per_second <= 1000u &&
+           (PSX_CPU_HZ % frames_per_second) == 0u;
+}
+
+static void set_vblank_period_rational(uint64_t period_numerator,
+                                       uint32_t period_denominator,
+                                       uint64_t rate_numerator,
+                                       uint32_t rate_denominator,
+                                       uint32_t nominal_rate,
+                                       int preserve_phase) {
+    uint32_t old_cycles = VBLANK_CYCLES;
+    if (period_denominator == 0u || rate_denominator == 0u) return;
+    if (!psx_vblank_clock_configure(&s_vblank_clock,
+                                    period_numerator,
+                                    period_denominator)) return;
+    s_vblank_rate_numerator = rate_numerator;
+    s_vblank_rate_denominator = rate_denominator;
+    s_vblank_rate = nominal_rate;
+    if (preserve_phase && old_cycles != 0u && old_cycles != VBLANK_CYCLES) {
+        /* Preserve the exact fractional CRTC position. This prevents a 50->100
+         * transition from manufacturing an immediately-overdue VBlank (or a
+         * 100->50 transition from repeating half a frame). */
+        cycles_since_vblank = (uint32_t)(
+            ((uint64_t)cycles_since_vblank * (uint64_t)VBLANK_CYCLES) /
+            (uint64_t)old_cycles);
+    }
+}
+
+static void set_effective_vblank_rate(uint32_t frames_per_second,
+                                      int preserve_phase) {
+    if (!vblank_rate_valid(frames_per_second)) return;
+    set_vblank_period_rational((uint64_t)PSX_CPU_HZ,
+                               frames_per_second,
+                               frames_per_second, 1u,
+                               frames_per_second, preserve_phase);
+}
+
+int interrupts_configure_vblank(uint32_t base_frames_per_second,
+                                uint32_t multiplier) {
+    if ((base_frames_per_second != PSX_VBLANK_RATE_NTSC &&
+         base_frames_per_second != PSX_VBLANK_RATE_PAL) ||
+        multiplier < 1u || multiplier > 8u ||
+        base_frames_per_second > 1000u / multiplier) {
+        return 0;
+    }
+    uint32_t effective = base_frames_per_second * multiplier;
+    if (base_frames_per_second != PSX_VBLANK_RATE_PAL &&
+        !vblank_rate_valid(effective)) {
+        return 0;
+    }
+    s_vblank_base_rate = base_frames_per_second;
+    s_vblank_multiplier = multiplier;
+    if (base_frames_per_second == PSX_VBLANK_RATE_PAL) {
+        const uint64_t period_num =
+            (uint64_t)PSX_CPU_HZ * (uint64_t)PSX_PAL_CRTC_TICKS_PER_FRAME;
+        const uint32_t period_den = PSX_PAL_VIDEO_CLOCK_HZ * multiplier;
+        const uint64_t rate_num =
+            (uint64_t)PSX_PAL_VIDEO_CLOCK_HZ * (uint64_t)multiplier;
+        set_vblank_period_rational(period_num, period_den,
+                                   rate_num, PSX_PAL_CRTC_TICKS_PER_FRAME,
+                                   effective, 1);
+    } else {
+        set_effective_vblank_rate(effective, 1);
+    }
+    return 1;
+}
+
+uint32_t interrupts_get_vblank_base_rate(void) { return s_vblank_base_rate; }
+uint32_t interrupts_get_vblank_multiplier(void) { return s_vblank_multiplier; }
+double interrupts_get_vblank_rate_hz(void) {
+    return (double)s_vblank_rate_numerator /
+           (double)s_vblank_rate_denominator;
+}
+uint64_t interrupts_native_cycles_for_frames(uint32_t frames) {
+    return psx_vblank_clock_cycles_for_frames_ceil(&s_vblank_clock, frames);
+}
+uint64_t interrupts_frames_for_native_cycles(uint64_t cycles) {
+    return psx_vblank_clock_frames_for_cycles_floor(&s_vblank_clock, cycles);
+}
+uint32_t interrupts_get_vblank_fraction(void) {
+    return s_vblank_clock.fraction;
+}
+void interrupts_set_vblank_fraction(uint32_t value) {
+    (void)psx_vblank_clock_restore_fraction(&s_vblank_clock, value);
+}
+
+uint32_t interrupts_get_vblank_rate(void) { return s_vblank_rate; }
 static uint32_t dispatch_count;
 static uint64_t total_checks;
-static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
 extern uint64_t g_vblank_raise_count;
 extern int g_cosim_dirty_pump_site;
 
@@ -391,6 +490,10 @@ static void fire_vblank_edge(void) {
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
     cycles_since_vblank -= VBLANK_CYCLES;
+    /* PAL periods are rational in native CPU cycles. Advance the Bresenham
+     * remainder only when an edge actually fires, then publish the duration
+     * of the newly scheduled frame. */
+    psx_vblank_clock_next(&s_vblank_clock);
     dispatch_count = 0;
     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
@@ -704,6 +807,22 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
 }
 
 void interrupts_init(void) {
+    /* Base/multiplier are title configuration, not prior-session machine state.
+     * Re-derive the exact effective period but reset phase below. */
+    if (s_vblank_base_rate == PSX_VBLANK_RATE_PAL) {
+        const uint64_t period_num =
+            (uint64_t)PSX_CPU_HZ * (uint64_t)PSX_PAL_CRTC_TICKS_PER_FRAME;
+        const uint32_t period_den =
+            PSX_PAL_VIDEO_CLOCK_HZ * s_vblank_multiplier;
+        const uint64_t rate_num =
+            (uint64_t)PSX_PAL_VIDEO_CLOCK_HZ * s_vblank_multiplier;
+        set_vblank_period_rational(
+            period_num, period_den, rate_num, PSX_PAL_CRTC_TICKS_PER_FRAME,
+            s_vblank_base_rate * s_vblank_multiplier, 0);
+    } else {
+        set_effective_vblank_rate(
+            s_vblank_base_rate * s_vblank_multiplier, 0);
+    }
     dispatch_count = 0;
     in_exception = 0;
     exception_nest_depth = 0;

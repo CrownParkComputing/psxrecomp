@@ -39,10 +39,12 @@ extern "C" {
 /* v1 = incomplete RAM-only; v2 = full machine but host-struct memcpy (padding);
  * v3 = little-endian field wire (portable Win/Linux/macOS ARM);
  * v4 = v3 + optional zlib on large sections (section pad bit0 = compressed);
- * v5 = v4 + CD-ROM Sub-Q replacement state. */
-#define BOOT_STATE_VERSION 5u
-/* v5 intentionally breaks older savestates after the CD-ROM wire grew. */
-#define BOOT_STATE_VERSION_MIN_READ 5u
+ * v5 = v4 + CD-ROM Sub-Q replacement state;
+ * v6 = exact CPU-overclock clock domain + rational CRTC phase/config identity
+ *      + CPU GTE/muldiv/load-interlock timing pipeline. */
+#define BOOT_STATE_VERSION 6u
+/* v6 intentionally rejects states that lack the 900% fractional clock carry. */
+#define BOOT_STATE_VERSION_MIN_READ 6u
 /* Section pad bit0: payload is u32 LE uncompressed_len + zlib deflate bytes. */
 #define BOOT_STATE_SEC_ZLIB 1u
 
@@ -62,7 +64,7 @@ typedef struct {
     uint32_t codegen_ver;    /* PSX_OVERLAY_CODEGEN_VER                           */
     /* ---- layout ---- */
     uint32_t section_count;  /* number of sections that follow                    */
-    uint32_t reserved;       /* 0                                                 */
+    uint32_t reserved;       /* active game/config hash (v6+)                    */
 } BootStateHeader;
 
 #define BOOT_STATE_HEADER_WIRE_BYTES 36u
@@ -78,12 +80,12 @@ typedef struct {
  * hard reject (incomplete restore is never allowed) -> normal boot + recapture.
  */
 enum {
-    BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
+    BS_SEC_CPU    = 0x01,  /* CPU registers + GTE/muldiv/load timing pipeline     */
     BS_SEC_RAM    = 0x02,  /* 2 MB main RAM                                       */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */
-    BS_SEC_IRQ    = 0x04,  /* i_stat / i_mask / cycles_since_vblank (12B; 8B ok)  */
+    BS_SEC_IRQ    = 0x04,  /* IRQ + exact rational CRTC phase/config (24B in v6)  */
     BS_SEC_TIMER  = 0x05,  /* 3 root counters (counter/mode/target/irq/frac)      */
-    BS_SEC_CLOCK  = 0x06,  /* psx_cycle_count                                     */
+    BS_SEC_CLOCK  = 0x06,  /* native/raw CPU clocks + OC ratio/carry (48B in v6)  */
     BS_SEC_GPU    = 0x07,  /* GPU regs: display/draw-area/offset/mask/texpage/xfer*/
     BS_SEC_VRAM   = 0x08,  /* 1 MB VRAM (1024x512x16)                             */
     BS_SEC_SPU    = 0x09,  /* SPU regs + 24 voice decode/ADSR state + latches     */

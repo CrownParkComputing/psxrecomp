@@ -1,4 +1,5 @@
 #include "mdec.h"
+#include "interrupts.h"
 #include "pst_wire.h"
 #include "psx_cycles.h"
 
@@ -774,9 +775,11 @@ int mdec_recently_active(uint32_t within_frames) {
     /* Guest-cycle hysteresis (not host s_frame_count). Present-skip / Replay
      * leave s_frame_count stale so a single decode looked "recent" forever
      * (false FMV lockstep on rematch; tip episodes into MotK FMV entry). */
-    const uint64_t cycles_per_frame = 338688ull;
-    const uint64_t window =
-        (uint64_t)within_frames * cycles_per_frame + (cycles_per_frame / 2ull);
+    const uint64_t frame_cycles = interrupts_native_cycles_for_frames(1u);
+    const uint64_t base_window =
+        interrupts_native_cycles_for_frames(within_frames);
+    const uint64_t window = base_window > UINT64_MAX - frame_cycles / 2u
+        ? UINT64_MAX : base_window + frame_cycles / 2u;
     if (psx_cycle_count < mdec_last_color_decode_cycle)
         return 0;
     return (psx_cycle_count - mdec_last_color_decode_cycle) <= window;
@@ -1192,11 +1195,11 @@ int mdec_snapshot_read(const uint8_t *p, uint32_t len) {
         mdec_last_color_decode_cycle = 0;
     else
         mdec_last_color_decode_cycle = psx_cycle_count - age;
-    /* Refresh host-frame hysteresis for local FMV policy only (~1 frame ≈
-     * 338688 cycles @ NTSC). Cap so recently_active stays meaningful. */
+    /* Refresh host-frame hysteresis for local FMV policy using the live CRTC
+     * period. This is PALx2-aware and does not confuse a nominal 100 Hz mode
+     * with a rounded 338688-cycle frame. */
     {
-        const uint64_t cycles_per_frame = 338688ull;
-        uint64_t frames_ago = age / cycles_per_frame;
+        uint64_t frames_ago = interrupts_frames_for_native_cycles(age);
         if (frames_ago > 100000ull)
             frames_ago = 100000ull;
         if (frames_ago >= s_frame_count)

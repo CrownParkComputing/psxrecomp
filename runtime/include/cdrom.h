@@ -179,6 +179,13 @@ typedef struct CDROMDebugState {
     uint64_t int1_pended;
     uint64_t int1_lost;
     uint8_t  int1_pending_now;
+    /* Native CDDA clock evidence. A playing single-speed stream must advance
+     * sectors_played at 75 sectors/second regardless of CPU OC or CRTC rate. */
+    uint8_t  cdda_playing;
+    int      cdda_track;
+    uint32_t cdda_lba;
+    int      cdda_delay;
+    uint64_t cdda_sectors_played;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {

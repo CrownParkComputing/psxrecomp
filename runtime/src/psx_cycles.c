@@ -3,7 +3,6 @@
 #include "psx_cycles.h"
 #include "cpu_state.h"
 #include <stdlib.h>
-#include <string.h>
 #if defined(_MSC_VER)
 #include <intrin.h>       /* MSVC intrinsics: _BitScanReverse (no __builtin_clz) */
 #endif
@@ -20,9 +19,32 @@
 #include "cosim_state.h"
 #endif
 
-/* CPU overclock state; the model is documented at psx_oc_apply in the header. */
-uint32_t g_psx_oc_scale_q16 = 65536u;   /* 1.0 = stock */
-uint32_t g_psx_oc_accum     = 0u;
+/* CPU overclock state; the exact rational model is documented at psx_oc_apply
+ * in the header. Reduced terms keep the hot multiply small (900% = 1/9). */
+uint32_t g_psx_oc_numerator   = 1u;
+uint32_t g_psx_oc_denominator = 1u;
+uint32_t g_psx_oc_accum       = 0u;
+static uint32_t s_psx_oc_requested_percent = 100u;
+static int      s_psx_oc_active = 1;
+static void psx_idle_countdown_reset(void);
+
+static uint32_t psx_gcd_u32(uint32_t a, uint32_t b) {
+    while (b != 0u) {
+        uint32_t r = a % b;
+        a = b;
+        b = r;
+    }
+    return a ? a : 1u;
+}
+
+static void psx_apply_cpu_overclock_state(void) {
+    uint32_t percent = s_psx_oc_active ? s_psx_oc_requested_percent : 100u;
+    uint32_t common = psx_gcd_u32(100u, percent);
+    g_psx_oc_numerator = 100u / common;
+    g_psx_oc_denominator = percent / common;
+    g_psx_oc_accum = 0u;
+    psx_idle_countdown_reset();
+}
 
 /* percent: 100 = stock, 1000 = 10x. Floor 100 because UNDERclocking would
  * starve the guest of cycles the game assumes it has; ceiling 6400 because
@@ -31,16 +53,33 @@ uint32_t g_psx_oc_accum     = 0u;
 void psx_set_cpu_overclock(uint32_t percent) {
     if (percent < 100u)  percent = 100u;
     if (percent > 6400u) percent = 6400u;
-    g_psx_oc_scale_q16 = (uint32_t)((65536ull * 100ull) / (uint64_t)percent);
-    if (g_psx_oc_scale_q16 == 0u) g_psx_oc_scale_q16 = 1u;
-    g_psx_oc_accum = 0u;
+    if (s_psx_oc_requested_percent == percent) return;
+    /* A ratio change is a clock-domain barrier. Publish work under the ratio
+     * at which it retired; never reinterpret a pending batch retroactively. */
+    psx_cyc_batch_flush();
+    s_psx_oc_requested_percent = percent;
+    psx_apply_cpu_overclock_state();
 }
 
 uint32_t psx_get_cpu_overclock(void) {
-    if (g_psx_oc_scale_q16 == 0u) return 100u;
-    return (uint32_t)((65536ull * 100ull) / (uint64_t)g_psx_oc_scale_q16);
+    return s_psx_oc_requested_percent;
+}
+
+void psx_set_cpu_overclock_active(int active) {
+    active = active ? 1 : 0;
+    if (s_psx_oc_active == active) return;
+    psx_cyc_batch_flush();
+    s_psx_oc_active = active;
+    psx_apply_cpu_overclock_state();
+}
+
+uint32_t psx_get_effective_cpu_overclock(void) {
+    return (uint32_t)(((uint64_t)g_psx_oc_denominator * 100ull) /
+                      (uint64_t)g_psx_oc_numerator);
 }
 uint64_t psx_cycle_count = 0;
+uint64_t psx_cpu_retired_cycles = 0;
+uint64_t psx_cpu_native_cycles = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
@@ -50,7 +89,11 @@ static uint64_t s_cycle_replay_live = 0;
 
 int psx_cycle_replay_begin(uint64_t start_cycle) {
     extern int g_ls_replay_active;
-    if (!g_ls_replay_active || s_cycle_replay_active) return 0;
+    /* The legacy replay API captures only native start time, not the raw CPU
+     * timestamp and converter remainder needed to replay a scaled CPU exactly.
+     * Fail closed until its checkpoint contract carries all three values. */
+    if (!g_ls_replay_active || s_cycle_replay_active ||
+        psx_get_effective_cpu_overclock() != 100u) return 0;
     s_cycle_replay_live = psx_cycle_count;
     psx_cycle_count = start_cycle;
     s_cycle_replay_active = 1;
@@ -129,9 +172,68 @@ static void advance_devices(uint32_t c) {
 #define PSX_DEADLINE_HARD_CAP 16384u
 
 static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here */
+/* Invalidates learned title-idle timing whenever device progress could have
+ * inserted IRQ-handler CPU work between two observed loop iterations. */
+static uint64_t s_device_service_epoch = 0;
 /* Exported for the inlined psx_advance_cycles / psx_cyc_charge hot path. */
 uint64_t psx_next_service_cycle = 0;         /* absolute; 0 = dirty, recompute  */
 int      psx_in_device_service  = 0;         /* re-entrancy guard               */
+
+void psx_clock_domain_snapshot(PSXClockDomainSnapshot *out) {
+    if (!out) return;
+    /* A save is a publication barrier. The caller normally flushes first, but
+     * doing it here makes the API safe in isolation as well. */
+    psx_cyc_batch_flush();
+    out->native_cycle_count = psx_cycle_count;
+    out->cpu_retired_cycles = psx_cpu_retired_cycles;
+    out->cpu_native_cycles = psx_cpu_native_cycles;
+    out->requested_percent = s_psx_oc_requested_percent;
+    out->overclock_active = (uint32_t)(s_psx_oc_active ? 1 : 0);
+    out->numerator = g_psx_oc_numerator;
+    out->denominator = g_psx_oc_denominator;
+    out->remainder = g_psx_oc_accum;
+    out->reserved_flags = 0u;
+}
+
+int psx_clock_domain_restore(const PSXClockDomainSnapshot *in) {
+    uint32_t percent, common, numerator, denominator;
+    if (!in || in->requested_percent < 100u ||
+        in->requested_percent > 6400u || in->overclock_active > 1u ||
+        in->reserved_flags != 0u) {
+        return 0;
+    }
+    percent = in->overclock_active ? in->requested_percent : 100u;
+    common = psx_gcd_u32(100u, percent);
+    numerator = 100u / common;
+    denominator = percent / common;
+    if (in->numerator != numerator || in->denominator != denominator ||
+        in->remainder >= denominator) {
+        return 0;
+    }
+    /* Runtime clock policy is configuration, not mutable save-state data. A
+     * state may restore the timeline/carry only under the same active ratio;
+     * it must never silently switch a newly configured build back to 900%. */
+    if (in->requested_percent != s_psx_oc_requested_percent ||
+        (int)in->overclock_active != s_psx_oc_active ||
+        numerator != g_psx_oc_numerator ||
+        denominator != g_psx_oc_denominator) {
+        return 0;
+    }
+
+    /* A restore happens outside generated execution. Discard any unpublished
+     * work from the abandoned host timeline before installing the snapshot. */
+    g_psx_cyc_batch = 0u;
+    g_psx_cyc_batch_limit = 0u;
+    g_psx_cyc_bb_defer = 0;
+    if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0u;
+    g_psx_cyc_local_acc = NULL;
+    psx_cycle_count = in->native_cycle_count;
+    psx_cpu_retired_cycles = in->cpu_retired_cycles;
+    psx_cpu_native_cycles = in->cpu_native_cycles;
+    g_psx_oc_accum = in->remainder;
+    psx_idle_countdown_reset();
+    return 1;
+}
 int      g_plp_cycle_diag       = 0;
 uint64_t g_plp_adv_calls        = 0;
 uint32_t g_plp_adv_max_chunk    = 0;
@@ -193,6 +295,7 @@ void psx_devices_service_to_now(void) {
     s_in_device_service = 1;
     uint64_t target = psx_cycle_count;
     if (s_devices_synced_cycle < target) {
+        s_device_service_epoch++;
         /* Rewind and re-play the gap in event-bounded chunks so device
          * callbacks see the same incremental psx_cycle_count they always did
          * and no chunk ever skips OVER a device event boundary. */
@@ -265,6 +368,7 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
      * share identically, so it is the alignment point for the full-state hash. */
     cosim_tick();
 #endif
+    if (cycles != 0u) s_device_service_epoch++;
     interrupts_service_scheduled_events();
     while (cycles > 0) {
         uint32_t step = cycles;
@@ -310,6 +414,12 @@ void psx_advance_cycles_slow(uint32_t cycles) {
       }
     }
     if (cycles == 0) return;
+    if (!psx_in_device_service) {
+        psx_cpu_retired_cycles += (uint64_t)cycles;
+        cycles = psx_oc_apply(cycles);
+        if (cycles == 0) return;
+        psx_cpu_native_cycles += (uint64_t)cycles;
+    }
 #ifdef PSX_COSIM
     psx_advance_cycles_exact(cycles);
 #else
@@ -351,10 +461,22 @@ void psx_advance_cycles_slow(uint32_t cycles) {
 #endif
 }
 
+void psx_advance_native_cycles(uint32_t cycles) {
+    /* Preserve CPU-before-device ordering even if a caller forgot the
+     * documented publication barrier. This does not count the native-only
+     * interval as retired CPU work. */
+    psx_cyc_batch_flush();
+    if (cycles == 0u) return;
+    psx_cycle_count += (uint64_t)cycles;
+    if (!psx_in_device_service &&
+        (psx_next_service_cycle == 0u ||
+         psx_cycle_count >= psx_next_service_cycle)) {
+        psx_devices_service_to_now();
+    }
+}
+
 uint64_t psx_get_cycle_count(void) {
-    uint64_t n = psx_cycle_count + (uint64_t)g_psx_cyc_batch;
-    if (g_psx_cyc_local_acc) n += (uint64_t)(*g_psx_cyc_local_acc);
-    return n;
+    return psx_preview_native_cycle_count();
 }
 
 /* ===== Idle-loop cycle skip (wait-loop elision, 2026-07-06) ==================
@@ -425,6 +547,24 @@ static uint64_t s_idle_last_cycle = 0;
 static uint64_t s_idle_last_stores = 0;
 static uint64_t s_idle_last_mmio = 0;
 
+static uint64_t s_countdown_last_retired = 0;
+static uint64_t s_countdown_last_service_epoch = 0;
+static uint32_t s_countdown_last_timeout = 0;
+static uint32_t s_countdown_candidate_quantum = 0;
+static uint32_t s_countdown_learned_quantum = 0;
+static uint32_t s_countdown_candidate_matches = 0;
+static int      s_countdown_have_last = 0;
+
+static void psx_idle_countdown_reset(void) {
+    s_countdown_last_retired = 0;
+    s_countdown_last_service_epoch = s_device_service_epoch;
+    s_countdown_last_timeout = 0;
+    s_countdown_candidate_quantum = 0;
+    s_countdown_learned_quantum = 0;
+    s_countdown_candidate_matches = 0;
+    s_countdown_have_last = 0;
+}
+
 static void idle_snapshot_regs(const CPUState *cpu) {
     for (int i = 1; i < 32; i++) s_idle_gpr[i] = cpu->gpr[i];
     s_idle_hi = cpu->hi;
@@ -451,6 +591,121 @@ static int idle_skip_on(void) {
 
 int psx_idle_skip_is_enabled(void) { return idle_skip_on(); }
 
+/* WipEout 3's VSync helper spills its two-million-iteration timeout to the
+ * stack, so the generic no-store detector cannot compact it.  This helper is
+ * called only at that loop's stable FAA4 boundary.  It first observes one
+ * complete real iteration to learn the exact timing-model charge, then retires
+ * additional identical iterations in one charge without crossing an internal
+ * device event.  The generated site applies the same timeout decrements to RAM;
+ * one real iteration is always left to perform the poll and branch. */
+uint32_t psx_idle_batch_countdown(uint32_t timeout_value) {
+#ifdef PSX_COSIM
+    (void)timeout_value;
+    return 0u;
+#else
+    extern int mdec_recently_active(uint32_t within_frames);
+    extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
+    extern int psx_get_in_exception(void);
+    if (!idle_skip_on() || psx_get_effective_cpu_overclock() <= 100u ||
+        mdec_recently_active(6u) || psx_get_in_exception() || g_psx_call_bail ||
+        g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
+        psx_idle_countdown_reset();
+        return 0u;
+    }
+
+    /* The generated LW can leave raw work in either deferred tier. Publish it
+     * before inspecting device deadlines: otherwise the projected skip can be
+     * computed from an earlier native instant and cross the event when
+     * psx_advance_cycles() folds that pending work in. */
+    psx_cyc_batch_flush();
+    {
+        extern uint32_t i_stat, i_mask;
+        if ((i_stat & i_mask) != 0u) {
+            psx_idle_countdown_reset();
+            return 0u;
+        }
+    }
+
+    uint64_t retired = psx_get_cpu_retired_cycle_count();
+    uint64_t service_epoch = s_device_service_epoch;
+    if (s_countdown_have_last &&
+        service_epoch == s_countdown_last_service_epoch &&
+        timeout_value == s_countdown_last_timeout - 1u) {
+        uint64_t delta = retired - s_countdown_last_retired;
+        if (delta > 0u && delta <= IDLE_QUANTUM_MAX) {
+            uint32_t q = (uint32_t)delta;
+            if (q == s_countdown_candidate_quantum) {
+                if (s_countdown_candidate_matches < UINT32_MAX)
+                    s_countdown_candidate_matches++;
+            } else {
+                s_countdown_candidate_quantum = q;
+                s_countdown_candidate_matches = 1u;
+                s_countdown_learned_quantum = 0u;
+            }
+            /* Two identical uninterrupted deltas (three real observations)
+             * are required before synthetic retirement is allowed. */
+            if (s_countdown_candidate_matches >= 2u)
+                s_countdown_learned_quantum = q;
+        } else {
+            psx_idle_countdown_reset();
+        }
+    } else if (s_countdown_have_last) {
+        psx_idle_countdown_reset();
+    }
+    s_countdown_last_retired = retired;
+    s_countdown_last_timeout = timeout_value;
+    s_countdown_last_service_epoch = service_epoch;
+    s_countdown_have_last = 1;
+
+    uint32_t q = s_countdown_learned_quantum;
+    if (q == 0u || timeout_value == 0u || timeout_value == UINT32_MAX)
+        return 0u;
+
+    /* Device countdowns describe distance from s_devices_synced_cycle, which
+     * can lag the published CPU/native clock on the deadline fast path. Using
+     * them directly here would count that already elapsed gap twice and could
+     * compact across an event (the service replay would raise it, but only
+     * after the CPU had synthetically retired iterations past its first
+     * observation boundary). psx_next_service_cycle is the authoritative
+     * absolute deadline from the current published clock. Its hard-cap wakeup
+     * is conservative when it precedes a real device event, which is safe. */
+    uint32_t dist = 1u;
+    if (psx_next_service_cycle > psx_cycle_count) {
+        uint64_t room = psx_next_service_cycle - psx_cycle_count;
+        dist = room > UINT32_MAX ? UINT32_MAX : (uint32_t)room;
+    }
+    if (dist <= 1u) return 0u;
+
+    /* Find the largest iteration count whose exact rational native charge
+     * remains strictly before the event. One real timeout iteration is always
+     * retained for the generated poll/store/branch path. */
+    uint32_t hi = timeout_value > 1u ? timeout_value - 1u : 0u;
+    uint64_t raw_cap = UINT32_MAX / q;
+    if ((uint64_t)hi > raw_cap) hi = (uint32_t)raw_cap;
+    uint32_t lo = 0u;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo + 1u) / 2u;
+        uint64_t raw = (uint64_t)mid * (uint64_t)q;
+        uint64_t native = psx_oc_preview_native(raw);
+        if (native < (uint64_t)dist) lo = mid;
+        else hi = mid - 1u;
+    }
+    if (lo == 0u) return 0u;
+
+    uint32_t raw = lo * q;
+    g_idle_skip_count++;
+    g_idle_skip_cycles += psx_oc_preview_native(raw);
+    g_idle_skip_last_pc = 0x8015FAA4u;
+    g_idle_skip_last_quantum = q;
+    psx_advance_cycles(raw);
+
+    s_countdown_last_retired = psx_get_cpu_retired_cycle_count();
+    s_countdown_last_timeout = timeout_value - lo;
+    s_countdown_last_service_epoch = s_device_service_epoch;
+    return lo;
+#endif
+}
+
 void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 #ifdef PSX_COSIM
     (void)cpu; (void)check_pc;
@@ -463,7 +718,13 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     /* A speculative replay must not clear or train the authoritative live idle
      * detector. Its clock/device view is transactional and cannot be skipped. */
     if (g_ls_replay_active) return;
-    if (!idle_skip_on() || g_idle_note_suppress) return;
+    if (!idle_skip_on() || g_idle_note_suppress ||
+        psx_get_effective_cpu_overclock() > 100u) {
+        s_idle_pc = 0;
+        s_idle_streak = 0;
+        s_idle_have_snap = 0;
+        return;
+    }
     if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
         g_precise_mode || g_ls_mode != 0) {
         s_idle_pc = 0;
@@ -553,7 +814,6 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 
     if (s_idle_progress_reg > 0)
         cpu->gpr[s_idle_progress_reg] -= k;
-
     g_idle_skip_count++;
     g_idle_skip_cycles += skip;
     g_idle_skip_last_pc = check_pc;
@@ -583,6 +843,8 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
     s_devices_synced_cycle = psx_cycle_count;
+    s_device_service_epoch++;
+    psx_idle_countdown_reset();
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
     /* Idle-skip detector latches absolute cycle/store counters from the
@@ -592,21 +854,10 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     s_idle_have_snap = 0;
     s_idle_progress_reg = -2;
     s_idle_last_cycle = psx_cycle_count;
-    /* GTE/muldiv completion deadlines and load-absorb give-back are host-only
-     * absolute cycle stamps (not in BS_SEC_CPU). After a warm load they still
-     * hold the pre-load live timeline; the next psx_gte_stall / muldiv_stall
-     * would then advance (live_ts - restored_cycle) in one shot — tens of
-     * millions of cycles / N nested presents with zero IRQ checks (MotK
-     * transform CTC2 path). Anchor them at the restored clock. */
-    if (cpu) {
-        cpu->gte_ts_done = psx_cycle_count;
-        cpu->muldiv_ts_done = psx_cycle_count;
-        memset(cpu->read_absorb, 0, sizeof(cpu->read_absorb));
-        cpu->read_absorb_which = 0;
-        cpu->read_fudge = 0x20u; /* no committed predecessor load */
-        cpu->ld_which_t = 0x20u; /* no pending load dest */
-        cpu->ld_absorb = 0;
-    }
+    /* v6 save-states carry GTE/muldiv deadlines and load-interlock state in
+     * BS_SEC_CPU. Do not re-anchor them here: doing so makes a mid-operation
+     * save resume with different CPU timing than the captured machine. */
+    (void)cpu;
     /* Dirty-RAM interpreter load-delay writebacks live in host statics, not
      * BS_SEC_CPU. Discard (do not flush): snap GPRs are already architectural.
      * A stale pending v0 write from the pre-load timeline was forking MotK
@@ -630,23 +881,31 @@ void psx_cycles_reset_for_boot(void) {
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
     psx_cycle_count        = 0;
+    psx_cpu_retired_cycles = 0;
+    psx_cpu_native_cycles  = 0;
+    g_psx_oc_accum         = 0;
     s_devices_synced_cycle = 0;
+    s_device_service_epoch = 0;
     s_next_service_cycle   = 0;
     s_in_device_service    = 0;
     g_psx_cycle_fast_limit = 0;
     s_next_watchdog        = 0;
     s_next_pc_sample       = 0;
+    psx_watchdog_throttle  = 0;
+    psx_pc_sample_throttle = 0;
+    s_cycle_replay_active  = 0;
+    s_cycle_replay_live    = 0;
+    psx_idle_countdown_reset();
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----
  *
- * MULT/MULTU/DIV/DIVU don't stall at the op; they set a completion DEADLINE.
- * A later MFLO/MFHI that reads HI/LO before the deadline STALLS (advances guest
- * cycles) until it. Instructions executed in between absorb the latency — so the
- * stall is (deadline - now), not a flat charge (this is why div+2filler+mflo costs
- * the same as div+mflo: the fillers ran during the latency window). REQUIRES
- * per-instruction cycle charging (PSX_CODEGEN_CYCLE_PER_INSN / the interp), so
- * `now` is the true cycle position at the op — block-up-front charging breaks it.
+ * MULT/MULTU/DIV/DIVU don't stall at the op; they set a completion deadline on
+ * the raw CPU-retirement timeline. A later MFLO/MFHI retires the remaining raw
+ * stall cycles; the overclock converter advances native device time exactly
+ * once. Instructions executed in between absorb latency, so the stall is
+ * (deadline - raw_now), not a flat charge. This requires per-instruction cycle
+ * charging: block-up-front charging breaks it.
  *
  * Latencies transcribed from Beetle cpu.cpp: DIV/DIVU = 37 (fixed). MULT/MULTU =
  * MULT_Tab24 indexed by the leading-zero count of the (sign-folded, for signed)
@@ -680,7 +939,8 @@ uint32_t psx_mult_latency_u(uint32_t rs) {  /* MULTU (unsigned) */
 /* DIV/DIVU latency is the fixed constant 37 — emitted directly at the op site. */
 
 void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
-    cpu->muldiv_ts_done = psx_cycle_count + (uint64_t)latency;
+    cpu->muldiv_ts_done =
+        psx_get_cpu_retired_cycle_count() + (uint64_t)latency;
 }
 
 void psx_muldiv_stall(CPUState* cpu) {
@@ -690,12 +950,13 @@ void psx_muldiv_stall(CPUState* cpu) {
      * have been "free" for following instructions are spent here instead. Plus the
      * off-by-one shortcut: a deadline exactly one cycle out just retracts (no stall).
      * (No-load code has read_absorb==0, so this reduces to a plain advance.) */
-    if (cpu->muldiv_ts_done > psx_cycle_count) {
-        if (cpu->muldiv_ts_done == psx_cycle_count + 1u) {
+    uint64_t cpu_now = psx_get_cpu_retired_cycle_count();
+    if (cpu->muldiv_ts_done > cpu_now) {
+        if (cpu->muldiv_ts_done == cpu_now + 1u) {
             cpu->muldiv_ts_done--;   /* off-by-one: retract the deadline, no advance */
             return;
         }
-        uint32_t stall = (uint32_t)(cpu->muldiv_ts_done - psx_cycle_count);
+        uint32_t stall = psx_cpu_cycles_until(cpu->muldiv_ts_done);
         uint8_t w = cpu->read_absorb_which;          /* fixed during the stall */
         uint32_t give = cpu->read_absorb[w];
         cpu->read_absorb[w] = (uint8_t)(give > stall ? give - stall : 0u);  /* consume */
@@ -709,8 +970,8 @@ void psx_muldiv_stall(CPUState* cpu) {
  * §1+DO_LDS that bracket this ran in the instruction's psx_cyc_step (COP2 is non-load).
  * MTC2/CTC2 (writes) use psx_gte_stall (stall only, no give-back). */
 void psx_gte_read(CPUState* cpu, uint32_t rt) {
-    if (cpu->gte_ts_done > psx_cycle_count) {
-        uint32_t stall = (uint32_t)(cpu->gte_ts_done - psx_cycle_count);
+    uint32_t stall = psx_cpu_cycles_until(cpu->gte_ts_done);
+    if (stall != 0u) {
         cpu->ld_absorb = stall;
         psx_advance_cycles(stall);
     } else {
@@ -726,9 +987,8 @@ void psx_gte_read(CPUState* cpu, uint32_t rt) {
  * verified from source); the COP2 instruction's own +1 base is charged
  * separately by per-instruction charging, so the *added* deadline latency is
  * cost-1. A later COP2 register access (MFC2/CFC2/MTC2/CTC2/LWC2/SWC2) stalls
- * until the deadline. Back-to-back commands serialize: psx_gte_set stalls to the
- * prior deadline before arming the next (Beetle stalls timestamp to gte_ts_done
- * at the command site before computing the new gte_ts_done).
+ * until the raw CPU deadline. Back-to-back commands serialize: psx_gte_set
+ * retires the raw remainder to the prior deadline before arming the next.
  *
  * Cost table = (cost-1), indexed by the 6-bit GTE command (instr & 0x3F).
  * cost values transcribed + verified from beetle-psx/mednafen/psx/gte.cpp op
@@ -767,14 +1027,13 @@ uint32_t psx_gte_cmd_latency(uint32_t cmd) {
 
 void psx_gte_set(CPUState* cpu, uint32_t latency) {
     /* Back-to-back GTE ops serialize: finish the prior op first. */
-    if (cpu->gte_ts_done > psx_cycle_count) {
-        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
-    }
-    cpu->gte_ts_done = psx_cycle_count + (uint64_t)latency;
+    uint32_t stall = psx_cpu_cycles_until(cpu->gte_ts_done);
+    if (stall != 0u) psx_advance_cycles(stall);
+    cpu->gte_ts_done =
+        psx_get_cpu_retired_cycle_count() + (uint64_t)latency;
 }
 
 void psx_gte_stall(CPUState* cpu) {
-    if (cpu->gte_ts_done > psx_cycle_count) {
-        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
-    }
+    uint32_t stall = psx_cpu_cycles_until(cpu->gte_ts_done);
+    if (stall != 0u) psx_advance_cycles(stall);
 }

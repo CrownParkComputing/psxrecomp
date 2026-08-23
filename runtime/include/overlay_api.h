@@ -86,6 +86,8 @@
  *      model participation with queue-safe guard/hysteresis policy. */
 /* v21: ws_angle_widen forwarder for exact, aspect-scaled 12-bit terrain
  *      frustum half-angle constants. */
+/* v22: guarded title-specific idle-countdown callback. Overlay shards flush
+ *      their private cycle batch before asking the host to compact the loop. */
 /* (PGXP, no version bump): OverlayCallbacks grew an appended-last PGXPHooks
  *      table pointer (pgxp_hooks.h). Only pgxp-flavour shards (compiled with
  *      -DPSX_PGXP=1, PSX_OVERLAY_FLAVOR_PGXP set) reference the psx_pgxp_*
@@ -93,7 +95,7 @@
  *      host/DLL flavor mix — base-flavour DLLs and hosts are untouched, so
  *      the version stays. The emit-content change (PGXP_*() macros in all
  *      generated C) is covered by the codegen hash + CODEGEN_VER below. */
-#define PSX_OVERLAY_ABI_VERSION 21
+#define PSX_OVERLAY_ABI_VERSION 22
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
  * record consumes one slot, even when another DLL carries an identical
@@ -308,6 +310,9 @@ typedef struct {
 
     /* Aspect-scaled terrain-frustum angle helper (ABI v21). */
     uint32_t (*ws_angle_widen)(uint32_t vanilla);
+
+    /* Guarded title-specific idle compactor (ABI v22). */
+    uint32_t (*idle_batch_countdown)(uint32_t timeout_value);
 
     /* PGXP dataflow-shadowing hook table (pgxp_hooks.h). Only pgxp-flavour
      * shards (PSX_OVERLAY_FLAVOR pgxp bit, compiled with -DPSX_PGXP=1) emit

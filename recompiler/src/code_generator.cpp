@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -1965,6 +1966,136 @@ std::string CodeGenerator::translate_basic_block(
                 delayed_load_active = false;
             }
             emit_cosim_instr(addr, config_.indent);
+            const auto idle_site = config_.idle_countdown_sites.find(addr);
+            if (idle_site != config_.idle_countdown_sites.end()) {
+                if (instr != idle_site->second) {
+                    if (!config_.overlay_mode) {
+                        throw std::runtime_error(fmt::format(
+                            "idle-countdown site 0x{:08X}: expected "
+                            "0x{:08X}, found 0x{:08X}",
+                            addr, idle_site->second, instr));
+                    }
+                } else {
+                    /* The configured LW is only the entry guard. The synthetic
+                     * mutation represents the title's following
+                     *
+                     *     nop; addiu rt,rt,-1; sw rt,off(base)
+                     *
+                     * sequence, so prove those exact words in the same basic
+                     * block too. Besides preventing a partial overlay capture
+                     * from manufacturing guest writes, this gives the emitted
+                     * store its real PC/instruction provenance. */
+                    const uint32_t base_reg = (instr >> 21) & 31u;
+                    const uint32_t value_reg = (instr >> 16) & 31u;
+                    const int32_t offset = (int32_t)(int16_t)(instr & 0xFFFFu);
+                    const uint32_t decrement_instr =
+                        0x24000000u | (value_reg << 21) |
+                        (value_reg << 16) | 0xFFFFu;
+                    const uint32_t store_instr =
+                        0xAC000000u | (base_reg << 21) |
+                        (value_reg << 16) | (instr & 0xFFFFu);
+                    const bool sequence_in_block =
+                        addr <= UINT32_MAX - 12u && addr + 12u <= block.end_addr;
+                    const auto delay_word = sequence_in_block
+                        ? exe_.read_word(addr + 4u) : std::nullopt;
+                    const auto decrement_word = sequence_in_block
+                        ? exe_.read_word(addr + 8u) : std::nullopt;
+                    const auto store_word = sequence_in_block
+                        ? exe_.read_word(addr + 12u) : std::nullopt;
+                    const bool sequence_matches =
+                        delay_word.has_value() && *delay_word == 0u &&
+                        decrement_word.has_value() &&
+                        *decrement_word == decrement_instr &&
+                        store_word.has_value() && *store_word == store_instr;
+                    if (!sequence_matches) {
+                        if (!config_.overlay_mode) {
+                            throw std::runtime_error(fmt::format(
+                                "idle-countdown site 0x{:08X}: expected guarded "
+                                "tail [00000000, {:08X}, {:08X}] through "
+                                "0x{:08X}",
+                                addr, decrement_instr, store_instr, addr + 12u));
+                        }
+                        /* Overlay captures may end in the middle of this main-
+                         * image title pattern, or contain unrelated bytes at the
+                         * same RAM address. Leave those variants authoritative
+                         * to their ordinary generated/interpreted instructions. */
+                        addr += 4;
+                        continue;
+                    }
+                    if (defer_load || delayed_load_active) {
+                        throw std::runtime_error(fmt::format(
+                            "idle-countdown site 0x{:08X}: destination has an "
+                            "immediate load-delay dependency",
+                            addr));
+                    }
+                    ss << config_.indent << "{\n"
+                       << config_.indent << config_.indent
+                       << fmt::format(
+                              "uint32_t _idle_addr = cpu->gpr[{}] + {};\n",
+                              base_reg, offset)
+                       << config_.indent << config_.indent
+                       << fmt::format(
+                              "uint32_t _idle_value = cpu->gpr[{}];\n",
+                              value_reg)
+                       << config_.indent << config_.indent
+                       << "uint32_t _idle_batch = "
+                          "psx_idle_batch_countdown(_idle_value);\n"
+                       << config_.indent << config_.indent
+                       << "if (_idle_batch != 0u) {\n"
+                       << "#if defined(PSX_PGXP) && PSX_PGXP\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << "uint32_t _idle_pgxp_left = _idle_batch;\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << "while (_idle_pgxp_left != 0u) {\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << "uint32_t _idle_step = _idle_pgxp_left > 0x7FFFu "
+                          "? 0x7FFFu : _idle_pgxp_left;\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << fmt::format("uint32_t _idle_prev = cpu->gpr[{}];\n",
+                                      value_reg)
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << fmt::format("cpu->gpr[{}] -= _idle_step;\n", value_reg)
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << fmt::format(
+                              "uint32_t _idle_addiu = 0x{:08X}u | "
+                              "((0u - _idle_step) & 0xFFFFu);\n",
+                              decrement_instr & 0xFFFF0000u)
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << fmt::format(
+                              "PGXP_ALU(_idle_addiu, cpu->gpr[{}], "
+                              "_idle_prev, 0u - _idle_step);\n",
+                              value_reg)
+                       << config_.indent << config_.indent << config_.indent
+                       << config_.indent
+                       << "_idle_pgxp_left -= _idle_step;\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << "}\n"
+                       << "#else\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << fmt::format("cpu->gpr[{}] -= _idle_batch;\n", value_reg)
+                       << "#endif\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << "psx_store_cycle_barrier();\n"
+                       << config_.indent << config_.indent << config_.indent
+                       << fmt::format("g_debug_last_store_pc = 0x{:08X}u;\n",
+                                      addr + 12u)
+                       << config_.indent << config_.indent << config_.indent
+                       << fmt::format("cpu->write_word(_idle_addr, cpu->gpr[{}]);\n",
+                                      value_reg)
+                       << config_.indent << config_.indent << config_.indent
+                       << fmt::format(
+                              "PGXP_STORE(0x{:08X}u, _idle_addr, "
+                              "cpu->gpr[{}]);\n",
+                              store_instr, value_reg)
+                       << config_.indent << config_.indent << "}\n"
+                       << config_.indent << "}\n";
+                }
+            }
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {

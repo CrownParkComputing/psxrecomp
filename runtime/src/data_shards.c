@@ -415,13 +415,15 @@ static void ds_apply(CPUState* cpu, DsShard* s) {
     for (int i = 0; i < 17; i++) cpu->gpr[k_ds_gprs[i]] = s->regs[i];
     cpu->hi = s->regs[17]; cpu->lo = s->regs[18];
     s_st.bytes_replayed += s->wr_total;
-    /* cycle credit: slices through the normal machinery so timers/VBlank/CD
-     * events and IRQ delivery land at their authentic guest cycles. */
+    /* PDS1 records elapsed native device time. Replay it in the same unit;
+     * feeding it through psx_advance_cycles() at 900% would divide the saved
+     * interval by nine. Data shards remain stock-only below because PDS1 does
+     * not also carry the raw CPU-retirement cost needed for OC telemetry. */
     uint32_t ra = cpu->gpr[31];
     uint64_t remaining = s->cyc_cost;
     while (remaining) {
         uint32_t chunk = remaining > 2048u ? 2048u : (uint32_t)remaining;
-        psx_advance_cycles(chunk);
+        psx_advance_native_cycles(chunk);
         remaining -= chunk;
         psx_check_interrupts_at(cpu, ra);
     }
@@ -431,7 +433,7 @@ static void ds_apply(CPUState* cpu, DsShard* s) {
 /* ---------- gen-time hooks ---------- */
 
 int psx_datashard_enter(CPUState* cpu, uint32_t key) {
-    if (!s_enabled) return 0;
+    if (!s_enabled || psx_get_effective_cpu_overclock() != 100u) return 0;
     s_st.enters++; s_st.last_key = key;
 
     if (g_ds_recording) {

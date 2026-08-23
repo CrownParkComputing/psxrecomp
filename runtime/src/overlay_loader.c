@@ -1090,6 +1090,10 @@ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
 static char s_cache_dir[512];
 static char s_game_id[64];
 static uint32_t s_config_hash;
+
+uint32_t overlay_loader_active_config_hash(void) {
+    return s_config_hash;
+}
 static int  s_active = 0;
 
 /* Canonical (filesystem-resolved) form of s_cache_dir, computed lazily on the
@@ -2231,6 +2235,7 @@ static void init_callbacks(void) {
     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
     /* Address of the header inline → out-of-line copy in this TU (host side). */
     s_callbacks.advance_cycles     = psx_advance_cycles;
+    s_callbacks.idle_batch_countdown = psx_idle_batch_countdown;
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
@@ -2699,6 +2704,14 @@ void overlay_loader_init(const char *cache_dir, const char *game_id,
     { extern void ds_init(const char*, const char*); ds_init(cache_dir, game_id); }
     init_callbacks();
     scan_cache_dir();
+    fprintf(stdout,
+            "psxrecomp: overlay cache audit: tag=cg%d_%08x_gc%08x_f%u "
+            "indexed=%d candidates=%d status=%s\n",
+            PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+            (unsigned)s_config_hash, (unsigned)PSX_OVERLAY_FLAVOR,
+            s_cache_idx_count, s_valid_count,
+            s_last_msg[0] ? s_last_msg : "ok");
+    fflush(stdout);
     load_bios_resident_shards();
     overlay_image_warm_init();
     overlay_image_warm_seed_boot_text();

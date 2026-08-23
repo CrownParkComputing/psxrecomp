@@ -1896,17 +1896,12 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * flush their local pending-cycle accumulator before entering these host
  * helpers, so this stays on the host side of that ABI boundary. */
 #if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
-extern uint64_t g_psx_cycle_fast_limit;
-extern int g_event_step_conservative;
 extern int g_ls_replay_active;
 static inline void psx_load_charge_cycles(uint32_t cycles) {
     if (g_ls_replay_active || cycles == 0u) return;
-    uint64_t next = psx_cycle_count + (uint64_t)cycles;
-    if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
-        next >= psx_cycle_count && next <= g_psx_cycle_fast_limit) {
-        psx_cycle_count = next;
-        return;
-    }
+    /* Memory wait-state charges are CPU work. Directly incrementing the native
+     * clock bypassed the OC converter in production builds, making dirty/interp
+     * loads and static loads run at different effective CPU frequencies. */
     psx_advance_cycles(cycles);
 }
 #else

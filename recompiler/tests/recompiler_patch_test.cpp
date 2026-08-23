@@ -89,6 +89,39 @@ std::string generate_first_instruction(uint32_t first_word,
     return generator.generate_function(function, cfg).full_code;
 }
 
+std::string generate_idle_countdown(bool overlay_mode,
+                                    bool matching_tail = true) {
+    constexpr uint32_t base = 0x80010000u;
+    constexpr uint32_t lw_v0_sp16 = 0x8FA20010u;
+    constexpr uint32_t addiu_v0_minus1 = 0x2442FFFFu;
+    constexpr uint32_t sw_v0_sp16 = 0xAFA20010u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = base;
+    exe.header.file_size = 24u;
+    append_word(exe.code_data, lw_v0_sp16);
+    append_word(exe.code_data, 0x00000000u); // load-delay nop
+    append_word(exe.code_data, matching_tail
+        ? addiu_v0_minus1 : 0x2442FFFEu);
+    append_word(exe.code_data, sw_v0_sp16);
+    append_word(exe.code_data, 0x03E00008u); // jr ra
+    append_word(exe.code_data, 0x00000000u); // return delay-slot nop
+
+    PSXRecomp::Function function{};
+    function.start_addr = base;
+    function.end_addr = base + 24u;
+    function.size = 24u;
+    function.name = "idle_countdown_test";
+
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenConfig config;
+    config.overlay_mode = overlay_mode;
+    config.idle_countdown_sites.emplace(base, lw_v0_sp16);
+    PSXRecomp::CodeGenerator generator(exe, config);
+    return generator.generate_function(function, cfg).full_code;
+}
+
 std::string base_config() {
     return R"toml([game]
 name = "Patch Test"
@@ -127,10 +160,55 @@ note = "Test-only fixture"
     check(config.recompiler_patches.size() == 1,
           "parser accepts one guarded patch");
     check(config.recompiler_patches[0].id == "gameplay-rate" &&
-          config.recompiler_patches[0].address == 0x80012340u &&
-          config.recompiler_patches[0].expected == 0x24020002u &&
-          config.recompiler_patches[0].replacement == 0x24020001u,
+              config.recompiler_patches[0].address == 0x80012340u &&
+              config.recompiler_patches[0].expected == 0x24020002u &&
+              config.recompiler_patches[0].replacement == 0x24020001u,
           "parser preserves patch fields");
+
+    const auto palx2 = write_config(root, "palx2-clock", R"toml(
+[video]
+cpu_overclock = 900
+pal_video_clock_multiplier = 2
+)toml");
+    const auto palx2_config = PSXRecompV4::load_game_config(palx2);
+    check(palx2_config.runtime.runtime_cpu_overclock == 900u &&
+              palx2_config.runtime.runtime_pal_video_clock_multiplier == 2u,
+          "parser keeps CPU overclock and PAL video clock independent");
+
+    const auto bad_pal_clock = write_config(root, "bad-pal-clock", R"toml(
+[video]
+pal_video_clock_multiplier = 0
+)toml");
+    check_throws(
+        [&] { (void)PSXRecompV4::load_game_config(bad_pal_clock); },
+        "must be in 1..8",
+        "parser rejects an invalid PAL video-clock multiplier");
+
+    const auto idle_countdown = write_config(root, "idle-countdown", R"toml(
+[[recompiler.idle_countdown]]
+address = "0x8015FAA4"
+expected = "0x8FA20010"
+)toml");
+    const auto idle_config = PSXRecompV4::load_game_config(idle_countdown);
+    check(idle_config.idle_countdown_sites.size() == 1u &&
+              idle_config.idle_countdown_sites[0].address == 0x8015FAA4u &&
+              idle_config.idle_countdown_sites[0].expected == 0x8FA20010u,
+          "parser preserves guarded idle-countdown site");
+    auto changed_idle_config = idle_config;
+    changed_idle_config.idle_countdown_sites[0].address += 4u;
+    check(PSXRecompV4::overlay_codegen_config_hash(idle_config) !=
+              PSXRecompV4::overlay_codegen_config_hash(changed_idle_config),
+          "idle-countdown sites change generated-code identity");
+
+    const auto bad_idle_opcode = write_config(root, "idle-countdown-bad-opcode", R"toml(
+[[recompiler.idle_countdown]]
+address = "0x8015FAA4"
+expected = "0xAFA20010"
+)toml");
+    check_throws(
+        [&] { (void)PSXRecompV4::load_game_config(bad_idle_opcode); },
+        "must be LW with a nonzero destination",
+        "parser rejects a non-LW idle-countdown site");
 
     const auto audio_buffer = write_config(root, "audio-buffer", R"toml(
 [runtime]
@@ -647,6 +725,56 @@ void codegen_tests() {
         },
         "conflicting recompiler patches",
         "config merge rejects cross-config ID conflicts");
+
+    PSXRecomp::CodeGenConfig idle_config;
+    idle_config.idle_countdown_sites.emplace(0x80010000u, 0x8FA20010u);
+    const std::string idle = generate_idle_countdown(false);
+    check(idle.find("psx_idle_batch_countdown(_idle_value)") !=
+              std::string::npos &&
+              idle.find("cpu->write_word(_idle_addr, cpu->gpr[2])") !=
+                  std::string::npos &&
+              idle.find("g_debug_last_store_pc = 0x8001000Cu") !=
+                  std::string::npos,
+          "main codegen emits guarded compactor with real SW provenance");
+    check(idle.find("#if defined(PSX_PGXP) && PSX_PGXP") !=
+              std::string::npos &&
+              idle.find("PGXP_ALU(_idle_addiu, cpu->gpr[2], _idle_prev, ") !=
+                  std::string::npos &&
+              idle.find("PGXP_STORE(0xAFA20010u, _idle_addr, cpu->gpr[2])") !=
+                  std::string::npos,
+          "countdown compaction keeps PGXP register and RAM shadows coherent");
+
+    const std::string idle_overlay_exact = generate_idle_countdown(true);
+    check(idle_overlay_exact.find("psx_idle_batch_countdown(_idle_value)") !=
+              std::string::npos &&
+              idle_overlay_exact.find(
+                  "PGXP_STORE(0xAFA20010u, _idle_addr, cpu->gpr[2])") !=
+                  std::string::npos,
+          "overlay codegen emits the exact guarded countdown sequence");
+
+    check_throws(
+        [&] { (void)generate_idle_countdown(false, false); },
+        "expected guarded tail",
+        "main-image countdown rejects a mismatched decrement/store tail");
+    const std::string idle_overlay_partial =
+        generate_idle_countdown(true, false);
+    check(idle_overlay_partial.find("psx_idle_batch_countdown") ==
+              std::string::npos,
+          "overlay countdown with a mismatched tail remains inert");
+
+    check_throws(
+        [&] {
+            (void)generate_first_instruction(
+                0x8FA30010u, {}, false, idle_config); // wrong destination
+        },
+        "expected 0x8FA20010, found 0x8FA30010",
+        "main-image countdown mismatch fails closed");
+
+    const std::string idle_overlay_mismatch = generate_first_instruction(
+        0x8FA30010u, {}, true, idle_config);
+    check(idle_overlay_mismatch.find("psx_idle_batch_countdown") ==
+              std::string::npos,
+          "overlay countdown mismatch remains unchanged");
 
     PSXRecomp::CodeGenConfig negsub_config;
     negsub_config.ws_cull_negsub_sites.insert(0x80010000u);

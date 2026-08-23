@@ -184,6 +184,19 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
         h.u32((uint32_t)lcb.size());
         for (uint32_t pc : lcb) h.u32(pc);
     }
+    {
+        std::vector<IdleCountdownSite> sites = c.idle_countdown_sites;
+        std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) {
+            if (a.address != b.address) return a.address < b.address;
+            return a.expected < b.expected;
+        });
+        h.tag("idle_countdown");
+        h.u32((uint32_t)sites.size());
+        for (const auto& site : sites) {
+            h.u32(site.address);
+            h.u32(site.expected);
+        }
+    }
     return h.value;
 }
 
@@ -569,6 +582,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("cpu_overclock")) {
             rt.runtime_cpu_overclock =
                 (uint32_t)toml::find<int>(video, "cpu_overclock");
+        }
+        if (video.contains("pal_video_clock_multiplier")) {
+            const int multiplier =
+                toml::find<int>(video, "pal_video_clock_multiplier");
+            if (multiplier < 1 || multiplier > 8) {
+                throw std::runtime_error(
+                    "[video].pal_video_clock_multiplier must be in 1..8");
+            }
+            rt.runtime_pal_video_clock_multiplier = (uint32_t)multiplier;
         }
         if (video.contains("geometry_correction")) {
             rt.video_geometry_correction =
@@ -1428,6 +1450,41 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     }
     if (load_charge_batch && load_charge_batch_funcs.empty())
         load_charge_batch_funcs = hot_funcs;
+    std::vector<IdleCountdownSite> idle_countdown_sites;
+    if (recomp.contains("idle_countdown")) {
+        const auto& sites = toml::find<toml::array>(recomp, "idle_countdown");
+        std::set<uint32_t> seen_addresses;
+        for (const auto& item : sites) {
+            IdleCountdownSite site;
+            site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                     "recompiler.idle_countdown.address");
+            site.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                      "recompiler.idle_countdown.expected");
+            if ((site.address & 3u) != 0u) {
+                throw std::runtime_error(fmt::format(
+                    "{}: idle-countdown address 0x{:08X} is not "
+                    "instruction-aligned",
+                    config_path.string(), site.address));
+            }
+            const uint32_t opcode = site.expected >> 26;
+            const uint32_t rt = (site.expected >> 16) & 31u;
+            if (opcode != 0x23u || rt == 0u) {
+                throw std::runtime_error(fmt::format(
+                    "{}: idle-countdown site 0x{:08X} expected word "
+                    "0x{:08X} must be LW with a nonzero destination",
+                    config_path.string(), site.address, site.expected));
+            }
+            const uint32_t address_key =
+                recompiler_patch_address_key(site.address);
+            if (!seen_addresses.insert(address_key).second) {
+                throw std::runtime_error(fmt::format(
+                    "{}: duplicate [[recompiler.idle_countdown]] physical "
+                    "address 0x{:08X}",
+                    config_path.string(), address_key));
+            }
+            idle_countdown_sites.push_back(site);
+        }
+    }
     uint32_t vsync_query_func = 0;
     uint32_t vsync_counter_addr = 0;
     uint32_t vsync_gpustat_ptr_addr = 0;
@@ -2059,6 +2116,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*hot_funcs*/             hot_funcs,
         /*load_charge_batch*/     load_charge_batch,
         /*load_charge_batch_funcs*/ load_charge_batch_funcs,
+        /*idle_countdown_sites*/  idle_countdown_sites,
         /*vsync_query_func*/      vsync_query_func,
         /*vsync_counter_addr*/    vsync_counter_addr,
         /*vsync_gpustat_ptr_addr*/ vsync_gpustat_ptr_addr,

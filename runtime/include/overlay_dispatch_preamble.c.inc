@@ -61,6 +61,11 @@ void psx_advance_cycles(uint32_t cycles) {
     if (cycles > UINT32_MAX - s_pending_cycles) overlay_flush_cycles();
     s_pending_cycles += cycles;
 }
+uint32_t psx_idle_batch_countdown(uint32_t timeout_value) {
+    overlay_flush_cycles();
+    return g_cbs.idle_batch_countdown
+        ? g_cbs.idle_batch_countdown(timeout_value) : 0u;
+}
 void gte_execute(CPUState *cpu, uint32_t cmd) {
     overlay_flush_cycles();
     g_cbs.gte_execute(cpu, cmd);

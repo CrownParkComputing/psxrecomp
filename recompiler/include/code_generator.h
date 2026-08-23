@@ -76,6 +76,10 @@ struct CodeGenConfig {
     // / function exit. Guest totals at those barriers are unchanged.
     std::set<uint32_t> load_charge_batch_funcs;
 
+    // [[recompiler.idle_countdown]] exact LW sites. The map value is the
+    // expected full instruction word; mismatches fail closed outside overlays.
+    std::map<uint32_t, uint32_t> idle_countdown_sites;
+
     // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
     // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
     // guest RAM VBlank counter returned by that query path.  Empty = inert.

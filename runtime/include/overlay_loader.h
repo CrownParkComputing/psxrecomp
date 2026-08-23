@@ -25,6 +25,9 @@ extern "C" {
 void overlay_loader_init(const char *cache_dir, const char *game_id,
                          uint32_t config_hash);
 
+/* Code-generation identity currently enforced by the active overlay loader. */
+uint32_t overlay_loader_active_config_hash(void);
+
 /* Per-function native-disable for small timing-sensitive overlay routines.
  * Addresses may be KUSEG/KSEG0/KSEG1; the loader keys by physical address. */
 int overlay_loader_native_block_add(uint32_t addr);

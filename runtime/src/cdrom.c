@@ -2837,6 +2837,11 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->last_sector_frame = last_sector_frame;
     out->last_sector_mode = last_sector_mode;
     out->last_sector_have_raw = last_sector_have_raw;
+    out->cdda_playing = (uint8_t)(cdda_playing ? 1 : 0);
+    out->cdda_track = cdda_track;
+    out->cdda_lba = cdda_lba;
+    out->cdda_delay = cdda_delay;
+    out->cdda_sectors_played = cdda_sectors_played;
 }
 
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {

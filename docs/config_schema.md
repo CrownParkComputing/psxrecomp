@@ -130,6 +130,10 @@ address     = "0x80012340"
 expected    = "0x24020002"
 replacement = "0x24020001"
 note        = "Why this game-owned instruction change is required" # optional
+
+[[recompiler.idle_countdown]]
+address     = "0x8015FAA4"
+expected    = "0x8FA20010" # exact LW of a spilled timeout value
 ```
 
 Output filenames: `<out_dir>/<out_stem>_full.c` and
@@ -175,6 +179,14 @@ title-specific addresses.
 Patches are build-time inputs, not runtime memory writes or live toggles.
 Regenerate the affected main executable or captured overlays after changing
 them.
+
+Each `[[recompiler.idle_countdown]]` identifies one exact `LW rt,off(base)`
+whose value is a verified loop countdown. After the ordinary load, generated
+code asks the runtime how many otherwise-identical iterations can retire before
+the next device deadline and writes the compacted value through the same
+base/offset. The full instruction word is required, `rt` must be nonzero, and a
+main-image mismatch is fatal. The runtime helper remains inert at stock speed,
+during MDEC activity, exceptions, lockstep/cosim, and other precise modes.
 
 ### Guarded widescreen participation comparisons
 
@@ -387,6 +399,8 @@ renderer = "opengl"       # "software", "opengl", or "vulkan"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
 auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
+cpu_overclock = 100       # CPU retirement rate relative to native device time
+pal_video_clock_multiplier = 1 # 2 = exact GooseStation PALx2 CRTC cadence
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
@@ -398,6 +412,12 @@ Vulkan after validating their visuals and stability.
 Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets
 it to false. The runtime then hides the Settings row, ignores stale persisted
 values, and leaves activation to the selected trusted plugin.
+
+`cpu_overclock` scales CPU retirement only; CD-ROM, SPU, SIO, timers, and the
+native device clock remain unscaled. `pal_video_clock_multiplier` is a separate
+title-level CRTC choice and is accepted above 1 only for PAL titles. A value of
+2 uses the PSX PAL video clock and 3406x314 ticks per frame, producing the exact
+GooseStation PALx2 cadence (~99.493634 Hz), not a rounded 100 Hz gameplay gate.
 
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc

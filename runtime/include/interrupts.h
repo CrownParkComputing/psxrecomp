@@ -72,19 +72,44 @@ int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc);
  * their explicit checks while dirty/interp-to-static entries get a boundary. */
 void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_pc);
 
-/* Accumulate emitted PSX cycles toward the next VBlank trigger.
- * Called from psx_advance_cycles() so the VBlank rate is gated on
- * guest cycles (correct PSX timing) rather than block-dispatch
- * count (which was 5-6x too fast and squeezed game-time to ~60% of
- * real). One real-PSX VBlank = 564480 cycles (33.8688 MHz / 60). */
+/* Accumulate native PSX device cycles toward the next CRTC VBlank edge.
+ * GooseStation PAL uses a 53,203,425 Hz video clock and 3406*314 ticks/frame;
+ * PALx2 doubles ONLY that video clock. Its nominal "100 Hz" is therefore
+ * 99.493634... Hz. The runtime represents the resulting 340411.728... native
+ * cycles/frame rationally rather than rounding it to a drifting integer.
+ * CPU retirement scaling must never change this schedule. */
+#define PSX_VBLANK_RATE_NTSC       60u
+#define PSX_VBLANK_RATE_PAL        50u
+#define PSX_VBLANK_CYCLES_NTSC 564480u
+#define PSX_PAL_VIDEO_CLOCK_HZ 53203425u
+#define PSX_PAL_CRTC_TICKS_PER_FRAME (3406u * 314u)
 void interrupts_advance_cycles(uint32_t cycles);
 void interrupts_service_scheduled_events(void);
 uint32_t interrupts_cycles_to_vblank(void);
-/* VBlank phase within the current frame (0 .. VBLANK_CYCLES-1). Persisted in
+/* VBlank phase within the current frame (0 .. live_period-1). Persisted in
  * BS_SEC_IRQ (and selfcheck's out-of-band latch) so resim keeps the snap's
  * phase. Legacy 8-byte IRQ sections still rebase to 0 on load. */
 uint32_t interrupts_get_cycles_since_vblank(void);
 void     interrupts_set_cycles_since_vblank(uint32_t v);
+/* Configure the title's CRTC as base rate x integer multiplier. Changes keep
+ * the fractional position within the current frame. The configuration survives
+ * interrupts_init() so cold boot and soft rematch start identically; init resets
+ * only phase. PALx2 is configure(50, 2): nominal 100 Hz, exact GooseStation
+ * rate 99.493634... Hz. */
+int      interrupts_configure_vblank(uint32_t base_frames_per_second,
+                                     uint32_t multiplier);
+uint32_t interrupts_get_vblank_base_rate(void);
+uint32_t interrupts_get_vblank_multiplier(void);
+double   interrupts_get_vblank_rate_hz(void);
+/* Deterministic average-period conversion for subsystems whose policy is
+ * expressed in CRTC frames (for example MDEC activity hysteresis). */
+uint64_t interrupts_native_cycles_for_frames(uint32_t frames);
+uint64_t interrupts_frames_for_native_cycles(uint64_t cycles);
+/* Fractional-period phase is deterministic machine state. The savestate owner
+ * serializes it alongside cycles_since_vblank; setter rejects out-of-range. */
+uint32_t interrupts_get_vblank_fraction(void);
+void     interrupts_set_vblank_fraction(uint32_t value);
+uint32_t interrupts_get_vblank_rate(void);
 
 /* Cycle-budgeted precise event slicing: minimum guest-CPU-cycle distance to the
  * next DELIVERABLE hardware interrupt (source raises its I_STAT bit AND that bit

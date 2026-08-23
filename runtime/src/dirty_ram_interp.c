@@ -89,21 +89,16 @@ extern int g_ls_replay_active;     /* defined in the lockstep section; used by e
  * generated overlay DLLs deliberately batch psx_advance_cycles() through a
  * DLL-local accumulator and must never bind directly to runtime cycle state. */
 #if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
-extern uint64_t g_psx_cycle_fast_limit;
-extern int g_event_step_conservative;
-
 static inline void interp_cyc_step(CPUState *cpu, uint32_t reg_mask) {
     uint8_t w = cpu->read_absorb_which;
     if (cpu->read_absorb[w]) {
         cpu->read_absorb[w]--;
     } else if (!g_ls_replay_active) {
-        uint64_t next = psx_cycle_count + 1u;
-        if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
-            next <= g_psx_cycle_fast_limit) {
-            psx_cycle_count = next;
-        } else {
-            psx_advance_cycles(1u);
-        }
+        /* This is CPU retirement, not native device time. The old direct
+         * psx_cycle_count increment was valid only at 100% and silently
+         * bypassed both the OC rational and retired-cycle telemetry in dirty
+         * RAM code. psx_advance_cycles keeps the deadline fast path inlined. */
+        psx_advance_cycles(1u);
     }
     psx_cyc_deps(cpu, reg_mask);
     psx_cyc_lds(cpu);

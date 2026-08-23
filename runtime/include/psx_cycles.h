@@ -12,6 +12,12 @@ extern "C" {
  * visible time. Peripherals derive all schedules from this counter. */
 extern uint64_t psx_cycle_count;
 
+/* Raw CPU work retired before overclock scaling. Unlike psx_cycle_count this
+ * excludes device-service advances, so their delta ratio is direct evidence
+ * that an overclock is actually giving the CPU more work per native tick. */
+extern uint64_t psx_cpu_retired_cycles;
+extern uint64_t psx_cpu_native_cycles;
+
 /* Deadline-device model bookkeeping (written by psx_cycles.c). Hot path
  * reads these from the inlined psx_advance_cycles below. */
 extern uint64_t psx_next_service_cycle; /* absolute; 0 = dirty / recompute */
@@ -40,6 +46,9 @@ void psx_devices_service_to_now(void);
 
 /* Rare/slow advance path (COSIM, conservative 1-cycle stepping, lockstep). */
 void psx_advance_cycles_slow(uint32_t cycles);
+/* Advance elapsed native machine time without retiring CPU work. Used only by
+ * proof-gated idle-loop elision after all pending CPU charges are published. */
+void psx_advance_native_cycles(uint32_t cycles);
 
 /* Sparse throttle fires (watchdog / PC sample) — not on the per-charge path. */
 extern uint32_t psx_watchdog_throttle;
@@ -87,24 +96,81 @@ void psx_advance_cycles(uint32_t cycles);
  * refresh rate keep their real-world rates. Scaling the VBlank period instead
  * would slow everything EXCEPT the CPU, which is the opposite.
  *
- * Q16 fixed point with a carried remainder rather than a divide: this is the
- * hottest path in the runtime (millions of charges/sec), and integer division
- * of a 1-2 cycle instruction cost would floor to zero and lose all time.
- * 65536 == 1.0 == stock, and the accumulator makes the total charge exact
- * over time rather than drifting by the truncation each call. */
-extern uint32_t g_psx_oc_scale_q16;
+ * The conversion is an exact reduced rational. At 900%, numerator=1 and
+ * denominator=9: every nine raw CPU cycles advance the native device clock by
+ * exactly one tick. g_psx_oc_accum carries the remainder modulo denominator,
+ * so splitting a charge into instructions or publishing it as one batch gives
+ * the same answer with no Q16 approximation or long-run drift. */
+extern uint32_t g_psx_oc_numerator;
+extern uint32_t g_psx_oc_denominator;
 extern uint32_t g_psx_oc_accum;
-
 /* percent: 100 = stock. hueponik's pal100full8 needs >900%. */
 void     psx_set_cpu_overclock(uint32_t percent);
 uint32_t psx_get_cpu_overclock(void);
+void     psx_set_cpu_overclock_active(int active);
+uint32_t psx_get_effective_cpu_overclock(void);
+
+/* Complete deterministic state for the CPU-retirement/native-device clock
+ * boundary. Save-states must carry the fractional converter remainder: at
+ * 900%, dropping it changes the native timestamp of a later CPU charge. */
+typedef struct PSXClockDomainSnapshot {
+    uint64_t native_cycle_count;
+    uint64_t cpu_retired_cycles;
+    uint64_t cpu_native_cycles;
+    uint32_t requested_percent;
+    uint32_t overclock_active;
+    uint32_t numerator;
+    uint32_t denominator;
+    uint32_t remainder;
+    uint32_t reserved_flags;
+} PSXClockDomainSnapshot;
+
+void psx_clock_domain_snapshot(PSXClockDomainSnapshot *out);
+int  psx_clock_domain_restore(const PSXClockDomainSnapshot *in);
+
+/* Proof-gated compactor used only at exact, full-word-guarded generated LW
+ * sites. Returns the number of additional countdown iterations retired. */
+uint32_t psx_idle_batch_countdown(uint32_t timeout_value);
+
+/* Preview or consume raw CPU cycles in native-device-clock units. Preview is
+ * deliberately non-mutating: clock reads must include pending global/local
+ * batches without publishing them or changing the carried fraction. */
+static inline uint64_t psx_oc_preview_native(uint64_t cycles) {
+    if (g_psx_oc_numerator == g_psx_oc_denominator) return cycles;
+    return (cycles * (uint64_t)g_psx_oc_numerator +
+            (uint64_t)g_psx_oc_accum) /
+           (uint64_t)g_psx_oc_denominator;
+}
 
 static inline uint32_t psx_oc_apply(uint32_t cycles) {
-    if (g_psx_oc_scale_q16 == 65536u) return cycles;   /* stock: exact */
-    uint64_t t = (uint64_t)cycles * (uint64_t)g_psx_oc_scale_q16
-               + (uint64_t)g_psx_oc_accum;
-    g_psx_oc_accum = (uint32_t)(t & 0xFFFFu);
-    return (uint32_t)(t >> 16);
+    if (g_psx_oc_numerator == g_psx_oc_denominator) return cycles;
+    uint64_t t = (uint64_t)cycles * (uint64_t)g_psx_oc_numerator +
+                 (uint64_t)g_psx_oc_accum;
+    g_psx_oc_accum = (uint32_t)(t % (uint64_t)g_psx_oc_denominator);
+    return (uint32_t)(t / (uint64_t)g_psx_oc_denominator);
+}
+
+static inline uint64_t psx_get_pending_cpu_cycles(void) {
+    uint64_t pending = (uint64_t)g_psx_cyc_batch;
+    if (g_psx_cyc_local_acc)
+        pending += (uint64_t)(*g_psx_cyc_local_acc);
+    return pending;
+}
+
+/* Raw CPU timeline used by CPU-internal GTE/muldiv completion deadlines. */
+static inline uint64_t psx_get_cpu_retired_cycle_count(void) {
+    return psx_cpu_retired_cycles + psx_get_pending_cpu_cycles();
+}
+
+static inline uint64_t psx_preview_native_cycle_count(void) {
+    return psx_cycle_count +
+           psx_oc_preview_native(psx_get_pending_cpu_cycles());
+}
+
+static inline uint32_t psx_cpu_cycles_until(uint64_t deadline) {
+    uint64_t now = psx_get_cpu_retired_cycle_count();
+    uint64_t remaining = deadline > now ? deadline - now : 0u;
+    return remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining;
 }
 
 static inline void psx_advance_cycles(uint32_t cycles) {
@@ -116,7 +182,12 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         if (cycles <= UINT32_MAX - b) cycles += b;
         else {
             /* Extreme: publish b first, then continue with cycles. */
-            psx_cycle_count += (uint64_t)psx_oc_apply(b);
+            psx_cpu_retired_cycles += (uint64_t)b;
+            {
+                uint32_t native_b = psx_oc_apply(b);
+                psx_cpu_native_cycles += (uint64_t)native_b;
+                psx_cycle_count += (uint64_t)native_b;
+            }
             if (!psx_in_device_service &&
                 (psx_next_service_cycle == 0u ||
                  psx_cycle_count >= psx_next_service_cycle)) {
@@ -151,8 +222,10 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         return;
     }
     /* CPU instruction retirement: this is the only charge an overclock scales. */
+    psx_cpu_retired_cycles += (uint64_t)cycles;
     cycles = psx_oc_apply(cycles);
     if (cycles == 0u) return;
+    psx_cpu_native_cycles += (uint64_t)cycles;
     psx_cycle_count += (uint64_t)cycles;
     if (psx_next_service_cycle == 0u ||
         psx_cycle_count >= psx_next_service_cycle) {
@@ -196,7 +269,8 @@ static inline void psx_cyc_batch_flush(void) {
 }
 #endif
 
-/* Read accessor for telemetry (includes deferred batch). */
+/* Read native device time including a non-mutating exact conversion of all
+ * deferred raw CPU charges. */
 uint64_t psx_get_cycle_count(void);
 
 /* Idle-loop cycle skip (see psx_cycles.c "Idle-loop cycle skip"). */

@@ -60,6 +60,14 @@ struct WidescreenSignedBoundSite {
     uint32_t expected = 0; // guarded LUI instruction
 };
 
+// One exact LW whose loaded countdown may be compacted by the runtime's
+// proof-gated idle helper. The full instruction guard keeps this title-owned
+// optimization from attaching to unrelated code at a reused virtual address.
+struct IdleCountdownSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded LW instruction
+};
+
 // One exact compare whose verdict is forced while a widescreen reveal is
 // active. The full instruction word is part of the identity because overlay
 // variants routinely place unrelated code at the same virtual address.
@@ -356,6 +364,9 @@ struct RuntimeConfig {
     // while timers, SPU, CDROM and refresh keep their real rates.
     // hueponik's pal100full8 patch requires >900%.
     uint32_t              runtime_cpu_overclock = 100;
+    // Title-level CRTC/video-clock multiplier. A PAL title with 2 reproduces
+    // GooseStation PALx2 (~99.493634 Hz); CPU/SPU/CD clocks are unaffected.
+    uint32_t              runtime_pal_video_clock_multiplier = 1;
 
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
@@ -781,6 +792,12 @@ struct GameConfig {
     // empty). Requires regen; guest totals at IRQ/MMIO barriers unchanged.
     bool                  load_charge_batch = false;
     std::vector<uint32_t> load_charge_batch_funcs;
+
+    // [[recompiler.idle_countdown]] exact LW sites. After the normal load,
+    // codegen emits a call that can retire repeated countdown iterations up to
+    // (but never across) the next device deadline, then publishes the compacted
+    // value through the original base+offset address. Requires regeneration.
+    std::vector<IdleCountdownSite> idle_countdown_sites;
 
     // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
     // implementation.  mode=-1 returns vsync_counter_addr while bypassing two

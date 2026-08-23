@@ -14,6 +14,7 @@ int g_ls_mode = 0;
 int g_precise_mode = 0;
 int g_psx_call_bail = 0;
 uint32_t i_mask = 0;
+uint32_t i_stat = 0;
 uint64_t g_guest_store_count = 0;
 uint64_t g_mmio_access_count = 0;
 
@@ -54,6 +55,10 @@ uint32_t dma_cycles_to_deliverable_irq(uint32_t mask) {
 }
 uint32_t sio_cycles_to_irq(uint32_t mask) { (void)mask; return UINT32_MAX; }
 int psx_get_in_exception(void) { return 0; }
+int mdec_recently_active(uint32_t within_frames) {
+    (void)within_frames;
+    return 0;
+}
 
 void starvation_watchdog_check(void) {}
 void starvation_ring_pc_sample(void) {}
@@ -85,6 +90,93 @@ int main(void) {
         return 1;
     }
 
-    fprintf(stderr, "PASS cross-device deadline preserves D-1 + 1 causality\n");
+    /* A 900% save/load must restore the CPU/native converter carry. Losing an
+     * 8/9 remainder changes the timestamp of the very next retired cycle. */
+    {
+        PSXClockDomainSnapshot saved;
+        psx_cycles_reset_for_boot();
+        psx_set_cpu_overclock(900u);
+        psx_advance_cycles(8u);
+        if (psx_cycle_count != 0u || g_psx_oc_accum != 8u) {
+            fprintf(stderr, "FAIL 900%% pre-snapshot carry\n");
+            return 1;
+        }
+        psx_clock_domain_snapshot(&saved);
+        psx_advance_cycles(1u);
+        if (psx_cycle_count != 1u || g_psx_oc_accum != 0u) {
+            fprintf(stderr, "FAIL 900%% carry consumption\n");
+            return 1;
+        }
+        psx_set_cpu_overclock(100u);
+        if (psx_clock_domain_restore(&saved)) {
+            fprintf(stderr, "FAIL mismatched clock policy accepted state\n");
+            return 1;
+        }
+        psx_set_cpu_overclock(900u);
+        if (!psx_clock_domain_restore(&saved)) {
+            fprintf(stderr, "FAIL clock-domain snapshot rejected\n");
+            return 1;
+        }
+        psx_cycles_resync_after_restore(NULL);
+        if (psx_cycle_count != 0u || psx_cpu_retired_cycles != 8u ||
+            g_psx_oc_accum != 8u) {
+            fprintf(stderr, "FAIL clock-domain snapshot state changed\n");
+            return 1;
+        }
+        psx_advance_cycles(1u);
+        if (psx_cycle_count != 1u || psx_cpu_retired_cycles != 9u ||
+            psx_cpu_native_cycles != 1u || g_psx_oc_accum != 0u) {
+            fprintf(stderr, "FAIL clock-domain snapshot continuation\n");
+            return 1;
+        }
+    }
+
+    /* The title countdown compactor must measure the next event from the
+     * current published native clock, not from the older device-sync point.
+     * Train a nine-raw-cycle loop while CD is synced at native cycle 1 with an
+     * event due at absolute cycle 5. At native cycle 3 only ONE synthetic loop
+     * is safe: it lands at 4 and leaves the real iteration to reach/observe 5.
+     * The stale device-relative distance is still 4 and would wrongly skip
+     * three iterations through the event. */
+    {
+        uint32_t skipped;
+        s_cd_cycles_remaining = 5u;
+        s_cd_ready = 0;
+        s_dma_ready_cycles = 0u;
+        i_stat = 0u;
+        i_mask = 0u;
+        g_idle_skip_enabled = 1;
+        psx_cycles_reset_for_boot();
+        psx_set_cpu_overclock(900u);
+
+        psx_advance_cycles(9u); /* native 1; sync devices, CD now 4 away */
+        if (psx_idle_batch_countdown(100u) != 0u) {
+            fprintf(stderr, "FAIL countdown compacted before training\n");
+            return 1;
+        }
+        psx_advance_cycles(9u); /* native 2 */
+        if (psx_idle_batch_countdown(99u) != 0u) {
+            fprintf(stderr, "FAIL countdown compacted after one sample\n");
+            return 1;
+        }
+        psx_advance_cycles(9u); /* native 3 */
+        skipped = psx_idle_batch_countdown(98u);
+        if (skipped != 1u || psx_cycle_count != 4u || s_cd_ready) {
+            fprintf(stderr,
+                    "FAIL countdown crossed event: skipped=%u cycle=%llu ready=%d\n",
+                    skipped, (unsigned long long)psx_cycle_count, s_cd_ready);
+            return 1;
+        }
+        psx_advance_cycles(9u); /* the retained real iteration reaches cycle 5 */
+        if (psx_cycle_count != 5u || !s_cd_ready) {
+            fprintf(stderr,
+                    "FAIL retained countdown iteration missed event: cycle=%llu ready=%d\n",
+                    (unsigned long long)psx_cycle_count, s_cd_ready);
+            return 1;
+        }
+    }
+
+    fprintf(stderr,
+            "PASS event boundary, 900%% clock state, and countdown deadline\n");
     return 0;
 }

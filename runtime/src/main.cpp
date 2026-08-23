@@ -32,6 +32,7 @@
 extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "mdec.h"
 #include "pgxp.h"
 #include "interrupts.h"
 #include "present_ring.h"
@@ -473,6 +474,13 @@ static int post_load_probe_env_on(void) {
 }
 static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
+static uint64_t s_fps_last_native_cycles = 0;
+static uint64_t s_fps_last_retired_cycles = 0;
+static uint64_t s_fps_last_cpu_native_cycles = 0;
+static uint64_t s_fps_last_spu_frames = 0;
+static uint64_t s_fps_last_cdda_sectors = 0;
+static uint64_t s_fps_last_idle_skip_count = 0;
+static uint64_t s_fps_last_idle_skip_cycles = 0;
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
@@ -1152,8 +1160,9 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  *
  * Driver vsync and the wall-clock pacer are XOR. Waiting on both (pacer then
  * FIFO SwapBuffers) double-blocks on Linux compositors: ~16.7 ms + ~16.7 ms
- * = 30 Hz / 0.50x with the CPU idle. ~60 Hz panels may use vsync as the clock;
- * otherwise the pacer holds 59.94 Hz and present must not wait on the swap. */
+ * = half-rate with the CPU idle. A closely matching panel may use vsync as the
+ * clock; otherwise the pacer holds the exact live CRTC rate and present must
+ * not wait on the swap. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
@@ -1174,6 +1183,8 @@ static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
 static double        g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 static bool          g_mod_native_vblank_rate = false;
 static uint32_t      g_mod_native_vblank_fps = 0;
+static uint32_t      g_title_video_clock_multiplier = 1u;
+static uint32_t      g_title_base_vblank_fps = PSX_VBLANK_RATE_NTSC;
 /* Activation-time request. -1 means no enabled mod owns load acceleration. */
 static int           g_mod_load_wall_multiplier = -1;
 static int           g_mod_load_release_frames = -1;
@@ -1277,7 +1288,7 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
 extern "C" int psx_mod_set_native_vblank_rate(
     uint32_t frames_per_second) {
     if (frames_per_second != 0 &&
-        (frames_per_second < 60 || frames_per_second > 1000)) {
+        (frames_per_second < 50 || frames_per_second > 1000)) {
         std::fprintf(stderr,
             "psxrecomp: mod rejected invalid native VBlank rate %u FPS\n",
             (unsigned)frames_per_second);
@@ -1288,13 +1299,9 @@ extern "C" int psx_mod_set_native_vblank_rate(
     g_frame_period_ms = frames_per_second
         ? 1000.0 / (double)frames_per_second
         : 0.0;
-    /*
-     * Above the physical panel rate (and in uncapped mode), swap-interval
-     * blocking would silently replace the requested guest cadence with the
-     * display cadence. The frame pacer owns fixed-rate timing here.
-     */
-    if (frames_per_second == 0 || frames_per_second > 60)
-        g_video_vsync = 0;
+    /* Do not overwrite the user's vsync preference. The live cadence policy
+     * selects immediate swaps whenever the panel does not closely match this
+     * target and restores driver-vsync ownership automatically when it does. */
     if (frames_per_second) {
         std::fprintf(stdout,
             "psxrecomp: mod selected native guest VBlank pacing at %u FPS "
@@ -2053,6 +2060,24 @@ static std::string region_label_from_serial(const std::string& serial) {
     return std::string();
 }
 
+/* Launcher labels and timing standards are different concepts. The launcher
+ * deliberately exposes friendly labels such as "(Europe)", while the CRTC
+ * needs an unambiguous PAL/NTSC decision. Accept the explicit config spellings
+ * used by existing projects, then fall back to the disc serial family. */
+static bool title_uses_pal_crtc(const std::string& configured_region,
+                                const std::string& serial) {
+    const std::string region = uppercase_ascii(configured_region);
+    if (region == "PAL" || region == "EUROPE" || region == "(EUROPE)" ||
+        region == "AUSTRALIA" || region == "(AUSTRALIA)") {
+        return true;
+    }
+    if (!region.empty()) return false;
+    const std::string up = uppercase_ascii(serial);
+    if (up.size() < 4u) return false;
+    const std::string prefix = up.substr(0, 4u);
+    return prefix == "SCES" || prefix == "SLES";
+}
+
 static bool read_at(std::ifstream& f, uint64_t offset, uint8_t* out, size_t len) {
     f.clear();
     f.seekg((std::streamoff)offset, std::ios::beg);
@@ -2524,8 +2549,15 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
  * wall-clock pacer double-blocks the vblank callback (present is before the
  * guest resumes), which shows up as MotK FMV ~30–40 FPS in netplay vs ~50+
  * offline. Force immediate swaps for the session; restore on soft-exit. */
-static int host_refresh_is_approx_60hz(void) {
-    return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
+static double present_target_hz(void) {
+    return g_frame_period_ms > 0.0 ? 1000.0 / g_frame_period_ms : 0.0;
+}
+
+static int host_refresh_matches_present_target(void) {
+    const double target = present_target_hz();
+    return target > 0.0 &&
+           g_host_refresh_hz >= target * 0.998 &&
+           g_host_refresh_hz <= target * 1.002;
 }
 
 static int present_vsync_owns_cadence(void) {
@@ -2537,7 +2569,7 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
-    return host_refresh_is_approx_60hz();
+    return host_refresh_matches_present_target();
 }
 
 static int present_effective_swap_interval(void) {
@@ -2607,6 +2639,42 @@ static void netplay_host_present_restore(void) {
     if (!g_netplay_vsync_forced_off) return;
     g_netplay_vsync_forced_off = 0;
     apply_present_cadence();
+}
+
+/* Establish the title-owned clock mode before any guest progress. This is a
+ * continuous CRTC configuration: GooseStation PALx2 doubles only the PAL video
+ * clock and never uses renderer history to switch menus/FMV/races in and out.
+ * CPU overclock remains a separately configured retirement policy; SPU/CD/SIO
+ * stay on native device time. The user vsync preference is never overwritten —
+ * apply_present_cadence selects driver vsync only when the panel matches the
+ * live target and otherwise gives cadence to the wall-clock pacer. */
+static int configure_title_clock_for_session(void) {
+    const uint32_t multiplier = g_title_video_clock_multiplier;
+    if (!interrupts_configure_vblank(g_title_base_vblank_fps, multiplier)) {
+        std::fprintf(stderr,
+            "psxrecomp: invalid title CRTC configuration base=%u multiplier=%u\n",
+            (unsigned)g_title_base_vblank_fps, (unsigned)multiplier);
+        return 0;
+    }
+
+    /* A configured overclock is continuous, matching emulator overclock
+     * semantics. Native device clocks remain outside the CPU charge scaler. */
+    psx_set_cpu_overclock_active(1);
+    const double crtc_hz = interrupts_get_vblank_rate_hz();
+    g_frame_period_ms = crtc_hz > 0.0 ? 1000.0 / crtc_hz : 0.0;
+    apply_present_cadence();
+    std::fprintf(stderr,
+        "[CLOCK] title_crtc=%s base=%uHz multiplier=%ux "
+        "effective=%.6fHz nominal=%uHz cpu=%u%% "
+        "device_clock=33.8688MHz spu=44100Hz\n",
+        g_title_base_vblank_fps == PSX_VBLANK_RATE_PAL && multiplier == 2u
+            ? "PALx2"
+            : (g_title_base_vblank_fps == PSX_VBLANK_RATE_PAL ? "PAL" : "NTSC"),
+        (unsigned)interrupts_get_vblank_base_rate(),
+        (unsigned)interrupts_get_vblank_multiplier(), crtc_hz,
+        (unsigned)interrupts_get_vblank_rate(),
+        (unsigned)psx_get_effective_cpu_overclock());
+    return 1;
 }
 
 static void netplay_soft_exit(const char *origin) {
@@ -5147,19 +5215,17 @@ static void sample_headless_pad_into_sio(int override) {
     sio_set_pad_state_slot(1, 0xFFFFu);
 }
 
-/* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
- * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
- * to the SDL audio device drain rate, eliminating queue overflow drops
- * and underruns. Uncapped, the host runs the simulation at whatever
- * speed it can — typically several × realtime — and audio glitches.
+/* Wall pacing follows the live title CRTC cadence. SPU generation remains
+ * continuous at 44.1 kHz from native device cycles and is independent of the
+ * number of VBlank edges. Uncapped, the host runs the simulation at whatever
+ * speed it can and eventually over/underruns the host audio queue.
  *
  * The wall-clock pacer target; nudged to the host display refresh at
- * window-creation time when the panel is ~60 Hz. Driver vsync and this pacer
+ * window-creation time only when the panel closely matches it. Driver vsync and this pacer
  * are XOR (see present_vsync_owns_cadence): both at once double-blocks on
  * Linux compositors to 30 Hz. See g_frame_period_ms. */
-/* Live pacer period (ms). Defaults to the PSX rate; set to the host refresh
- * period when the panel is within ~2% of 60 Hz. Left at the PSX rate on
- * non-~60Hz / unknown-refresh panels so vsync cannot run the sim fast.
+/* Live pacer period (ms). It is derived from the configured CRTC before guest
+ * progress. A mismatched/unknown panel cannot replace that guest cadence.
  * Declared with the early video/mod globals. */
 
 /* §33/§35/§47: re-present last Live frame on a wall-clock cadence while guest
@@ -5917,6 +5983,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         if (!s_fps_last_time) {
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_native_cycles = psx_cycle_count;
+            s_fps_last_retired_cycles = psx_cpu_retired_cycles;
+            s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
+            {
+                SpuDebugInfo si{};
+                spu_debug_info(&si);
+                s_fps_last_spu_frames = si.render_frames;
+            }
+            {
+                CDROMDebugState cd{};
+                cdrom_debug_snapshot(&cd);
+                s_fps_last_cdda_sectors = cd.cdda_sectors_played;
+            }
+            s_fps_last_idle_skip_count = g_idle_skip_count;
+            s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
             if (sdl_window && s_fps_base_title.empty()) {
                 const char *title = SDL_GetWindowTitle(sdl_window);
                 if (title) s_fps_base_title = title;
@@ -5924,7 +6005,32 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
-            const double speed = fps / 59.94;
+            const double target_vblank_hz = interrupts_get_vblank_rate_hz();
+            const double speed = target_vblank_hz
+                ? fps / target_vblank_hz : 0.0;
+            const uint64_t native_delta = psx_cycle_count - s_fps_last_native_cycles;
+            const uint64_t retired_delta =
+                psx_cpu_retired_cycles - s_fps_last_retired_cycles;
+            const uint64_t cpu_native_delta =
+                psx_cpu_native_cycles - s_fps_last_cpu_native_cycles;
+            const double effective_cpu = cpu_native_delta
+                ? (double)retired_delta / (double)cpu_native_delta : 0.0;
+            SpuDebugInfo spu_info{};
+            spu_debug_info(&spu_info);
+            const uint64_t spu_delta =
+                spu_info.render_frames - s_fps_last_spu_frames;
+            const double effective_spu_hz = native_delta
+                ? (double)spu_delta * 33868800.0 / (double)native_delta : 0.0;
+            CDROMDebugState cd_info{};
+            cdrom_debug_snapshot(&cd_info);
+            const uint64_t cdda_delta =
+                cd_info.cdda_sectors_played - s_fps_last_cdda_sectors;
+            const double effective_cdda_hz = native_delta
+                ? (double)cdda_delta * 33868800.0 / (double)native_delta : 0.0;
+            const uint64_t idle_count_delta =
+                g_idle_skip_count - s_fps_last_idle_skip_count;
+            const uint64_t idle_cycles_delta =
+                g_idle_skip_cycles - s_fps_last_idle_skip_cycles;
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -5985,12 +6091,39 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_np_guest_ticks = 0;
                 s_np_timing_frames = 0;
             } else {
-                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                             fps, speed, (unsigned long long)s_frame_count);
+                std::fprintf(stderr,
+                             "[CLOCK] game=%.1f fps speed=%.2fx frames=%llu "
+                             "cpu_requested=%u%% cpu_effective=%.3fx "
+                             "retired=%llu cpu_native=%llu device_clock=%llu "
+                             "spu_frames=%llu spu_effective=%.1fHz "
+                             "cdda_playing=%u cdda_track=%d "
+                             "cdda_sectors=%llu cdda_effective=%.2fHz "
+                             "idle_skips=%llu idle_native=%llu carry=%u\n",
+                             fps, speed, (unsigned long long)s_frame_count,
+                             psx_get_cpu_overclock(), effective_cpu,
+                             (unsigned long long)retired_delta,
+                             (unsigned long long)cpu_native_delta,
+                             (unsigned long long)native_delta,
+                             (unsigned long long)spu_delta,
+                             effective_spu_hz,
+                             (unsigned)cd_info.cdda_playing,
+                             cd_info.cdda_track,
+                             (unsigned long long)cdda_delta,
+                             effective_cdda_hz,
+                             (unsigned long long)idle_count_delta,
+                             (unsigned long long)idle_cycles_delta,
+                             g_psx_oc_accum);
             }
             std::fflush(stderr);
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_native_cycles = psx_cycle_count;
+            s_fps_last_retired_cycles = psx_cpu_retired_cycles;
+            s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
+            s_fps_last_spu_frames = spu_info.render_frames;
+            s_fps_last_cdda_sectors = cd_info.cdda_sectors_played;
+            s_fps_last_idle_skip_count = g_idle_skip_count;
+            s_fps_last_idle_skip_cycles = g_idle_skip_cycles;
         }
     }
 
@@ -6893,7 +7026,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     s_sw_hold_valid = 1;
 
     /* Vsync self-heal. PRESENTVSYNC is only armed when driver vsync owns
-     * cadence; the wall-clock pacer otherwise holds 59.94 Hz. Under some
+     * cadence; the wall-clock pacer otherwise holds the live CRTC rate. Under some
      * driver states (observed: NVIDIA GL with the swap queue wedged)
      * SwapBuffers blocks ~1.5 s per present, dragging the whole
      * emulation to ~0.7 fps for minutes (freeze dump 1781045865:
@@ -10647,6 +10780,17 @@ int main(int argc, char** argv) {
                 std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
                              psx_get_cpu_overclock());
             }
+            g_title_video_clock_multiplier =
+                gc.runtime.runtime_pal_video_clock_multiplier;
+            g_title_base_vblank_fps =
+                title_uses_pal_crtc(game_region, game_id)
+                    ? PSX_VBLANK_RATE_PAL
+                    : PSX_VBLANK_RATE_NTSC;
+            if (g_title_video_clock_multiplier != 1u &&
+                g_title_base_vblank_fps != PSX_VBLANK_RATE_PAL) {
+                throw std::runtime_error(
+                    "[video].pal_video_clock_multiplier requires a PAL title");
+            }
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -12281,6 +12425,8 @@ session_reboot:
     /* Soft-exit longjmps out of device service with a leftover guest clock;
      * rematch must start from cycle 0 or vblanks never fire again. */
     psx_cycles_reset_for_boot();
+    if (!configure_title_clock_for_session())
+        return 1;
     starvation_ring_reset();
     present_session_reset();
     /* Rematch ≈ cold start for netplay sim residue a cold peer lacks
@@ -12726,23 +12872,26 @@ session_reboot:
     }
     psx_apply_window_icon(sdl_window, argv[0]);
 
-    /* Host refresh: if the panel is within ~2% of 60 Hz, record it so driver
-     * vsync can own cadence (pacer skipped). Non-~60 Hz and unknown refresh
-     * (common on Wayland) keep PSX 59.94 Hz pacing and force swap interval 0
-     * — vsync as the clock would run the sim at the panel rate. */
+    /* Host refresh is presentation state, not guest timing. Driver vsync owns
+     * cadence only for a very close match to the live CRTC rate; a nominal
+     * 100 Hz panel must not silently turn GooseStation's 99.493634 Hz PALx2
+     * into integer 100 Hz. Otherwise the exact wall pacer owns cadence and
+     * apply_present_cadence selects immediate swaps without changing the
+     * user's configured vsync preference. */
     {
         SDL_DisplayMode dm;
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
         if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
-            double host_hz = (double)dm.refresh_rate;
-            g_host_refresh_hz = host_hz;
-            if (host_hz >= 58.8 && host_hz <= 61.2) {
-                g_frame_period_ms = 1000.0 / host_hz;
-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
-                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            g_host_refresh_hz = (double)dm.refresh_rate;
+            if (host_refresh_matches_present_target()) {
+                std::printf("psxrecomp: sync-to-host-refresh: %.3f Hz CRTC on "
+                            "%d Hz panel (driver vsync eligible)\n",
+                            present_target_hz(), dm.refresh_rate);
             } else {
-                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
-                            "59.94 Hz pacing\n", dm.refresh_rate);
+                std::printf("psxrecomp: host panel %d Hz differs from %.6f Hz "
+                            "CRTC; keeping exact %.6f ms wall pacing\n",
+                            dm.refresh_rate, present_target_hz(),
+                            g_frame_period_ms);
             }
         }
     }
@@ -12827,7 +12976,7 @@ session_reboot:
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
     /* PRESENTVSYNC only when driver vsync owns cadence; otherwise the
-     * wall-clock pacer holds 59.94Hz (may tear). */
+     * wall-clock pacer holds the live CRTC rate (may tear). */
     Uint32 rflags = SDL_RENDERER_ACCELERATED |
                     (present_effective_swap_interval() != 0
                          ? SDL_RENDERER_PRESENTVSYNC : 0u);

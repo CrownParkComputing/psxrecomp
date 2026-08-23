@@ -6,6 +6,7 @@
 #include "gpu_vram_dirty.h"
 #include "cpu_state.h"     /* gte_canonicalize_cpu_state after CPU wire restore   */
 #include "interrupts.h"
+#include "overlay_loader.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
 #include "pst_wire.h"
@@ -78,8 +79,10 @@ extern uint32_t mdec_snapshot_bytes(void);
 extern void     mdec_snapshot_write(uint8_t* p);
 extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
 
-/* CPU regs wire: 32+3+32+32+32 LE u32 = 131 * 4 = 524 bytes (no padding). */
-#define CPU_REGS_WIRE_BYTES (524u)
+/* CPU wire: architectural registers (524B) plus raw-timeline GTE/muldiv
+ * deadlines and the R3000A load-interlock pipeline (56B). Function pointers
+ * remain process-owned and are never serialized. */
+#define CPU_REGS_WIRE_BYTES (580u)
 /* Timer wire: 3*u16 + 3*u32 + 3*u16 + 3*i32 + 3*u32 = 48 bytes (no pad holes). */
 #define TIMER_REGS_WIRE_BYTES (48u)
 
@@ -298,6 +301,13 @@ static int write_cpu_section(BsOut* o, const CPUState* cpu) {
         if (!pst_w_u32(&w, cpu->gte_data[i])) return 0;
     for (int i = 0; i < 32; i++)
         if (!pst_w_u32(&w, cpu->gte_ctrl[i])) return 0;
+    if (!pst_w_u64(&w, cpu->muldiv_ts_done) ||
+        !pst_w_u64(&w, cpu->gte_ts_done) ||
+        !pst_w_bytes(&w, cpu->read_absorb, sizeof cpu->read_absorb) ||
+        !pst_w_u8(&w, cpu->read_absorb_which) ||
+        !pst_w_u8(&w, cpu->read_fudge) ||
+        !pst_w_u8(&w, cpu->ld_which_t) ||
+        !pst_w_u32(&w, cpu->ld_absorb)) return 0;
     if (w.written != CPU_REGS_WIRE_BYTES) return 0;
     return write_section(o, BS_SEC_CPU, buf, CPU_REGS_WIRE_BYTES);
 }
@@ -362,6 +372,15 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
                               uint32_t bios_checksum, uint32_t entry_pc) {
     BootStateHeader h;
     int ok;
+
+    /* Establish one coherent machine boundary before serializing any section.
+     * A deferred CPU batch can cross a device deadline when published. Flushing
+     * only while writing BS_SEC_CLOCK would therefore pair pre-service CPU/RAM/
+     * IRQ/device sections with a post-service clock, producing a state that
+     * never existed. The later clock snapshot keeps its defensive flush, which
+     * is a no-op after this barrier. */
+    psx_cyc_batch_flush();
+
     memset(&h, 0, sizeof h);
     h.magic         = BOOT_STATE_MAGIC;
     h.version       = BOOT_STATE_VERSION;
@@ -371,6 +390,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
     h.section_count = 16;
+    h.reserved      = overlay_loader_active_config_hash();
 
     ok = write_header_le(o, &h);
 
@@ -378,25 +398,36 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        RAM_SIZE);
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
     if (ok) {
-        /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
-         * rebased every tip to phase 0 and forked MotK wait-loop resim
-         * (IRQ at CD54 vs CDA0). Selfcheck already restored csv out-of-band. */
-        uint8_t irq[12];
+        /* Rational PALx2 needs both the native phase and the Bresenham carry.
+         * Base/multiplier make a state fail closed if loaded under a different
+         * title clock contract. */
+        uint8_t irq[24];
         PstW w;
         pst_w_init(&w, irq, sizeof irq);
         ok = pst_w_u32(&w, i_stat) && pst_w_u32(&w, i_mask) &&
              pst_w_u32(&w, interrupts_get_cycles_since_vblank()) &&
-             write_section(o, BS_SEC_IRQ, irq, 12);
+             pst_w_u32(&w, interrupts_get_vblank_fraction()) &&
+             pst_w_u32(&w, interrupts_get_vblank_base_rate()) &&
+             pst_w_u32(&w, interrupts_get_vblank_multiplier()) &&
+             write_section(o, BS_SEC_IRQ, irq, sizeof irq);
     }
     if (ok) ok = write_timer_section(o);
     if (ok) {
-        uint8_t cyc[8];
+        uint8_t cyc[48];
+        PSXClockDomainSnapshot snap;
         PstW w;
         pst_w_init(&w, cyc, sizeof cyc);
-        /* Publish deferred load-charge batch before snapshotting the clock. */
-        psx_cyc_batch_flush();
-        ok = pst_w_u64(&w, psx_cycle_count) &&
-             write_section(o, BS_SEC_CLOCK, cyc, 8);
+        psx_clock_domain_snapshot(&snap);
+        ok = pst_w_u64(&w, snap.native_cycle_count) &&
+             pst_w_u64(&w, snap.cpu_retired_cycles) &&
+             pst_w_u64(&w, snap.cpu_native_cycles) &&
+             pst_w_u32(&w, snap.requested_percent) &&
+             pst_w_u32(&w, snap.overclock_active) &&
+             pst_w_u32(&w, snap.numerator) &&
+             pst_w_u32(&w, snap.denominator) &&
+             pst_w_u32(&w, snap.remainder) &&
+             pst_w_u32(&w, snap.reserved_flags) &&
+             write_section(o, BS_SEC_CLOCK, cyc, sizeof cyc);
     }
     if (ok) ok = write_module_section(o, BS_SEC_GPU, gpu_snapshot_bytes, gpu_snapshot_write);
     if (ok) {
@@ -533,8 +564,17 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &cpu->gte_data[i])) return 0;
         for (int i = 0; i < 32; i++)
             if (!pst_r_u32(&r, &cpu->gte_ctrl[i])) return 0;
-        /* Architectural normalize + drop host-only projection provenance that
-         * belonged to the pre-load timeline (not part of the wire format). */
+        if (!pst_r_u64(&r, &cpu->muldiv_ts_done) ||
+            !pst_r_u64(&r, &cpu->gte_ts_done) ||
+            !pst_r_bytes(&r, cpu->read_absorb, sizeof cpu->read_absorb) ||
+            !pst_r_u8(&r, &cpu->read_absorb_which) ||
+            !pst_r_u8(&r, &cpu->read_fudge) ||
+            !pst_r_u8(&r, &cpu->ld_which_t) ||
+            !pst_r_u32(&r, &cpu->ld_absorb)) return 0;
+        if (cpu->read_absorb_which > 0x20u || cpu->read_fudge > 0x20u ||
+            cpu->ld_which_t > 0x20u) return 0;
+        /* Architectural normalize + drop projection provenance. CPU timing
+         * pipeline state above is deterministic machine state and survives. */
         gte_canonicalize_cpu_state(cpu);
         return 1;
     }
@@ -552,19 +592,20 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     case BS_SEC_IRQ: {
         PstR r;
-        uint32_t st, mk, csv;
-        if (len != 8 && len != 12) return 0;
+        uint32_t st, mk, csv, fraction, base_rate, multiplier;
+        if (len != 24) return 0;
         pst_r_init(&r, p, len);
-        if (!pst_r_u32(&r, &st) || !pst_r_u32(&r, &mk)) return 0;
+        if (!pst_r_u32(&r, &st) || !pst_r_u32(&r, &mk) ||
+            !pst_r_u32(&r, &csv) || !pst_r_u32(&r, &fraction) ||
+            !pst_r_u32(&r, &base_rate) ||
+            !pst_r_u32(&r, &multiplier)) return 0;
+        if (base_rate != interrupts_get_vblank_base_rate() ||
+            multiplier != interrupts_get_vblank_multiplier()) return 0;
         i_stat = st;
         i_mask = mk;
-        if (len == 12) {
-            if (!pst_r_u32(&r, &csv)) return 0;
-            interrupts_set_cycles_since_vblank(csv);
-        } else {
-            /* Legacy UI/disk snaps: no phase — rebase like pre-csv saves. */
-            interrupts_set_cycles_since_vblank(0);
-        }
+        interrupts_set_vblank_fraction(fraction);
+        if (interrupts_get_vblank_fraction() != fraction) return 0;
+        interrupts_set_cycles_since_vblank(csv);
         return 1;
     }
     case BS_SEC_TIMER: {
@@ -589,12 +630,19 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     }
     case BS_SEC_CLOCK: {
         PstR r;
-        uint64_t cyc;
-        if (len != 8) return 0;
+        PSXClockDomainSnapshot snap;
+        if (len != 48) return 0;
         pst_r_init(&r, p, len);
-        if (!pst_r_u64(&r, &cyc)) return 0;
-        psx_cycle_count = cyc;
-        return 1;
+        if (!pst_r_u64(&r, &snap.native_cycle_count) ||
+            !pst_r_u64(&r, &snap.cpu_retired_cycles) ||
+            !pst_r_u64(&r, &snap.cpu_native_cycles) ||
+            !pst_r_u32(&r, &snap.requested_percent) ||
+            !pst_r_u32(&r, &snap.overclock_active) ||
+            !pst_r_u32(&r, &snap.numerator) ||
+            !pst_r_u32(&r, &snap.denominator) ||
+            !pst_r_u32(&r, &snap.remainder) ||
+            !pst_r_u32(&r, &snap.reserved_flags)) return 0;
+        return psx_clock_domain_restore(&snap);
     }
     case BS_SEC_GPU:
         return gpu_snapshot_read(p, len);
@@ -776,6 +824,12 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
     if (h.codegen_ver != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
         snprintf(part, sizeof(part), "codegen_ver=%u(want %u)",
                  (unsigned)h.codegen_ver, (unsigned)PSX_OVERLAY_CODEGEN_VER);
+        boot_state_append_reason(reason, reason_cap, part);
+    }
+    if (h.reserved != overlay_loader_active_config_hash()) {
+        snprintf(part, sizeof(part), "config_hash=%08X(want %08X)",
+                 (unsigned)h.reserved,
+                 (unsigned)overlay_loader_active_config_hash());
         boot_state_append_reason(reason, reason_cap, part);
     }
 
