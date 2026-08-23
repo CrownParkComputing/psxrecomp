@@ -23,19 +23,27 @@ inline int16_t get_imm16(uint32_t i) { return (int16_t)(i & 0xFFFF); }
  * BEFORE the statement; everything else is read after it. In the base build
  * the macros preprocess to ((void)0) and the optimizer erases the dead
  * capture locals, so base objects are unchanged; only a -DPSX_PGXP=1 TU pays.
- *
  * Operations that only destroy precision use PGXP_GPR_WRITE: a byte-identical
  * result must still kill the old projection provenance, because numeric
  * equality is not a writer identity. The macro checks a live-GPR bit before
  * calling, so the common untracked destination costs one predictable branch. */
+bool emission_ends_on_preprocessor_directive(const std::string& code) {
+    /* Scan back to the start of the final line, then find its first
+     * non-blank character. A directive is legal with leading whitespace, so
+     * "    #endif" counts just as much as "#endif". */
+    const std::size_t nl = code.find_last_of('\n');
+    const std::size_t line_begin = (nl == std::string::npos) ? 0u : nl + 1u;
+    for (std::size_t i = line_begin; i < code.size(); ++i) {
+        const char c = code[i];
+        if (c == ' ' || c == '\t' || c == '\r') continue;
+        return c == '#';
+    }
+    return false;  /* blank final line -- appending is already safe */
+}
+
 void append_pgxp_hooks(uint32_t instr, std::string& code) {
-    /* A translation ending in a preprocessor directive (the block-cycles
-     * muldiv wrappers end in `#endif`) would swallow an appended hook: the
-     * preprocessor discards tokens after #endif (the "extra tokens at end of
-     * #endif" warning class), so the MULT/DIV/MFLO/MFHI hooks silently never
-     * ran. Give the hook its own line. */
-    if (code.size() >= 6 && code.compare(code.size() - 6, 6, "#endif") == 0)
-        code += "\n    ";
+    const char* join = emission_ends_on_preprocessor_directive(code) ?
+        "\n    " : " ";
     const uint32_t opcode = (instr >> 26) & 0x3F;
     const uint32_t rs = get_rs(instr);
     const uint32_t rt = get_rt(instr);
@@ -53,38 +61,38 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         case 0x00: case 0x02: case 0x03:       /* SLL / SRL / SRA             */
             if (rd == 0 || instr == 0) return; /* skip plain nop              */
             code = fmt::format(
-                "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, {}u); }}",
+                "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, {}u); }}",
                 reg_name(rt), code, instr, reg_name(rd), (instr >> 6) & 31u);
             return;
         case 0x04: case 0x06: case 0x07:       /* SLLV / SRLV / SRAV          */
             if (rd == 0) return;
             code = fmt::format(
-                "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {} "
+                "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
                 "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
                 reg_name(rt), reg_name(rs), code, instr, reg_name(rd));
             return;
         case 0x10: case 0x12:                  /* MFHI / MFLO                 */
             if (rd == 0) return;
-            code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
+            code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
                                code, instr, reg_name(rd),
                                funct == 0x10 ? "cpu->hi" : "cpu->lo");
             return;
         case 0x11: case 0x13:                  /* MTHI / MTLO                 */
-            code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
+            code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
                                code, instr,
                                funct == 0x11 ? "cpu->hi" : "cpu->lo",
                                funct == 0x11 ? "cpu->hi" : "cpu->lo");
             return;
         case 0x18: case 0x19: case 0x1A: case 0x1B:  /* MULT(U)/DIV(U)        */
             code = fmt::format(
-                "{} PGXP_MULDIV(0x{:08X}u, cpu->hi, cpu->lo, {}, {});",
+                "{}\n    PGXP_MULDIV(0x{:08X}u, cpu->hi, cpu->lo, {}, {});",
                 code, instr, reg_name(rs), reg_name(rt));
             return;
         case 0x20: case 0x21: case 0x22: case 0x23:  /* ADD(U)/SUB(U)         */
         case 0x25:                                   /* OR                    */
             if (rd == 0) return;
             code = fmt::format(
-                "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {} "
+                "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
                 "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
                 reg_name(rs), reg_name(rt), code, instr, reg_name(rd));
             return;
@@ -92,7 +100,7 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         case 0x24: case 0x26: case 0x27:             /* AND/XOR/NOR           */
         case 0x2A: case 0x2B:                        /* SLT/SLTU              */
             if (rd == 0) return;
-            code = fmt::format("{} PGXP_GPR_WRITE({}u);", code, rd);
+            code = fmt::format("{}{}PGXP_GPR_WRITE({}u);", code, join, rd);
             return;
         default:
             return;
@@ -100,66 +108,65 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
     }
     case 0x01: {                               /* REGIMM link branches        */
         if (rt == 0x10 || rt == 0x11)
-            code = fmt::format("{} PGXP_GPR_WRITE(31u);", code);
+            code = fmt::format("{}{}PGXP_GPR_WRITE(31u);", code, join);
         return;
     }
     case 0x03:                                 /* JAL                         */
-        code = fmt::format("{} PGXP_GPR_WRITE(31u);", code);
+        code = fmt::format("{}{}PGXP_GPR_WRITE(31u);", code, join);
         return;
     case 0x08: case 0x09:                      /* ADDI / ADDIU                */
         if (rt == 0) return;
         code = fmt::format(
-            "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
             reg_name(rs), code, instr, reg_name(rt),
             (uint32_t)(int32_t)offset);
         return;
     case 0x0D:                                 /* ORI                         */
         if (rt == 0) return;
         code = fmt::format(
-            "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
+            "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
             reg_name(rs), code, instr, reg_name(rt),
             (uint32_t)(uint16_t)offset);
         return;
     case 0x0A: case 0x0B: case 0x0C: case 0x0E: /* SLTI(U)/ANDI/XORI        */
         if (rt == 0) return;
-        code = fmt::format("{} PGXP_GPR_WRITE({}u);", code, rt);
+        code = fmt::format("{}{}PGXP_GPR_WRITE({}u);", code, join, rt);
         return;
     case 0x0F:                                 /* LUI                         */
         if (rt == 0) return;
-        code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
+        code = fmt::format("{}\n    PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
                            code, instr, reg_name(rt));
         return;
     case 0x12: {                               /* COP2 register transfers     */
         const uint32_t cop_op = (instr >> 21) & 0x1F;
         if (((cop_op == 0x00 || cop_op == 0x02) && rt != 0) ||
             cop_op == 0x04)                    /* MFC2/CFC2/MTC2             */
-            code = fmt::format("{} PGXP_COP2(0x{:08X}u, {}, 0u);",
-                               code, instr, reg_name(rt));
+            code = fmt::format("{}{}PGXP_COP2(0x{:08X}u, {}, 0u);",
+                               code, join, instr, reg_name(rt));
         return;
     }
     case 0x10: {                               /* COP0                       */
         const uint32_t cop_op = (instr >> 21) & 0x1F;
         if ((cop_op == 0x00 || cop_op == 0x02) && rt != 0)
-            code = fmt::format("{} PGXP_GPR_WRITE({}u);", code, rt);
+            code = fmt::format("{}{}PGXP_GPR_WRITE({}u);", code, join, rt);
         return;
     }
     case 0x20: case 0x21: case 0x22: case 0x23:
     case 0x24: case 0x25: case 0x26:           /* loads                       */
         if (rt == 0) return;
         code = fmt::format(
-            "{{ uint32_t _pgxa = {}; {} PGXP_LOAD(0x{:08X}u, _pgxa, {}); }}",
+            "{{ uint32_t _pgxa = {}; {}\n    PGXP_LOAD(0x{:08X}u, _pgxa, {}); }}",
             addr_expr(), code, instr, reg_name(rt));
         return;
     case 0x28: case 0x29: case 0x2A: case 0x2B:
     case 0x2E:                                 /* stores                      */
         code = fmt::format(
-            "{{ uint32_t _pgxa = {}; {} PGXP_STORE(0x{:08X}u, _pgxa, {}); }}",
+            "{{ uint32_t _pgxa = {}; {}\n    PGXP_STORE(0x{:08X}u, _pgxa, {}); }}",
             addr_expr(), code, instr, reg_name(rt));
         return;
     default:
         return;
     }
 }
-
 
 } // namespace PSXRecomp

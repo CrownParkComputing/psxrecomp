@@ -274,7 +274,24 @@ target_include_directories(l2_structural_test PRIVATE
 )
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
 
+# Emitter directive-line guard — pins the predicate that keeps same-line
+# appenders off preprocessor-directive lines (the PR #171 hazard class).
+add_executable(emitter_directive_line_test
+    tests/emitter_directive_line_test.cpp
+    src/pgxp_hook_emitter.cpp
+)
+target_include_directories(emitter_directive_line_test PRIVATE
+    include
+    src
+    lib/rabbitizer/include
+    lib/rabbitizer/cplusplus/include
+    lib/fmt/include
+)
+target_link_libraries(emitter_directive_line_test PRIVATE fmt rabbitizer)
+
 if(BUILD_TESTING)
+    add_test(NAME emitter_directive_line_test
+             COMMAND emitter_directive_line_test)
     add_executable(debug_trace_ranges_test
         ../runtime/tests/test_debug_trace_ranges.c
         ../runtime/src/debug_trace_ranges.c
@@ -400,9 +417,21 @@ if(BUILD_TESTING)
                     --recompiler $<TARGET_FILE:psxrecomp-game>
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         add_test(
+            NAME kuseg_dispatch_lookup
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kuseg_dispatch_lookup.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
             NAME overlay_shim_compile_contract
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_shim_compile.py)
+        add_test(
+            NAME lwlr_load_delay_forward
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lwlr_load_delay_forward.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         add_test(
             NAME dirty_text_continuation_guards
             COMMAND ${Python3_EXECUTABLE}

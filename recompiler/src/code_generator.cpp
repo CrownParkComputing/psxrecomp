@@ -470,7 +470,7 @@ std::string CodeGenerator::translate_lwl(uint32_t instr) {
         return fmt::format("(void)psx_lwl(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwl(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_lwr(uint32_t instr) {
@@ -490,7 +490,7 @@ std::string CodeGenerator::translate_lwr(uint32_t instr) {
         return fmt::format("(void)psx_lwr(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwr(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_swl(uint32_t instr) {
@@ -1720,6 +1720,16 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     PSXRecomp::append_pgxp_hooks(instr, code);
+    /* The trailing disassembly comment must not land ON a preprocessor
+     * directive line -- it would be swallowed as extra tokens and dropped,
+     * costing the annotation and emitting -Wendif-labels noise. Reachable
+     * whenever the PGXP hook did NOT get appended after a block-cycles stall
+     * block, e.g. `mfhi $zero` / `mflo $zero` (append_pgxp_hooks returns early
+     * for rd==0, leaving the emission ending on a bare #endif). Same hazard
+     * class as PR #171. */
+    if (!comment.empty() &&
+        PSXRecomp::emission_ends_on_preprocessor_directive(code))
+        return config_.indent + code + "\n" + config_.indent + comment;
     return config_.indent + code + comment;
 }
 
@@ -1980,7 +1990,22 @@ std::string CodeGenerator::translate_basic_block(
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            // If this is the successor half of a deferred load pair AND it is an
+            // LWL/LWR merging into that same register, hardware forwards the
+            // pending load into the merge (see set_lwlr_merge_forward). Point
+            // the merge operand at the deferred temporary before translating.
+            const uint32_t succ_op = instr >> 26;
+            const bool succ_is_lwlr = (succ_op == 0x22u || succ_op == 0x26u);
+            const bool forward_to_lwlr =
+                delayed_load_active && addr == delayed_load_addr + 4u &&
+                succ_is_lwlr && get_rt(instr) == delayed_load_dest;
+            if (forward_to_lwlr) {
+                set_lwlr_merge_forward(
+                    delayed_load_dest,
+                    fmt::format("psx_ldd_{:08X}", delayed_load_addr));
+            }
             std::string emitted = translate_instruction(addr, instr);
+            if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
             if (!delayed_load_active && load_dest > 0 && addr + 4u <= block.end_addr &&
@@ -1995,16 +2020,29 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    /* Assign into a function-scope temp. PGXP wraps loads in
-                     * `{{ ... }}`; declaring the temp inside that block left
-                    * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
+                    // Declare the temp in the pair block, not inline at the
+                    // load: with PGXP the load already sits in its own
+                    // `{ uint32_t _pgxa = ...; <load> PGXP_LOAD(...); }`
+                    // wrapper, so an inline declaration would go out of
+                    // scope before the writeback below.
                     emitted.replace(pos, lhs.size(), temp + " =");
-                    const size_t hook = emitted.find("PGXP_LOAD(");
-                    if (hook != std::string::npos)
-                        emitted.replace(hook, std::string("PGXP_LOAD").size(),
-                                       "PGXP_LOAD_DELAYED");
-                    ss << config_.indent << "uint32_t " << temp << ";\n";
+                    // Stage PGXP load provenance from the temp. The writeback
+                    // is deferred, so the GPR still holds the pre-load value.
+                    const std::string pgxp_tail =
+                        fmt::format(", _pgxa, cpu->gpr[{}]);", load_dest);
+                    const size_t hook = emitted.rfind(pgxp_tail);
+                    const size_t hook_macro =
+                        hook == std::string::npos ? std::string::npos
+                                                  : emitted.rfind("PGXP_LOAD(", hook);
+                    if (hook_macro != std::string::npos) {
+                        emitted.replace(hook_macro, std::string("PGXP_LOAD").size(),
+                                        "PGXP_LOAD_DELAYED");
+                        emitted.replace(hook, pgxp_tail.size(),
+                                        fmt::format(", _pgxa, {});", temp));
+                    }
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
+                    ss << config_.indent
+                       << fmt::format("    uint32_t {} = 0;\n", temp);
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
                     delayed_load_active = true;
@@ -2016,7 +2054,11 @@ std::string CodeGenerator::translate_basic_block(
                 const bool successor_replaces_pending =
                     successor_load_dest == static_cast<int>(delayed_load_dest) &&
                     ((instr >> 21) & 31u) == delayed_load_dest;
-                if (writes_gpr(instr, delayed_load_dest) && !successor_replaces_pending) {
+                if (forward_to_lwlr) {
+                    ss << config_.indent << fmt::format(
+                        "/* psx_ldd_{:08X} forwarded into the LWL/LWR merge above */\n",
+                        delayed_load_addr);
+                } else if (writes_gpr(instr, delayed_load_dest) && !successor_replaces_pending) {
                     ss << config_.indent << fmt::format(
                         "PGXP_LOAD_CANCEL({}u);  /* successor write wins */\n",
                         delayed_load_dest);
@@ -2510,18 +2552,14 @@ std::string CodeGenerator::translate_basic_block(
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
                               next_addr);
         } else if (cps_enabled_) {
-            // No successor block and no known function owns the next PC —
-            // the block runs off the region/image edge. Emitting only the
-            // interrupt check here let execution FALL OFF the C function with
-            // the entry-switch's consumed pc==0: the dispatcher returned
-            // "handled" with a null PC and the top-level trampoline read it
-            // as "program ended". Publish
-            // the continuation instead: the dispatcher routes it to whoever
-            // owns it (a neighboring region variant, AOT text, or the
-            // interpreter).
+            // Unit-edge fall-through with no known successor function (e.g. a
+            // partial overlay capture). Falling off the body would leave
+            // cpu->pc == 0 (the continuation-entry prologue cleared it), which
+            // the trampoline reads as a normal guest exit — a silent shutdown.
+            // Publish the PC so dispatch can route it instead.
             ss << emit_interrupt_check(next_addr, config_.indent);
             ss << config_.indent
-               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS fallthrough past unit edge */\n",
                               next_addr);
         } else {
             // Non-CPS legacy: the check-only fall-through remains valid (the

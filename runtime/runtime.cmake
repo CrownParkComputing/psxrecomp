@@ -907,6 +907,13 @@ function(psxrecomp_add_runtime_target target)
             if(game_dispatch_native_ok_decl)
                 set(has_game_dispatch_native_ok TRUE)
             endif()
+            file(STRINGS "${PSXRT_GAME_GENERATED_DISPATCH_C}"
+                game_dispatch_native_ok_full_decl
+                REGEX "int[ \t]+psx_game_text_native_ok_full\\("
+                LIMIT_COUNT 1)
+            if(game_dispatch_native_ok_full_decl)
+                set(has_game_dispatch_native_ok_full TRUE)
+            endif()
         endif()
     endif()
     # Layer B: statically-compiled overlay dispatch. Inert unless a game
@@ -1367,6 +1374,12 @@ function(psxrecomp_add_runtime_target target)
             APPEND PROPERTY COMPILE_DEFINITIONS
             PSX_GAME_DISPATCH_HAS_NATIVE_OK=1)
     endif()
+    if(has_game_dispatch_native_ok_full)
+        set_property(SOURCE
+            ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
+            APPEND PROPERTY COMPILE_DEFINITIONS
+            PSX_GAME_DISPATCH_HAS_NATIVE_OK_FULL=1)
+    endif()
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
     endif()
@@ -1483,6 +1496,8 @@ function(psxrecomp_add_runtime_target target)
     if(WIN32 OR MINGW)
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
+        # iphlpapi: GetAdaptersAddresses in the launcher's netplay
+        # local-address discovery (MSVC does not link it implicitly).
         target_link_libraries(${target} PRIVATE ws2_32 iphlpapi dbghelp comdlg32 opengl32)
         # Newer mingw-w64 maps clock_gettime → clock_gettime64 in libwinpthread.
         # Link it even when netplay code prefers Win32 clocks, so any residual

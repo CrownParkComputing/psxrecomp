@@ -433,11 +433,7 @@ std::atomic<bool>     g_string_table_nonempty{false}; // any STRING entries (not
  * So: on by default only where the rest of the authoring/debug tooling lives,
  * off in a release build. PSX_XLATE_CAPTURE=1 turns it back on for authoring;
  * PSX_XLATE_CAPTURE=0 turns it off in a debug-tools build. */
-#ifdef PSX_NO_DEBUG_TOOLS
-std::atomic<bool>     g_capture_on{false};    // release: authoring inventory off
-#else
-std::atomic<bool>     g_capture_on{true};     // debug-tools build: always-on
-#endif
+std::atomic<bool>     g_capture_on{false};    // authoring inventory default off
 /* Dispatch hook aggregate gate. VRAM-only translations use the upload hook and
  * do not need to touch every CPU dispatch once RAM patches have settled. */
 std::atomic<bool>     g_dispatch_armed{false};
@@ -974,7 +970,8 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
         g_dir = (fs::path(project_root) / "translations").string();
     /* Explicit env wins in both directions over the build-flavour default. */
     const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
-    if (capenv && capenv[0]) g_capture_on.store(capenv[0] != '0');
+    if (capenv && capenv[0] == '0') g_capture_on.store(false);
+    else if (capenv && capenv[0] == '1') g_capture_on.store(true);
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
 }

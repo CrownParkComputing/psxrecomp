@@ -1462,6 +1462,7 @@ int main(int argc, char** argv) {
         ds << "#include \"psx_runtime.h\"\n\n";
         ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges_from(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc);\n\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
@@ -1507,9 +1508,13 @@ int main(int argc, char** argv) {
                 records.push_back({cont, cont, owner, 0, 0});
             }
         }
+        // Sort by PHYSICAL address. psx_game_find_entry() compares masked
+        // addresses so a KUSEG-executing guest still matches KSEG-normalized
+        // keys; the search invariant must therefore be the masked order too.
+        // Within one segment this is identical to sorting by the raw address.
         std::sort(records.begin(), records.end(),
                   [](const DispatchRecord& a, const DispatchRecord& b) {
-                      return a.addr < b.addr;
+                      return (a.addr & 0x1FFFFFFFu) < (b.addr & 0x1FFFFFFFu);
                   });
 
         // Attach the exact CFG instruction ranges from the manifest to every
@@ -1604,26 +1609,32 @@ int main(int argc, char** argv) {
         ds << "#endif\n";
         ds << "static PSX_GAME_LOOKUP_THREAD_LOCAL PsxGameLookupCacheEntry "
               "s_psx_game_lookup_cache[PSX_GAME_LOOKUP_CACHE_SLOTS];\n\n";
+        ds << "/* PS1 segments alias the same physical RAM. A game whose PS-X EXE\n";
+        ds << " * header carries KUSEG addresses (load address and entry PC without the\n";
+        ds << " * KSEG bit) executes with a KUSEG PC, while this table is keyed by the\n";
+        ds << " * recompiler's KSEG-normalized addresses. Comparing raw values made every\n";
+        ds << " * lookup fail for such a title. Canonicalize high-RAM aliases, then compare\n";
+        ds << " * the 29-bit physical address; the table is sorted by the same masked key. */\n";
         ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
         ds << "    extern uint32_t psx_ram_canon_code_addr(uint32_t);\n";
-        ds << "    addr = psx_ram_canon_code_addr(addr);\n";
-        ds << "    uint32_t slot = (((addr >> 2) * 2654435761u) >> 22);\n";
+        ds << "    const uint32_t want = psx_ram_canon_code_addr(addr) & 0x1FFFFFFFu;\n";
+        ds << "    uint32_t slot = (((want >> 2) * 2654435761u) >> 22);\n";
         ds << "    PsxGameLookupCacheEntry* memo = &s_psx_game_lookup_cache[slot];\n";
-        ds << "    if (memo->valid && memo->addr == addr) return memo->entry;\n";
+        ds << "    if (memo->valid && memo->addr == want) return memo->entry;\n";
         ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
         ds << "    while (lo < hi) {\n";
         ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
-        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr;\n";
-        ds << "        if (addr < key) hi = mid;\n";
-        ds << "        else if (addr > key) lo = mid + 1;\n";
+        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr & 0x1FFFFFFFu;\n";
+        ds << "        if (want < key) hi = mid;\n";
+        ds << "        else if (want > key) lo = mid + 1;\n";
         ds << "        else {\n";
-        ds << "            memo->addr = addr;\n";
+        ds << "            memo->addr = want;\n";
         ds << "            memo->entry = &k_psx_game_dispatch[mid];\n";
         ds << "            memo->valid = 1u;\n";
         ds << "            return memo->entry;\n";
         ds << "        }\n";
         ds << "    }\n";
-        ds << "    memo->addr = addr;\n";
+        ds << "    memo->addr = want;\n";
         ds << "    memo->entry = 0;\n";
         ds << "    memo->valid = 1u;\n";
         ds << "    return memo->entry;\n";
@@ -1635,6 +1646,14 @@ int main(int argc, char** argv) {
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
         ds << "    return dirty_ram_text_native_ok_ranges_from(\n";
         ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr);\n";
+        ds << "}\n\n";
+
+        ds << "/* Full-range validity for straight-line interpreter-to-AOT handoff. */\n";
+        ds << "int psx_game_text_native_ok_full(uint32_t addr) {\n";
+        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
+        ds << "    if (!entry || entry->range_count == 0) return 0;\n";
+        ds << "    return dirty_ram_text_native_ok_ranges(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count);\n";
         ds << "}\n\n";
 
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
