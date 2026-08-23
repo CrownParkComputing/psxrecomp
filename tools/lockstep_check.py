@@ -85,11 +85,15 @@ def summarise(d, func_mode, out=sys.stdout):
                   f"divergence could easily sit in what was skipped.", file=out)
             return "weak"
         print(f"\nNo divergence across {checked} {unit}(s). The compiled code "
-              f"matched the interpreter everywhere it was compared — so within "
-              f"this window, recompilation is not the fault.", file=out)
+              f"matched the interpreter everywhere it was compared.\n"
+              f"\nThat exonerates the TRANSLATION — compiled and interpreted "
+              f"agree. It does not exonerate anything the two share: the memory "
+              f"subsystem, HLE, DMA and device emulation are common to both "
+              f"paths, so a fault there is invisible to this comparison.",
+              file=out)
         return "clean"
 
-    kind = d.get("kind", "?")
+    kind = d.get("div_kind", d.get("kind", "?"))
     print(f"\nFIRST DIVERGENCE ({kind}): {MEANING.get(kind, 'see the fields below')}",
           file=out)
     print(f"  frame     {d.get('frame')}", file=out)
@@ -156,11 +160,19 @@ def main(argv=None):
         return 2
 
     body = rep.get("lockstep") or rep.get("lockstep_func") or {}
-    doc.update(body if isinstance(body, dict) else {})
+    if isinstance(body, dict):
+        body = dict(body)
+        # The engine calls the DIVERGENCE type "kind", and so does every report
+        # document this toolchain writes. Merging the reply as-is overwrote the
+        # document type with "none" on a clean run, and the Studio then rejected
+        # its own output as a foreign file. Keep the two names apart.
+        doc["div_kind"] = body.pop("kind", "none")
+        doc.update(body)
+    doc["kind"] = KIND
     doc["verdict"] = summarise(doc, args.func)
     # Carry the plain-English reading of the divergence kind, so the GUI does
     # not have to keep its own copy of this table and drift from it.
-    doc["meaning"] = MEANING.get(doc.get("kind", ""), "")
+    doc["meaning"] = MEANING.get(doc.get("div_kind", ""), "")
     doc["skipped_total"] = sum(doc.get(k, 0) for k in SKIPS)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:

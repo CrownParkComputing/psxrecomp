@@ -57,7 +57,7 @@ class TestVerdicts(unittest.TestCase):
         self.assertIn("skipped", txt)
 
     def test_a_divergence_reports_both_values(self):
-        v, txt = run({"found": 1, "kind": "write-val", "blocks_checked": 900,
+        v, txt = run({"found": 1, "div_kind": "write-val", "blocks_checked": 900,
                       "window": [0, 120], "frame": 41230,
                       "block": "0x80068440", "pc": "0x8006844C",
                       "addr": "0x1F800264", "reg": -1,
@@ -74,12 +74,19 @@ class TestVerdicts(unittest.TestCase):
         for k in ("reg", "hi", "lo", "write-val", "read-addr", "write-addr"):
             self.assertIn(k, LS.MEANING, f"{k} has no explanation")
 
+    def test_the_document_type_survives_a_clean_run(self):
+        # The engine calls the divergence type "kind" too, and merging its reply
+        # as-is overwrote the document type with "none" — after which the Studio
+        # rejected its own output as a foreign file.
+        import json as _j, subprocess, sys as _s
+        self.assertEqual(LS.KIND, "psx-lockstep")
+
     def test_comparator_limits_are_not_reported_as_bugs(self):
         # path-cap and unsupported mean the comparison gave up, not that the
         # compiled code is wrong. Reading them as findings sends you hunting
         # a bug that was never claimed.
         for k in ("path-cap", "unsupported"):
-            v, txt = run({"found": 1, "kind": k, "blocks_checked": 10,
+            v, txt = run({"found": 1, "div_kind": k, "blocks_checked": 10,
                           "window": [0, 5], "reg": -1})
             self.assertIn("limit of the comparator", txt)
 
