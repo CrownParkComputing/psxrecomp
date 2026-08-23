@@ -229,30 +229,35 @@ def walk_side(conn, label, *, addr=None, near=None, pause=False,
                 print(f"  [{label}] coherent re-read failed ({e}); using the "
                       f"running snapshot", file=out)
         else:
-            # Verify by RE-READING, not by pausing -- but compare STRUCTURE,
-            # not bytes.
+            # Read once and let the WALK validate itself. No pausing, and no
+            # comparison against a second read.
             #
-            # Byte-identity was the obvious check and it is exactly wrong
-            # here: while the effect plays, the game rewrites the list every
-            # frame, so two consecutive reads never match and every animated
-            # frame gets discarded as torn. That filter keeps only the frames
-            # without the animation in them, which is the opposite of what
-            # this is for.
+            # Two attempts at a two-read check both failed the same way, and
+            # the failure is worth recording. Byte-identity rejected every
+            # frame in which any colour changed; comparing the list SHAPE
+            # rejected every frame in which the list changed SIZE. During an
+            # animation that is all of them -- so both filters kept only the
+            # frames WITHOUT the animation and reported the rest as
+            # corruption, which is the exact opposite of the job.
             #
-            # A genuinely torn read is not merely different, it is malformed:
-            # packet word counts stop matching their opcodes and the walk
-            # loses entries. So require the two reads to agree on the SHAPE of
-            # the list -- entry count and the opcode/length of each entry --
-            # while letting the colours differ, since colours changing between
-            # two reads is the effect working, not corruption.
+            # A genuinely torn read is malformed, not merely different: packet
+            # word counts stop matching their opcodes. walk_ordering_table
+            # already refuses those entries, so the walk succeeding IS the
+            # coherence check, and it costs one read instead of two.
             try:
                 first = read_ram_range(conn, 0x80000000 + span_lo, span_len)
-                shape_a = _accept(first)
-                second = read_ram_range(conn, 0x80000000 + span_lo, span_len)
-                shape_b = _accept(second)
-                if shape_a is not None and shape_b is not None and \
-                        _list_shape(shape_a) == _list_shape(shape_b):
-                    entries, coherent = shape_a, True
+                walked = _accept(first)
+                if walked is not None:
+                    # Trust the walk's OWN validation rather than comparing
+                    # two reads. walk_ordering_table only admits entries whose
+                    # word count matches their opcode, so torn data drops out
+                    # there; requiring two reads to agree on the whole list
+                    # shape rejected every frame in which the list CHANGED
+                    # SIZE -- which during an animation is all of them. That
+                    # is the same mistake as requiring byte-identity, one step
+                    # weaker: it discarded precisely the frames being looked
+                    # for, and reported them as corruption.
+                    entries, coherent = walked, True
                 else:
                     meta["torn"] = True
             except DebugError as e:

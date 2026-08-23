@@ -146,6 +146,20 @@ def signature(prims):
     }
 
 
+def _wanted(sig, spec):
+    """Does this sample show the object we are after?
+
+    Without this, a quota fills up on whatever is on screen first -- the
+    land-placement glow is 144 quads over 155 lines and is always available,
+    so twelve samples of it would be collected and compared while the effect
+    itself was never seen.
+    """
+    if not spec or spec == "any":
+        return True
+    q, _, ln = spec.partition("x")
+    return sig["quads"] == int(q) and sig["y_span"] == int(ln)
+
+
 def group_key(sig):
     """Which on-screen object a sample is of.
 
@@ -189,6 +203,7 @@ def merge(sigs):
             tuple(c) for c in sig.get("all_colours", []))
     for g in groups.values():
         g["union_size"] = len(g.get("union", ()))
+        g["union_list"] = sorted(list(c) for c in g.get("union", ()))
     return {"groups": groups, "samples": len(sigs),
             "samples_with_quads": len(live)}
 
@@ -299,7 +314,7 @@ def sample_native(conn, args, out=sys.stderr):
         except DebugError:
             continue
         s = signature(d.get("prims", []))
-        if s["quads"]:
+        if s["quads"] and _wanted(s, args.object):
             sigs.append(s)
         if len(sigs) >= args.samples:
             break
@@ -338,6 +353,7 @@ def sample_oracle(conn, args, out=sys.stderr):
     empty = 0
     torn = 0
     truncated = 0
+    other = collections.Counter()
     root = None          # once known, read only the span around it
     expect_nodes = 0     # what a FULL walk found; a windowed one must match
     seen_classes = collections.Counter()
@@ -390,11 +406,13 @@ def sample_oracle(conn, args, out=sys.stderr):
                 time.sleep(args.poll)
                 continue
             sig = signature(rep.get("prims") or [])
-            if sig["quads"]:
+            if sig["quads"] and _wanted(sig, args.object):
                 sigs.append(sig)
                 print(f"  oracle sample {len(sigs)}/{args.samples}: "
                       f"{sig['quads']} quads, {sig['distinct_colours']} "
                       f"colours, {sig['y_span']} line span", file=out)
+            elif sig["quads"]:
+                other[(sig["quads"], sig["y_span"])] += 1
             else:
                 empty += 1
         time.sleep(args.poll)
@@ -405,6 +423,11 @@ def sample_oracle(conn, args, out=sys.stderr):
     if truncated:
         print(f"  oracle: {truncated} windowed read(s) came back short and "
               f"were re-read in full", file=out)
+    if other:
+        seen = ", ".join(f"{q}q/{s_}ln x{n}" for (q, s_), n in
+                         other.most_common(4))
+        print(f"  oracle: skipped samples of other objects ({seen}) -- they "
+              f"do not fill the quota for --object {args.object}", file=out)
     if not sigs:
         # Say WHAT was walked. "None held additive shaded quads" is equally
         # consistent with the effect not playing and with the walk reading the
@@ -433,6 +456,11 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_NATIVE_PORT)
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--object", default="64x599", metavar="QUADSxLINES",
+                    help="the effect object samples must match to count, as "
+                         "quad-count x vertical-span. Samples of anything else "
+                         "(the land-placement glow is 144x155) do not fill the "
+                         "quota and never drive the verdict. 'any' disables.")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--watch-secs", type=float, default=90.0,
                     help="how long to keep reading the running oracle")
@@ -462,8 +490,12 @@ def main():
                              args)
 
     nat, orc = merge(nat_sigs), merge(orc_sigs)
-    doc["native"] = {f"{k[0]}x{k[1]}": v for k, v in nat["groups"].items()}
-    doc["oracle"] = {f"{k[0]}x{k[1]}": v for k, v in orc["groups"].items()}
+    def _plain(g):
+        return {k: v for k, v in g.items() if k != "union"}
+    doc["native"] = {f"{k[0]}x{k[1]}": _plain(v)
+                     for k, v in nat["groups"].items()}
+    doc["oracle"] = {f"{k[0]}x{k[1]}": _plain(v)
+                     for k, v in orc["groups"].items()}
     doc["native_samples"], doc["oracle_samples"] = nat_sigs, orc_sigs
     v, why, which = verdict(nat, orc)
     doc["verdict"], doc["explanation"] = v, why

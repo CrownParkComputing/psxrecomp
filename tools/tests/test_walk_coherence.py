@@ -89,13 +89,27 @@ class ListShapeTest(unittest.TestCase):
         self.assertIn("park_for_reread", sig.parameters)
         self.assertTrue(sig.parameters["park_for_reread"].default)
 
-    def test_verify_branch_compares_shape_not_bytes(self):
-        """Guard against reintroducing the byte-identity check."""
+    def test_verify_branch_does_not_compare_two_reads(self):
+        """Guard against reintroducing either rejected-everything filter.
+
+        Byte-identity rejected every frame in which a colour changed; whole
+        list-shape equality rejected every frame in which the list changed
+        size. During an animation that is all of them, so both kept only the
+        frames without the animation and called the rest corruption.
+        """
         src = inspect_source(gdl.walk_side)
-        verify = src.split("else:\n            # Verify by RE-READING", 1)[1]
+        verify = src.split("else:\n            # Read once", 1)[1]
         verify = verify.split('meta["coherent"] = coherent', 1)[0]
-        self.assertIn("_list_shape", verify)
         self.assertNotIn("if first == second:", verify)
+        self.assertNotIn("_list_shape(", verify)
+        self.assertIn("_accept(first)", verify)
+
+    def test_single_read_in_the_verify_branch(self):
+        """One read, not two: the walk's own validation is the check."""
+        src = inspect_source(gdl.walk_side)
+        verify = src.split("else:\n            # Read once", 1)[1]
+        verify = verify.split('meta["coherent"] = coherent', 1)[0]
+        self.assertEqual(verify.count("read_ram_range("), 1)
 
     def test_non_parking_path_never_pauses(self):
         """With park_for_reread=False no pause/continue may be issued.
@@ -106,7 +120,7 @@ class ListShapeTest(unittest.TestCase):
         src = inspect_source(gdl.walk_side)
         marker = "if park_for_reread:"
         self.assertIn(marker, src)
-        after = src.split("else:\n            # Verify by RE-READING", 1)[1]
+        after = src.split("else:\n            # Read once", 1)[1]
         # The verify branch runs up to the end of the coherence block.
         verify_branch = after.split('meta["coherent"] = coherent', 1)[0]
         self.assertNotIn('conn.cmd("pause")', verify_branch)

@@ -392,3 +392,38 @@ class UnionTest(unittest.TestCase):
         u = ep.union_compare(ep.merge([]), ep.merge([]), (64, 599))
         self.assertEqual(u["native_total"], 0)
         self.assertEqual(u["oracle_total"], 0)
+
+
+class ObjectFilterTest(unittest.TestCase):
+    """Only samples of the object under investigation may fill the quota.
+
+    The land-placement glow (144 quads / 155 lines) is on screen before the
+    effect starts and is always readable, so an unfiltered quota fills with
+    twelve samples of it and the verdict is drawn from the wrong object.
+    """
+
+    def test_matching_object_accepted(self):
+        self.assertTrue(ep._wanted({"quads": 64, "y_span": 599}, "64x599"))
+
+    def test_other_object_rejected(self):
+        self.assertFalse(ep._wanted({"quads": 144, "y_span": 155}, "64x599"))
+
+    def test_any_disables_the_filter(self):
+        self.assertTrue(ep._wanted({"quads": 144, "y_span": 155}, "any"))
+        self.assertTrue(ep._wanted({"quads": 144, "y_span": 155}, ""))
+
+    def test_quad_count_alone_is_not_enough(self):
+        self.assertFalse(ep._wanted({"quads": 64, "y_span": 155}, "64x599"))
+
+
+class SerialisationTest(unittest.TestCase):
+    def test_group_is_json_serialisable_without_the_set(self):
+        import json
+        m = ep.merge([{"quads": 64, "y_span": 599, "distinct_colours": 1,
+                       "saturated_colours": 0, "peak_channel": 5,
+                       "all_colours": [[1, 2, 3]]}])
+        plain = {f"{k[0]}x{k[1]}": {kk: vv for kk, vv in v.items()
+                                    if kk != "union"}
+                 for k, v in m["groups"].items()}
+        json.dumps(plain)                      # must not raise
+        self.assertEqual(plain["64x599"]["union_list"], [[1, 2, 3]])
