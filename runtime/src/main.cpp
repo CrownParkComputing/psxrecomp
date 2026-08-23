@@ -1170,33 +1170,10 @@ static_assert((int)PSX_MOD_CONTROLLER_ANALOG ==
 static_assert((int)PSX_MOD_CONTROLLER_DIGITAL ==
               (int)PSXRecompV4::PAD_MODE_DIGITAL);
 static double        g_host_refresh_hz = 0.0;
-static constexpr double PSX_FRAME_HZ_NTSC = 59.94;
-static constexpr double PSX_FRAME_HZ_PAL  = 50.0;
-static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / PSX_FRAME_HZ_NTSC;
+static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
 static double        g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 static bool          g_mod_native_vblank_rate = false;
 static uint32_t      g_mod_native_vblank_fps = 0;
-
-static double psx_crtc_frame_hz(void) {
-    const uint32_t period = gpu_vblank_period_cycles();
-    if (period == 0u)
-        return PSX_FRAME_HZ_NTSC;
-    /* 33.8688 MHz CPU clock / cycles-per-vblank. */
-    return 33868800.0 / (double)period;
-}
-
-static void refresh_frame_pacer_period(void) {
-    if (g_mod_native_vblank_rate)
-        return;
-    const double psx_hz = psx_crtc_frame_hz();
-    g_frame_period_ms = 1000.0 / psx_hz;
-    if (g_host_refresh_hz > 0.0) {
-        const double lo = psx_hz * 0.98;
-        const double hi = psx_hz * 1.02;
-        if (g_host_refresh_hz >= lo && g_host_refresh_hz <= hi)
-            g_frame_period_ms = 1000.0 / g_host_refresh_hz;
-    }
-}
 /* Activation-time request. -1 means no enabled mod owns load acceleration. */
 static int           g_mod_load_wall_multiplier = -1;
 static int           g_mod_load_release_frames = -1;
@@ -1300,7 +1277,7 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
 extern "C" int psx_mod_set_native_vblank_rate(
     uint32_t frames_per_second) {
     if (frames_per_second != 0 &&
-        (frames_per_second < 50 || frames_per_second > 1000)) {
+        (frames_per_second < 60 || frames_per_second > 1000)) {
         std::fprintf(stderr,
             "psxrecomp: mod rejected invalid native VBlank rate %u FPS\n",
             (unsigned)frames_per_second);
@@ -1327,46 +1304,6 @@ extern "C" int psx_mod_set_native_vblank_rate(
         std::fprintf(stdout,
             "psxrecomp: mod selected uncapped native guest VBlank pacing\n");
     }
-    return 1;
-}
-
-extern "C" int psx_mod_set_crtc_refresh_multiplier(
-    uint32_t multiplier) {
-    if (multiplier < 1u || multiplier > 8u) {
-        std::fprintf(stderr,
-            "psxrecomp: mod rejected invalid CRTC refresh multiplier %u\n",
-            (unsigned)multiplier);
-        return 0;
-    }
-    gpu_set_crtc_refresh_multiplier(multiplier);
-    std::fprintf(stdout,
-        "psxrecomp: mod selected CRTC refresh multiplier %u "
-        "(guest VBlank period / %u)\n",
-        (unsigned)multiplier, (unsigned)multiplier);
-    return 1;
-}
-
-extern "C" int psx_mod_set_crtc_vblank_hz(uint32_t hz) {
-    if (hz == 0u) {
-        gpu_set_crtc_vblank_period_override(0u);
-        std::fprintf(stdout,
-            "psxrecomp: mod cleared CRTC VBlank period override "
-            "(follow GP1 video mode)\n");
-        return 1;
-    }
-    if (hz != 50u && hz != 60u) {
-        std::fprintf(stderr,
-            "psxrecomp: mod rejected invalid CRTC VBlank rate %u Hz "
-            "(use 50, 60, or 0)\n",
-            (unsigned)hz);
-        return 0;
-    }
-    const uint32_t cycles =
-        (hz == 50u) ? PSX_VBLANK_CYCLES_PAL : PSX_VBLANK_CYCLES_NTSC;
-    gpu_set_crtc_vblank_period_override(cycles);
-    std::fprintf(stdout,
-        "psxrecomp: mod forced CRTC VBlank to %u Hz (%u guest cycles)\n",
-        (unsigned)hz, (unsigned)cycles);
     return 1;
 }
 
@@ -2587,10 +2524,8 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
  * wall-clock pacer double-blocks the vblank callback (present is before the
  * guest resumes), which shows up as MotK FMV ~30–40 FPS in netplay vs ~50+
  * offline. Force immediate swaps for the session; restore on soft-exit. */
-static int host_refresh_matches_crtc(void) {
-    const double psx_hz = psx_crtc_frame_hz();
-    return g_host_refresh_hz >= psx_hz * 0.98 &&
-           g_host_refresh_hz <= psx_hz * 1.02;
+static int host_refresh_is_approx_60hz(void) {
+    return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
 }
 
 static int present_vsync_owns_cadence(void) {
@@ -2602,7 +2537,7 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
-    return host_refresh_matches_crtc();
+    return host_refresh_is_approx_60hz();
 }
 
 static int present_effective_swap_interval(void) {
@@ -5989,7 +5924,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
-            const double speed = fps / psx_crtc_frame_hz();
+            const double speed = fps / 59.94;
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -6483,14 +6418,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     }
 
     /* Offline wall-clock pacing before present. Skipped when driver vsync
-     * owns cadence (panel near the live CRTC rate) so the two waits cannot
-     * double-block.
+     * owns cadence (~60 Hz panel) so the two waits cannot double-block.
      * Netplay paces in the epilogue AFTER present so Swap overlaps the
      * peer's guest quantum. Self-check replay runs uncapped like netplay
      * resim. */
     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
-        refresh_frame_pacer_period();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
@@ -7011,7 +6944,6 @@ static void sdl_vblank_present(void) {
         return;
     }
     uint64_t perf_start = runtime_perf_section_begin();
-    refresh_frame_pacer_period();
     if (present_should_wall_pace())
         frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
@@ -12794,28 +12726,23 @@ session_reboot:
     }
     psx_apply_window_icon(sdl_window, argv[0]);
 
-    /* Host refresh: if the panel is within ~2% of the live CRTC rate (NTSC
-     * 59.94 / PAL 50), record it so driver vsync can own cadence. Otherwise
-     * keep the PSX CRTC period and force swap interval 0. Mods that own
-     * native VBlank keep their cadence. */
+    /* Host refresh: if the panel is within ~2% of 60 Hz, record it so driver
+     * vsync can own cadence (pacer skipped). Non-~60 Hz and unknown refresh
+     * (common on Wayland) keep PSX 59.94 Hz pacing and force swap interval 0
+     * — vsync as the clock would run the sim at the panel rate. */
     {
         SDL_DisplayMode dm;
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
-        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0)
-            g_host_refresh_hz = (double)dm.refresh_rate;
-        refresh_frame_pacer_period();
-        if (!g_mod_native_vblank_rate) {
-            const double psx_hz = psx_crtc_frame_hz();
-            if (host_refresh_matches_crtc()) {
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            g_host_refresh_hz = host_hz;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_ms = 1000.0 / host_hz;
                 std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
-                            "(%.4f ms/frame, %s CRTC)\n",
-                            (int)(g_host_refresh_hz + 0.5), g_frame_period_ms,
-                            gpu_display_is_pal() ? "PAL" : "NTSC");
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
             } else {
-                std::printf("psxrecomp: host panel %.0f Hz; keeping %s %.2f Hz pacing\n",
-                            g_host_refresh_hz,
-                            gpu_display_is_pal() ? "PAL" : "NTSC",
-                            psx_hz);
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
             }
         }
     }
