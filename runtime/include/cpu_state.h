@@ -324,15 +324,23 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
 #include "psx_cyc.h"
 
 /* Release call-entry stamp — inlined into every generated BIOS/game TU that
- * includes this header (MotK VLC entry tax). Debug builds use the out-of-line
- * ring path in debug_server.c. */
+ * includes this header (MotK VLC entry tax). Diagnostic builds use the
+ * out-of-line ring path in debug_server.c. Shipping product builds deliberately
+ * omit this post-mortem-only volatile store; dispatch/crash state and explicitly
+ * armed tracing remain available through their separate paths. */
 #ifdef PSX_NO_DEBUG_TOOLS
 #ifdef __cplusplus
 extern "C" {
 #endif
+#ifndef PSX_SHIPPING_MINIMAL_DIAGNOSTICS
 extern volatile uint32_t g_psx_last_fn_entry;
+#endif
 #ifdef PSX_OVERLAY_DLL_BUILD
 void debug_server_log_call_entry(uint32_t func_addr);
+#elif defined(PSX_SHIPPING_MINIMAL_DIAGNOSTICS)
+static inline void debug_server_log_call_entry(uint32_t func_addr) {
+    (void)func_addr;
+}
 #else
 static inline void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_last_fn_entry = func_addr;

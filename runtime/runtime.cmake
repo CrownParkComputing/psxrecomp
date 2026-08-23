@@ -254,6 +254,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_sdl_audio.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_stick.c
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
+    ${PSXRECOMP_ROOT}/runtime/src/dirty_text_generation_cache.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
     ${PSXRECOMP_ROOT}/runtime/src/ws_ui_group.c
     ${PSXRECOMP_ROOT}/runtime/src/ws_aspect_cone_math.c
@@ -860,6 +861,13 @@ function(psxrecomp_add_runtime_target target)
     if(PSXRT_GAME_GENERATED_FULL_C)
         foreach(_full_src IN LISTS PSXRT_GAME_GENERATED_FULL_C)
             set_source_files_properties("${_full_src}" PROPERTIES GENERATED TRUE)
+            # Only generated game bodies pay the text-size tradeoff for the
+            # force-inlined per-instruction pipeline step. BIOS monoliths and
+            # ordinary runtime TUs keep the compact outlined helper; overlay
+            # DLLs opt in independently through PSX_OVERLAY_DLL_BUILD.
+            set_property(SOURCE "${_full_src}" APPEND PROPERTY
+                COMPILE_DEFINITIONS
+                    "$<$<CONFIG:Release>:PSX_GAME_GENERATED_FAST_CYC=1>")
             list(APPEND generated_sources "${_full_src}")
             list(APPEND _game_generated_check "${_full_src}")
         endforeach()
@@ -1318,6 +1326,20 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # Product Release binaries omit only unconditional post-mortem bookkeeping
+    # from the dispatch/function-entry hot paths. Keep the switch narrowly
+    # target- and configuration-scoped: framework-only runtimes, oracle/cosim,
+    # explicit debug-tool builds, and every non-Release configuration retain the
+    # complete diagnostic behavior. Armed fntrace/parity paths remain compiled
+    # and operational under this define.
+    if(has_game_dispatch
+       AND NOT PSXRT_ORACLE
+       AND NOT PSXRT_COSIM
+       AND NOT PSX_DEBUG_TOOLS)
+        target_compile_definitions(${target} PRIVATE
+            $<$<CONFIG:Release>:PSX_SHIPPING_MINIMAL_DIAGNOSTICS=1>)
     endif()
 
     if(PSXRECOMP_HAS_RECOMP_NET)

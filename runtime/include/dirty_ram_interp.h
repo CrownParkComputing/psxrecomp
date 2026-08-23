@@ -144,6 +144,13 @@ void     dirty_ram_text_guard_resync_after_restore(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
+/* Notify a direct/bulk RAM writer before or immediately after changing bytes.
+ * Only overlapping pages already registered by exact generated ranges advance. */
+void     dirty_ram_text_note_range_write(uint32_t phys, uint32_t len);
+/* Lifecycle for the generation qualifier. These accompany reference-image
+ * registration and whole-RAM timeline changes; ordinary writers use note. */
+void     dirty_ram_text_cache_register(uint32_t phys_lo, uint32_t len);
+void     dirty_ram_text_cache_reset(int clear_watches);
 int      dirty_ram_text_native_ok(uint32_t phys);
 /* Exact CFG ranges; exec_pc clips ranges that end before the resume PC. */
 int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
@@ -151,6 +158,19 @@ int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                              uint32_t exec_pc);
 int      dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
                                         uint32_t count);
+/* Generated-dispatch cache qualification. Each cache is two uint64_t values:
+ * {text-image epoch, monotonic generation sum for the exact clipped pages}.
+ * Suffix and full-range callers must use distinct storage. */
+int      dirty_ram_text_range_generation_from(const uint32_t *lo_len_pairs,
+                                             uint32_t count,
+                                             uint32_t exec_pc,
+                                             uint64_t out[2]);
+int      dirty_ram_text_native_ok_ranges_from_cached(
+            const uint32_t *lo_len_pairs, uint32_t count, uint32_t exec_pc,
+            uint64_t cached_generation[2]);
+int      dirty_ram_text_native_ok_ranges_cached(
+            const uint32_t *lo_len_pairs, uint32_t count,
+            uint64_t cached_generation[2]);
 int      dirty_ram_text_image_registered(void);
 /* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
  * into the text reference image so it is not mistaken for self-modifying code. */

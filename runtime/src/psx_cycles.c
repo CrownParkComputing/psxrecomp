@@ -83,6 +83,7 @@ uint64_t psx_cpu_native_cycles = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
+int      g_psx_cyc_inline_fast = 0;
 uint32_t *g_psx_cyc_local_acc = NULL;
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
@@ -229,6 +230,7 @@ int psx_clock_domain_restore(const PSXClockDomainSnapshot *in) {
     g_psx_cyc_batch = 0u;
     g_psx_cyc_batch_limit = 0u;
     g_psx_cyc_bb_defer = 0;
+    g_psx_cyc_inline_fast = 0;
     if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0u;
     g_psx_cyc_local_acc = NULL;
     psx_cycle_count = in->native_cycle_count;
@@ -853,6 +855,7 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     g_psx_cyc_batch        = 0;
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
+    g_psx_cyc_inline_fast  = 0;
     s_devices_synced_cycle = psx_cycle_count;
     s_device_service_epoch++;
     psx_idle_countdown_reset();
@@ -891,6 +894,7 @@ void psx_cycles_reset_for_boot(void) {
     g_psx_cyc_batch        = 0;
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
+    g_psx_cyc_inline_fast  = 0;
     psx_cycle_count        = 0;
     psx_cpu_retired_cycles = 0;
     psx_cpu_native_cycles  = 0;

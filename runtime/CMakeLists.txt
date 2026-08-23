@@ -38,8 +38,35 @@ if(BUILD_TESTING)
     add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE
-        PSX_ENABLE_BLOCK_CYCLES=1)
+        PSX_ENABLE_BLOCK_CYCLES=1
+        PSX_GAME_GENERATED_FAST_CYC=1)
     add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
+
+    # Shipping product builds keep required dispatch/game-start work and armed
+    # traces while compiling out unconditional post-mortem rings/stamps. Build
+    # the same focused harness both ways so the preprocessor boundary cannot
+    # silently drift.
+    foreach(_fntrace_mode IN ITEMS diagnostic shipping)
+        set(_fntrace_target fntrace_${_fntrace_mode}_test)
+        add_executable(${_fntrace_target}
+            tests/test_fntrace_shipping.c
+            src/fntrace.c)
+        target_include_directories(${_fntrace_target} PRIVATE include)
+        target_compile_definitions(${_fntrace_target} PRIVATE
+            PSX_NO_DEBUG_TOOLS=1)
+        if(_fntrace_mode STREQUAL "shipping")
+            target_compile_definitions(${_fntrace_target} PRIVATE
+                PSX_SHIPPING_MINIMAL_DIAGNOSTICS=1)
+        endif()
+        add_test(NAME ${_fntrace_target} COMMAND ${_fntrace_target})
+    endforeach()
+
+    add_executable(dirty_text_generation_cache_test
+        tests/test_dirty_text_generation_cache.c
+        src/dirty_text_generation_cache.c)
+    target_include_directories(dirty_text_generation_cache_test PRIVATE include)
+    add_test(NAME dirty_text_generation_cache_test
+             COMMAND dirty_text_generation_cache_test)
 
     add_executable(psx_icache_fastpath_test
         tests/test_psx_icache_fastpath.c

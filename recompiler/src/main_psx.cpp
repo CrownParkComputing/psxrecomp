@@ -1463,6 +1463,8 @@ int main(int argc, char** argv) {
         ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges_from(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges_from_cached(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc, uint64_t cached_generation[2]);\n\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges_cached(const uint32_t* lo_len_pairs, uint32_t count, uint64_t cached_generation[2]);\n\n";
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
@@ -1595,6 +1597,11 @@ int main(int argc, char** argv) {
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
+        ds << "typedef struct {\n";
+        ds << "    uint64_t suffix[2];\n";
+        ds << "    uint64_t full[2];\n";
+        ds << "} PsxGameDispatchValidity;\n";
+        ds << "static PsxGameDispatchValidity k_psx_game_validity[PSX_GAME_DISPATCH_COUNT];\n\n";
         ds << "/* PS1 segments alias the same physical RAM. A game whose PS-X EXE\n";
         ds << " * header carries KUSEG addresses (load address and entry PC without the\n";
         ds << " * KSEG bit) executes with a KUSEG PC, while this table is keyed by the\n";
@@ -1616,28 +1623,36 @@ int main(int argc, char** argv) {
         ds << "    return 0;\n";
         ds << "}\n\n";
 
+        ds << "static PsxGameDispatchValidity* psx_game_entry_validity(\n";
+        ds << "        const PsxGameDispatchEntry* entry) {\n";
+        ds << "    return &k_psx_game_validity[(uint32_t)(entry - k_psx_game_dispatch)];\n";
+        ds << "}\n\n";
+
         ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
         ds << "int psx_game_text_native_ok(uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
-        ds << "    return dirty_ram_text_native_ok_ranges_from(\n";
-        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr);\n";
+        ds << "    return dirty_ram_text_native_ok_ranges_from_cached(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr,\n";
+        ds << "        psx_game_entry_validity(entry)->suffix);\n";
         ds << "}\n\n";
 
         ds << "/* Full-range validity for straight-line interpreter-to-AOT handoff. */\n";
         ds << "int psx_game_text_native_ok_full(uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
-        ds << "    return dirty_ram_text_native_ok_ranges(\n";
-        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count);\n";
+        ds << "    return dirty_ram_text_native_ok_ranges_cached(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count,\n";
+        ds << "        psx_game_entry_validity(entry)->full);\n";
         ds << "}\n\n";
 
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry) return 0;\n";
-        ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges_from(\n";
-        ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr)) return 0;\n";
+        ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges_from_cached(\n";
+        ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr,\n";
+        ds << "            psx_game_entry_validity(entry)->suffix)) return 0;\n";
         ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
         if (codegen.cps_enabled())
             ds << "    cpu->pc = entry->resume_pc;\n";

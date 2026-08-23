@@ -1727,6 +1727,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern int (*g_psx_bios_hle_hook)(CPUState* cpu, uint32_t phys);\n\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
     out += "extern int psx_game_address_in_text(uint32_t addr);\n";
+    out += "extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);\n";
     out += "#endif\n\n";
 
     // Forward declarations for all emitted functions.
@@ -2060,6 +2061,16 @@ void FullFunctionEmitter::emit_dispatch(
         out += "        if (!found && psx_bios_try_native_call_stub(cpu, addr))\n";
         out += "            found = 1;\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
+    out += "        /* Fast route for clean compiled-game entries. The game dispatcher\n";
+    out += "         * validates every emitted CFG range against live RAM before it\n";
+    out += "         * executes and returns 0 on an unknown or byte-mismatched target.\n";
+    out += "         * Therefore a pre-game address that overlaps the BIOS shell\n";
+    out += "         * still falls through to the existing shell normalization below,\n";
+    out += "         * while clean game code avoids both the large BIOS-table miss and\n";
+    out += "         * the generic dirty-RAM router. HLE and live A0/B0/C0 stubs remain\n";
+    out += "         * authoritative because they run before this tier. */\n";
+    out += "        if (!found && psx_game_address_in_text(addr))\n";
+    out += "            found = psx_dispatch_game_compiled(cpu, addr);\n";
     out += "        /* Game EXEs can overlap the BIOS shell copy window at\n";
     out += "         * physical 0x30000-0x5AFFF. If the target belongs to the\n";
     out += "         * active game text range, route it through the game/dirty-RAM\n";

@@ -70,6 +70,12 @@ extern uint32_t g_psx_cyc_batch_limit;
  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
 extern int g_psx_cyc_bb_defer;
 
+/* Derived guard for the force-inlined generated instruction step. It is true
+ * only inside a normal deferred generated activation; replay, conservative
+ * stepping, device service, local accumulation, COSIM, and non-generated code
+ * keep it false and use the exact generic charge path. */
+extern int g_psx_cyc_inline_fast;
+
 /* Emitter-level VLC load-charge batching: when non-NULL, psx_cyc_charge
  * accumulates into *g_psx_cyc_local_acc instead of g_psx_cyc_batch. Publish
  * via psx_cyc_local_publish / psx_cyc_batch_flush before IRQ/MMIO barriers. */

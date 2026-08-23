@@ -96,9 +96,10 @@ static inline int armed_match(uint32_t target) {
 }
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ─────────────────
- * Records every dispatch where the guest SP crossed a 64 KB domain since the
- * previous dispatch. Ordinary call nesting never moves SP that far, so the
- * ring stays quiet except at genuine stack switches: game green-thread /
+ * Non-shipping diagnostics record every dispatch where the guest SP crossed a
+ * 64 KB domain since the previous dispatch. Ordinary call nesting never moves
+ * SP that far, so the ring stays quiet except at genuine stack switches: game
+ * green-thread /
  * coroutine context restores, longjmps, kernel thread changes, and crt0
  * stack (re)initialization. Those transitions are exactly the provenance
  * question in stack-corruption deaths (Tomba 2 splash→title reload: the
@@ -107,9 +108,11 @@ static inline int armed_match(uint32_t target) {
  * per dispatch; entries only on domain edges. Dumped via `sp_ring`. */
 SpDomainEntry g_spdom_ring[SPDOM_RING_CAP];
 uint64_t      g_spdom_seq = 0;
+#ifndef PSX_SHIPPING_MINIMAL_DIAGNOSTICS
 static uint32_t s_spdom_prev_sp = 0;
+#endif
 
-/* Always-on dispatch tail ring: the last DISP_TAIL_CAP dispatches with
+/* Diagnostic dispatch tail ring: the last DISP_TAIL_CAP dispatches with
  * target/ra/sp/cycle. Unlike the armed fntrace ring this is unconditional —
  * sized tiny so the post-mortem question "what was the exact dispatch
  * sequence in the final iterations" is always answerable (the Tomba 2
@@ -121,6 +124,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     /* The BIOS has completed the PS-X EXE load by the time it dispatches the
      * entry point. Apply the validated plan before the first guest instruction. */
     mod_runtime_on_dispatch(target);
+#ifndef PSX_SHIPPING_MINIMAL_DIAGNOSTICS
     {
         extern uint64_t psx_get_cycle_count(void);
         DispTailEntry *t = &g_disp_tail[g_disp_tail_seq % DISP_TAIL_CAP];
@@ -151,6 +155,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             s_spdom_prev_sp = sp_now;
         }
     }
+#endif
 
     /* On-the-fly string translation (framework feature — text_xlate.cpp). The
      * generated psx_dispatch_impl calls us at the top of each dispatch iteration
@@ -178,6 +183,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
      * the traps.c bail ledger (surfaced in the heartbeat as bail_top_site_ra /
      * bail_top_wild_pc) so the dominant wild-returning function is readable even
      * when the bail storm makes the window "Not Responding". */
+#ifndef PSX_SHIPPING_MINIMAL_DIAGNOSTICS
     {
         extern uint64_t g_psx_bail_flattened;
         extern uint32_t g_debug_current_func_addr;
@@ -190,6 +196,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             psx_bail_record(g_debug_current_func_addr, cpu->gpr[29], target, cpu->gpr[31]);
         }
     }
+#endif
 
     if (!s_game_started && s_game_entry_phys != 0) {
         /* Latch on the entry_pc dispatch (the common case) OR the first dispatch

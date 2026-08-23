@@ -116,6 +116,7 @@ uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
 void memory_clear_low_boot_scratch(void) {
+    dirty_ram_text_note_range_write(0u, 0x10u);
     memset(ram, 0, 0x10u);
 }
 
@@ -411,6 +412,7 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
     text_ref_lo = phys_lo;
     text_ref_hi = phys_lo + len;
+    dirty_ram_text_cache_register(phys_lo, len);
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_native_blocked = 0;
@@ -427,6 +429,7 @@ int dirty_ram_text_image_registered(void) { return text_ref_image != NULL; }
 
 static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
     if (!text_ref_image) return;
+    dirty_ram_text_note_range_write(phys, (uint32_t)size);
     if (phys < text_ref_lo || phys + (uint32_t)size > text_ref_hi) return;
     const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
     uint8_t buf[4] = { (uint8_t)val, (uint8_t)(val >> 8),
@@ -561,6 +564,7 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
     uint8_t *ref = text_ref_image + (lo - text_ref_lo);
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
+    dirty_ram_text_note_range_write(lo, hi - lo);
     memcpy(ref, src, hi - lo);
     /* Re-open the affected pages: clear the sticky diverged bit so the next
      * dispatch re-runs the compare against the now-updated reference. */
@@ -583,6 +587,7 @@ uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index) {
 
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
+    dirty_ram_text_note_range_write(phys, len);
     psx_kernel_bless_note_range(phys, len);
     uint32_t end = phys + len - 1u;
     if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
@@ -682,6 +687,7 @@ void dirty_ram_reset_for_boot(void) {
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
+    dirty_ram_text_cache_reset(1);
     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
@@ -742,6 +748,7 @@ void dirty_ram_text_guard_resync_after_restore(void) {
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
+    dirty_ram_text_cache_reset(0);
 }
 
 void overlay_watch_invalidate_after_ram_restore(void) {

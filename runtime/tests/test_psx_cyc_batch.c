@@ -11,6 +11,7 @@ uint64_t psx_next_service_cycle = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int g_psx_cyc_bb_defer = 0;
+int g_psx_cyc_inline_fast = 0;
 uint32_t *g_psx_cyc_local_acc = 0;
 int psx_in_device_service = 0;
 int g_event_step_conservative = 0;
@@ -40,6 +41,7 @@ static void reset_clock(uint64_t deadline) {
     g_psx_cyc_batch = 0;
     g_psx_cyc_batch_limit = 0;
     g_psx_cyc_bb_defer = 0;
+    g_psx_cyc_inline_fast = 0;
     g_psx_cyc_local_acc = 0;
     psx_cpu_retired_cycles = 0;
     psx_cpu_native_cycles = 0;
@@ -183,6 +185,165 @@ int main(void) {
         assert(acc == 0u);
         psx_cyc_local_end();
         assert(g_psx_cyc_local_acc == 0);
+    }
+
+    /* Forced-inline one-cycle path: preserve the complete pipeline update while
+     * charging through the same deferred batch used by generated functions. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 3u;
+        cpu.ld_which_t = 5u;
+        cpu.ld_absorb = 7u;
+        cpu.read_absorb[1] = 9u;
+        cpu.read_absorb[3] = 0u;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_step(&cpu, (1u << 1) | (1u << 2));
+        assert(g_psx_cyc_batch == 1u);
+        assert(cpu.read_absorb[1] == 0u);
+        assert(cpu.read_absorb[2] == 0u);
+        assert(cpu.read_absorb[5] == 7u);
+        assert(cpu.read_fudge == 5u);
+        assert(cpu.ld_which_t == 0x20u);
+        psx_cyc_bb_defer_end();
+        assert(psx_cycle_count == 1u);
+    }
+
+    /* A pending read-absorb cycle substitutes for the base charge exactly as
+     * before; dependency and LDS state still advance. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 4u;
+        cpu.read_absorb[4] = 2u;
+        cpu.ld_which_t = 0x20u;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_step(&cpu, 0u);
+        assert(cpu.read_absorb[4] == 1u);
+        assert(g_psx_cyc_batch == 0u);
+        psx_cyc_bb_defer_end();
+        assert(psx_cycle_count == 0u);
+    }
+
+    /* Local function accumulators remain authoritative over the basic-block
+     * batch, matching the ordering in the generic charge path. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        uint32_t acc = 0u;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_local_begin(&acc);
+        psx_cyc_step(&cpu, 0u);
+        assert(acc == 1u);
+        assert(g_psx_cyc_batch == 0u);
+        psx_cyc_local_end();
+        psx_cyc_bb_defer_end();
+        assert(psx_cycle_count == 1u);
+    }
+
+    /* Conservative replay never enters the deferred fast path. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        g_event_step_conservative = 1;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == 1u);
+        assert(g_psx_cyc_batch == 0u);
+        g_event_step_conservative = 0;
+        psx_cyc_bb_defer_end();
+    }
+
+    /* Lockstep replay has the same priority as conservative stepping. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        g_ls_replay_active = 1;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == 1u);
+        assert(g_psx_cyc_batch == 0u);
+        g_ls_replay_active = 0;
+        psx_cyc_bb_defer_end();
+    }
+
+    /* Device-service work remains native time even under a 900% CPU policy. */
+    reset_clock(1000u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        g_psx_oc_numerator = 1u;
+        g_psx_oc_denominator = 9u;
+        psx_in_device_service = 1;
+        psx_cyc_bb_defer_begin();
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == 1u);
+        assert(psx_cpu_retired_cycles == 0u);
+        assert(g_psx_oc_accum == 0u);
+        psx_in_device_service = 0;
+        psx_cyc_bb_defer_end();
+    }
+
+    /* The local soft cap publishes the old accumulator before accepting the
+     * new cycle; it never wraps or loses the boundary charge. */
+    reset_clock(UINT64_MAX);
+    {
+        CPUState cpu;
+        uint32_t acc = (1u << 28) - 1u;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        g_psx_cyc_local_acc = &acc;
+        g_psx_cyc_inline_fast = 0;
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == ((1u << 28) - 1u));
+        assert(acc == 1u);
+        g_psx_cyc_local_acc = 0;
+    }
+
+    /* A saturated deferred batch fails over to the generic publication path. */
+    reset_clock(UINT64_MAX);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        g_psx_cyc_bb_defer = 1;
+        g_psx_cyc_inline_fast = 1;
+        g_psx_cyc_batch = UINT32_MAX;
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == (uint64_t)UINT32_MAX + 1u);
+        assert(g_psx_cyc_batch == 0u);
+        g_psx_cyc_bb_defer = 0;
+        g_psx_cyc_inline_fast = 0;
+    }
+
+    /* Outside generated defer scope, one-cycle charges retain the ordinary
+     * deadline-aware batching behavior. */
+    reset_clock(5u);
+    {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.read_absorb_which = 0x20u;
+        cpu.ld_which_t = 0x20u;
+        for (int i = 0; i < 4; i++) psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == 0u && g_psx_cyc_batch == 4u);
+        psx_cyc_step(&cpu, 0u);
+        assert(psx_cycle_count == 5u && g_psx_cyc_batch == 0u);
+        assert(service_count == 1);
     }
     return 0;
 }

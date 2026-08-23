@@ -1,16 +1,14 @@
 ﻿/* fntrace.h — always-on call ring for recomp psx_dispatch.
  *
- * Records every entry into psx_dispatch with the caller's argument
+ * Records selected entries into psx_dispatch with the caller's argument
  * registers and return address. Mirrors beetle_libretro.cpp's fntrace
  * ring (same wire commands: fntrace_arm / fntrace_dump / fntrace_clear)
  * so cross-process tools that already speak Beetle's protocol work
  * unchanged against psx-runtime.
  *
- * Why "always-on" rather than arm-then-record: see CLAUDE.md global
- * rule "Never time/attach for observability". The ring captures every
- * dispatch from boot; arming only narrows what the dump command
- * reports, never what is recorded. To investigate a window of
- * interest, fntrace_dump it after the fact.
+ * Recording is armed explicitly (or with PSX_FNTRACE_ALL). Shipping product
+ * builds retain that armed path, but omit separate unconditional post-mortem
+ * rings from the dispatch hot loop.
  *
  * Coverage: every psx_dispatch entry — both static-recompiled targets
  * (ROM functions, shell-relocated functions) and dirty-RAM dispatches.
@@ -50,9 +48,10 @@ extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 extern uint64_t     g_fntrace_seq;     /* monotonic; index into ring = seq % CAP */
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ──────────────────
- * One entry per dispatch whose guest SP crossed a 64 KB domain since the
- * previous dispatch. Quiet in normal execution; fires at genuine stack
- * switches (green-thread/coroutine restores, longjmp, kernel ChangeThread,
+ * In non-shipping diagnostic builds, one entry per dispatch whose guest SP
+ * crossed a 64 KB domain since the previous dispatch. Quiet in normal
+ * execution; fires at genuine stack switches (green-thread/coroutine restores,
+ * longjmp, kernel ChangeThread,
  * crt0 stack init) — the provenance record for "who installed this SP".
  * Dumped via the `sp_ring` TCP command. */
 #define SPDOM_RING_CAP 512u
@@ -69,9 +68,10 @@ typedef struct {
 extern SpDomainEntry g_spdom_ring[SPDOM_RING_CAP];
 extern uint64_t      g_spdom_seq;
 
-/* Always-on dispatch tail ring: last N dispatches (target/ra/sp/cycle),
- * recorded unconditionally so the final control-flow sequence before a death
- * is always reconstructable. Dumped via `disp_ring`. */
+/* Diagnostic dispatch tail ring: last N dispatches (target/ra/sp/cycle).
+ * Shipping product builds leave this ring idle; other builds record it
+ * unconditionally so the final control-flow sequence before a death remains
+ * reconstructable. Dumped via `disp_ring`. */
 #define DISP_TAIL_CAP 128u
 typedef struct {
     uint64_t cycle;
@@ -100,9 +100,9 @@ void fntrace_mark_game_started(CPUState* cpu);
  * the latch fires. */
 void fntrace_maybe_mark_game_started(CPUState* cpu, uint32_t addr);
 
-/* Arm a target filter. arm_count == 0 means "record all" (default).
- * When arm_count > 0, only dispatches whose target matches one of the
- * armed entries are recorded. Use for noise reduction on a hot ring. */
+/* Arm a target filter. arm_count == 0 records nothing by default. When
+ * arm_count > 0, only dispatches whose target matches one of the armed entries
+ * are recorded; target 0xFFFFFFFF requests the explicit record-all mode. */
 #define FNTRACE_ARM_MAX 32
 void fntrace_arm(uint32_t target);     /* add to arm list, or 0 to clear */
 void fntrace_arm_clear(void);

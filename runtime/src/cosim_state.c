@@ -13,6 +13,7 @@
  * and compiled-vs-compiled gates.
  */
 #include "cosim_state.h"
+#include "dirty_ram_interp.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -154,6 +155,7 @@ uint64_t cosim_state_hash(CosimSubHashes *sub) {
 
     /* apply pending gate-4 injection to live state */
     if (s_inj_ram_phys >= 0 && (uint32_t)s_inj_ram_phys < RAM_SIZE) {
+        dirty_ram_text_note_range_write((uint32_t)s_inj_ram_phys, 1u);
         ram[s_inj_ram_phys] ^= s_inj_ram_xor; cosim_note_ram_write((uint32_t)s_inj_ram_phys, 1);
         s_inj_ram_phys = -1;
     }

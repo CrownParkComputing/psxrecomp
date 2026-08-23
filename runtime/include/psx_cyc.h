@@ -39,6 +39,28 @@
 extern "C" {
 #endif
 
+/* The generated game calls psx_cyc_step once per retired instruction.  Plain
+ * `static inline` is only a hint: GCC was outlining the helper into a ~0x210
+ * byte TU-local function and emitting a native call for nearly every guest
+ * instruction.  At a 9x CPU clock that call boundary alone is a host-side
+ * throughput ceiling.  Force only the small, constant-mask pipeline helpers
+ * inline; keep the complete charge fallback out of line once per generated TU
+ * so rare diagnostic/non-deferred paths do not explode code size. */
+#if defined(__GNUC__) || defined(__clang__)
+#if defined(PSX_GAME_GENERATED_FAST_CYC) || defined(PSX_OVERLAY_DLL_BUILD)
+#define PSX_CYC_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define PSX_CYC_ALWAYS_INLINE static inline
+#endif
+#define PSX_CYC_NOINLINE      static __attribute__((noinline, unused))
+#elif defined(_MSC_VER)
+#define PSX_CYC_ALWAYS_INLINE static inline
+#define PSX_CYC_NOINLINE      static __declspec(noinline)
+#else
+#define PSX_CYC_ALWAYS_INLINE static inline
+#define PSX_CYC_NOINLINE      static
+#endif
+
 /* Load-charge batching (MotK VLC): cache the nearer of the next device
  * deadline or a 64-cycle soft publication limit once per batch. Generated
  * GCC/Clang blocks may defer to their IRQ edge; MMIO also flushes. Pipeline
@@ -53,10 +75,24 @@ static inline void psx_cyc_bb_defer_flush(void) { overlay_flush_cycles(); }
 static inline void psx_cyc_local_begin(uint32_t *acc) { (void)acc; }
 static inline void psx_cyc_local_end(void) { }
 #else
-static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
+static inline void psx_cyc_bb_defer_begin(void) {
+    g_psx_cyc_bb_defer++;
+#if defined(PSX_COSIM)
+    g_psx_cyc_inline_fast = 0;
+#else
+    if (g_psx_cyc_bb_defer == 1)
+        g_psx_cyc_inline_fast = 1;
+    if (g_ls_replay_active || g_event_step_conservative ||
+        psx_in_device_service || g_psx_cyc_local_acc)
+        g_psx_cyc_inline_fast = 0;
+#endif
+}
 static inline void psx_cyc_bb_defer_end(void) {
     if (g_psx_cyc_bb_defer > 0) g_psx_cyc_bb_defer--;
-    if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
+    if (g_psx_cyc_bb_defer == 0) {
+        psx_cyc_batch_flush();
+        g_psx_cyc_inline_fast = 0;
+    }
 }
 static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
 
@@ -66,6 +102,7 @@ static inline void psx_cyc_local_begin(uint32_t *acc) {
 #if !defined(PSX_COSIM)
     if (acc) *acc = 0;
     g_psx_cyc_local_acc = acc;
+    g_psx_cyc_inline_fast = 0;
 #else
     (void)acc;
 #endif
@@ -151,11 +188,51 @@ static inline void psx_cyc_charge(uint32_t cycles) {
 #endif
 }
 
+/* One-cycle specialization for the overwhelmingly common non-load instruction
+ * path. Generated functions enter bb-defer before executing guest code, so the
+ * normal case is exactly the corresponding branch in psx_cyc_charge(1): add one
+ * raw CPU cycle to the pending batch and publish it at the existing IRQ/MMIO/
+ * branch barrier. The slow helper preserves every exceptional mode and keeps
+ * the large generic charge body out of each forced-inline instruction site. */
+#if !defined(PSX_OVERLAY_DLL_BUILD) && defined(PSX_GAME_GENERATED_FAST_CYC)
+PSX_CYC_NOINLINE void psx_cyc_charge_one_slow(void) {
+    psx_cyc_charge(1u);
+}
+#endif
+
+PSX_CYC_ALWAYS_INLINE void psx_cyc_charge_one(void) {
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    /* Overlay TUs already accumulate in their local shim. Inlining the pipeline
+     * state still removes psx_cyc_step and constant-folds its register mask;
+     * the one remaining call is the shim's inexpensive accumulator update. */
+    psx_advance_cycles(1u);
+#elif defined(PSX_GAME_GENERATED_FAST_CYC)
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(g_psx_cyc_inline_fast, 1)) {
+#else
+    if (g_psx_cyc_inline_fast) {
+#endif
+        uint32_t prior = g_psx_cyc_batch;
+        if (prior != UINT32_MAX) {
+            g_psx_cyc_batch = prior + 1u;
+            return;
+        }
+    }
+    psx_cyc_charge_one_slow();
+#else
+    /* Ordinary runtime, BIOS, debug, and focused-test TUs retain the compact
+     * generic helper. In particular, do not emit a TU-local slow fallback here:
+     * at -O0 even an unused static function would acquire references to the
+     * complete timing runtime and break intentionally narrow unit harnesses. */
+    psx_cyc_charge(1u);
+#endif
+}
+
 /* §1 base (Beetle cpu.cpp:795-798). */
-static inline void psx_cyc_base(CPUState* cpu) {
+PSX_CYC_ALWAYS_INLINE void psx_cyc_base(CPUState* cpu) {
     uint8_t w = cpu->read_absorb_which;
     if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
-    else                     psx_cyc_charge(1u);
+    else                     psx_cyc_charge_one();
 }
 
 /* GPR_DEPRES (Beetle cpu.cpp:702-705): zero ReadAbsorb[n] for every source/dest
@@ -200,7 +277,7 @@ static inline void psx_cyc_lds(CPUState* cpu) {
  * branch, jump, store, COP control, LWC2/SWC2 pre-step, mult/div, mfhi/mflo, ...).
  * reg_mask from psx_cyc_dep_res_mask(). MUST be emitted BEFORE the instruction
  * body so §1 precedes any muldiv/GTE deadline stall in the body (Beetle order). */
-static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
+PSX_CYC_ALWAYS_INLINE void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     psx_cyc_lds(cpu);

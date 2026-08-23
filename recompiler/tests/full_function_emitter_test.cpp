@@ -220,6 +220,62 @@ void link_and_synthetic_writes_have_pgxp_barriers() {
            "full emitter invalidates PGXP provenance in its synthetic BIOS jump stub");
 }
 
+void compiled_game_fast_route_preserves_dispatch_precedence() {
+    const auto result = run_case(
+        "compiled-game-fast-route",
+        {
+            0x03E00008u,  // jr ra
+            0x00000000u,  // delay-slot nop
+        },
+        {function_at(kBase, kBase + 4u, {kBase})});
+
+    const auto hle = result.dispatch.find(
+        "g_psx_bios_hle_hook(cpu, addr & 0x1FFFFFFFu)");
+    const auto stub = result.dispatch.find("psx_bios_try_native_call_stub(cpu, addr)");
+    const auto game_guard = result.dispatch.find(
+        "if (!found && psx_game_address_in_text(addr))");
+    const auto game_dispatch = result.dispatch.find(
+        "found = psx_dispatch_game_compiled(cpu, addr)", game_guard);
+    const auto shell_fallback = result.dispatch.find(
+        "if (!found && (game_shell_overlap || game_text_in_shell_window ||",
+        game_dispatch);
+    const auto bios_normalize = result.dispatch.find("uint32_t phys = normalize(addr)",
+                                                     shell_fallback);
+    const auto bios_search = result.dispatch.find("while (lo <= hi)", bios_normalize);
+    const auto generic_dirty_fallback = result.dispatch.find(
+        "if (dirty_ram_dispatch(cpu, addr, stop_addr))", bios_search);
+
+    expect(hle != std::string::npos && stub != std::string::npos &&
+               game_guard != std::string::npos && game_dispatch != std::string::npos &&
+               shell_fallback != std::string::npos && bios_normalize != std::string::npos &&
+               bios_search != std::string::npos &&
+               generic_dirty_fallback != std::string::npos && hle < stub &&
+               stub < game_guard && game_guard < game_dispatch &&
+               game_dispatch < shell_fallback && shell_fallback < bios_normalize &&
+               bios_normalize < bios_search && bios_search < generic_dirty_fallback,
+           "compiled-game fast route follows HLE/stubs and precedes shell, BIOS, and generic dirty fallbacks");
+}
+
+void compiled_game_fast_route_fails_closed() {
+    const auto result = run_case(
+        "compiled-game-fast-route-fallback",
+        {
+            0x03E00008u,  // jr ra
+            0x00000000u,  // delay-slot nop
+        },
+        {function_at(kBase, kBase + 4u, {kBase})});
+
+    expect(result.dispatch.find(
+               "if (!found && psx_game_address_in_text(addr))\n"
+               "            found = psx_dispatch_game_compiled(cpu, addr);") !=
+               std::string::npos,
+           "compiled-game rejection leaves found clear for the existing fallbacks");
+    expect(result.dispatch.find(
+               "extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);") !=
+               std::string::npos,
+           "generated dispatcher declares the compiled-game fast-route ABI");
+}
+
 }  // namespace
 
 int main() {
@@ -245,6 +301,8 @@ int main() {
     noncomplementary_lwl_falls_back();
     complementary_lwl_lwr_stays_native();
     link_and_synthetic_writes_have_pgxp_barriers();
+    compiled_game_fast_route_preserves_dispatch_precedence();
+    compiled_game_fast_route_fails_closed();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d full-function emitter test(s) failed\n", failures);
