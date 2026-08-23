@@ -58,3 +58,42 @@ class VerdictTest(unittest.TestCase):
     def test_empty_frames_ignored_not_counted_as_constant(self):
         v, _ = swf.verdict_of([swf.distinct_scales([])])
         self.assertEqual(v, "no-samples")
+
+
+class ScratchRegisterTest(unittest.TestCase):
+    """The probe arms a window of block leaders, not one instruction.
+
+    For $s6 that is harmless -- it is callee-saved and holds one value all
+    frame. For $v0 it is not: $v0 holds a different intermediate at every
+    instruction, so counting distinct values across PCs reports the program
+    running normally as if it were a fault. It did exactly that, reporting
+    'varies-within-frame' for a colour computation that was provably correct
+    (248*80>>7 = 155, 136*80>>7 = 85, 8*80>>7 = 5, assembled 0x3805559B).
+    """
+
+    def test_scratch_register_verdict_is_refused(self):
+        v, why = swf.verdict_of([swf.distinct_scales([sample(1), sample(2)])],
+                                reg="v0")
+        self.assertEqual(v, "not-applicable")
+        self.assertIn("scratch register", why)
+
+    def test_callee_saved_still_evaluated(self):
+        v, _ = swf.verdict_of([swf.distinct_scales([sample(128)] * 4)],
+                              reg="s6")
+        self.assertEqual(v, "constant-within-frame")
+
+    def test_by_pc_separates_instructions(self):
+        samples = [{"pc": "0x80068428", "regs": {"v0": "0x9B"}},
+                   {"pc": "0x80068430", "regs": {"v0": "0x55"}},
+                   {"pc": "0x80068428", "regs": {"v0": "0x9B"}}]
+        g = swf.by_pc(samples, "v0")
+        self.assertEqual(len(g), 2)
+        self.assertEqual(list(g["0x80068428"]), [0x9B])
+        self.assertEqual(list(g["0x80068430"]), [0x55])
+
+    def test_each_pc_can_be_constant_while_the_union_varies(self):
+        samples = [{"pc": "0xA", "regs": {"v0": "0x9B"}},
+                   {"pc": "0xB", "regs": {"v0": "0x55"}}]
+        g = swf.by_pc(samples, "v0")
+        self.assertTrue(all(len(c) == 1 for c in g.values()))
+        self.assertEqual(len(swf.distinct_scales(samples, "v0")), 2)
