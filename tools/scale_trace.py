@@ -346,6 +346,7 @@ def main(argv=None):
         """
         vals, why = sample_per_frame(conn, pc_, count, reg_)
         if vals:
+            doc["native_sampling"] = "per-frame"
             return vals, why
         print(f"  psx-runtime: per-frame captured nothing ({why}); retrying "
               f"free-running — the steps will be aliased, but a measurement "
@@ -355,6 +356,10 @@ def main(argv=None):
             doc["native_sampling"] = "free-running-fallback"
         return vals2, (why2 or why)
 
+    # Recorded up front and overwritten by whichever path actually ran. Leaving
+    # it unset on success meant a per-frame series and a free-running one looked
+    # identical in the report -- and they support completely different claims.
+    doc["native_sampling"] = "free-running"
     if args.per_frame:
         print("  psx-runtime: stepping one frame between reads, so the deltas "
               "are the real per-frame increment")
@@ -495,16 +500,30 @@ def main(argv=None):
                 print(f"\n  Step sizes are comparable "
                       f"(psx-runtime max {a['max_step']}, oracle max "
                       f"{b['max_step']}), so the fade granularity matches too.")
-        elif (args.per_frame and a["samples"] >= 5
-              and doc.get("native_sampling") != "free-running-fallback"):
+        elif doc.get("native_sampling") == "per-frame" and a["samples"] >= 4:
+            # Consecutive frames measure the increment directly. That is not a
+            # sample of a distribution needing a quorum -- four adjacent frames
+            # showing steps of 2 IS the step, whereas four free-running samples
+            # ninety frames apart say nothing however many there are.
             doc["granularity"] = "native-measured-per-frame"
-            print(f"\n  psx-runtime, sampled on CONSECUTIVE frames, moves in "
-                  f"steps of up to {a['max_step']} (median "
-                  f"{a['median_step']}). That is its real animation increment. "
-                  f"The oracle's series is not frame-adjacent, so its apparent "
-                  f"step is an upper bound only — but a per-frame increment "
-                  f"this large is a coarse fade regardless of what the oracle "
-                  f"does.")
+            smooth = a["max_step"] <= 8
+            doc["native_smooth"] = smooth
+            print(f"\n  psx-runtime, on {a['samples']} CONSECUTIVE frames, "
+                  f"moves in steps of up to {a['max_step']} (median "
+                  f"{a['median_step']}). That is its real animation increment.")
+            if smooth:
+                print(f"  That is a SMOOTH fade — at {a['median_step']} per "
+                      f"frame the scale crosses its whole range in about "
+                      f"{128 // max(1, int(a['median_step']))} frames. It does "
+                      f"not produce hard bands, so the coarse-fade explanation "
+                      f"is out.")
+            else:
+                print(f"  That is a COARSE fade: jumping by up to "
+                      f"{a['max_step']} per frame produces hard bands rather "
+                      f"than a gradient, which is the reported symptom.")
+            print(f"  The oracle's series is not frame-adjacent, so its "
+                  f"apparent step is an upper bound only and the two step "
+                  f"figures are not comparable.")
         elif doc.get("native_sampling") == "free-running-fallback":
             # The claim that must never be made from aliased data: these steps
             # are an artefact of sampling ~90 frames apart, not the animation

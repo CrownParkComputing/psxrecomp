@@ -376,7 +376,10 @@ class TestAliasedDataIsNeverCalledPerFrame(unittest.TestCase):
         for marker in ('"native-measured-per-frame"', '"native-per-frame-only"'):
             i = src.index(marker)
             window = src[max(0, i - 400):i]
-            self.assertIn("free-running-fallback", window,
+            # Either spelling of the guard is fine — excluding the fallback, or
+            # requiring per-frame outright. What matters is that the claim is
+            # conditioned on HOW the numbers were obtained.
+            self.assertIn("native_sampling", window,
                           f"{marker} is set without checking native_sampling")
 
     def test_a_fallback_run_gets_its_own_granularity_label(self):
@@ -404,3 +407,52 @@ class TestSampleSelection(unittest.TestCase):
         src = inspect.getsource(ST.sample_per_frame)
         self.assertIn("for cand in ranked:", src)
         self.assertIn("break", src)
+
+
+class TestSamplingMethodIsAlwaysRecorded(unittest.TestCase):
+    """The report must say HOW the numbers were obtained, on every path.
+
+    A clean run came back with four psx-runtime samples stepping by 2 and no
+    native_sampling field at all, because it was only set on the fallback path.
+    A per-frame series and a free-running one then look identical in the report
+    — and they support completely different claims. Steps of 2 across
+    consecutive frames is a smooth fade; steps of 2 across samples ninety
+    frames apart is nothing.
+    """
+
+    def test_a_default_is_set_before_either_path_runs(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn('doc["native_sampling"] = "free-running"', src)
+
+    def test_success_labels_itself_per_frame(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn('doc["native_sampling"] = "per-frame"', src)
+
+    def test_the_fallback_still_labels_itself(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn('"free-running-fallback"', src)
+
+
+class TestConsecutiveFramesNeedNoQuorum(unittest.TestCase):
+    """Four adjacent frames stepping by 2 IS the step.
+
+    Per-frame samples measure the increment directly rather than sampling a
+    distribution, so the eight-sample floor that free-running data needs does
+    not apply — and applying it discarded a measurement that was already
+    conclusive.
+    """
+
+    def test_four_per_frame_samples_are_enough(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        i = src.index('doc["granularity"] = "native-measured-per-frame"')
+        # The condition sits above the comment block explaining it.
+        self.assertIn('a["samples"] >= 4', src[max(0, i - 700):i])
+
+    def test_free_running_still_needs_more(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn('a["samples"] >= 8 and b["samples"] >= 8', src)
