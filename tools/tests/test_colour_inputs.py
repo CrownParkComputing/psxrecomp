@@ -165,3 +165,51 @@ class TestAddressCorrespondence(unittest.TestCase):
         ram[0x100:0x100 + len(needle)] = needle
         ram[0x900:0x900 + len(needle)] = needle
         self.assertEqual(CI.find_table(bytes(ram), needle), [0x100, 0x900])
+
+
+class TestGraduatedMatch(unittest.TestCase):
+    """An exact miss is not the same finding as absence.
+
+    Measured on a live pair: the oracle's 32-byte colour table was absent from
+    psx-runtime as a contiguous run, yet its first 4 bytes appeared six times on
+    a 0x18 stride, and a nearby region (0x0E4600) was byte-identical between the
+    two emulators. Calling that "the table does not exist anywhere" was wrong,
+    and wrong in a direction the operator could not check — it points upstream
+    at data generation when the data plainly exists.
+    """
+
+    def test_the_longest_present_prefix_is_reported(self):
+        needle = bytes.fromhex("f850500008080800f850503800000000")
+        ram = bytearray(0x2000)
+        ram[0x100:0x104] = needle[:4]        # only the first 4 bytes exist
+        k, hits = CI.graduated_find(bytes(ram), needle)
+        self.assertEqual(k, 4)
+        self.assertEqual(hits, [0x100])
+
+    def test_a_full_match_short_circuits_at_the_longest_length(self):
+        needle = bytes.fromhex("f850500008080800f850503800000000") * 2
+        ram = bytearray(0x2000)
+        ram[0x400:0x400 + 32] = needle[:32]
+        k, hits = CI.graduated_find(bytes(ram), needle)
+        self.assertEqual(k, 32)
+
+    def test_a_regular_stride_is_detected(self):
+        # This is what psx-runtime actually looked like: the same 4-byte entry
+        # repeating every 0x18 bytes — a different record size, not absence.
+        ram = bytearray(0x2000)
+        for i in range(6):
+            ram[0x100 + i * 0x18:0x100 + i * 0x18 + 4] = b"\xf8\x50\x50\x00"
+        k, hits = CI.graduated_find(bytes(ram), b"\xf8\x50\x50\x00" + b"\xff" * 28)
+        self.assertEqual(k, 4)
+        self.assertEqual(CI.stride_of(hits), 0x18)
+
+    def test_irregular_hits_report_no_stride(self):
+        self.assertEqual(CI.stride_of([0x10, 0x33, 0x91]), 0)
+
+    def test_two_hits_are_too_few_to_claim_a_stride(self):
+        # Any two points are evenly spaced; that is not evidence of a layout.
+        self.assertEqual(CI.stride_of([0x10, 0x28]), 0)
+
+    def test_nothing_present_reports_zero(self):
+        k, hits = CI.graduated_find(bytes(bytearray(0x800)), b"\xf8\x50\x50\x11")
+        self.assertEqual((k, hits), (0, []))

@@ -73,6 +73,39 @@ def looks_like_triplets(b, stride=4):
     return True
 
 
+def graduated_find(ram, needle, lengths=(32, 16, 12, 8, 4)):
+    """Longest prefix of `needle` that appears in `ram`, and where.
+
+    An exact miss cannot distinguish "this data does not exist here" from "it
+    exists with different contents", and those point at completely different
+    places. Measured on a live pair: the full 32-byte run was absent from
+    psx-runtime, yet its first 4 bytes appeared six times on a 0x18 stride, and
+    a nearby region was byte-identical between the two emulators. Reporting
+    that as "absent" was wrong in a way the operator could not see.
+    """
+    for k in lengths:
+        if k > len(needle):
+            continue
+        hits, at = [], 0
+        while len(hits) < 8:
+            i = ram.find(needle[:k], at)
+            if i < 0:
+                break
+            hits.append(i)
+            at = i + 1
+        if hits:
+            return k, hits
+    return 0, []
+
+
+def stride_of(hits):
+    """Constant spacing between hits, if there is one."""
+    if len(hits) < 3:
+        return 0
+    d = hits[1] - hits[0]
+    return d if all(b - a == d for a, b in zip(hits, hits[1:])) else 0
+
+
 def find_table(ram, needle, min_len=12):
     """Where does this exact byte run appear in a RAM image?
 
@@ -201,13 +234,39 @@ def main(argv=None):
         hits = find_table(ram, needle)
         doc["native_hits"] = [f"0x{h:08X}" for h in hits]
         if not hits:
-            doc["verdict"] = "table-absent-on-native"
-            msg = ("psx-runtime's RAM does not contain this colour table "
-                   "ANYWHERE. The oracle's table is confirmed correct (its "
-                   "entries scaled by the recorded factor reproduce the colours "
-                   "in its own display list), so the data psx-runtime is "
-                   "scaling was never built the same way. The divergence is "
-                   "upstream of this routine, in whatever produces the table.")
+            # Not found as an exact run. Before calling it absent, find out how
+            # much of it IS there: same palette in a different arrangement
+            # points somewhere completely different from genuinely missing data.
+            k, near = graduated_find(ram, b[:32])
+            stride = stride_of(near)
+            here = ram[src:src + args.span]
+            doc["partial_match_len"] = k
+            doc["partial_hits"] = [f"0x{h:08X}" for h in near[:6]]
+            doc["partial_stride"] = stride
+            doc["native_at_oracle_addr"] = here.hex()
+            doc["native_addr_looks_like_table"] = looks_like_triplets(here)
+
+            if k >= 4:
+                doc["verdict"] = "table-rearranged"
+                msg = (f"psx-runtime does NOT hold this table as a contiguous "
+                       f"run, but {k} of its leading bytes appear "
+                       f"{len(near)} time(s)"
+                       + (f" on a 0x{stride:X} stride" if stride else "")
+                       + f", first at {doc['partial_hits'][0]}. The same colour "
+                       f"values exist; their arrangement does not match. And at "
+                       f"the oracle's own pointer address psx-runtime holds "
+                       f"something that is not a colour table at all.")
+            else:
+                doc["verdict"] = "table-absent-on-native"
+                msg = ("psx-runtime's RAM contains no part of this table. The "
+                       "oracle's is confirmed correct — its entries scaled by "
+                       "the recorded factor reproduce the colours in its own "
+                       "display list — so this data was never built the same "
+                       "way, and the divergence is upstream of this routine.")
+            msg += ("\n\nWhat this CANNOT say: which table psx-runtime's own "
+                    "code reads. That needs its $s4, and psx-runtime has no PC "
+                    "breakpoint. The two may simply keep this structure "
+                    "somewhere else.")
             print(f"\nVERDICT: {msg}")
             doc["note"] = msg
             return _finish(doc, args, 0)
