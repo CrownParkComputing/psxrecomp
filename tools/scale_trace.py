@@ -60,10 +60,15 @@ def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
         if v:
             vals.append(int(v, 16))
         elif pr.get("error"):
-            print(f"  psx-runtime: {pr['error']}", file=out)
-            return vals, pr["error"]
+            # Drop the cached leader and keep going: one failed sample is not a
+            # reason to abandon a series, and the usual cause is the block not
+            # being reached on that pass.
+            leader = None
+            if len(vals) == 0 and i >= 2:
+                print(f"  psx-runtime: {pr['error']}", file=out)
+                return vals, pr["error"]
         time.sleep(gap)
-    return vals, None
+    return vals, (None if vals else "no samples were captured")
 
 
 def sample_oracle(conn, pc, n, reg, out=sys.stderr):
@@ -185,6 +190,23 @@ def main(argv=None):
                 print(f"\nStill worth recording: {who}'s ${args.reg} DOES vary "
                       f"({got['min']}..{got['max']}, values {got['values']}), so "
                       f"it is not pinned.", file=sys.stderr)
+        return _finish(doc, args, 1)
+
+    # "Never moved" is a claim about a series, and one sample is not a series.
+    # Reported on a single sample it produced exactly the conclusion this
+    # investigation had already disproved twice -- the most dangerous shape a
+    # bug can take, since it agrees with what someone already suspects.
+    MIN_FOR_CONSTANT = 5
+    thin = [n for n, d in (("psx-runtime", a), ("oracle", b))
+            if d["constant"] and d["samples"] < MIN_FOR_CONSTANT]
+    if thin:
+        doc["verdict"] = "too-few-samples"
+        doc["note"] = (
+            f"{', '.join(thin)} produced fewer than {MIN_FOR_CONSTANT} samples "
+            f"(psx-runtime {a['samples']}, oracle {b['samples']}), so 'never "
+            f"moved' cannot be claimed for it. That is a statement about a "
+            f"series, and this is not one yet.")
+        print(f"\nINCONCLUSIVE: {doc['note']}", file=sys.stderr)
         return _finish(doc, args, 1)
 
     if a["constant"] and not b["constant"]:

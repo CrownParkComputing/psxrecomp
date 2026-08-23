@@ -177,3 +177,45 @@ class TestGranularity(unittest.TestCase):
         d = self.d([28, 128, 128])
         self.assertEqual(d["samples"], 3)
         self.assertEqual(d["distinct"], 2)
+
+
+class TestMinimumSamplesForAVerdict(unittest.TestCase):
+    """"Never moved" is a claim about a series, and one sample is not a series.
+
+    The tool reported verdict "native-not-animating" from ONE psx-runtime
+    sample, with the note "never moved from 128 across 1 samples". That is not
+    a claim anyone can make — and it happened to agree with a hypothesis this
+    investigation had already disproved twice, which is the most dangerous
+    shape a bug can take: it confirms what someone already suspects.
+
+    The cause was upstream. Caching the block leader to speed up sampling
+    removed the fallback search, so the moment the cached address stopped
+    firing the run ended — turning a 24-sample request into one sample and then
+    drawing a conclusion from it.
+    """
+
+    def d(self, vals):
+        return ST.describe(vals, "x", out=io.StringIO())
+
+    def test_one_sample_cannot_establish_constancy(self):
+        d = self.d([128])
+        self.assertTrue(d["constant"], "trivially true of a single value")
+        self.assertEqual(d["samples"], 1)
+        # ...which is exactly why the verdict must not rest on `constant` alone.
+
+    def test_five_identical_samples_is_the_threshold(self):
+        d = self.d([128] * 5)
+        self.assertTrue(d["constant"])
+        self.assertEqual(d["samples"], 5)
+
+    def test_a_varying_side_needs_no_such_floor(self):
+        # Variation is positive evidence: seeing two different values proves it
+        # moves, however few samples there are.
+        d = self.d([112, 128])
+        self.assertFalse(d["constant"])
+
+    def test_the_oracle_series_from_the_live_run_is_a_smooth_ramp(self):
+        d = self.d([112, 116, 120, 124, 128])
+        self.assertEqual(d["max_step"], 4)
+        self.assertEqual(d["distinct"], 5)
+        self.assertFalse(d["constant"])

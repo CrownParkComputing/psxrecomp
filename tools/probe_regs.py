@@ -111,8 +111,14 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
     # A caller sampling repeatedly already knows the leader from the first
     # call. Re-running the sweep every time is what limited a run to three
     # samples, which is far too few to compare an animating quantity.
-    windows = ([[int(leader, 16) if isinstance(leader, str) else leader]]
-               if leader else search_windows(pc, max_back=max(back, 0x400)))
+    # A cached leader is a fast path, NOT a replacement for the search. It can
+    # stop firing -- an overlay reloads at a different address, or that block
+    # simply is not reached this time -- and forcing a single window then gave
+    # up instead of looking, which capped a 24-sample run at one sample.
+    windows = search_windows(pc, max_back=max(back, 0x400))
+    if leader:
+        lead = int(leader, 16) if isinstance(leader, str) else leader
+        windows = [[lead]] + windows
     # Sweep backwards until something fires. One window is a guess about where
     # the block starts; a wrong guess reports "not a block leader", which is
     # true and tells the operator nothing they can act on.
