@@ -753,6 +753,36 @@ def verify_install(lay: Layout) -> List[str]:
     return [ln.strip() for ln in proc.stdout.splitlines() if "not found" in ln]
 
 
+def wire_memcard(lay: "Layout", card: Path) -> bool:
+    """Point the oracle at the SAME memory card the game uses.
+
+    This is what unblocks comparing anything that only happens partway into a
+    game. Overlay code exists only while its overlay is resident, so a
+    breakpoint on it never fires unless the oracle is at the same point --
+    which has been the recurring blocker: psx-runtime gets driven to the scene
+    by hand and the oracle sits at a title screen forever.
+
+    Sharing the card lets the oracle load the player's own in-game save and
+    arrive at the same place, which is far more practical than replaying input
+    from boot or trying to move a savestate between two different emulators.
+
+    Deliberately a COPY rather than the same file: two emulators writing one
+    card is a good way to lose a save, and the reference copy only needs to be
+    read.
+    """
+    if not card.is_file():
+        return False
+    dest_dir = lay.app / "memcards"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / card.name
+    shutil.copy2(card, dest)
+    merge_ini(lay.app / "settings.ini", {
+        "MemoryCards": {"Card1Type": "Shared", "Card1Path": str(dest)},
+    })
+    log(f"memcard: {card} -> {dest} (shared)")
+    return True
+
+
 def seed_settings(lay: Layout, timeout: float = 20.0) -> None:
     """Let DuckStation write its own default settings.ini, then stop it.
 
@@ -1118,6 +1148,15 @@ def cmd_start(args: argparse.Namespace) -> int:
             f"port {port} is in use by something that is not the oracle. Find it "
             f"with:  ss -ltnp | grep {port}")
 
+    # Share the game's memory card, so the oracle can load the player's own
+    # save and reach the same point. Without this it sits wherever a fresh boot
+    # leaves it, and any breakpoint on overlay code never fires.
+    if getattr(args, "memcard", None):
+        card = Path(args.memcard).expanduser().resolve()
+        if not wire_memcard(lay, card):
+            log(f"WARNING: memcard {card} not found; the oracle will boot with "
+                f"its own empty card and cannot reach an in-game save")
+
     cmd = [str(lay.launcher if lay.launcher.is_file() else lay.binary)]
     if args.disc:
         disc = Path(args.disc).expanduser().resolve()
@@ -1249,6 +1288,12 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("start", help="launch the oracle headless")
     p.add_argument("--disc", default=None, help="cue/bin/chd to boot")
+    p.add_argument("--memcard", default=None,
+                   help="the game's memory card (e.g. saves/card1.mcd). Copied "
+                        "in and shared, so the oracle can load the player's own "
+                        "in-game save and reach the same point — without which "
+                        "a breakpoint on overlay code never fires, because that "
+                        "overlay is only resident partway into the game.")
     p.add_argument("--port", type=int, default=0)
     p.add_argument("--wait", type=float, default=45.0, help="seconds to wait for a ping")
     p.add_argument("--headless", action="store_true", default=True)

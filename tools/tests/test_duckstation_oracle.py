@@ -330,3 +330,48 @@ class TestForeignPortOwner(EnvGuard):
                              "our own oracle answering is not a conflict")
         finally:
             DSO.state = real_state
+
+
+class TestMemcardWiring(EnvGuard):
+    """Sharing the game's memory card is what lets the oracle reach the scene.
+
+    Overlay code exists only while its overlay is resident, so a breakpoint on
+    it never fires unless the oracle is at the same point in the game. That has
+    been the recurring blocker: psx-runtime gets driven to the effect by hand
+    and the oracle sits wherever a fresh boot leaves it. Loading the player's
+    own in-game save is far more practical than replaying input from boot or
+    moving a savestate between two different emulators.
+    """
+
+    def _layout(self):
+        os.environ["RETCOMM_ORACLE_DIR"] = tempfile.mkdtemp()
+        lay = DSO.Layout()
+        lay.app.mkdir(parents=True, exist_ok=True)
+        return lay
+
+    def test_the_card_is_copied_not_shared_in_place(self):
+        # Two emulators writing one card file is a good way to lose a save, and
+        # the reference copy only ever needs to be read.
+        lay = self._layout()
+        src = Path(tempfile.mkdtemp()) / "card1.mcd"
+        src.write_bytes(b"\x01" * 128)
+        self.assertTrue(DSO.wire_memcard(lay, src))
+        dest = lay.app / "memcards" / "card1.mcd"
+        self.assertTrue(dest.is_file())
+        self.assertNotEqual(str(dest), str(src))
+        self.assertEqual(dest.read_bytes(), b"\x01" * 128)
+
+    def test_the_settings_point_at_the_copy(self):
+        lay = self._layout()
+        src = Path(tempfile.mkdtemp()) / "card1.mcd"
+        src.write_bytes(b"\x02" * 64)
+        DSO.wire_memcard(lay, src)
+        ini = (lay.app / "settings.ini").read_text()
+        self.assertIn("Card1Type = Shared", ini)
+        self.assertIn("memcards", ini)
+
+    def test_a_missing_card_is_reported_not_silently_ignored(self):
+        # Booting with an empty card looks like a working oracle that simply
+        # never reaches the scene — the least debuggable outcome.
+        lay = self._layout()
+        self.assertFalse(DSO.wire_memcard(lay, Path("/nonexistent/card1.mcd")))
