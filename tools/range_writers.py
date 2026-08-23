@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from packet_writers import disasm_around  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_NATIVE_PORT, DebugConn, DebugError, class_on_screen,
+    wait_for_class,
 )
 
 KIND = "psx-range-writers"
@@ -84,6 +85,9 @@ def main(argv=None):
                          "trace")
     ap.add_argument("--disasm", type=int, default=3,
                     help="how many top writers to disassemble")
+    ap.add_argument("--wait-secs", type=float, default=120.0,
+                    help="wait this long for --expect-class to "
+                         "appear; 0 disables the wait")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
@@ -102,7 +106,13 @@ def main(argv=None):
         # emulator. An unreachable one has to read as a message, not as a
         # traceback from somewhere three calls down.
         try:
-            on, drawing = class_on_screen(conn, args.expect_class)
+            # Wait rather than sample once: the effect is transient, and an
+            # empty trace looks like a statement about the code.
+            if args.wait_secs > 0:
+                on, drawing = wait_for_class(conn, args.expect_class,
+                                             args.wait_secs, out=sys.stderr)
+            else:
+                on, drawing = class_on_screen(conn, args.expect_class)
         except DebugError as e:
             print(f"error: {e}", file=sys.stderr)
             doc["error"] = str(e)

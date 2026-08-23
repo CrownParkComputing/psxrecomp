@@ -40,7 +40,8 @@ WRITERS_KIND = "psx-packet-writers"
 
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_NATIVE_PORT, DebugConn, DebugError, decode_entries,
-    find_display_lists, read_ram_range, snapshot_ram, walk_ordering_table,
+    find_display_lists, read_ram_range, snapshot_ram, wait_for_class,
+    walk_ordering_table,
 )
 
 
@@ -198,6 +199,9 @@ def main(argv=None):
                     help="legacy free-running trace, in seconds. Produces "
                          "aliased attribution once the buffer moves; --frames "
                          "is correct.")
+    ap.add_argument("--wait-secs", type=float, default=120.0,
+                    help="wait this long for the class to appear "
+                         "before tracing; 0 disables the wait")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--json", default=None)
     ap.add_argument("--no-disasm", dest="disasm", action="store_false",
@@ -207,6 +211,21 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     conn = DebugConn(args.host, args.port, args.timeout)
+
+    # Wait for the effect rather than requiring it to be on screen at the
+    # instant this was launched. Losing that race produces "no writes recorded",
+    # which reads as a statement about the code rather than about the timing.
+    if args.wait_secs > 0:
+        want_op = args.want.split("|")[0]
+        on, drawing = wait_for_class(conn, want_op, args.wait_secs, out=sys.stderr)
+        if not on:
+            top = ", ".join(f"{k} x{v}" for k, v in
+                            sorted(drawing.items(), key=lambda kv: -kv[1])[:5])
+            msg = (f"{want_op} never appeared within {args.wait_secs:.0f}s. "
+                   f"Drawing instead: {top or 'nothing'}.")
+            print(f"error: {msg}", file=sys.stderr)
+            return 1
+
     try:
         # Park before walking. Everything below depends on the layout in `ram`
         # still describing the buffer when the writes happen, and a walk of a

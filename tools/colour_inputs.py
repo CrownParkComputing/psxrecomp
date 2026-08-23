@@ -51,6 +51,7 @@ from probe_regs import plausible_pointer, probe_registers  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
     DebugConn, DebugError, oracle_resume, read_ram_range, snapshot_ram,
+    wait_for_class,
 )
 
 KIND = "psx-colour-inputs"
@@ -295,6 +296,9 @@ def main(argv=None):
                     help="seconds to wait for the PC to be reached. "
                          "A paused oracle answers about once a second, so this needs headroom.")
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--wait-for", default="PolyG4+semi",
+                    help="class to wait for on BOTH sides first")
+    ap.add_argument("--wait-secs", type=float, default=120.0)
     ap.add_argument("--probe-wait", type=float, default=6.0,
                     help="seconds to let psx-runtime's block probe collect")
     ap.add_argument("--no-phase-test", dest="phase_test",
@@ -312,6 +316,24 @@ def main(argv=None):
     ds = DebugConn(args.host, args.ds_port, args.timeout)
     native = DebugConn(args.host, args.native_port, args.timeout)
     try:
+        # Both sides need the effect live: the oracle to hit the breakpoint, and
+        # psx-runtime for its block probe. Wait for each rather than requiring
+        # both to be inside it when this was launched.
+        if args.wait_secs > 0:
+            for label, conn in (("oracle", ds), ("psx-runtime", native)):
+                on, drawing = wait_for_class(conn, args.wait_for,
+                                             args.wait_secs, out=sys.stderr)
+                if not on:
+                    top = ", ".join(f"{k} x{v}" for k, v in
+                                    sorted(drawing.items(),
+                                           key=lambda kv: -kv[1])[:4])
+                    msg = (f"{args.wait_for} never appeared on {label} within "
+                           f"{args.wait_secs:.0f}s. Drawing instead: "
+                           f"{top or 'nothing'}.")
+                    print(f"error: {msg}", file=sys.stderr)
+                    doc["error"] = msg
+                    return _finish(doc, args, 1)
+
         print(f"arming the oracle at 0x{pc:08X} …")
         hit = wait_for_hit(ds, pc, args.wait)
         if not hit:

@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from probe_regs import probe_registers  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, DebugConn, DebugError,
-    ORACLE_PAUSED_POLL_S, class_on_screen, oracle_resume,
+    ORACLE_PAUSED_POLL_S, class_on_screen, oracle_resume, wait_for_class,
 )
 
 KIND = "psx-scale-trace"
@@ -255,6 +255,13 @@ def main(argv=None):
                          "differences are the actual animation increment "
                          "rather than aliasing of a value sampled ~90 frames "
                          "apart")
+    ap.add_argument("--wait-for", default="PolyG4+semi",
+                    help="wait for this primitive class to appear before "
+                         "sampling, on each side independently. Start the tool "
+                         "first, then trigger the effect — instead of racing a "
+                         "transient animation with a button click. Empty "
+                         "disables the wait.")
+    ap.add_argument("--wait-secs", type=float, default=120.0)
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
@@ -278,8 +285,22 @@ def main(argv=None):
     # reported no samples.
     res = {}
 
-    def go(key, fn, *a):
+    def go(key, conn, fn, *a):
+        # Wait for the effect on THIS side before sampling it. Each side is
+        # waited for in its own thread, so neither has to be inside the effect
+        # when the button is pressed -- only at some point during the window.
         try:
+            if args.wait_for:
+                on, drawing = wait_for_class(conn, args.wait_for, args.wait_secs,
+                                             out=sys.stderr)
+                if not on:
+                    top = ", ".join(f"{k} x{v}" for k, v in
+                                    sorted(drawing.items(),
+                                           key=lambda kv: -kv[1])[:4])
+                    res[key] = ([], f"{args.wait_for} never appeared within "
+                                    f"{args.wait_secs:.0f}s. Drawing instead: "
+                                    f"{top or 'nothing'}.")
+                    return
             res[key] = fn(*a)
         except DebugError as e:
             res[key] = ([], str(e))
@@ -287,13 +308,15 @@ def main(argv=None):
     if args.per_frame:
         print("  psx-runtime: stepping one frame between reads, so the deltas "
               "are the real per-frame increment")
-        nt = threading.Thread(target=go, args=("nat", sample_per_frame, n, pc,
-                                               args.samples, args.reg))
+        nt = threading.Thread(target=go, args=("nat", n, sample_per_frame, n,
+                                               pc, args.samples, args.reg))
     else:
-        nt = threading.Thread(target=go, args=("nat", sample_native, n, pc,
-                                               args.samples, args.gap, args.reg))
-    ot = threading.Thread(target=go, args=("orc", sample_oracle, o, pc,
-                                           max(3, args.samples // 3), args.reg))
+        nt = threading.Thread(target=go, args=("nat", n, sample_native, n, pc,
+                                               args.samples, args.gap,
+                                               args.reg))
+    ot = threading.Thread(target=go, args=("orc", o, sample_oracle, o, pc,
+                                           max(3, args.samples // 3),
+                                           args.reg))
     print("  sampling both sides concurrently — keep the effect running on BOTH")
     nt.start()
     ot.start()

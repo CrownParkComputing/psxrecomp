@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DUMP_KIND = "psx-gpu-frame"
@@ -1231,6 +1232,41 @@ def class_on_screen(conn, op_name: str) -> Tuple[bool, Dict[str, int]]:
         if p["kind"] == "poly":
             counts[p["op_name"]] = counts.get(p["op_name"], 0) + 1
     return counts.get(op_name, 0) > 0, counts
+
+
+def wait_for_class(conn, op_name: str, timeout: float = 120.0,
+                   poll: float = 0.6, out=None) -> Tuple[bool, Dict[str, int]]:
+    """Block until a primitive class appears on screen, or time out.
+
+    Every tool here needs the effect to be RUNNING: a write trace over its
+    packets, a block probe at one of its instructions, a walk of the list it
+    builds. Requiring it to be on screen at the instant a button is clicked
+    means racing a transient animation, and losing that race produces a
+    different-looking failure in each tool -- no writes recorded, no candidate
+    fired, no table found, the block was not reached.
+
+    Waiting inverts it: start the tool, then trigger the effect. The cost is one
+    display-list walk per poll, which is cheap next to what follows it.
+    """
+    deadline = time.time() + timeout
+    said = False
+    while time.time() < deadline:
+        try:
+            on, drawing = class_on_screen(conn, op_name)
+        except DebugError:
+            time.sleep(poll)
+            continue
+        if on:
+            return True, drawing
+        if out and not said:
+            said = True
+            print(f"  waiting for {op_name} to appear (up to {timeout:.0f}s) — "
+                  f"trigger the effect now", file=out)
+        time.sleep(poll)
+    try:
+        return False, class_on_screen(conn, op_name)[1]
+    except DebugError:
+        return False, {}
 
 
 def dma_gpu_list_root(conn: "DebugConn") -> Optional[int]:
