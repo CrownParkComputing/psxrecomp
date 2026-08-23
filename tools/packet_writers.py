@@ -154,6 +154,43 @@ def disasm_around(conn, pc, before=10, count=20):
     return out
 
 
+class ParkGuard:
+    """Park the emulator, and guarantee it gets handed back.
+
+    Leaving it parked is worse than any error this tool can report: the game
+    stops advancing, so the effect never comes round again, and every retry
+    walks the same stale display list and fails the same way. The symptom is
+    "it keeps failing to find the writer" and the cause is invisible from the
+    outside.
+
+    The park deliberately spans the walk AND the trace -- the layout has to
+    still describe the buffer when the writes happen -- so a plain try/finally
+    around either half is not enough. Every exit between them needs the same
+    guarantee.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.parked = False
+
+    def __enter__(self):
+        self.conn.cmd("pause")
+        self.parked = True
+        return self
+
+    def resume(self):
+        if self.parked:
+            self.parked = False
+            try:
+                self.conn.cmd("continue")
+            except DebugError:
+                pass
+
+    def __exit__(self, *exc):
+        self.resume()
+        return False
+
+
 def field_map(prims, want=None):
     """addr -> 'colour' | 'vertex', derived from each packet's real layout.
 
@@ -226,24 +263,32 @@ def main(argv=None):
             print(f"error: {msg}", file=sys.stderr)
             return 1
 
+    # Park before walking: everything below depends on the layout in `ram`
+    # still describing the buffer when the writes happen, and a walk of a
+    # running emulator is stale before it finishes. The guard makes sure the
+    # game is handed back on EVERY path out of here.
+    with ParkGuard(conn) as park:
+        return _parked_main(conn, args, park)
+
+
+def _parked_main(conn, args, park):
+    """Everything that needs the emulator parked.
+
+    Split out so the guard wraps EVERY exit. The class-absent path used to
+    return from the middle of this without resuming, which stops the game
+    advancing — so the effect never comes round again, and every retry walks
+    the same stale list and fails identically. The symptom is "it keeps failing
+    to find the writer" and the cause is invisible from outside.
+    """
     try:
-        # Park before walking. Everything below depends on the layout in `ram`
-        # still describing the buffer when the writes happen, and a walk of a
-        # running emulator is stale before it finishes.
-        conn.cmd("pause")
         ram = snapshot_ram(conn)
         cands = find_display_lists(ram)
         if not cands:
-            conn.cmd("continue")
             print("no display list found", file=sys.stderr)
             return 1
         root = cands[0]["root"]
         prims = decode_entries(walk_ordering_table(ram, root))
     except DebugError as e:
-        try:
-            conn.cmd("continue")
-        except DebugError:
-            pass
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -341,10 +386,7 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         return 2
     finally:
-        try:
-            conn.cmd("continue")
-        except DebugError:
-            pass
+        park.resume()
 
     entries = rep.get("entries", [])
     if not entries:
