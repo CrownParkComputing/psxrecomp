@@ -89,12 +89,57 @@ def ensure_oracle(args) -> int:
     return 0
 
 
-def compare_images(pa, pb, out_path):
+def display_origin(state):
+    """Where in VRAM this side's visible framebuffer starts.
+
+    The two emulators do not put it in the same place. Measured: psx-runtime
+    reports (0, 0) and the oracle (1, 8), consistently, in both halves of the
+    double buffer (0/240 against 8/248). Each screenshot is that side's own
+    display area, so pixel (0,0) of one is NOT pixel (0,0) of the other.
+    """
+    c = canon(state)
+    try:
+        return int(c.get("display_x", 0)), int(c.get("display_y", 0))
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def compare_images(pa, pb, out_path, origin_a=(0, 0), origin_b=(0, 0)):
     a = Image.open(pa).convert("RGB")
     b = Image.open(pb).convert("RGB")
     note = None
+
+    # Line the two up by their VRAM origins before comparing anything.
+    #
+    # Without this the comparison was meaningless: a 1-pixel horizontal and
+    # 8-pixel vertical shift makes almost every pixel differ, and 91.9% is
+    # exactly what two CORRECT images produce when they are offset. The
+    # difference was being read as a rendering fault when it was a framebuffer
+    # placed elsewhere in VRAM.
+    #
+    # Only the horizontal origin and the vertical offset WITHIN the buffer
+    # matter; the 240-line jump between buffer halves is double buffering, not
+    # a displacement, so it is taken modulo the frame height.
+    dx = origin_b[0] - origin_a[0]
+    dy = (origin_b[1] - origin_a[1]) % 240
+    if dy > 120:
+        dy -= 240
+    if dx or dy:
+        note = (f"aligned by VRAM origin: the oracle's framebuffer sits "
+                f"{dx:+d},{dy:+d} from psx-runtime's")
+        # Shift into a common frame by cropping the overlapping region.
+        ax0, ay0 = max(0, dx), max(0, dy)
+        bx0, by0 = max(0, -dx), max(0, -dy)
+        w = min(a.width - ax0, b.width - bx0)
+        h = min(a.height - ay0, b.height - by0)
+        if w > 0 and h > 0:
+            a = a.crop((ax0, ay0, ax0 + w, ay0 + h))
+            b = b.crop((bx0, by0, bx0 + w, by0 + h))
+
     if a.size != b.size:
-        note = f"size mismatch: {a.size} vs {b.size}; compared over the common region"
+        note = ((note + "; " if note else "")
+                + f"size mismatch: {a.size} vs {b.size}; compared over the "
+                  f"common region")
         w, h = min(a.width, b.width), min(a.height, b.height)
         a, b = a.crop((0, 0, w, h)), b.crop((0, 0, w, h))
     na = np.asarray(a, dtype=np.int16)
@@ -198,9 +243,34 @@ def align_frames(native, ds, want, result, settle=400):
     target = want if want is not None else max(fa, fb)
     result["target_frame"] = target
 
+    # A large gap cannot be closed meaningfully.
+    #
+    # Frame numbers count from each emulator's OWN boot, so equal numbers are
+    # not the same guest moment -- driving the oracle 1818 frames forward moves
+    # it thirty seconds past the effect without bringing it any closer to what
+    # psx-runtime is showing. Measured on a live pair: native 15822 against
+    # oracle 14004.
+    MEANINGFUL_GAP = 120
+    if abs(fa - fb) > MEANINGFUL_GAP:
+        result["frame_gap"] = fa - fb
+        result["alignment_note"] = (
+            f"psx-runtime is at {fa} and the oracle at {fb}, {abs(fa - fb)} "
+            f"frames apart. These count from each emulator's own boot, so "
+            f"closing that gap would not put them at the same guest moment — it "
+            f"would only run one of them past the effect. Not attempted.")
+        result["native_frame"], result["duckstation_frame"] = fa, fb
+        return False
+
     if fb < target:
         try:
             ds.run_to_frame(target)
+            # run_to_frame ARMS a target; it does not block. Reading the frame
+            # straight afterwards reports where the oracle still is, which is
+            # how alignment "failed" while never having been waited for.
+            for _ in range(settle):
+                if ds.frame() >= target:
+                    break
+                time.sleep(0.05)
         except DebugError as e:
             result["duckstation_drive_error"] = str(e)
     if fa < target:
@@ -311,8 +381,13 @@ def main(argv=None):
             result["duckstation_image"] = pb
 
             try:
-                result["gpu_state"] = gpu_state_delta(native.cmd("gpu_state"),
-                                                      ds.cmd("gpu_state"))
+                st_a = native.cmd("gpu_state")
+                st_b = ds.cmd("gpu_state")
+                result["gpu_state"] = gpu_state_delta(st_a, st_b)
+                # Kept for compare_images: the framebuffers are not at the same
+                # place in VRAM, and comparing them un-shifted compares nothing.
+                result["origin_native"] = list(display_origin(st_a))
+                result["origin_oracle"] = list(display_origin(st_b))
             except DebugError as e:
                 result["gpu_state_error"] = str(e)
 
@@ -347,7 +422,10 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    result["image"] = compare_images(pa, pb, os.path.join(outdir, "diff.png"))
+    result["image"] = compare_images(
+        pa, pb, os.path.join(outdir, "diff.png"),
+        origin_a=tuple(result.get("origin_native", (0, 0))),
+        origin_b=tuple(result.get("origin_oracle", (0, 0))))
     with open(os.path.join(outdir, "parity.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)
 

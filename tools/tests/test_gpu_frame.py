@@ -625,3 +625,37 @@ class TestLooksComplete(unittest.TestCase):
     def test_nesting_is_tracked(self):
         self.assertFalse(GF._looks_complete(b'{"a":{"b":1}'))
         self.assertTrue(GF._looks_complete(b'{"a":{"b":1}}'))
+
+
+class TestParityImageAlignment(unittest.TestCase):
+    """Two correct images at different VRAM origins differ almost everywhere.
+
+    Measured: psx-runtime's framebuffer at (0, 0), the oracle's at (1, 8), in
+    both halves of the double buffer (0/240 against 8/248). A 1-pixel
+    horizontal and 8-pixel vertical shift makes nearly every pixel differ, and
+    91.9% is exactly what that produces. It was being read as a rendering
+    fault.
+    """
+
+    def setUp(self):
+        self.P = _load("gpu_parity")
+
+    def test_the_origin_is_read_through_the_alias_map(self):
+        self.assertEqual(self.P.display_origin({"display_x": 0, "display_y": 0}),
+                         (0, 0))
+        self.assertEqual(
+            self.P.display_origin({"display_area_x": 1, "display_area_y": 8}),
+            (1, 8))
+
+    def test_a_missing_origin_defaults_rather_than_raising(self):
+        self.assertEqual(self.P.display_origin({}), (0, 0))
+
+    def test_the_double_buffer_jump_is_not_a_displacement(self):
+        # The two sides swap buffers independently, so one can be on the 0 half
+        # while the other is on the 240 half. That 240-line jump is buffering,
+        # not offset, and treating it as offset would crop the whole frame away.
+        for ay, by in ((0, 8), (240, 248), (0, 248), (240, 8)):
+            dy = (by - ay) % 240
+            if dy > 120:
+                dy -= 240
+            self.assertEqual(dy, 8, f"native y={ay}, oracle y={by}")
