@@ -38,7 +38,7 @@ from gpu_parity import compare_images, display_origin  # noqa: E402
 from probe_regs import search_windows  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
-    DebugConn, DebugError, oracle_resume, wait_for_class,
+    DebugConn, DebugError, OracleBreak, oracle_resume, wait_for_class,
 )
 
 KIND = "psx-phase-parity"
@@ -55,32 +55,46 @@ def oracle_phase(conn, pc, reg, tries=25, out=sys.stderr, reject=()):
     """
     reject = set(reject)
     seen = []
-    for _ in range(tries):
-        oracle_resume(conn)
-        try:
-            conn.cmd("pc_hit_clear")
-        except DebugError:
-            pass
-        conn.cmd("pc_break", addr=pc)
-        time.sleep(ORACLE_PAUSED_POLL_S)
-        try:
-            rep = conn.cmd("pc_hit_last")
-        except DebugError:
-            continue
-        if not rep.get("valid"):
-            continue
-        v = rep.get("regs", {}).get(reg)
-        if not v:
-            continue
-        val = int(v, 16)
-        seen.append(val)
-        if val in reject:
-            print(f"  oracle at ${reg} = {val} (too common to lock on); "
-                  f"resuming for a mid-ramp value", file=out)
-            continue
-        # Leave it PARKED here: this is the phase to match, and resuming
-        # would lose it before psx-runtime catches up.
-        return val
+    # NOTE: the breakpoint is armed ONCE, outside the loop, and removed by the
+    # guard on every exit path. Re-arming per iteration used to leave a live
+    # breakpoint behind whenever this returned early, and DuckStation refuses
+    # a duplicate address -- so the next tool's pc_break failed while the
+    # leaked one kept pausing the emulator.
+    brk = OracleBreak(conn, pc)
+    brk.__enter__()
+    keep_parked = False
+    try:
+        for _ in range(tries):
+            oracle_resume(conn)
+            try:
+                conn.cmd("pc_hit_clear")
+            except DebugError:
+                pass
+            time.sleep(ORACLE_PAUSED_POLL_S)
+            try:
+                rep = conn.cmd("pc_hit_last")
+            except DebugError:
+                continue
+            if not rep.get("valid"):
+                continue
+            v = rep.get("regs", {}).get(reg)
+            if not v:
+                continue
+            val = int(v, 16)
+            seen.append(val)
+            if val in reject:
+                print(f"  oracle at ${reg} = {val} (too common to lock on); "
+                      f"resuming for a mid-ramp value", file=out)
+                continue
+            # Leave it PARKED here: this is the phase to match, and resuming
+            # would lose it before psx-runtime catches up. The breakpoint is
+            # still removed -- parked is deliberate, armed is a leak.
+            keep_parked = True
+            conn.raw("pc_unbreak", addr=brk.addr)
+            return val
+    finally:
+        if not keep_parked:
+            brk.__exit__(None, None, None)
     if seen:
         print(f"  oracle only ever stopped at {sorted(set(seen))}, all of "
               f"which are too common to lock on", file=out)

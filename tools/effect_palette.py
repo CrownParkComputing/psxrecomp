@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gpu_display_list import blend_of, walk_side  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, ORACLE_PAUSED_POLL_S,
-    DebugConn, DebugError, capture, oracle_resume,
+    DebugConn, DebugError, OracleBreak, capture, oracle_resume,
 )
 
 KIND = "psx-effect-palette"
@@ -188,38 +188,36 @@ def sample_native(conn, args, out=sys.stderr):
 def sample_oracle(conn, args, out=sys.stderr):
     """Signatures from parked OT walks, parking on the effect's own code."""
     sigs = []
-    for i in range(args.samples):
-        oracle_resume(conn)
-        try:
-            conn.cmd("pc_hit_clear")
-        except DebugError:
-            pass
-        try:
-            conn.cmd("pc_break", addr=args.pc)
-        except DebugError as e:
-            print(f"  oracle pc_break failed: {e}", file=out)
-            break
-        time.sleep(ORACLE_PAUSED_POLL_S)
-        try:
-            hit = conn.cmd("pc_hit_last")
-        except DebugError:
-            continue
-        if not hit.get("valid"):
-            continue
-        with open(os.devnull, "w") as quiet:
-            rep, _meta = walk_side(conn, "oracle", pause=False,
-                                   max_nodes=args.max_nodes, out=quiet)
-        if not rep:
-            continue
-        s = signature(rep.get("prims") or [])
-        if s["quads"]:
-            sigs.append(s)
+    try:
+        with OracleBreak(conn, args.pc) as brk:
+            if brk.cleared:
+                print(f"  cleared {brk.cleared} stale breakpoint(s) left by an "
+                      f"earlier run", file=out)
+            for _ in range(args.samples):
+                try:
+                    conn.raw("pc_hit_clear")
+                except DebugError:
+                    pass
+                oracle_resume(conn)
+                time.sleep(ORACLE_PAUSED_POLL_S)
+                try:
+                    hit = conn.cmd("pc_hit_last")
+                except DebugError:
+                    continue
+                if not hit.get("valid"):
+                    continue
+                with open(os.devnull, "w") as quiet:
+                    rep, _meta = walk_side(conn, "oracle", pause=False,
+                                           max_nodes=args.max_nodes, out=quiet)
+                if not rep:
+                    continue
+                sig = signature(rep.get("prims") or [])
+                if sig["quads"]:
+                    sigs.append(sig)
+    except DebugError as e:
+        print(f"  oracle: {e}", file=out)
     print(f"  oracle: {len(sigs)} parked walks carried additive shaded quads",
           file=out)
-    try:
-        oracle_resume(conn)
-    except DebugError:
-        pass
     return sigs
 
 

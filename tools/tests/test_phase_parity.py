@@ -15,17 +15,35 @@ import phase_parity  # noqa: E402
 
 
 class FakeConn:
-    """Replays a scripted sequence of pc_hit_last values."""
+    """Replays a scripted sequence of pc_hit_last values.
+
+    Also models the oracle's breakpoint table, because a leaked breakpoint is
+    the failure this code exists to prevent: DuckStation refuses a duplicate
+    address, so one left armed makes the next run's pc_break fail while the
+    old one keeps pausing the emulator.
+    """
 
     def __init__(self, phases):
         self.phases = list(phases)
         self.resumes = 0
         self.breaks = 0
+        self.armed = set()          # addresses currently breakpointed
+        self.sent = []              # every command name, in order
 
-    def cmd(self, name, **kw):
+    def _dispatch(self, name, **kw):
+        self.sent.append(name)
         if name == "pc_break":
+            addr = kw.get("addr")
             self.breaks += 1
-            return {}
+            if addr in self.armed:          # duplicate refused, as DuckStation does
+                return {"ok": False, "addr": addr, "slot": -1}
+            self.armed.add(addr)
+            return {"ok": True, "addr": addr, "slot": 0}
+        if name == "pc_unbreak":
+            self.armed.discard(kw.get("addr"))
+            return {"ok": True}
+        if name == "pc_break_list":
+            return {"breaks": sorted(self.armed)}
         if name == "pc_hit_last":
             if not self.phases:
                 return {"valid": False}
@@ -35,8 +53,11 @@ class FakeConn:
             return {"valid": True, "regs": {"s6": f"0x{v:X}"}}
         return {}
 
-    def raw(self, *a, **k):
-        return {}
+    def cmd(self, name, **kw):
+        return self._dispatch(name, **kw)
+
+    def raw(self, name, **kw):
+        return self._dispatch(name, **kw)
 
 
 class OraclePhaseTest(unittest.TestCase):
@@ -59,9 +80,10 @@ class OraclePhaseTest(unittest.TestCase):
         got = oracle = phase_parity.oracle_phase(
             conn, 0x8006844C, "s6", reject={128}, out=io.StringIO())
         self.assertEqual(got, 96)
-        # It had to resume and re-break to get past the two neutral frames.
+        # It had to resume repeatedly to get past the two neutral frames,
+        # but the breakpoint is armed once, not per iteration.
         self.assertGreaterEqual(conn.resumes, 3)
-        self.assertGreaterEqual(conn.breaks, 3)
+        self.assertEqual(conn.breaks, 1)
         del oracle
 
     def test_all_rejected_returns_none(self):
@@ -86,3 +108,53 @@ class OraclePhaseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BreakpointLeakTest(unittest.TestCase):
+    """A leaked breakpoint keeps pausing the oracle across tool runs."""
+
+    def setUp(self):
+        self._sleep = phase_parity.time.sleep
+        phase_parity.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        phase_parity.time.sleep = self._sleep
+
+    def test_no_breakpoint_left_after_success(self):
+        conn = FakeConn([96])
+        got = phase_parity.oracle_phase(conn, 0x8006844C, "s6",
+                                        reject={128}, out=io.StringIO())
+        self.assertEqual(got, 96)
+        self.assertEqual(conn.armed, set(), "breakpoint leaked on success")
+
+    def test_no_breakpoint_left_after_giving_up(self):
+        conn = FakeConn([128] * 6)
+        got = phase_parity.oracle_phase(conn, 0x8006844C, "s6", tries=6,
+                                        reject={128}, out=io.StringIO())
+        self.assertIsNone(got)
+        self.assertEqual(conn.armed, set(), "breakpoint leaked on failure")
+
+    def test_stale_breakpoint_from_earlier_run_is_cleared(self):
+        """This is the exact state that made effect_palette fail."""
+        conn = FakeConn([96])
+        conn.armed.add("0x8006844C")      # left by a previous tool
+        got = phase_parity.oracle_phase(conn, 0x8006844C, "s6",
+                                        reject={128}, out=io.StringIO())
+        self.assertEqual(got, 96)
+        self.assertEqual(conn.armed, set())
+
+    def test_oracle_resumed_when_arming_fails(self):
+        class Refusing(FakeConn):
+            def _dispatch(self, name, **kw):
+                if name == "pc_break":
+                    return {"ok": False, "addr": kw.get("addr"), "slot": -1}
+                return FakeConn._dispatch(self, name, **kw)
+
+        conn = Refusing([96])
+        with self.assertRaises(Exception):
+            phase_parity.oracle_phase(conn, 0x8006844C, "s6",
+                                      reject={128}, out=io.StringIO())
+        # Observed on the wire, not via a monkeypatch: a 'continue' must have
+        # been sent, whichever module actually issued it.
+        self.assertIn("continue", conn.sent,
+                      "oracle left paused when arming failed")

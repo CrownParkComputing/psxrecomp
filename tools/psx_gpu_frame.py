@@ -1012,6 +1012,100 @@ def oracle_resume(conn) -> bool:
         return False
 
 
+def oracle_break_list(conn) -> list:
+    """Addresses the oracle currently has execute breakpoints on."""
+    try:
+        rep = conn.raw("pc_break_list")
+    except DebugError:
+        return []
+    out = []
+    for a in rep.get("breaks") or rep.get("addrs") or []:
+        try:
+            out.append(int(a, 16) if isinstance(a, str) else int(a))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def oracle_clear_breaks(conn) -> int:
+    """Remove every execute breakpoint the oracle holds. Returns how many.
+
+    Stale breakpoints are not inert. DuckStation's AddBreakpointWithCallback
+    refuses a duplicate address, so a leaked breakpoint makes the NEXT run's
+    pc_break return ok:false -- while the leaked one keeps firing and pausing
+    the emulator. Resuming then re-pauses immediately, which is exactly the
+    "oracle gets paused and never unpaused" symptom, and it survives across
+    tool invocations because it lives in the oracle, not in the tool.
+    """
+    n = 0
+    for addr in oracle_break_list(conn):
+        try:
+            conn.raw("pc_unbreak", addr=f"0x{addr:08X}")
+            n += 1
+        except DebugError:
+            pass
+    return n
+
+
+class OracleBreak:
+    """Arm one execute breakpoint on the oracle and guarantee its removal.
+
+    Use as a context manager. On exit the breakpoint is removed and the
+    oracle is resumed on EVERY path -- normal return, exception, or the
+    caller breaking out of a loop mid-way. Tools in this tree have leaked a
+    parked oracle repeatedly; the guard is the fix, not remembering to
+    resume.
+    """
+
+    def __init__(self, conn, addr, clear_stale: bool = True):
+        self.conn = conn
+        self.addr = addr if isinstance(addr, str) else f"0x{addr:08X}"
+        self.clear_stale = clear_stale
+        self.armed = False
+        self.cleared = 0
+
+    def __enter__(self):
+        oracle_resume(self.conn)
+        if self.clear_stale:
+            self.cleared = oracle_clear_breaks(self.conn)
+        try:
+            self.conn.raw("pc_hit_clear")
+        except DebugError:
+            pass
+        rep = self.conn.raw("pc_break", addr=self.addr)
+        self.armed = bool(rep.get("ok"))
+        if not self.armed:
+            # Removing our own address and retrying covers the case where the
+            # list command is unavailable, so clear_stale found nothing.
+            try:
+                self.conn.raw("pc_unbreak", addr=self.addr)
+            except DebugError:
+                pass
+            rep = self.conn.raw("pc_break", addr=self.addr)
+            self.armed = bool(rep.get("ok"))
+        if not self.armed:
+            # Make the claim in the message true before making it. An error
+            # path that leaves the emulator parked is how this whole class of
+            # bug started.
+            try:
+                self.conn.raw("pc_unbreak", addr=self.addr)
+            except DebugError:
+                pass
+            oracle_resume(self.conn)
+            raise DebugError(
+                f"pc_break {self.addr} refused ({rep}). The oracle would not "
+                f"arm, so nothing was sampled; it has been left running.")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.conn.raw("pc_unbreak", addr=self.addr)
+        except DebugError:
+            pass
+        oracle_resume(self.conn)
+        return False
+
+
 def read_ram_range(conn: "DebugConn", addr: int, length: int,
                    chunk: int = MAX_READ_RAM) -> bytes:
     """Read guest RAM in chunks, tolerating a peer that returns short."""
