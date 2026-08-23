@@ -1194,6 +1194,10 @@ static int           g_hd_texture_dump = 0;
 static std::string   g_hd_texture_dir;
 static std::vector<std::string> g_hd_texture_exclude; /* [video] hd_texture_exclude */   /* relocates the whole convention (dev knob) */
 static std::string   g_bezel_path;      /* [video] bezel -- margin artwork */
+/* The config value, kept so a bezel mod's selection can be cleared back to it
+ * before activation re-runs -- otherwise disabling the package would leave the
+ * last team latched across a soft return to the launcher. */
+static std::string   g_bezel_path_default;
 static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
@@ -1539,6 +1543,26 @@ extern "C" int psx_mod_set_auto_skip_fmv(int enabled) {
     return 1;
 }
 
+extern "C" int psx_mod_set_bezel(const char* selection) {
+    /* The value reaches the filesystem in the loader below -- a bare name
+     * becomes <exe dir>/bezels/<name>.png, anything else is taken as a path --
+     * so bound it here rather than at the open(). Plugins are statically
+     * linked and trusted, so this rejects nonsense, not hostility. */
+    if (!selection || !*selection) {
+        std::fprintf(stderr, "psxrecomp: mod rejected empty bezel selection\n");
+        return 0;
+    }
+    if (std::strlen(selection) >= 256) {
+        std::fprintf(stderr,
+                     "psxrecomp: mod rejected over-long bezel selection\n");
+        return 0;
+    }
+    g_bezel_path = selection;
+    std::fprintf(stdout, "psxrecomp: mod selected bezel artwork \"%s\"\n",
+                 selection);
+    return 1;
+}
+
 extern "C" int psx_mod_set_load_acceleration(
     uint32_t wall_clock_multiplier, uint32_t release_frames) {
     /* Host pacing only changes how fast wall-clock time is fed to a load; every
@@ -1740,7 +1764,6 @@ static int g_ws_projection_num = 4;
 static int g_ws_projection_den = 3;
 static int g_ws_projection_mode = -1;
 extern "C" int psx_ws_scene_wide_active(void);  /* gpu.c: ws scene gate */
-extern "C" uint64_t psx_gpu_display_flip_count(void);  /* gpu.c: internal fps */
 
 static void refresh_widescreen_projection() {
     if (!g_ws_engaged) return;
@@ -6553,14 +6576,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
             const double speed = fps / psx_crtc_frame_hz();
-            /* Internal rendered-frame rate (display-origin flips): the game
-             * actually finishing frames, as distinct from the vblank rate —
-             * the two diverge under load and users need both on screen. */
-            static uint64_t s_fps_last_flips = 0;
-            const uint64_t flips_now = psx_gpu_display_flip_count();
-            const double render_fps =
-                (double)(flips_now - s_fps_last_flips) / seconds;
-            s_fps_last_flips = flips_now;
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -6571,13 +6586,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char title[256];
                 if (display_fps > 0.0) {
                     snprintf(title, sizeof(title),
-                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps | Display %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, render_fps,
-                             display_fps);
+                             "%s  [Game %.0f fps %.2fx | Display %.0f fps]",
+                             s_fps_base_title.c_str(), fps, speed, display_fps);
                 } else {
-                    snprintf(title, sizeof(title),
-                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, render_fps);
+                    snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
+                             s_fps_base_title.c_str(), fps, speed);
                 }
                 SDL_SetWindowTitle(sdl_window, title);
             }
@@ -6585,12 +6598,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char osd[96];
                 if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
-                             "VBl %.0f/s %.2fx  Render %.0f FPS  Disp %.0f",
-                             fps, speed, render_fps, display_fps);
+                             "Game %.0f FPS  %.2fx | Display %.0f FPS",
+                             fps, speed, display_fps);
                 } else {
-                    snprintf(osd, sizeof(osd),
-                             "VBl %.0f/s %.2fx  Render %.0f FPS",
-                             fps, speed, render_fps);
+                    snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
+                             fps, speed);
                 }
                 host_osd_set_status(osd);
             }
@@ -6613,10 +6625,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
                 netplay_present_gap_stats(&gap_p95, &gap_max);
                 std::fprintf(stderr,
-                    "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu | "
+                    "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
                     "present_gap_p95=%u ms max=%u ms (n=%llu)\n",
-                    fps, speed, render_fps, (unsigned long long)s_frame_count,
+                    fps, speed, (unsigned long long)s_frame_count,
                     guest_ms, admit_ms, replay_pct,
                     (unsigned)gap_p95, (unsigned)gap_max,
                     (unsigned long long)s_np_timing_frames);
@@ -6624,10 +6636,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_np_guest_ticks = 0;
                 s_np_timing_frames = 0;
             } else {
-                std::fprintf(stderr,
-                             "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu\n",
-                             fps, speed, render_fps,
-                             (unsigned long long)s_frame_count);
+                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                             fps, speed, (unsigned long long)s_frame_count);
             }
             std::fflush(stderr);
 
@@ -13072,6 +13082,7 @@ int main(int argc, char** argv) {
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
             g_hd_texture_exclude = gc.runtime.video_hd_texture_exclude;
             g_bezel_path       = gc.runtime.video_bezel;
+            g_bezel_path_default = g_bezel_path;
             if (gc.runtime.runtime_cpu_overclock != 100u) {
                 psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
                 std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
@@ -14808,6 +14819,7 @@ int main(int argc, char** argv) {
     if (!turbo_loads_offered)
         g_turbo_loads_enabled = 0;
     g_frame_interpolation_blend = g_frame_interpolation_blend_default;
+    g_bezel_path = g_bezel_path_default;
     mod_runtime_activate_plugins();
     apply_netplay_local_viewport_aspect(net_cfg.enabled);
     if (g_mod_controller_mode_override[0] >= 0)
@@ -15543,17 +15555,26 @@ session_reboot:
         const std::filesystem::path bez_dir =
             exe_dir_from_argv(argv[0]) / "bezels";
         if (g_bezel_path == "random") {
-            std::vector<std::filesystem::path> pool;
-            std::error_code bec;
-            for (const auto &e : std::filesystem::directory_iterator(bez_dir, bec)) {
-                if (bec) break;
-                if (e.is_regular_file(bec) && e.path().extension() == ".png")
-                    pool.push_back(e.path());
-            }
-            std::sort(pool.begin(), pool.end());   /* directory order is not defined */
-            if (!pool.empty()) {
-                std::random_device rd;
-                bp = pool[rd() % pool.size()];
+            /* Held for the process, not just for one call: a netplay rematch
+             * re-enters this block through session_reboot, and a mark that
+             * changed between races would read as a glitch. */
+            static std::string s_random_pick;
+            if (!s_random_pick.empty()) {
+                bp = std::filesystem::path(s_random_pick);
+            } else {
+                std::vector<std::filesystem::path> pool;
+                std::error_code bec;
+                for (const auto &e : std::filesystem::directory_iterator(bez_dir, bec)) {
+                    if (bec) break;
+                    if (e.is_regular_file(bec) && e.path().extension() == ".png")
+                        pool.push_back(e.path());
+                }
+                std::sort(pool.begin(), pool.end());   /* directory order is not defined */
+                if (!pool.empty()) {
+                    std::random_device rd;
+                    bp = pool[rd() % pool.size()];
+                    s_random_pick = bp.string();
+                }
             }
         } else {
             bp = std::filesystem::path(g_bezel_path);

@@ -414,6 +414,7 @@ renderer = "opengl"       # "software", "opengl", or "vulkan"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
 auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
+bezel = "off"             # margin artwork; "off" when the game owns it in Mods
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
@@ -425,6 +426,16 @@ Vulkan after validating their visuals and stability.
 Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets
 it to false. The runtime then hides the Settings row, ignores stale persisted
 values, and leaves activation to the selected trusted plugin.
+
+`bezel` names the artwork tiled into the letterbox/pillarbox margins: `"off"`
+(the default — black margins), `"random"` for one of the images in
+`<exe dir>/bezels` chosen once per launch, a bare name for
+`<exe dir>/bezels/<name>.png`, or a path relative to the disc directory. Art is
+drawn only by the OpenGL renderer, and only while the game rect leaves a
+margin. A game owning this through Mods pins the key to `"off"` and calls
+`psx_mod_set_bezel()` from an activation plugin — the setter runs before the
+loader, and the runtime restores this config value before each activation pass
+so disabling the package cannot leave a selection latched.
 
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
