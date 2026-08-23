@@ -350,13 +350,6 @@ struct RuntimeConfig {
     // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
 
-    // [video] cpu_overclock — percent of stock CPU speed. 100 = stock.
-    // The guest runs as native code, so this scales the per-instruction cycle
-    // CHARGE down: the CPU completes more work inside the same CRTC period
-    // while timers, SPU, CDROM and refresh keep their real rates.
-    // hueponik's pal100full8 patch requires >900%.
-    uint32_t              runtime_cpu_overclock = 100;
-
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
     // fraction away when it saturates SXY to integer screen pixels; vertices of
