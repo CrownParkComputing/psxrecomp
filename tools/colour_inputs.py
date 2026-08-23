@@ -58,6 +58,42 @@ SRC_OFFSET = -12          # lwr $t6,-12($s4): the source word's base
 DEFAULT_SPAN = 48         # enough to see the table around it
 
 
+def region_phase_dependence(conn, pc, lo, hi, first_scale, tries=12,
+                            gap=0.7, out=sys.stderr):
+    """Does this region change as the animation advances? ONE emulator.
+
+    Every cross-emulator comparison here is confounded by phase, and the churn
+    check (re-read after 0.4s) is too short to catch a region that is only
+    rewritten when the animation STEPS. So ask a question that needs no second
+    emulator at all: sample this region on psx-runtime at two different values
+    of $s6 and see whether it moved.
+
+    If it did, the region is phase-driven and comparing it across two emulators
+    at different scales says nothing — which would make every "region-differs"
+    result so far an artefact. If it did not, the region is phase-independent
+    and the difference is real.
+    """
+    from probe_regs import probe_registers
+    base = read_ram_range(conn, 0x80000000 | lo, hi - lo)
+    for _ in range(tries):
+        time.sleep(gap)
+        pr = probe_registers(conn, pc, want=("s6",), wait=1.5)
+        s6 = pr.get("regs", {}).get("s6")
+        if not s6:
+            continue
+        val = int(s6, 16)
+        if val == first_scale:
+            continue
+        now = read_ram_range(conn, 0x80000000 | lo, hi - lo)
+        moved = sum(1 for x, y in zip(base, now) if x != y)
+        print(f"  psx-runtime at scale {first_scale} vs {val}: "
+              f"{moved} byte(s) of the region changed", file=out)
+        return {"tested": True, "from_scale": first_scale, "to_scale": val,
+                "changed_bytes": moved, "phase_dependent": moved > 0}
+    return {"tested": False,
+            "note": "the scale did not change within the sampling window"}
+
+
 def diff_clusters(a, b, base, gap=8, limit=12):
     """Where two buffers differ, coalesced into runs.
 
@@ -256,6 +292,11 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--probe-wait", type=float, default=6.0,
                     help="seconds to let psx-runtime's block probe collect")
+    ap.add_argument("--no-phase-test", dest="phase_test",
+                    action="store_false",
+                    help="skip checking whether the region is driven "
+                         "by the animation (it is the check that "
+                         "decides whether a difference means anything)")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -402,6 +443,27 @@ def main(argv=None):
                     doc["note"] = "region reads returned different lengths"
                     print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
                     return _finish(doc, args, 1)
+                # Before reading a difference as real, find out whether this
+                # region moves with the animation at all. One emulator, no
+                # alignment: if it does, comparing two emulators at different
+                # scales cannot mean anything.
+                if args.phase_test:
+                    dep = region_phase_dependence(native, pc, lo, hi, nat_scale)
+                    doc["phase_dependence"] = dep
+                    if dep.get("phase_dependent"):
+                        doc["verdict"] = "region-phase-dependent"
+                        doc["note"] = (
+                            f"psx-runtime's own copy of this region changed by "
+                            f"{dep['changed_bytes']} byte(s) between scale "
+                            f"{dep['from_scale']} and {dep['to_scale']}. The "
+                            f"region is driven by the animation, so comparing it "
+                            f"between two emulators at different scales "
+                            f"(psx-runtime {nat_scale}, oracle {scale}) proves "
+                            f"nothing — including every earlier "
+                            f"'region-differs' result.")
+                        print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
+                        return _finish(doc, args, 0)
+
                 nd = sum(1 for x, y in zip(ra_, rb_) if x != y)
                 doc["region_differing_bytes"] = nd
                 doc["region_bytes"] = len(ra_)

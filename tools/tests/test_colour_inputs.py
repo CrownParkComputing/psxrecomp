@@ -18,6 +18,7 @@ it fails for a different one, which is a miserable thing to debug.
 import importlib.util
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -338,3 +339,83 @@ class TestDifferenceShape(unittest.TestCase):
         a = bytes.fromhex("f8505000")
         self.assertEqual(CI.diff_clusters(a, a, 0), [])
         self.assertEqual(CI.describe_difference([]), "")
+
+
+class TestPhaseDependenceGate(unittest.TestCase):
+    """The check that decides whether a region difference means anything.
+
+    Every cross-emulator comparison in this investigation has been confounded by
+    phase — frame numbers, buffer halves, array offsets, and now possibly this
+    region. The churn check (re-read after 0.4s) is too short to catch a region
+    rewritten only when the animation STEPS, which is why a region can read as
+    "static" and still be phase-driven.
+
+    Sampling one emulator at two different scales needs no alignment and no
+    second emulator, and it answers the question outright.
+    """
+
+    class FakeConn:
+        """Returns different region bytes once the scale has moved on."""
+
+        def __init__(self, changes=True):
+            self.changes = changes
+            self.scale = 0x80
+            self.reads = 0
+
+        def cmd(self, name, **kw):
+            if name == "read_ram":
+                self.reads += 1
+                n = int(kw["len"])
+                fill = b"\xaa" if (self.reads == 1 or not self.changes) else b"\xbb"
+                return {"ok": True, "hex": (fill * n).hex()}
+            return {"ok": True}
+
+    def test_a_region_that_moves_with_the_scale_is_flagged(self):
+        import io
+        conn = self.FakeConn(changes=True)
+        with unittest.mock.patch.object(
+                CI, "region_phase_dependence", wraps=CI.region_phase_dependence):
+            pass
+        # Drive the helper directly with a stub probe.
+        import probe_regs
+        orig = probe_regs.probe_registers
+        probe_regs.probe_registers = lambda *a, **k: {"regs": {"s6": "0x48"}}
+        try:
+            r = CI.region_phase_dependence(conn, 0x8006844C, 0x1000, 0x1100,
+                                           0x80, tries=2, gap=0,
+                                           out=io.StringIO())
+        finally:
+            probe_regs.probe_registers = orig
+        self.assertTrue(r["tested"])
+        self.assertTrue(r["phase_dependent"])
+        self.assertEqual(r["to_scale"], 0x48)
+
+    def test_a_stable_region_is_not_flagged(self):
+        import io, probe_regs
+        conn = self.FakeConn(changes=False)
+        orig = probe_regs.probe_registers
+        probe_regs.probe_registers = lambda *a, **k: {"regs": {"s6": "0x48"}}
+        try:
+            r = CI.region_phase_dependence(conn, 0x8006844C, 0x1000, 0x1100,
+                                           0x80, tries=2, gap=0,
+                                           out=io.StringIO())
+        finally:
+            probe_regs.probe_registers = orig
+        self.assertFalse(r["phase_dependent"])
+        self.assertEqual(r["changed_bytes"], 0)
+
+    def test_a_scale_that_never_moves_reports_untested(self):
+        # Not the same as "not phase dependent" — nothing was learned, and
+        # saying otherwise would license the comparison on no evidence.
+        import io, probe_regs
+        conn = self.FakeConn()
+        orig = probe_regs.probe_registers
+        probe_regs.probe_registers = lambda *a, **k: {"regs": {"s6": "0x80"}}
+        try:
+            r = CI.region_phase_dependence(conn, 0x8006844C, 0x1000, 0x1100,
+                                           0x80, tries=3, gap=0,
+                                           out=io.StringIO())
+        finally:
+            probe_regs.probe_registers = orig
+        self.assertFalse(r["tested"])
+        self.assertNotIn("phase_dependent", r)
