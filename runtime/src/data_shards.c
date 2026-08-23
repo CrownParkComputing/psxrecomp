@@ -30,6 +30,7 @@
  *    functions are data transforms; a GTE-using function must not be listed).
  */
 #include "data_shards.h"
+#include "psx_memory.h"
 #include "psx_cycles.h"
 #include "interrupts.h"
 #include "crc32.h"
@@ -47,7 +48,7 @@ extern void psx_write_word(uint32_t addr, uint32_t val);
 extern void psx_write_byte(uint32_t addr, uint8_t val);
 extern void dirty_ram_mark_executable_range(uint32_t addr, uint32_t len);
 
-#define DS_RAM_BYTES   (2u * 1024u * 1024u)
+#define DS_RAM_BYTES   PSX_MAIN_RAM_BYTES
 #define DS_SP_BYTES    1024u
 #define DS_SPACE       (DS_RAM_BYTES + DS_SP_BYTES)   /* unified index space */
 #define DS_PAGE_SHIFT  12

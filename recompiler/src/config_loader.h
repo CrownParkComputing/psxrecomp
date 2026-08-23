@@ -137,6 +137,11 @@ struct RuntimeConfig {
     bool                  has_debug_port = false;
     uint16_t              debug_port     = 0;
 
+    /* Main-RAM geometry is a title/build contract, not a player preference.
+     * 2 keeps retail four-way mirroring; 8 uniquely decodes the full DRAM
+     * window. It participates in overlay/state identity. */
+    uint32_t              main_ram_mib   = 2;
+
     // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
     // language selects the translations/*.toml column; "jp"/"off"/"" disables
     // APPLY (capture still runs). From [localization].language or [runtime].
@@ -1129,9 +1134,13 @@ struct UserSettings {
     // [video]
     bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4
-    // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
-    // both the launcher and the emulator window so they boot at the same size.
-    bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
+    // Output surface/window geometry. Older settings only carry width and keep
+    // the historical aspect-derived height. WipEout SE's explicit output-mode
+    // selector persists all three presentation values; refresh never changes
+    // guest timing.
+    bool has_window_width   = false; int  window_width   = 1280;
+    bool has_window_height  = false; int  window_height  = 960;
+    bool has_display_refresh_hz = false; int display_refresh_hz = 100;
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     // Sub-pixel vertex precision / perspective-correct UVs (see RuntimeConfig).

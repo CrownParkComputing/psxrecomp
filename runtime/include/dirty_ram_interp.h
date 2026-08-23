@@ -16,6 +16,7 @@
 #define PSXRECOMP_DIRTY_RAM_INTERP_H
 
 #include <stdint.h>
+#include "psx_memory.h"
 #include "cpu_state.h"
 
 #ifdef __cplusplus
@@ -243,13 +244,14 @@ extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
  * bitmap instead of probing a large hash table for every retired instruction.
  * This covers all 524,288 RAM words (the old 262K-entry hash could saturate)
  * and is also the execution-verified seed source used by overlay_capture. */
-#define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
+#define DIRTY_RAM_EXEC_WORD_COUNT   (PSX_MAIN_RAM_BYTES / 4u)
 #define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 /* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
  * guard; they clear that page's capture bits rather than serializing from the
  * universal store hot path. */
-#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 16u
+#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS \
+    (((PSX_MAIN_RAM_BYTES / 4096u) + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
 /* Presence-only companion for interpreted block/dispatch entries. The richer
  * counter table remains for telemetry, while capture can snapshot/reset this

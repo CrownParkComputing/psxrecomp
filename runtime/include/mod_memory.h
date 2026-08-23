@@ -32,13 +32,20 @@ static inline int psx_mod_gpu_dma_aperture_offset_for(
  * Preserve the retail DMAC's 2 MiB folding unless the address is inside the
  * portion of the enhancement aperture that has actually been allocated.
  */
-static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
-    uint32_t address, uint32_t used) {
+static inline uint32_t psx_mod_gpu_dma_resolve_address_for_geometry(
+    uint32_t address, uint32_t used, uint32_t ram_mask) {
     uint32_t canonical = address & 0x00FFFFFCu;
     if (psx_mod_gpu_dma_aperture_offset_for(
             canonical, 4u, used, (uint32_t *)0))
         return canonical;
-    return canonical & 0x001FFFFCu;
+    return canonical & ram_mask & 0x00FFFFFCu;
+}
+
+/* Compatibility helper for retail-runtime callers and existing packages. */
+static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
+    uint32_t address, uint32_t used) {
+    return psx_mod_gpu_dma_resolve_address_for_geometry(
+        address, used, 0x001FFFFFu);
 }
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);

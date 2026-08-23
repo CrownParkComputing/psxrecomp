@@ -35,7 +35,9 @@
 #include "pgxp.h"
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
+#include "psx_memory.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -62,20 +64,23 @@ struct PGXPValue {
     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
 };
 
-#define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
+#define PGXP_RAM_WORDS     (PSX_MAIN_RAM_BYTES >> 2) /* target RAM geometry    */
 #define PGXP_SCRATCH_WORDS (0x400u >> 2)      /* 1 KB scratchpad              */
 #define PGXP_REG_HI        32
 #define PGXP_REG_LO        33
 
-static PGXPValue *s_ram = nullptr;            /* lazily allocated, ~10 MB     */
+static PGXPValue *s_ram = nullptr;            /* lazy, target-sized (~10/40MB)*/
 static PGXPValue  s_scratch[PGXP_SCRATCH_WORDS];
 static PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
 static PGXPValue  s_gte[32];                  /* GTE data registers           */
+static PGXPValue  s_gte_fifo_before_write[4]; /* atomic SXYP bridge snapshot  */
+static int        s_gte_fifo_write_pending = 0;
 
 static uint32_t s_gen = 1;
 static int      s_enabled = 0;
 static int      s_cpu_mode = 0;
-static float    s_tolerance = 0.5f;   /* user-validated seam clamp (G1.10) */
+static int      s_vertex_cache = 0;   /* reference default: explicit opt-in */
+static float    s_tolerance = -1.0f;  /* reference default: clamp disabled  */
 static uint32_t s_suppress = 0;
 static int      s_deferred_invalidate = 0;
 
@@ -93,6 +98,7 @@ static PGXPStats s_stats;
 
 extern "C" void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+    s_gte_fifo_write_pending = 0;
     if (++s_gen == 0) {
         /* generation wrapped: physically clear so stale slots can't revive */
         if (s_ram) std::memset(s_ram, 0, PGXP_RAM_WORDS * sizeof(PGXPValue));
@@ -121,6 +127,11 @@ extern "C" int  pgxp_cpu_mode(void) { return s_cpu_mode; }
 extern "C" void  pgxp_set_tolerance(float pixels) { s_tolerance = pixels; }
 extern "C" float pgxp_tolerance(void) { return s_tolerance; }
 
+extern "C" void pgxp_set_vertex_cache(int enabled) {
+    s_vertex_cache = enabled ? 1 : 0;
+}
+extern "C" int pgxp_vertex_cache(void) { return s_vertex_cache; }
+
 extern "C" void pgxp_suppress_begin(void) {
     ++s_suppress;
     recompute_active();
@@ -147,8 +158,8 @@ extern "C" void pgxp_get_stats(PGXPStats *out) {
 /* Guest address -> shadow slot, or NULL for BIOS/MMIO/KSEG2 (untrackable). */
 static inline PGXPValue *pgxp_ptr(uint32_t addr) {
     uint32_t m = addr & 0x1FFFFFFFu;
-    if (m < 0x00800000u)                       /* RAM + its mirrors           */
-        return s_ram ? &s_ram[(m & 0x1FFFFCu) >> 2] : nullptr;
+    if (m < PSX_MAIN_RAM_EXPANDED_BYTES)       /* RAM + target-sized mirrors  */
+        return s_ram ? &s_ram[(m & PSX_MAIN_RAM_WORD_MASK) >> 2] : nullptr;
     if ((m & 0xFFFFFC00u) == 0x1F800000u)      /* scratchpad                  */
         return &s_scratch[(m & 0x3FCu) >> 2];
     return nullptr;
@@ -180,6 +191,83 @@ static inline void pv_reset(PGXPValue *pv, uint32_t value) {
 }
 
 static inline void pv_kill(PGXPValue *pv) { pv->gen = 0; }
+
+/* Install the provenance carried by a guest GTE data-register transfer.
+ * gte_write_data reports its architectural SXY2/SXYP mirror writes before
+ * the PGXP transfer hook runs. pgxp_gte_reg_written snapshots the old FIFO,
+ * allowing this point (which knows whether the instruction targeted 14 or
+ * 15) to preserve the exact hardware shift instead of guessing. */
+static inline void pv_install_gte_data_write(uint32_t reg,
+                                             const PGXPValue *next) {
+    if (reg == 15) {
+        if (s_gte_fifo_write_pending) {
+            s_gte[12] = s_gte_fifo_before_write[1];
+            s_gte[13] = s_gte_fifo_before_write[2];
+        } else {
+            pv_kill(&s_gte[12]);
+            pv_kill(&s_gte[13]);
+        }
+        s_gte[14] = *next;
+        s_gte[15] = *next;
+    } else {
+        if (reg == 14) {
+            if (s_gte_fifo_write_pending) {
+                s_gte[12] = s_gte_fifo_before_write[0];
+                s_gte[13] = s_gte_fifo_before_write[1];
+            }
+            s_gte[14] = *next;
+            s_gte[15] = *next;
+        } else {
+            s_gte[reg] = *next;
+        }
+    }
+    s_gte_fifo_write_pending = 0;
+}
+
+/* Convert an integer coordinate to signed 16.16 without left-shifting a
+ * negative signed value (undefined in C++). All callers pass a signed
+ * 16-bit component or the GPU's signed 11-bit screen coordinate, so the
+ * widened product is representable in int32_t. */
+static inline int32_t fixed16_from_int(int32_t value) {
+    return (int32_t)((int64_t)value * 65536);
+}
+
+/* Add a signed 16.16 delta with the MIPS word's modulo-2^32 behavior. This
+ * matters for ADDI(U) -32768: its fixed-point delta is INT32_MIN and cannot
+ * be formed by negating a positive int32_t. */
+static inline int32_t fixed16_add_wrap(int32_t value, int64_t delta) {
+    const uint32_t bits = (uint32_t)value + (uint32_t)delta;
+    int32_t result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+extern "C" void pgxp_external_write(uint32_t addr, uint32_t size) {
+    if (!s_enabled || !s_ram || size == 0 || s_suppress != 0)
+        return;
+
+    s_stats.external_ranges++;
+    const uint64_t end = (uint64_t)addr + (uint64_t)size;
+
+    /* A wrapped or implausibly large device write is safer and much cheaper
+     * as an O(1) global invalidation. Ordinary DMA/MDEC transfers stay on the
+     * precise range path below. */
+    if (end > 0x100000000ull || size > 0x01000000u) {
+        s_stats.external_full++;
+        pgxp_invalidate_all();
+        return;
+    }
+
+    const uint64_t first = (uint64_t)(addr & ~3u);
+    const uint64_t last = (end - 1u) & ~3ull;
+    for (uint64_t word = first; word <= last; word += 4u) {
+        PGXPValue *pv = pgxp_ptr((uint32_t)word);
+        if (pv && pv->gen == s_gen) {
+            pv_kill(pv);
+            s_stats.external_words++;
+        }
+    }
+}
 
 /* ------------------------------------------------------------------------- */
 /* Instruction field helpers                                                  */
@@ -234,7 +322,7 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
         /* The high half of the extended GPR is a known-exact constant
          * (0/-1 for LH, 0 for LHU): track it so re-packing via sll/or in
          * cpu-mode keeps working. */
-        dst->y16 = ((int32_t)value >> 16) << 16;
+        dst->y16 = fixed16_from_int((int16_t)(value >> 16));
         dst->flags = PGXP_F_VY;
         if (src && src->gen == s_gen) {
             uint32_t actual_half = (value & 0xFFFFu) << (hi_half ? 16 : 0);
@@ -317,13 +405,15 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
     switch (f_op(instr)) {
     case 0x32: {                               /* LWC2: gte[rt] <- [addr]     */
         PGXPValue *src = pgxp_ptr(addr);
-        PGXPValue *dst = &s_gte[f_rt(instr)];
+        const uint32_t reg = f_rt(instr);
+        PGXPValue next;
         if (src && src->gen == s_gen) {
             pv_validate(src, value);
-            *dst = *src;
+            next = *src;
         } else {
-            pv_reset(dst, value);
+            pv_reset(&next, value);
         }
+        pv_install_gte_data_write(reg, &next);
         return;
     }
     case 0x3A: {                               /* SWC2: [addr] <- gte[rt]     */
@@ -354,16 +444,15 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
         }
         case 0x04: {                           /* MTC2: gte[rd] <- gpr[rt]    */
             uint32_t rt = f_rt(instr);
-            PGXPValue *dst = &s_gte[f_rd(instr)];
+            const uint32_t reg = f_rd(instr);
+            PGXPValue next;
             if (rt != 0 && s_gpr[rt].gen == s_gen) {
                 pv_validate(&s_gpr[rt], value);
-                *dst = s_gpr[rt];
+                next = s_gpr[rt];
             } else {
-                pv_reset(dst, value);
+                pv_reset(&next, value);
             }
-            /* An SXYP write (rd==15) shifts the hardware FIFO; we do not
-             * model it — regs 12..14 now describe words they no longer
-             * match, and validation drops them on next use. */
+            pv_install_gte_data_write(reg, &next);
             return;
         }
         case 0x02: {                           /* CFC2: control regs carry no
@@ -397,7 +486,7 @@ static inline int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
             ((pv->value ^ value) & 0xFFFF0000u) == 0)
             return pv->y16;
     }
-    return ((int32_t)(int16_t)(hi_half ? (value >> 16) : value)) << 16;
+    return fixed16_from_int((int16_t)(hi_half ? (value >> 16) : value));
 }
 
 static inline int comp_tracked(const PGXPValue *pv, uint32_t value, int hi_half) {
@@ -481,7 +570,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                     dst->x16 = src->y16;
                     dst->flags |= PGXP_F_VX;
                 }
-                dst->y16 = ((int32_t)result >> 16) << 16;  /* 0 or sign fill  */
+                dst->y16 = fixed16_from_int((int16_t)(result >> 16));
                 dst->flags |= PGXP_F_VY;
             }
             return;
@@ -564,7 +653,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
     case 0x0F: {                               /* LUI: both halves exact      */
         pv_reset(dst, result);
         dst->x16 = 0;
-        dst->y16 = ((int32_t)result >> 16) << 16;
+        dst->y16 = fixed16_from_int((int16_t)(result >> 16));
         dst->flags = PGXP_F_VXY;
         return;
     }
@@ -589,9 +678,9 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                 pv_reset(dst, result);
                 return;
             }
-            int32_t dx = (int32_t)(mag & 0xFFFFu) << 16;
             pv_reset(dst, result);
-            dst->x16 = comp16(a, s1, 0) + (neg ? -dx : dx);
+            dst->x16 = fixed16_add_wrap(comp16(a, s1, 0),
+                                        (int64_t)imm * 65536);
             dst->y16 = comp16(a, s1, 1);   /* no carry crossed: Y untouched  */
             dst->flags = PGXP_F_VXY;
         }
@@ -610,7 +699,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                     dst->x16 = a->x16; dst->flags |= PGXP_F_VX;
                 }
             } else {                           /* exact constant low half     */
-                dst->x16 = ((int32_t)(int16_t)imm) << 16;
+                dst->x16 = fixed16_from_int((int16_t)imm);
                 dst->flags |= PGXP_F_VX;
             }
             return;
@@ -640,8 +729,9 @@ extern "C" void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr,
 /* ------------------------------------------------------------------------- */
 
 extern "C" void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
-                                  uint32_t packed) {
+                                   uint32_t packed) {
     if (!g_pgxp_active) return;
+    s_gte_fifo_write_pending = 0;
     s_stats.produced++;
     s_gte[12] = s_gte[13];
     s_gte[13] = s_gte[14];
@@ -672,6 +762,27 @@ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
      * machine state back, so its writes must not stick to the shadows). */
     if (s_suppress != 0) return;
     if (reg < 0 || reg > 31) return;
+    if (reg == 14) {
+        for (int i = 0; i < 4; ++i)
+            s_gte_fifo_before_write[i] = s_gte[12 + i];
+        s_gte_fifo_write_pending = 1;
+    }
+    if (reg == 15) {
+        if (!s_gte_fifo_write_pending) {
+            for (int i = 0; i < 4; ++i)
+                s_gte_fifo_before_write[i] = s_gte[12 + i];
+            s_gte_fifo_write_pending = 1;
+        }
+        /* Until the instruction-specific transfer hook consumes the saved
+         * state, fail closed: a raw/direct SXYP write has no stale precision. */
+        for (int i = 12; i <= 15; ++i)
+            pv_kill(&s_gte[i]);
+        pv_reset(&s_gte[14], value);
+        pv_reset(&s_gte[15], value);
+        return;
+    }
+    if (reg != 14)
+        s_gte_fifo_write_pending = 0;
     pv_kill(&s_gte[reg]);
     pv_reset(&s_gte[reg], value);
 }
@@ -705,32 +816,40 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
         }
     }
 
-    if (!have && gte_geometry_correction_lookup(packet_word, &px, &py)) {
+    if (!have && s_vertex_cache &&
+        gte_geometry_correction_lookup(packet_word, &px, &py)) {
         pz = 0;                                /* fallback never carries depth */
         have = PGXP_SRC_FALLBACK;
     }
 
     if (have) {
-        /* Truncation agreement: the GPU parsed 11-bit integers out of the
-         * packet; a precise position whose integer part disagrees (a
-         * wrapped/CPU-modified coordinate) must not be believed. */
-        if ((px >> 16) != int_x || (py >> 16) != int_y) {
-            s_stats.trunc_reject++;
-            have = 0;
-        } else if (s_tolerance >= 0.0f) {
-            float dx = (float)(px - (int_x << 16)) * (1.0f / 65536.0f);
-            float dy = (float)(py - (int_y << 16)) * (1.0f / 65536.0f);
-            if (dx > s_tolerance || dy > s_tolerance) {
+        /* Apply the tolerance symmetrically before the structural agreement
+         * check. Besides matching the intended absolute-distance contract,
+         * this makes telemetry identify an out-of-tolerance negative delta
+         * as such instead of hiding it behind the later truncation reject. */
+        if (s_tolerance >= 0.0f) {
+            const float dx = (float)((int64_t)px - fixed16_from_int(int_x)) *
+                             (1.0f / 65536.0f);
+            const float dy = (float)((int64_t)py - fixed16_from_int(int_y)) *
+                             (1.0f / 65536.0f);
+            if (std::abs(dx) > s_tolerance || std::abs(dy) > s_tolerance) {
                 s_stats.tolerance_reject++;
                 have = 0;
             }
+        }
+        /* Truncation agreement: the GPU parsed 11-bit integers out of the
+         * packet; a precise position whose integer part disagrees (a
+         * wrapped/CPU-modified coordinate) must not be believed. */
+        if (have && ((px >> 16) != int_x || (py >> 16) != int_y)) {
+            s_stats.trunc_reject++;
+            have = 0;
         }
     }
 
     if (!have) {
         s_stats.native++;
-        *x16 = int_x << 16;
-        *y16 = int_y << 16;
+        *x16 = fixed16_from_int(int_x);
+        *y16 = fixed16_from_int(int_y);
         *sz = 0;
         return PGXP_SRC_NATIVE;
     }

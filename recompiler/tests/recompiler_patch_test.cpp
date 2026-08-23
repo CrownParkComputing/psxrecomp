@@ -184,6 +184,29 @@ pal_video_clock_multiplier = 0
         "must be in 1..8",
         "parser rejects an invalid PAL video-clock multiplier");
 
+    const auto expanded_ram = write_config(root, "expanded-ram", R"toml(
+[runtime]
+main_ram_mib = 8
+)toml");
+    const auto expanded_ram_config =
+        PSXRecompV4::load_game_config(expanded_ram);
+    check(expanded_ram_config.runtime.main_ram_mib == 8u,
+          "parser preserves immutable 8 MiB main-RAM geometry");
+    auto retail_ram_config = expanded_ram_config;
+    retail_ram_config.runtime.main_ram_mib = 2u;
+    check(PSXRecompV4::overlay_codegen_config_hash(expanded_ram_config) !=
+              PSXRecompV4::overlay_codegen_config_hash(retail_ram_config),
+          "main-RAM geometry changes generated overlay identity");
+
+    const auto invalid_ram = write_config(root, "invalid-ram", R"toml(
+[runtime]
+main_ram_mib = 4
+)toml");
+    check_throws(
+        [&] { (void)PSXRecompV4::load_game_config(invalid_ram); },
+        "main_ram_mib must be 2 or 8",
+        "parser rejects hybrid main-RAM geometry");
+
     const auto idle_countdown = write_config(root, "idle-countdown", R"toml(
 [[recompiler.idle_countdown]]
 address = "0x8015FAA4"

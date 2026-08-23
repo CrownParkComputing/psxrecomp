@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exhaustively verify generated O(1) game dispatch and PS1 aliases.
 
-The generated map is two-level and bounded: a 512-element 4 KiB page table,
+The generated map is two-level and bounded: a 512- or 2048-element 4 KiB page table,
 then one 1024-element instruction-word table for each populated page. Every
 lookup therefore uses a constant number of masks, bounds checks and loads; it
 does not compare/search as the number of compiled entries grows.
@@ -22,8 +22,6 @@ from pathlib import Path
 
 LOAD = 0x00010000
 PHYS_MASK = 0x1FFFFFFF
-RAM_SIZE = 2 * 1024 * 1024
-PAGE_COUNT = RAM_SIZE // 4096
 SLOTS_PER_PAGE = 4096 // 4
 
 
@@ -75,7 +73,7 @@ def generate_dispatch(recompiler, tmp):
     return dispatches[0].read_text(encoding="utf-8")
 
 
-def parse_dispatch(source):
+def parse_dispatch(source, ram_size):
     table = re.search(
         r"static const PsxGameDispatchEntry k_psx_game_dispatch\[\] = \{"
         r"(.*?)\n\};", source, re.DOTALL)
@@ -111,9 +109,10 @@ def parse_dispatch(source):
     # Alternation returns an empty capture for zero; retain positional count.
     raw_tokens = re.findall(r"k_psx_game_dispatch_page_[0-9A-Fa-f]{3}|\b0\b",
                             page_table.group(1))
-    if len(raw_tokens) != PAGE_COUNT:
+    page_count = ram_size // 4096
+    if len(raw_tokens) != page_count:
         raise AssertionError(
-            f"page table has {len(raw_tokens)} entries, expected {PAGE_COUNT}")
+            f"page table has {len(raw_tokens)} entries, expected {page_count}")
     pointer_pages = {
         index: int(token.rsplit("_", 1)[1], 16)
         for index, token in enumerate(raw_tokens) if token != "0"
@@ -125,9 +124,9 @@ def parse_dispatch(source):
     return keys, pages
 
 
-def mapped_index(pages, addr):
+def mapped_index(pages, addr, ram_size):
     phys = addr & PHYS_MASK
-    if phys >= RAM_SIZE or (phys & 3):
+    if phys >= ram_size or (phys & 3):
         return None
     page = pages.get(phys >> 12)
     if page is None:
@@ -143,9 +142,14 @@ def verify(source):
     if not find:
         raise AssertionError("psx_game_find_entry not found")
     body = find.group(1)
+    ram_guard = re.search(r"phys >= 0x([0-9A-Fa-f]+)u", body)
+    if not ram_guard:
+        raise AssertionError("direct lookup is missing a concrete RAM bound")
+    ram_size = int(ram_guard.group(1), 16)
+    if ram_size not in (2 * 1024 * 1024, 8 * 1024 * 1024):
+        raise AssertionError(f"unsupported generated RAM size 0x{ram_size:X}")
     required = (
         "addr & 0x1FFFFFFFu",
-        "phys >= 0x200000u",
         "(phys & 3u) != 0u",
         "k_psx_game_dispatch_pages[phys >> 12]",
         "page[(phys & 0xFFFu) >> 2]",
@@ -175,7 +179,7 @@ def verify(source):
         if fragment not in source:
             raise AssertionError(f"epoch-qualified direct dispatch missing: {fragment}")
 
-    keys, pages = parse_dispatch(source)
+    keys, pages = parse_dispatch(source, ram_size)
     if len(keys) < 2:
         raise AssertionError(f"expected at least two dispatch entries, got {len(keys)}")
     if len(keys) != len(set(keys)):
@@ -185,7 +189,7 @@ def verify(source):
     # segment alias must resolve to the identical record.
     for index, key in enumerate(keys):
         for alias in (key, key | 0x80000000, key | 0xA0000000):
-            actual = mapped_index(pages, alias)
+            actual = mapped_index(pages, alias, ram_size)
             if actual != index:
                 raise AssertionError(
                     f"entry {index} key 0x{key:08X} alias 0x{alias:08X} "
@@ -198,7 +202,7 @@ def verify(source):
         for slot, encoded in enumerate(slots):
             phys = (page_number << 12) | (slot << 2)
             if encoded == 0:
-                if mapped_index(pages, phys) is not None:
+                if mapped_index(pages, phys, ram_size) is not None:
                     raise AssertionError(f"empty slot 0x{phys:08X} produced a hit")
                 continue
             nonzero += 1
@@ -209,22 +213,22 @@ def verify(source):
         raise AssertionError(
             f"map covers {nonzero} records, dispatch table has {len(keys)}")
 
-    # Exhaust the complete 2 MiB instruction address space, including all
-    # unpopulated pages: every one of its 524,288 aligned words is either the
+    # Exhaust the complete active instruction address space, including all
+    # unpopulated pages: every aligned word is either the
     # unique expected record or a fail-closed miss.
     expected_by_phys = {key: index for index, key in enumerate(keys)}
     misses = 0
-    for phys in range(0, RAM_SIZE, 4):
-        actual = mapped_index(pages, phys)
+    for phys in range(0, ram_size, 4):
+        actual = mapped_index(pages, phys, ram_size)
         expected = expected_by_phys.get(phys)
         if actual != expected:
             raise AssertionError(
                 f"exhaustive word 0x{phys:08X}: expected {expected}, got {actual}")
         if expected is None:
             misses += 1
-    if mapped_index(pages, keys[0] + 1) is not None:
+    if mapped_index(pages, keys[0] + 1, ram_size) is not None:
         raise AssertionError("unaligned address did not fail closed")
-    if mapped_index(pages, RAM_SIZE) is not None:
+    if mapped_index(pages, ram_size, ram_size) is not None:
         raise AssertionError("out-of-RAM address did not fail closed")
 
     return len(keys), len(pages), misses

@@ -18,6 +18,7 @@
 #include "bios_hle_plan.h"
 #include "psx_bios_backend.h"
 #include "psx_cycles.h"
+#include "psx_memory.h"
 #include "starvation_ring.h"
 #include "load_accel.h"
 #include "savestate.h"
@@ -1142,7 +1143,9 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
-static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
+static int           g_video_win_w    = 1280;
+static int           g_video_win_h    = 960;  /* explicit output surface height */
+static int           g_video_output_refresh_hz = 100; /* host mode preference only */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_audio_freq     = 44100; /* host device request */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
@@ -1884,6 +1887,27 @@ int g_audio_unmute_resync = 0;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
 extern "C" {
 int g_audio_host_rate = 44100;
+}
+
+/* Apply the launcher's presentation-mode request to exclusive fullscreen.
+ * This deliberately does not touch g_frame_period_ms, native vblank, CPU,
+ * CD-ROM, SPU, or FMV clocks: display refresh is host scanout state only. */
+static void psx_apply_requested_exclusive_display_mode(SDL_Window* window) {
+    if (!window || g_video_win_w <= 0 || g_video_win_h <= 0 ||
+        g_video_output_refresh_hz <= 0) return;
+    SDL_DisplayMode requested{};
+    requested.w = g_video_win_w;
+    requested.h = g_video_win_h;
+    requested.refresh_rate = g_video_output_refresh_hz;
+    if (SDL_SetWindowDisplayMode(window, &requested) != 0) {
+        std::fprintf(stderr,
+            "psxrecomp: requested exclusive output %dx%d @ %d Hz unavailable: %s\n",
+            requested.w, requested.h, requested.refresh_rate, SDL_GetError());
+        return;
+    }
+    std::fprintf(stdout,
+        "psxrecomp: requested exclusive output %dx%d @ %d Hz (presentation only)\n",
+        requested.w, requested.h, requested.refresh_rate);
 }
 
 /* Pull-callback wall health.  The SPU and CD counters below prove simulated
@@ -6499,6 +6523,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                          * matching the historical (pre-tri-state) behaviour. */
                         Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
                         if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
+                        if (g_fullscreen == 2)
+                            psx_apply_requested_exclusive_display_mode(sdl_window);
                         SDL_SetWindowFullscreen(sdl_window, target);
                         host_osd_push("Fullscreen", 1500);
                     }
@@ -9013,6 +9039,7 @@ namespace {
         PsxLobbyMatchCaps caps{};
         caps.valid = 1;
         switch (s ? s->aspect_index : 0) {
+            case 3:  caps.aspect_num = 32; caps.aspect_den = 9; break;
             case 2:  caps.aspect_num = 21; caps.aspect_den = 9; break;
             case 1:  caps.aspect_num = 16; caps.aspect_den = 9; break;
             default: caps.aspect_num = 4;  caps.aspect_den = 3; break;
@@ -10603,6 +10630,56 @@ namespace {
         "Rewind",
         "Save states",
     };
+    static const char* const kWipeoutAspectLabels[] = {
+        "4:3 (Native)", "16:9", "21:9", "32:9"
+    };
+    static const char* const kWipeoutResolutionLabels[] = {
+        "1280 x 960 (4:3)", "1600 x 1200 (4:3)",
+        "1920 x 1440 (4:3)", "2560 x 1920 (4:3)",
+        "3200 x 2400 (4:3)", "3840 x 2880 (4:3)",
+        "5760 x 4320 (4:3, 8K)",
+        "1280 x 720 (16:9)", "1600 x 900 (16:9)",
+        "1920 x 1080 (16:9)", "2560 x 1440 (16:9)",
+        "3200 x 1800 (16:9)", "3840 x 2160 (16:9, 4K)",
+        "5120 x 2880 (16:9, 5K)", "7680 x 4320 (16:9, 8K)",
+        "2560 x 1080 (21:9)", "3440 x 1440 (21:9)",
+        "3840 x 1600 (21:9)", "5120 x 2160 (21:9)",
+        "6880 x 2880 (21:9)", "7680 x 3200 (21:9, 8K)",
+        "3840 x 1080 (32:9)", "5120 x 1440 (32:9)",
+        "7680 x 2160 (32:9, 8K)",
+    };
+    static const int kWipeoutResolutionWidths[] = {
+        1280, 1600, 1920, 2560, 3200, 3840, 5760,
+        1280, 1600, 1920, 2560, 3200, 3840, 5120, 7680,
+        2560, 3440, 3840, 5120, 6880, 7680,
+        3840, 5120, 7680,
+    };
+    static const int kWipeoutResolutionHeights[] = {
+        960, 1200, 1440, 1920, 2400, 2880, 4320,
+        720, 900, 1080, 1440, 1800, 2160, 2880, 4320,
+        1080, 1440, 1600, 2160, 2880, 3200,
+        1080, 1440, 2160,
+    };
+    static const int kWipeoutResolutionMaxRefreshHz[] = {
+        100, 100, 100, 100, 100, 100, 60,
+        100, 100, 100, 100, 100, 100, 100, 60,
+        100, 100, 100, 100, 100, 60,
+        100, 100, 60,
+    };
+    static const char* const kWipeoutRefreshLabels[] = { "60 Hz", "100 Hz" };
+    static const int kWipeoutRefreshHz[] = { 60, 100 };
+    static_assert(sizeof(kWipeoutResolutionLabels) /
+                      sizeof(kWipeoutResolutionLabels[0]) ==
+                  sizeof(kWipeoutResolutionWidths) /
+                      sizeof(kWipeoutResolutionWidths[0]));
+    static_assert(sizeof(kWipeoutResolutionLabels) /
+                      sizeof(kWipeoutResolutionLabels[0]) ==
+                  sizeof(kWipeoutResolutionHeights) /
+                      sizeof(kWipeoutResolutionHeights[0]));
+    static_assert(sizeof(kWipeoutResolutionLabels) /
+                      sizeof(kWipeoutResolutionLabels[0]) ==
+                  sizeof(kWipeoutResolutionMaxRefreshHz) /
+                      sizeof(kWipeoutResolutionMaxRefreshHz[0]));
 
     void ae_rui_set_sidecar_paths(const char* argv0) {
         const auto exe = exe_dir_from_argv(argv0 ? argv0 : "");
@@ -10615,6 +10692,7 @@ namespace {
         const char* game_name_c,
         const char* region_c,
         int game_players_n,
+        bool wipeout_display_controls_b,
         bool ws_offered_b,
         bool ws_ultrawide_offered_b,
         bool skip_fmv_offered_b,
@@ -10650,6 +10728,29 @@ namespace {
         gi->locked_pad_mode = locked_pad_mode_i;
         gi->lock_device = ctrl_lock_device_b ? 1 : 0;
         gi->aspect_mask = 0;
+        if (wipeout_display_controls_b) {
+            gi->aspect_labels = kWipeoutAspectLabels;
+            gi->num_aspect_labels =
+                (int)(sizeof(kWipeoutAspectLabels) /
+                      sizeof(kWipeoutAspectLabels[0]));
+            gi->aspect_setting_label = "Display aspect";
+            gi->aspect_setting_help =
+                "Changes the host view through the trusted WipEout display "
+                "aspect API. Simulation timing is unchanged.";
+            gi->output_resolution_labels = kWipeoutResolutionLabels;
+            gi->output_resolution_widths = kWipeoutResolutionWidths;
+            gi->output_resolution_heights = kWipeoutResolutionHeights;
+            gi->output_resolution_max_refresh_hz =
+                kWipeoutResolutionMaxRefreshHz;
+            gi->num_output_resolutions =
+                (int)(sizeof(kWipeoutResolutionLabels) /
+                      sizeof(kWipeoutResolutionLabels[0]));
+            gi->output_refresh_labels = kWipeoutRefreshLabels;
+            gi->output_refresh_hz = kWipeoutRefreshHz;
+            gi->num_output_refresh_rates =
+                (int)(sizeof(kWipeoutRefreshHz) /
+                      sizeof(kWipeoutRefreshHz[0]));
+        }
         gi->renderer_labels = kPsxRendererLabels;
         gi->num_renderers = vulkan_offered_b ? 3 : 2;
         gi->settings_bindings = 1;
@@ -10944,6 +11045,12 @@ int main(int argc, char** argv) {
     if (game_config_path) {
         try {
             const auto gc = PSXRecompV4::load_game_config(game_config_path);
+            if (gc.runtime.main_ram_mib * 1024u * 1024u !=
+                PSX_MAIN_RAM_BYTES) {
+                throw std::runtime_error(
+                    "[runtime].main_ram_mib disagrees with the immutable "
+                    "MAIN_RAM_MIB target geometry");
+            }
             game_name = gc.name;
             game_id   = gc.id;
             game_region = gc.region;
@@ -11356,6 +11463,7 @@ int main(int argc, char** argv) {
 #endif
 
     if (!game_name.empty()) s_picker_game_name = game_name;
+    const bool wipeout_display_controls = (game_id == "SCES-02845");
 
     /* Layer the launcher-written settings.toml (next to the exe) over the
      * bundled game.toml. Any field present there overrides the config value;
@@ -11417,6 +11525,11 @@ int main(int argc, char** argv) {
 #endif
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
+        if (us.has_window_width && !us.has_window_height)
+            g_video_win_h = 0; /* migrate legacy width-only setting via catalog */
+        if (us.has_window_height)  g_video_win_h     = us.window_height;
+        if (us.has_display_refresh_hz)
+            g_video_output_refresh_hz = us.display_refresh_hz;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_geometry_correction)
@@ -11559,17 +11672,22 @@ int main(int argc, char** argv) {
         g_frame_interpolation_fps = 0;
     }
 
-    /* Widescreen/View mode is mod-owned on PSX. Clamp the generic display
-     * aspect to native 4:3 so neither a legacy game.toml offer/default nor a
-     * stale settings.toml value can engage it before trusted mod activation. */
-    if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
+    /* WipEout SE is the one explicit title-facing display contract: route its
+     * persisted selector through the trusted aspect API. Every other PSX game
+     * keeps the generic display row hidden and clamps stale values to 4:3. */
+    if (wipeout_display_controls) {
+        (void)psx_mod_set_fixed_display_aspect(
+            (uint32_t)g_video_aspect_num, (uint32_t)g_video_aspect_den);
+    } else if (!ws_offered &&
+               (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
         std::fprintf(stdout, "psxrecomp: widescreen is mod-owned on PSX; "
                      "clamping display aspect %d:%d -> 4:3\n",
                      g_video_aspect_num, g_video_aspect_den);
         g_video_aspect_num = 4;
         g_video_aspect_den = 3;
     }
-    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+    if (!wipeout_display_controls && !ws_ultrawide_offered &&
+        g_video_aspect_num * 9 == g_video_aspect_den * 21) {
         std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
                      ws_offered ? "16:9" : "4:3");
         g_video_aspect_num = ws_offered ? 16 : 4;
@@ -11951,6 +12069,9 @@ int main(int argc, char** argv) {
                 seed.has_deadzone = true;
             }
             seed.window_width = g_video_win_w; seed.has_window_width = true;
+            seed.window_height = g_video_win_h; seed.has_window_height = true;
+            seed.display_refresh_hz = g_video_output_refresh_hz;
+            seed.has_display_refresh_hz = true;
 
             /* recomp-ui creates + owns its SDL2/GL window internally, so there
              * is no launcher window/context to manage here. */
@@ -12013,13 +12134,16 @@ int main(int argc, char** argv) {
             ls.msu1_dir[0]    = '\0';
             std::snprintf(ls.netplay_player_name, sizeof(ls.netplay_player_name), "%s",
                           has_netplay_player_name ? netplay_player_name.c_str() : "");
-            /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
-            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
+            /* aspect_index: 0=4:3, 1=16:9, 2=21:9, 3=32:9. */
+            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 32) ? 3 :
+                                 (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
                                  (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
 
             /* ---- deeper PSX-style settings (capability-gated via launcher_profile
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
             ls.window_width      = seed.window_width;
+            ls.window_height     = seed.window_height;
+            ls.display_refresh_hz = seed.display_refresh_hz;
             ls.renderer           = seed.renderer;
             /* Fresh / invalid seed → OpenGL (DEFAULT_VIDEO_RENDERER), never
              * Software — unless the user explicitly saved software. */
@@ -12112,6 +12236,7 @@ int main(int argc, char** argv) {
                 game_name.empty() ? nullptr : game_name.c_str(),
                 rui_region.empty() ? nullptr : rui_region.c_str(),
                 game_players,
+                wipeout_display_controls,
                 ws_offered,
                 ws_ultrawide_offered,
                 skip_fmv_offered,
@@ -12210,9 +12335,10 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
+                /* aspect_index round-trips the WipEout fixed display choices, superseding the
                  * legacy ls.widescreen bool (still set above for older callers). */
                 switch (ls.aspect_index) {
+                    case 3:  seed.aspect_num = 32; seed.aspect_den = 9; break;
                     case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
                     case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
                     default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
@@ -12261,6 +12387,8 @@ int main(int argc, char** argv) {
                 /* ---- deeper PSX-style settings write-back (mirrors the seed
                  * fields above), all gated on by the "psx" launcher_profile caps. */
                 seed.window_width          = ls.window_width;          seed.has_window_width          = true;
+                seed.window_height         = ls.window_height;         seed.has_window_height         = true;
+                seed.display_refresh_hz    = ls.display_refresh_hz;    seed.has_display_refresh_hz    = true;
                 seed.renderer              = ls.renderer;              seed.has_renderer              = true;
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
                 seed.antialiasing          = ls.antialiasing != 0;     seed.has_antialiasing          = true;
@@ -12481,8 +12609,13 @@ int main(int argc, char** argv) {
                 g_fullscreen      = seed.fullscreen;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
-                g_video_aspect_num = seed.aspect_num;
-                g_video_aspect_den = seed.aspect_den;
+                if (wipeout_display_controls) {
+                    (void)psx_mod_set_fixed_display_aspect(
+                        (uint32_t)seed.aspect_num, (uint32_t)seed.aspect_den);
+                } else {
+                    g_video_aspect_num = seed.aspect_num;
+                    g_video_aspect_den = seed.aspect_den;
+                }
                 g_audio_freq      = seed.audio_freq;
                 g_audio_spu_hq    = seed.spu_hq;
                 g_rewind_depth   = seed.has_rewind_depth && seed.rewind_depth > 0
@@ -12547,6 +12680,8 @@ int main(int argc, char** argv) {
                     if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
                 }
                 g_video_win_w = seed.window_width;
+                g_video_win_h = seed.window_height;
+                g_video_output_refresh_hz = seed.display_refresh_hz;
                 /* Persist the user's choices next to the exe. */
                 PSXRecompV4::save_user_settings(
                     exe_dir_from_argv(argv[0]) / "settings.toml", seed);
@@ -13119,8 +13254,10 @@ session_reboot:
      * height follows the configured display aspect (4:3 native, wider for the
      * widescreen hack); the present path letterboxes to the same aspect, so
      * the image scales to fill the larger window with no further distortion. */
-    int game_w = g_video_win_w, game_h = 0;
-    clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
+    int game_w = g_video_win_w, game_h = g_video_win_h;
+    if (game_h <= 0)
+        clamp_window_aspect(&game_w, &game_h,
+                            g_video_aspect_num, g_video_aspect_den);
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -13132,6 +13269,8 @@ session_reboot:
         return 1;
     }
     psx_apply_window_icon(sdl_window, argv[0]);
+    if (g_fullscreen == 2)
+        psx_apply_requested_exclusive_display_mode(sdl_window);
 
     /* Host refresh is presentation state, not guest timing. Driver vsync owns
      * cadence only for a very close match to the live CRTC rate; a nominal
@@ -13829,7 +13968,7 @@ soft_return_lobby:
         RecompLauncherCSettings ls{};
         ls.output_method = 2;
         ls.window_scale = std::max(1, std::min(4, g_video_win_w / 320));
-        ls.fullscreen = g_fullscreen ? 1 : 0;
+        ls.fullscreen = g_fullscreen;
         ls.ignore_aspect = 0;
         ls.linear_filter = (g_video_texfilter != 0) ? 1 : 0;
         ls.widescreen =
@@ -13839,6 +13978,8 @@ soft_return_lobby:
         ls.audio_freq = g_audio_freq;
         ls.volume = host_volume_get();
         ls.window_width = g_video_win_w;
+        ls.window_height = g_video_win_h;
+        ls.display_refresh_hz = g_video_output_refresh_hz;
         ls.renderer = g_video_renderer;
         if (ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1))
             ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -13863,7 +14004,8 @@ soft_return_lobby:
             normalize_hotkey_pad_binding(
                 g_hotkey_pad_save_state_menu,
                 PSX_HOTKEY_PAD_SELECT_R1);
-        ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
+        ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 32) ? 3
+            : (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
             : (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
         ls.language_index = 0;
         for (size_t li = 0; li < lang_menu_options.size(); li++) {
@@ -13938,6 +14080,7 @@ soft_return_lobby:
             game_name.empty() ? nullptr : game_name.c_str(),
             rui_region.empty() ? nullptr : rui_region.c_str(),
             game_players,
+            wipeout_display_controls,
             ws_offered,
             ws_ultrawide_offered,
             skip_fmv_offered,
@@ -14127,11 +14270,16 @@ soft_return_lobby:
                 us.has_auto_skip_fmv = skip_fmv_offered;
                 us.turbo_loads = ls.turbo_loads != 0;
                 us.has_turbo_loads = turbo_loads_offered;
-                us.fullscreen = ls.fullscreen != 0;
+                us.fullscreen = ls.fullscreen;
                 us.has_fullscreen = true;
                 us.window_width = ls.window_width > 0 ? ls.window_width : g_video_win_w;
                 us.has_window_width = true;
+                us.window_height = ls.window_height > 0 ? ls.window_height : g_video_win_h;
+                us.has_window_height = true;
+                us.display_refresh_hz = ls.display_refresh_hz;
+                us.has_display_refresh_hz = true;
                 switch (ls.aspect_index) {
+                    case 3:  us.aspect_num = 32; us.aspect_den = 9; break;
                     case 2:  us.aspect_num = 21; us.aspect_den = 9; break;
                     case 1:  us.aspect_num = 16; us.aspect_den = 9; break;
                     default: us.aspect_num = 4;  us.aspect_den = 3; break;
@@ -14164,7 +14312,7 @@ soft_return_lobby:
              * offered flags are false for both, so leave both globals alone. */
             if (skip_fmv_offered)     g_auto_skip_fmv = ls.auto_skip_fmv ? 1 : 0;
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
-            g_fullscreen = ls.fullscreen != 0;
+            g_fullscreen = ls.fullscreen;
             g_frame_interpolation = ls.frame_interp ? 1 : 0;
             g_frame_interpolation_fps = ls.frame_interp_fps;
             g_audio_freq = ls.audio_freq;
@@ -14183,12 +14331,23 @@ soft_return_lobby:
             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
                 ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
                 PSX_HOTKEY_PAD_SELECT_R1);
-            switch (ls.aspect_index) {
-                case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
-                case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
-                default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;
+            if (wipeout_display_controls) {
+                switch (ls.aspect_index) {
+                    case 3: (void)psx_mod_set_fixed_display_aspect(32u, 9u); break;
+                    case 2: (void)psx_mod_set_fixed_display_aspect(21u, 9u); break;
+                    case 1: (void)psx_mod_set_fixed_display_aspect(16u, 9u); break;
+                    default: (void)psx_mod_set_fixed_display_aspect(4u, 3u); break;
+                }
+            } else {
+                switch (ls.aspect_index) {
+                    case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
+                    case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
+                    default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;
+                }
             }
             g_video_win_w = ls.window_width > 0 ? ls.window_width : g_video_win_w;
+            g_video_win_h = ls.window_height > 0 ? ls.window_height : g_video_win_h;
+            g_video_output_refresh_hz = ls.display_refresh_hz;
             /* Preference for persistence; session settle may override boot path. */
             if (ls.bios_path[0])
                 bios_path_str = ls.bios_path;

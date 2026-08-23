@@ -1,6 +1,7 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "freeze_heartbeat.h"
+#include "psx_memory.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -70,7 +71,6 @@ extern int      g_present_vsync_disabled;
  * debug_cpu_ptr (CPUState*) is declared in debug_server.h; CPUState layout
  * (gpr[32], pc) in cpu_state.h — both already included above. */
 extern uint8_t *memory_get_scratchpad_ptr(void);   /* memory.c */
-extern uint8_t *g_psx_ram;                         /* memory.c — 2 MiB DRAM */
 
 static int s_started = 0;
 static char s_backend[32] = "psx-runtime";
@@ -323,8 +323,7 @@ static void freeze_dump_unlock(void) {
 #endif
 }
 
-/* Guest DRAM or scratchpad bytes at `vaddr`, as a JSON object. No MMIO.
- * 2 MiB RAM is mirrored across the first 8 MiB of each KSEG. */
+/* Guest DRAM or scratchpad bytes at `vaddr`, as a JSON object. No MMIO. */
 static int hb_append_ram_peek(char *out, int n, size_t cap, uint32_t vaddr, int len) {
     static const char hexd[] = "0123456789abcdef";
     uint32_t phys = vaddr & 0x1FFFFFFFu;
@@ -340,10 +339,10 @@ static int hb_append_ram_peek(char *out, int n, size_t cap, uint32_t vaddr, int 
                 ncopy = (int)(0x400u - off);
         }
     } else if (phys < 0x00800000u && g_psx_ram) {
-        uint32_t folded = phys & 0x1FFFFFu;
+        uint32_t folded = phys & PSX_MAIN_RAM_MASK;
         src = g_psx_ram + folded;
-        if (folded + (uint32_t)ncopy > 0x200000u)
-            ncopy = (int)(0x200000u - folded);
+        if (folded + (uint32_t)ncopy > PSX_MAIN_RAM_BYTES)
+            ncopy = (int)(PSX_MAIN_RAM_BYTES - folded);
     }
     if (!src) ncopy = 0;
     int m = snprintf(out + n, cap - (size_t)n,
@@ -369,7 +368,7 @@ static uint32_t hb_jal_target_from_ra(uint32_t ra) {
         uint8_t *sp = memory_get_scratchpad_ptr();
         if (sp) src = sp + (phys - 0x1F800000u);
     } else if (phys < 0x00800000u && g_psx_ram) {
-        src = g_psx_ram + (phys & 0x1FFFFFu);
+        src = g_psx_ram + (phys & PSX_MAIN_RAM_MASK);
     }
     if (!src) return 0;
     memcpy(&insn, src, 4);

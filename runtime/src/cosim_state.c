@@ -14,6 +14,7 @@
  */
 #include "cosim_state.h"
 #include "dirty_ram_interp.h"
+#include "psx_memory.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,7 +52,11 @@ extern uint64_t interrupts_cosim_hash(uint64_t seed);
 /* renderer-agnostic VRAM readback (sw renderer = cheap memcpy). */
 extern void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *dst);
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
+#if PSX_MAIN_RAM_BYTES == PSX_MAIN_RAM_EXPANDED_BYTES
+#error "8 MiB main RAM requires an expanded-memory cosim oracle"
+#endif
+
+#define RAM_SIZE   PSX_MAIN_RAM_BYTES
 #define SPAD_SIZE  (1024u)
 #define PAGE       4096u
 #define RAM_PAGES  (RAM_SIZE / PAGE)      /* 512 */

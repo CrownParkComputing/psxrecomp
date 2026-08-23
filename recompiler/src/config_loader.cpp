@@ -58,6 +58,9 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
     ConfigHash h;
     h.tag("psxrecomp-overlay-config-v1");
 
+    h.tag("main_ram_mib");
+    h.u32(c.runtime.main_ram_mib);
+
     h.words("sprite_tag_funcs", c.ws_sprite_tag_funcs);
     h.words("mod_function_entry_funcs", c.mod_function_entry_funcs);
     h.words("cull_bias", c.ws_cull_bias_sites);
@@ -355,6 +358,14 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         rt.debug_port = static_cast<uint16_t>(port);
         rt.has_debug_port = true;
+    }
+    if (runtime.contains("main_ram_mib")) {
+        const auto mib = toml::find<int64_t>(runtime, "main_ram_mib");
+        if (mib != 2 && mib != 8) {
+            throw std::runtime_error(fmt::format(
+                "[runtime] main_ram_mib must be 2 or 8, got {}", mib));
+        }
+        rt.main_ram_mib = static_cast<uint32_t>(mib);
     }
     if (runtime.contains("window_title")) {
         rt.window_title = toml::find<std::string>(runtime, "window_title");
@@ -2267,7 +2278,18 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("window_width")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "window_width");
-            if (n >= 640 && n <= 3840) { s.window_width = (int)n; s.has_window_width = true; }
+            if (n >= 640 && n <= 7680) { s.window_width = (int)n; s.has_window_width = true; }
+        });
+        if (v.contains("window_height")) try_get([&]{
+            const auto n = toml::find<int64_t>(v, "window_height");
+            if (n >= 480 && n <= 4320) { s.window_height = (int)n; s.has_window_height = true; }
+        });
+        if (v.contains("display_refresh_hz")) try_get([&]{
+            const auto n = toml::find<int64_t>(v, "display_refresh_hz");
+            if (n == 60 || n == 100) {
+                s.display_refresh_hz = (int)n;
+                s.has_display_refresh_hz = true;
+            }
         });
         if (v.contains("antialiasing")) try_get([&]{
             s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
@@ -2580,6 +2602,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "supersampling     = " << s.supersampling << "\n";
     if (s.has_window_width)
         f << "window_width      = " << s.window_width << "\n";
+    if (s.has_window_height)
+        f << "window_height     = " << s.window_height << "\n";
+    if (s.has_display_refresh_hz)
+        f << "display_refresh_hz = " << s.display_refresh_hz << "\n";
     if (s.has_antialiasing)
         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
     if (s.has_texture_filter)

@@ -40,6 +40,7 @@
 #include "cpu_state.h"
 #include "psx_bss.h"
 #include "crash_trace.h"
+#include "psx_memory.h"
 #include "autocompile.h"   /* autocompile_degraded_reason — stamp a degraded
                             * (interpreter-only) run into its own report */
 
@@ -58,8 +59,7 @@ static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ")";
 /* CPU state pointer (set by debug server at init). */
 extern CPUState *debug_cpu_ptr;
 
-/* Main RAM (2 MiB) and scratchpad — peeks in the crash report, no MMIO. */
-extern uint8_t *g_psx_ram;
+/* Main RAM and scratchpad — peeks in the crash report, no MMIO. */
 extern uint8_t *memory_get_scratchpad_ptr(void);
 
 /* Overlay loader snapshot (post-FMV splash miss vs resim load freeze). */
@@ -151,8 +151,8 @@ static void json_escape(const char *in, char *out, size_t outcap) {
     out[o] = 0;
 }
 
-/* Copy `len` guest bytes at `vaddr` into `dst`. DRAM (2 MiB, mirrored across
- * the first 8 MiB of each KSEG) or scratchpad only — never MMIO. Returns
+/* Copy `len` guest bytes at `vaddr` into `dst`. Active DRAM geometry or
+ * scratchpad only — never MMIO. Returns
  * bytes copied (0 if the address is not in those regions). */
 static int crash_peek_guest(uint32_t vaddr, uint8_t *dst, int len) {
     uint32_t phys = vaddr & 0x1FFFFFFFu;
@@ -166,8 +166,9 @@ static int crash_peek_guest(uint32_t vaddr, uint8_t *dst, int len) {
         return len;
     }
     if (phys < 0x00800000u && g_psx_ram) {
-        uint32_t folded = phys & 0x1FFFFFu;
-        if (folded + (uint32_t)len > 0x200000u) len = (int)(0x200000u - folded);
+        uint32_t folded = phys & PSX_MAIN_RAM_MASK;
+        if (folded + (uint32_t)len > PSX_MAIN_RAM_BYTES)
+            len = (int)(PSX_MAIN_RAM_BYTES - folded);
         if (len <= 0) return 0;
         memcpy(dst, g_psx_ram + folded, (size_t)len);
         return len;

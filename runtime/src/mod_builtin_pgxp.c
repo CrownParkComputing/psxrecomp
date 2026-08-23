@@ -5,8 +5,9 @@
  * the emulated GTE/GPU pair, not of any particular disc, so it ships here and
  * mods/builtin/packages/psx.enhancement.pgxp targets game_id "*". Default off
  * (the faithful floor, ENHANCEMENTS.md G1.9); enabling arms the value-
- * propagation engine (pgxp.cpp) with the user-validated defaults — tolerance
- * clamp 0.5px, cpu-mode per the mod option.
+ * propagation engine (pgxp.cpp) with reference-compatible safe defaults —
+ * tolerance and ambiguous vertex-cache fallback disabled, cpu-mode per the
+ * mod option.
  *
  * Coverage note: the engine reaches near-total dataflow coverage on a binary
  * compiled with the PGXP hook variant (-DPSX_PGXP=1, PSX_PGXP_VARIANT); on a

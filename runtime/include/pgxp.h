@@ -39,9 +39,23 @@ int  pgxp_cpu_mode(void);
 void  pgxp_set_tolerance(float pixels);
 float pgxp_tolerance(void);
 
+/* Screen-position fallback cache. Off by default, matching the reference:
+ * unlike address-keyed dataflow it cannot prove memory provenance and can
+ * otherwise apply old 3D precision to equal-valued 2D packet coordinates. */
+void pgxp_set_vertex_cache(int enabled);
+int  pgxp_vertex_cache(void);
+
 /* Drop all shadows (savestate load, raw RAM restore, timeline breaks).
  * O(1) via generation bump. Deferred while suppressed. */
 void pgxp_invalidate_all(void);
+
+/* Guest-memory write performed outside the tracked CPU store hook (DMA,
+ * MDEC, host loaders, etc.). Invalidates every shadow word touched by the
+ * byte range even when the replacement bytes are identical. This preserves
+ * provenance: equal packed coordinates can originate from different precise
+ * projections. The architectural writer must call this before any tracked
+ * CPU-store hook installs replacement provenance. */
+void pgxp_external_write(uint32_t addr, uint32_t size);
 
 /* Counted suppression bracket for speculative native-validation passes and
  * the GTE replay sandbox: hooks and producers no-op inside it. */
@@ -59,16 +73,16 @@ void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed);
  * Returns nonzero when the shadow is live and carries X/Y precision. */
 int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16);
 
-/* Guest write to a GTE data register outside gte_execute (MTC2/CTC2 handled
- * by psx_pgxp_cop2; this is for direct gte_write_data paths): reg 15 performs
- * the SXYP FIFO push on the shadows, others just invalidate/overwrite. */
+/* Guest write notification from gte_write_data. Raw SXYP notifications fail
+ * closed; the paired psx_pgxp_cop2 MTC2/LWC2 hook consumes the captured
+ * pre-write FIFO and installs the exact shift with transfer provenance. */
 void pgxp_gte_reg_written(int reg, uint32_t value);
 
 /* --- GPU consumer (gpu.c) ------------------------------------------------ */
 
 enum {
     PGXP_SRC_NATIVE   = 0,   /* no shadow — caller uses the parsed integers  */
-    PGXP_SRC_FALLBACK = 1,   /* position-cache fallback (never carries depth)*/
+    PGXP_SRC_FALLBACK = 1,   /* opt-in position cache (never carries depth)  */
     PGXP_SRC_DATAFLOW = 2,   /* address-keyed shadow, value-validated        */
 };
 
@@ -77,7 +91,7 @@ enum {
  *               unknown (immediate GP0 writes) — skips the dataflow tier.
  *   packet_word the actual word (validation key).
  *   int_x/int_y the natively parsed 11-bit positions (pre-draw-offset).
- * On DATAFLOW/FALLBACK, *x16/*y16 hold the sub-pixel position (16.16, same
+ * On DATAFLOW/FALLBACK, *x16 and *y16 hold the sub-pixel position (16.16, same
  * coordinate space as the packet halves); *sz is the projected depth or 0.
  * Safeguards applied here: the integer part must match the native parse
  * (truncation agreement) and the tolerance clamp. */
@@ -98,6 +112,9 @@ typedef struct PGXPStats {
     uint64_t w_valid;            /* lookups that also carried a usable depth */
     uint64_t produced;           /* RTPS/RTPT projections pushed into shadows */
     uint64_t swc2_stores;        /* GTE reg shadows copied to RAM shadows     */
+    uint64_t external_ranges;    /* untracked guest-memory write ranges       */
+    uint64_t external_words;     /* live shadow words killed by those ranges  */
+    uint64_t external_full;      /* oversized/wrapping ranges -> generation   */
 } PGXPStats;
 
 void pgxp_get_stats(PGXPStats *out);

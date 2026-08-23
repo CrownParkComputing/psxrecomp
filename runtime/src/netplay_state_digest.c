@@ -6,6 +6,7 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"
+#include "psx_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,12 @@ static uint32_t digest_module(uint32_t (*bytes_fn)(void), void (*write_fn)(uint8
     return crc32_compute(buf, n);
 }
 
-#define NP_RAM_SIZE (2u * 1024u * 1024u)
+#define NP_RAM_SIZE PSX_MAIN_RAM_BYTES
+
+#if PSX_MAIN_RAM_BYTES == PSX_MAIN_RAM_EXPANDED_BYTES && \
+    defined(PSX_HAS_RECOMP_NET)
+#error "8 MiB main RAM requires geometry-aware netplay negotiation"
+#endif
 
 uint32_t netplay_cdrom_digest(void)
 {

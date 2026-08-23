@@ -153,6 +153,12 @@ if(BUILD_TESTING)
     target_include_directories(pgxp_test PRIVATE include)
     add_test(NAME pgxp_test COMMAND pgxp_test)
 
+    add_executable(pgxp_expanded_test tests/test_pgxp.cpp src/pgxp.cpp)
+    target_include_directories(pgxp_expanded_test PRIVATE include)
+    target_compile_definitions(pgxp_expanded_test PRIVATE
+        PSX_MAIN_RAM_BYTES=0x00800000u)
+    add_test(NAME pgxp_expanded_test COMMAND pgxp_expanded_test)
+
     add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
     target_include_directories(psx_instr_cost_test PRIVATE include)
     add_test(NAME psx_instr_cost_test COMMAND psx_instr_cost_test)
@@ -177,6 +183,17 @@ if(BUILD_TESTING)
     target_include_directories(mod_gpu_dma_aperture_test PRIVATE include)
     add_test(NAME mod_gpu_dma_aperture_test
              COMMAND mod_gpu_dma_aperture_test)
+
+    foreach(_ram_geometry IN ITEMS retail expanded)
+        set(_ram_target psx_memory_geometry_${_ram_geometry}_test)
+        add_executable(${_ram_target} tests/test_psx_memory_geometry.c)
+        target_include_directories(${_ram_target} PRIVATE include)
+        if(_ram_geometry STREQUAL "expanded")
+            target_compile_definitions(${_ram_target} PRIVATE
+                PSX_MAIN_RAM_BYTES=0x00800000u)
+        endif()
+        add_test(NAME ${_ram_target} COMMAND ${_ram_target})
+    endforeach()
 
     # Clean-room SPU DSP fidelity (issue #103): SPU IRQ on every RAM access
     # class, reverb (write gating + work-area wrap + CD-only path), noise

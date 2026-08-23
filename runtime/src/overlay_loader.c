@@ -1,4 +1,5 @@
 #include "overlay_loader.h"
+#include "psx_memory.h"
 #include "overlay_api.h"
 #include "overlay_path_canon.h"
 #include "code_provider.h"
@@ -116,7 +117,7 @@ static int       s_cand_n = 0;
  * scales catastrophically once a warmed cache contains hundreds of variant
  * DLLs. Index candidates by the 4 KiB RAM pages touched by their code ranges;
  * a continuation then examines only candidates that could contain its PC. */
-#define RANGE_PAGE_COUNT (2u * 1024u * 1024u / 4096u)
+#define RANGE_PAGE_COUNT (PSX_MAIN_RAM_BYTES / 4096u)
 #define RANGE_LINK_CAP   (CAND_CAP * 8)
 typedef struct { int cand, next; } RangeLink;
 static int       s_range_page_head[RANGE_PAGE_COUNT];
@@ -182,7 +183,7 @@ static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
 static void exact_entry_set(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    if (phys < PSX_MAIN_RAM_BYTES && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
     }
@@ -190,7 +191,7 @@ static void exact_entry_set(uint32_t phys) {
 
 static int exact_entry_has(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
+    if (phys >= PSX_MAIN_RAM_BYTES || (phys & 3u) != 0u) return 0;
     uint32_t word = phys >> 2;
     return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
 }
@@ -585,8 +586,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0u || lo >= 2u * 1024u * 1024u ||
-            len > 2u * 1024u * 1024u - lo) {
+        if (len == 0u || lo >= PSX_MAIN_RAM_BYTES ||
+            len > PSX_MAIN_RAM_BYTES - lo) {
             s_static_match_crc_misses++;
             return 0;
         }
@@ -662,7 +663,7 @@ typedef struct {
     int      n;
 } ManFn;
 
-#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
+#define OVERLAY_RAM_SIZE PSX_MAIN_RAM_BYTES
 #define MANIFEST_LINE_MAX 128u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
 #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
@@ -895,7 +896,7 @@ static int mips_control_kind(uint32_t instr) {
 static int ranges_contain_word(const uint32_t *lo_list,
                                const uint32_t *len_list, int n,
                                uint32_t phys) {
-    if ((phys & 3u) != 0u || phys > (2u * 1024u * 1024u) - 4u) return 0;
+    if ((phys & 3u) != 0u || phys > PSX_MAIN_RAM_BYTES - 4u) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
         uint32_t len = len_list[r];
@@ -911,7 +912,7 @@ static int ranges_contain_word(const uint32_t *lo_list,
 static int ranges_delay_slots_hashed(const uint32_t *lo_list,
                                      const uint32_t *len_list, int n) {
     const uint8_t *ram = memory_get_ram_ptr();
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
     if (!ram || n < 1 || n > MAX_CODE_RANGES) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
@@ -4004,7 +4005,7 @@ int overlay_fp_enabled(void) {
  * so the comparison isolates COMPUTATION (and is longjmp-safe). A divergence
  * here = a real codegen bug (function + exact register/RAM). Zero divergence =
  * computation is correct and the fault is timing/interrupt-ordering. */
-#define SHADOW_RAM_SIZE  (2u * 1024u * 1024u)
+#define SHADOW_RAM_SIZE  PSX_MAIN_RAM_BYTES
 #define SHADOW_SPAD_SIZE 1024u
 static uint8_t  s_ram0[SHADOW_RAM_SIZE], s_ramN[SHADOW_RAM_SIZE], s_ramI[SHADOW_RAM_SIZE];
 static uint8_t  s_spad0[SHADOW_SPAD_SIZE], s_spadI[SHADOW_SPAD_SIZE];

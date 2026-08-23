@@ -3,6 +3,7 @@
 #include "dirty_ram_interp.h"
 #include "code_provider.h"
 #include "crc32.h"
+#include "psx_memory.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -355,11 +356,11 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
              * boot/overlay capture-window boundary is required: those windows
              * stabilize region keys, but they are not MIPS execution barriers.
              * Adjacent dirty pages were already folded into this run. */
-            const uint32_t ram_size = 2u * 1024u * 1024u;
+            const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
             if (phys <= ram_size && size <= ram_size - phys &&
                 phys + size <= ram_size - 4u)
                 size += 4u;
-            uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
+            uint32_t virt = 0x80000000u | (phys & PSX_MAIN_RAM_MASK);
             in_run = 0;
 
             /* Seeds: only per-PC interpreter hits — execution-verified. */
@@ -789,7 +790,7 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
                                    uint32_t scope_lo, uint32_t scope_hi,
                                    int include_halo)
 {
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
     memset(bitmap, 0, (size_t)bw * sizeof(uint32_t));
     if (scope_hi > ram_size) scope_hi = ram_size;
     if (scope_lo >= scope_hi) return;
@@ -843,16 +844,16 @@ void overlay_capture_write_json(void)
      * can otherwise merge them into a giant region that changes every run.
      * Final/manual captures use the same executed-page scope as autocapture. */
     (void)overlay_capture_write_current("shutdown-or-manual",
-                                        0, 2u * 1024u * 1024u, 0);
+                                        0, PSX_MAIN_RAM_BYTES, 0);
 }
 
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
 {
     if (!s_enabled || !s_active || size == 0) return;
-    uint32_t lo = load_addr & 0x1FFFFFu;
+    uint32_t lo = load_addr & PSX_MAIN_RAM_MASK;
     uint32_t hi = lo + size;
-    if (lo >= 2u * 1024u * 1024u) return;
-    if (hi > 2u * 1024u * 1024u || hi < lo) hi = 2u * 1024u * 1024u;
+    if (lo >= PSX_MAIN_RAM_BYTES) return;
+    if (hi > PSX_MAIN_RAM_BYTES || hi < lo) hi = PSX_MAIN_RAM_BYTES;
 
     /* Snapshot complete pages touched by this DMA. Page scope prevents sticky
      * dirty runs from turning a small sector replacement into a multi-megabyte
@@ -1179,7 +1180,7 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
                                                 int scoped)
 {
     extern uint8_t *memory_get_ram_ptr(void);
-    const size_t ram_size = 2u * 1024u * 1024u;
+    const size_t ram_size = PSX_MAIN_RAM_BYTES;
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     AutocapWriteJob *job = (AutocapWriteJob *)calloc(1, sizeof(*job));
     if (!job) return NULL;
@@ -1217,7 +1218,7 @@ static int autocap_write_start(void)
      * RAM. Evidence-scoping keeps the background manifest proportional to live
      * coverage and avoids multi-megabyte rewrites every cooldown. */
     AutocapWriteJob *job = capture_snapshot_create(
-        0, 2u * 1024u * 1024u, 1);
+        0, PSX_MAIN_RAM_BYTES, 1);
     if (!job) return 0;
     if (!autocap_write_launch(job)) {
         s_autocap_write_job = NULL;

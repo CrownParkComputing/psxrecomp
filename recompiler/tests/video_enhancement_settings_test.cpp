@@ -123,6 +123,9 @@ static void test_user_settings_read() {
         "[video]\n"
         "geometry_correction = true\n"
         "perspective_texturing = false\n"
+        "window_width = 3840\n"
+        "window_height = 2160\n"
+        "display_refresh_hz = 100\n"
         "[audio]\n"
         "frequency = 48000\n");
     auto us = PSXRecompV4::load_user_settings(p);
@@ -133,6 +136,12 @@ static void test_user_settings_read() {
           "settings.toml perspective_texturing = false read (explicit off)");
     check(us.has_audio_freq && us.audio_freq == 48000,
           "settings.toml audio frequency read");
+    check(us.has_window_width && us.window_width == 3840,
+          "settings.toml output width read");
+    check(us.has_window_height && us.window_height == 2160,
+          "settings.toml output height read");
+    check(us.has_display_refresh_hz && us.display_refresh_hz == 100,
+          "settings.toml display refresh read");
     fs::remove(p);
 }
 
@@ -155,6 +164,9 @@ static void test_user_settings_round_trip() {
     out.geometry_correction = true;   out.has_geometry_correction = true;
     out.perspective_texturing = true; out.has_perspective_texturing = true;
     out.audio_freq = 48000;           out.has_audio_freq = true;
+    out.window_width = 7680;          out.has_window_width = true;
+    out.window_height = 4320;         out.has_window_height = true;
+    out.display_refresh_hz = 60;      out.has_display_refresh_hz = true;
 
     fs::path p = fs::temp_directory_path() / "psxrecomp_pgxp_roundtrip.toml";
     check(PSXRecompV4::save_user_settings(p, out), "save_user_settings writes");
@@ -167,6 +179,12 @@ static void test_user_settings_round_trip() {
           "perspective_texturing survives a save/load round trip");
     check(back.has_audio_freq && back.audio_freq == 48000,
           "audio frequency survives a save/load round trip");
+    check(back.has_window_width && back.window_width == 7680,
+          "8K output width survives a save/load round trip");
+    check(back.has_window_height && back.window_height == 4320,
+          "8K output height survives a save/load round trip");
+    check(back.has_display_refresh_hz && back.display_refresh_hz == 60,
+          "display refresh survives a save/load round trip");
     fs::remove(p);
 }
 

@@ -611,7 +611,7 @@ bool FullFunctionEmitter::emit_function(
             addr_to_raw.begin(), addr_to_raw.end(),
             [](const auto& insn) {
                 return (bios_runtime_pc(insn.first) & 0x1FFFFFFFu) <
-                       (2u * 1024u * 1024u);
+                       (8u * 1024u * 1024u);
             });
         if (!ram_backed) {
             throw std::runtime_error(fmt::format(

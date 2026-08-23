@@ -6,6 +6,7 @@
 
 #include "pgxp.h"
 #include "pgxp_hooks.h"
+#include "psx_memory.h"
 
 #include <cstdio>
 #include <cstring>
@@ -73,10 +74,16 @@ static const uint16_t SZ3     = 100;
 
 static const uint32_t ADDR_A  = 0x80100000u;   /* packet slot A (KSEG0)  */
 static const uint32_t ADDR_B  = 0x00100040u;   /* packet slot B (KUSEG)  */
+static const uint32_t ADDR_C  = 0x00100044u;   /* adjacent packet word    */
+
+static void produce_custom(uint32_t addr, uint32_t packed,
+                           int32_t x16, int32_t y16, uint16_t z) {
+    pgxp_gte_push_sxy(x16, y16, z, packed);
+    psx_pgxp_cop2(nullptr, SWC2(14), packed, addr);
+}
 
 static void produce_at(uint32_t addr) {
-    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED);
-    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, addr);
+    produce_custom(addr, PACKED, X16, Y16, SZ3);
 }
 
 static int lookup(uint32_t addr, uint32_t word, int32_t ix, int32_t iy,
@@ -91,8 +98,46 @@ static int lookup(uint32_t addr, uint32_t word, int32_t ix, int32_t iy,
 
 int main(void) {
     pgxp_set_enabled(1);
+    CHECK(pgxp_tolerance() < 0.0f);
+    CHECK(!pgxp_vertex_cache());
     pgxp_set_tolerance(-1.0f);
     pgxp_set_cpu_mode(0);
+
+    /* --- negative screen coordinates: fixed conversion is UB-free -------- */
+    {
+        const uint32_t packed = ((uint32_t)(uint16_t)-80 << 16) |
+                                (uint16_t)-160;
+        const int32_t x16 = -160 * 65536 + 0x8000; /* -159.5, floor = -160 */
+        const int32_t y16 = -80 * 65536 + 0x4000;  /* -79.75, floor = -80 */
+        int32_t x, y; uint16_t z;
+        produce_custom(ADDR_A, packed, x16, y16, SZ3);
+        pgxp_set_tolerance(0.25f);
+        CHECK(lookup(ADDR_A, packed, -160, -80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+        CHECK(x == -160 * 65536 && y == -80 * 65536 && z == 0);
+        pgxp_set_tolerance(0.75f);
+        CHECK(lookup(ADDR_A, packed, -160, -80, &x, &y, &z) ==
+              PGXP_SRC_DATAFLOW);
+        CHECK(x == x16 && y == y16 && z == SZ3);
+        pgxp_set_tolerance(-1.0f);
+    }
+
+    /* A precise coordinate below its packet integer produces a negative
+     * delta. It must hit the tolerance gate symmetrically, before the later
+     * structural truncation safeguard. */
+    {
+        PGXPStats before, after;
+        const int32_t below_x16 = 159 * 65536 + 0x8000; /* 159.5 vs 160 */
+        produce_custom(ADDR_A, PACKED, below_x16, Y16, SZ3);
+        pgxp_set_tolerance(0.25f);
+        pgxp_get_stats(&before);
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+              PGXP_SRC_NATIVE);
+        pgxp_get_stats(&after);
+        CHECK(after.tolerance_reject == before.tolerance_reject + 1);
+        CHECK(after.trunc_reject == before.trunc_reject);
+        pgxp_set_tolerance(-1.0f);
+    }
 
     /* --- SWC2 produce -> GPU consume (the perspective-texturing spine) --- */
     produce_at(ADDR_A);
@@ -140,6 +185,56 @@ int main(void) {
         psx_pgxp_store(nullptr, SW(1, 8), dst, PACKED);
         CHECK(lookup(dst, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
               PGXP_SRC_NATIVE);
+    }
+
+    /* --- external same-value writes invalidate by provenance, not value --- */
+    {
+        int32_t x, y; uint16_t z;
+        produce_at(ADDR_A);
+        produce_at(ADDR_C);
+        pgxp_external_write(ADDR_A + 1u, 1u);
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+        CHECK(lookup(ADDR_C, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_DATAFLOW);
+
+        /* KSEG aliases invalidate the canonical shadow slot too. */
+        produce_at(ADDR_A);
+        pgxp_external_write(0x00100000u, 4u);
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+
+        /* Speculative/rollback writes are deliberately suppressed. */
+        produce_at(ADDR_A);
+        pgxp_suppress_begin();
+        pgxp_external_write(ADDR_A, 4u);
+        pgxp_suppress_end();
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_DATAFLOW);
+    }
+
+    /* --- target RAM geometry controls provenance aliasing ---------------- */
+    {
+        const uint32_t low = 0x00000000u;
+        const uint32_t high = 0x00600000u;
+        int32_t x, y; uint16_t z;
+        pgxp_invalidate_all();
+        produce_at(high);
+#if PSX_MAIN_RAM_BYTES == PSX_MAIN_RAM_EXPANDED_BYTES
+        CHECK(lookup(high, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_DATAFLOW);
+        CHECK(lookup(low, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+        pgxp_external_write(high, 4u);
+        CHECK(lookup(high, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+#else
+        CHECK(lookup(low, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_DATAFLOW);
+        pgxp_external_write(low, 4u);
+        CHECK(lookup(high, PACKED, 160, 80, &x, &y, &z) ==
+              PGXP_SRC_NATIVE);
+#endif
     }
 
     /* --- destructive ALU alias: equal integer result still replaces shadow --- */
@@ -255,14 +350,18 @@ int main(void) {
           PGXP_SRC_DATAFLOW);
     pgxp_set_tolerance(-1.0f);
 
-    /* --- fallback tier: no address -> position cache, never a depth --- */
+    /* --- fallback cache: explicit opt-in, never carries depth ------------ */
     g_fb_valid = 1; g_fb_packed = PACKED; g_fb_x16 = X16; g_fb_y16 = Y16;
+    CHECK(lookup(0xFFFFFFFFu, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+          PGXP_SRC_NATIVE);
+    pgxp_set_vertex_cache(1);
     {
         int32_t x, y; uint16_t z;
         CHECK(lookup(0xFFFFFFFFu, PACKED, 160, 80, &x, &y, &z) ==
               PGXP_SRC_FALLBACK);
         CHECK(x == X16 && y == Y16 && z == 0);
     }
+    pgxp_set_vertex_cache(0);
     g_fb_valid = 0;
 
     /* --- suppression bracket: nothing records inside it --- */
@@ -301,6 +400,86 @@ int main(void) {
         CHECK(!valid);
     }
 
+    /* --- guest SXYP writes never leave stale FIFO precision -------------- */
+    {
+        const uint32_t old0 = (10u << 16) | 1u;
+        const uint32_t old1 = (20u << 16) | 2u;
+        const uint32_t old2 = (30u << 16) | 3u;
+        pgxp_test_seed_gte_sxy(0, old0, 1 * 65536, 10 * 65536, 10, 1);
+        pgxp_test_seed_gte_sxy(1, old1, 2 * 65536, 20 * 65536, 20, 1);
+        pgxp_test_seed_gte_sxy(2, old2, 3 * 65536, 30 * 65536, 30, 1);
+        pgxp_test_seed_gte_sxy(3, old2, 3 * 65536, 30 * 65536, 30, 1);
+        pgxp_gte_reg_written(15, PACKED);
+        for (uint32_t i = 0; i < 4; ++i) {
+            uint8_t valid = 1;
+            pgxp_test_get_gte_sxy(i, nullptr, nullptr, nullptr, nullptr,
+                                  &valid);
+            CHECK(!valid);
+        }
+
+        /* The COP2 hook has the instruction context needed to consume the
+         * pre-write snapshot and perform the exact hardware FIFO shift. */
+        produce_at(ADDR_A);
+        psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+        pgxp_test_seed_gte_sxy(0, old0, 1 * 65536, 10 * 65536, 10, 1);
+        pgxp_test_seed_gte_sxy(1, old1, 2 * 65536, 20 * 65536, 20, 1);
+        pgxp_test_seed_gte_sxy(2, old2, 3 * 65536, 30 * 65536, 30, 1);
+        pgxp_test_seed_gte_sxy(3, old2, 3 * 65536, 30 * 65536, 30, 1);
+        pgxp_gte_reg_written(14, PACKED);
+        pgxp_gte_reg_written(15, PACKED);
+        psx_pgxp_cop2(nullptr, MTC2(8, 15), PACKED, 0);
+        {
+            uint32_t packed; int32_t x, y; uint16_t z; uint8_t valid;
+            pgxp_test_get_gte_sxy(0, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == old1 && x == 2 * 65536 &&
+                  y == 20 * 65536 && z == 20);
+            pgxp_test_get_gte_sxy(1, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == old2 && x == 3 * 65536 &&
+                  y == 30 * 65536 && z == 30);
+        }
+        for (uint32_t i = 2; i < 4; ++i) {
+            uint32_t packed; int32_t x, y; uint16_t z; uint8_t valid;
+            pgxp_test_get_gte_sxy(i, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == PACKED && x == X16 && y == Y16 &&
+                  z == SZ3);
+        }
+
+        /* Direct SXY2 writes keep SXY0/SXY1 and mirror new provenance into
+         * SXYP (gte_write_data reports 14+15 for this path too). */
+        pgxp_gte_reg_written(14, PACKED);
+        pgxp_gte_reg_written(15, PACKED);
+        psx_pgxp_cop2(nullptr, MTC2(8, 14), PACKED, 0);
+        {
+            uint32_t packed; int32_t x, y; uint16_t z; uint8_t valid;
+            pgxp_test_get_gte_sxy(0, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == old1 && x == 2 * 65536 &&
+                  y == 20 * 65536 && z == 20);
+            pgxp_test_get_gte_sxy(1, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == old2 && x == 3 * 65536 &&
+                  y == 30 * 65536 && z == 30);
+        }
+        for (uint32_t i = 2; i < 4; ++i) {
+            uint32_t packed; int32_t x, y; uint16_t z; uint8_t valid;
+            pgxp_test_get_gte_sxy(i, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == PACKED && x == X16 && y == Y16 &&
+                  z == SZ3);
+        }
+
+        /* LWC2 to SXYP consumes the same exact FIFO snapshot contract. */
+        pgxp_gte_reg_written(14, PACKED);
+        pgxp_gte_reg_written(15, PACKED);
+        psx_pgxp_cop2(nullptr, LWC2(15), PACKED, ADDR_A);
+        {
+            uint32_t packed; int32_t x, y; uint16_t z; uint8_t valid;
+            pgxp_test_get_gte_sxy(0, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == old2 && x == 3 * 65536 &&
+                  y == 30 * 65536 && z == 30);
+            pgxp_test_get_gte_sxy(1, &packed, &x, &y, &z, &valid);
+            CHECK(valid && packed == PACKED && x == X16 && y == Y16 &&
+                  z == SZ3);
+        }
+    }
+
     /* --- stats sanity: dataflow hits were counted --- */
     {
         PGXPStats st;
@@ -310,6 +489,8 @@ int main(void) {
         CHECK(st.native > 0);
         CHECK(st.fallback_hit > 0);
         CHECK(st.value_mismatch > 0);
+        CHECK(st.external_ranges >= 2);
+        CHECK(st.external_words >= 2);
     }
 
     if (g_failures) {

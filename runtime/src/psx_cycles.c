@@ -250,10 +250,6 @@ uint64_t g_plp_svc_calls        = 0;
 static uint64_t s_next_watchdog        = 0;
 static uint64_t s_next_pc_sample       = 0;
 
-/* Absolute inclusive limit for dirty_ram_interp.c's exact one-cycle path.
- * Zero means that the next charge must visit psx_advance_cycles(). */
-uint64_t g_psx_cycle_fast_limit = 0;
-
 /* Distance to the nearest INTERNAL device event, mask-blind (i_mask =
  * all-unmasked). This is the chunking bound for catch-up: the sio/cdrom/dma
  * *_advance() functions fire at most ONE event boundary per call (their
@@ -297,7 +293,6 @@ static void psx_devices_recompute_deadline(void) {
 void psx_devices_service_to_now(void) {
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
     if (g_plp_cycle_diag) g_plp_svc_calls++;
-    g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
     uint64_t target = psx_cycle_count;
     if (s_devices_synced_cycle < target) {
@@ -903,7 +898,6 @@ void psx_cycles_reset_for_boot(void) {
     s_device_service_epoch = 0;
     s_next_service_cycle   = 0;
     s_in_device_service    = 0;
-    g_psx_cycle_fast_limit = 0;
     s_next_watchdog        = 0;
     s_next_pc_sample       = 0;
     psx_watchdog_throttle  = 0;

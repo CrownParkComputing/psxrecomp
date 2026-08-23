@@ -275,12 +275,14 @@ def main():
         raise AssertionError("ABI preflight can execute a legacy Windows DllMain")
 
     interp_step = body(interp, "interp_cyc_step")
-    if "g_psx_cycle_fast_limit" not in interp_step or "next <= g_psx_cycle_fast_limit" not in interp_step:
-        raise AssertionError("interpreter lost its exact pre-deadline one-cycle fast path")
-    if "g_ls_replay_active" not in interp_step or "g_event_step_conservative" not in interp_step:
-        raise AssertionError("interpreter cycle fast path does not guard exact diagnostic modes")
-    if "g_psx_cycle_fast_limit" in cyc_header:
-        raise AssertionError("runtime cycle fast path leaked into the overlay-DLL shared header")
+    if "psx_advance_cycles(1u)" not in interp_step:
+        raise AssertionError("interpreter no longer retires through the overclock-aware clock path")
+    if "psx_cycle_count += 1" in interp_step:
+        raise AssertionError("interpreter bypasses CPU-retirement scaling with a raw device-clock increment")
+    if "g_ls_replay_active" not in interp_step:
+        raise AssertionError("interpreter cycle path does not preserve diagnostic replay isolation")
+    if "g_psx_cycle_fast_limit" in interp or "g_psx_cycle_fast_limit" in cycles:
+        raise AssertionError("dead pre-overclock direct-clock fast-limit machinery remains")
     if "PSX_NO_DEBUG_TOOLS" not in starvation or "STARVATION_RING_ENABLED 0" not in starvation:
         raise AssertionError("production still enables the diagnostic starvation ring")
     dep_mask = body(instr_cost, "psx_cyc_dep_res_mask")
@@ -301,31 +303,25 @@ def main():
                          "gte_mfc2(&gte", "gte_cfc2(&gte"):
         if old_selector in gte_marshaling:
             raise AssertionError("GTE command bridge regressed to selector dispatch loops")
-    for fn in ("psx_devices_mmio_sync", "psx_advance_cycles_exact", "psx_cycles_resync_after_restore"):
-        if "g_psx_cycle_fast_limit = 0" not in body(cycles, fn):
-            raise AssertionError(f"{fn} does not invalidate the inline cycle limit")
     mmio_sync = body(cycles, "psx_devices_mmio_sync")
-    if not (mmio_sync.find("psx_devices_service_to_now()") <
-            mmio_sync.find("s_next_service_cycle = 0") <
-            mmio_sync.find("g_psx_cycle_fast_limit = 0")):
-        raise AssertionError("MMIO catch-up can republish a stale inline cycle limit")
+    flush = mmio_sync.find("psx_cyc_batch_flush()")
+    service = mmio_sync.find("psx_devices_service_to_now()")
+    recompute = mmio_sync.find("psx_devices_recompute_deadline()")
+    if min(flush, service, recompute) < 0 or not flush < service < recompute:
+        raise AssertionError("MMIO synchronization does not publish CPU work before device catch-up")
     service = body(cycles, "psx_devices_service_to_now")
-    if not (service.find("g_psx_cycle_fast_limit = 0") <
-            service.find("s_in_device_service = 1") <
+    if not (service.find("s_in_device_service = 1") <
             service.find("psx_devices_recompute_deadline()") <
-            service.find("s_in_device_service = 0")):
-        raise AssertionError("device-service reentrancy can observe a nonzero inline cycle limit")
+            service.find("psx_in_device_service = 0")):
+        raise AssertionError("device-service deadline publication escapes its reentrancy guard")
     load_charge = body(memory, "psx_load_charge_cycles")
-    if "next <= g_psx_cycle_fast_limit" not in load_charge or "psx_advance_cycles(cycles)" not in load_charge:
-        raise AssertionError("runtime load timing lost its exact deadline fast/fallback paths")
-    for guard in ("g_ls_replay_active", "g_event_step_conservative", "next >= psx_cycle_count"):
-        if guard not in load_charge:
-            raise AssertionError(f"runtime load timing lost guard: {guard}")
+    if "psx_advance_cycles(cycles)" not in load_charge or "g_ls_replay_active" not in load_charge:
+        raise AssertionError("runtime load timing bypasses the overclock-aware retirement clock")
     if "!defined(PSX_COSIM) && !STARVATION_RING_ENABLED" not in memory:
         raise AssertionError("runtime load fast path leaks into COSIM/diagnostic builds")
     load_timing = body(memory, "psx_cyc_load_timing")
-    if "psx_load_charge_cycles(1u)" not in load_timing or "psx_cyc_base(cpu)" in load_timing:
-        raise AssertionError("runtime loads still use the out-of-line one-cycle base charge")
+    if "psx_cyc_base(cpu)" not in load_timing:
+        raise AssertionError("runtime loads no longer share the exact CPU-retirement base step")
     ram_fast = body(memory, "psx_cyc_main_ram_fast_addr")
     for guard in ("g_ls_mode != 0", "g_ls_replay_active", "g_ds_recording",
                   "g_ram_read_watch_active",
@@ -333,8 +329,14 @@ def main():
                   "phys >= 0x00800000u", "RAM_SIZE - width"):
         if guard not in ram_fast:
             raise AssertionError(f"main-RAM value fast path lost guard: {guard}")
-    for fn in ("psx_cyc_load_word", "psx_cyc_load_half", "psx_cyc_load_byte",
-               "psx_cyc_lwc2_read"):
+    for fn in ("psx_cyc_load_word", "psx_cyc_load_half"):
+        load_body = body(cyc_header, fn)
+        timing = load_body.find("psx_cyc_base(cpu)")
+        fast = load_body.find("memcpy(&value, g_psx_ram")
+        fallback = load_body.find(f"{fn}_slow")
+        if min(timing, fast, fallback) < 0 or not timing < fast < fallback:
+            raise AssertionError(f"{fn} does not order timing, inline RAM value, slow fallback")
+    for fn in ("psx_cyc_load_byte", "psx_cyc_lwc2_read"):
         load_body = body(memory, fn)
         timing = load_body.find("psx_cyc_")
         fast = load_body.find("psx_cyc_main_ram_fast_addr")

@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "pgxp.h"
 #include "mod_memory.h"
+#include "psx_memory.h"
 #include "gpu_primitive_reject.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_vram_dirty.h"
@@ -1701,7 +1702,7 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
  * start (the first character of a frame would be suppressed forever). */
 void psx_ws_sprite_tag(CPUState* cpu) {
     if (!ws_engaged() || !ws_anchor_addr) return;
-    uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
+    uint32_t key = cpu->gpr[4] & PSX_MAIN_RAM_WORD_MASK;
     if (!key) return;
     uint32_t sxy = cpu->read_word(ws_anchor_addr);
     int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
@@ -1727,7 +1728,7 @@ static int ws_tagged_anchor(int32_t *out_ax) {
     if (!ws_active() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
     uint32_t now = (uint32_t)s_frame_count;
     for (int variant = 0; variant < 2; variant++) {
-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
+        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & PSX_MAIN_RAM_WORD_MASK;
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
@@ -1864,7 +1865,7 @@ int psx_ws_prim_is_tagged(void) {
     if (!ws_engaged() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
     uint32_t now = (uint32_t)s_frame_count;
     for (int variant = 0; variant < 2; variant++) {
-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
+        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & PSX_MAIN_RAM_WORD_MASK;
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
@@ -1952,7 +1953,7 @@ static int ws_auto_ui_anchor(int32_t *out_anchor) {
     if (!ws_auto_ui_squash || !ws_active() ||
         gp0_cmd_source_addr == 0xFFFFFFFFu)
         return 0;
-    uint32_t src = gp0_cmd_source_addr & 0x1FFFFCu;
+    uint32_t src = gp0_cmd_source_addr & PSX_MAIN_RAM_WORD_MASK;
     for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
         if (ws_ui_prepass[i].src_addr != src) continue;
         if (out_anchor) *out_anchor = ws_ui_prepass[i].group.anchor;
@@ -3254,7 +3255,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     int indices[3] = { i0, i1, i2 };
     uint16_t z[3];
     for (int i = 0; i < 3; i++) {
-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
+        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & PSX_MAIN_RAM_WORD_MASK;
         if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
             z[i] == 0)
             return;
@@ -4290,8 +4291,9 @@ static void gp0_exec_cpu_to_vram(void) {
             a0_history[slot].s2_val = debug_cpu_ptr->gpr[18]; /* $s2 = source ptr */
             a0_history[slot].a0_val = debug_cpu_ptr->gpr[4];  /* $a0 */
             a0_history[slot].a1_val = debug_cpu_ptr->gpr[5];  /* $a1 */
-            uint32_t sp_phys = sp & 0x1FFFFFu;
-            for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= 0x200000u; si++)
+            uint32_t sp_phys = sp & PSX_MAIN_RAM_MASK;
+            for (int si = 0; si < 10 &&
+                 sp_phys + (uint32_t)(si + 1) * 4u <= PSX_MAIN_RAM_BYTES; si++)
                 a0_history[slot].stack[si] = psx_read_word(sp + si * 4);
         }
         a0_capture_slot = slot;
@@ -4509,7 +4511,7 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
     item->group.x = min_x - X;
     item->group.width = width;
     item->group.anchor = 0;
-    item->src_addr = source_addr & 0x1FFFFCu;
+    item->src_addr = source_addr & PSX_MAIN_RAM_WORD_MASK;
     item->ot_rank = rank;
 }
 
@@ -4639,7 +4641,7 @@ static void gp0_capture_builder_chain(uint32_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = 0;
     uint8_t *ram = memory_get_ram_ptr();
     if (!ram) return;
-    const uint32_t RMASK = 0x001FFFFFu;             /* 2 MB, mirror-folded */
+    const uint32_t RMASK = PSX_MAIN_RAM_MASK;
     uint32_t rawsp = debug_guest_sp();
     g_gp0_last_copy_sp = rawsp;
     if ((rawsp & 0x1FFFFFFFu) >= 0x00800000u) return; /* not in RAM/mirror */

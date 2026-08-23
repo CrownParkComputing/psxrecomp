@@ -235,12 +235,14 @@ static int psxrecomp_main(int argc, char** argv) {
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
     uint32_t              configured_text_size = 0;
+    uint32_t              main_ram_mib = 2;
     std::filesystem::path bios_profile_path;   // [recompiler] bios_config
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
         exe_path             = cfg.exe_path;
         configured_text_size = cfg.text_size;
+        main_ram_mib         = cfg.runtime.main_ram_mib;
         reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
@@ -355,6 +357,13 @@ static int psxrecomp_main(int argc, char** argv) {
     // sites (same TOML) — std::set insert dedupes.
     if (!ws_config_path.empty()) {
         const auto wscfg = PSXRecompV4::load_game_config(ws_config_path);
+        if (!config_path.empty() && main_ram_mib != wscfg.runtime.main_ram_mib) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: --config and --ws-config disagree on "
+                "[runtime].main_ram_mib\n");
+            return 1;
+        }
+        main_ram_mib = wscfg.runtime.main_ram_mib;
         ws_tag_funcs.insert(wscfg.ws_sprite_tag_funcs.begin(), wscfg.ws_sprite_tag_funcs.end());
         mod_entry_funcs.insert(wscfg.mod_function_entry_funcs.begin(),
                                wscfg.mod_function_entry_funcs.end());
@@ -1523,11 +1532,12 @@ static int psxrecomp_main(int argc, char** argv) {
         // Direct physical-PC index. Each populated 4 KiB page owns 1024
         // instruction-word slots containing dispatch-table index + 1 (zero is
         // a miss). WipEout SE has 23,336 entries on 172 pages, so this removes
-        // the per-dispatch binary search without paying for a dense 2 MiB map.
+        // the per-dispatch binary search without paying for a dense RAM map.
         // Segment aliases naturally share one physical slot.
-        constexpr uint32_t kDispatchRamSize = 2u * 1024u * 1024u;
+        const uint32_t kDispatchRamSize =
+            main_ram_mib * 1024u * 1024u;
         constexpr uint32_t kDispatchPageShift = 12u;
-        constexpr uint32_t kDispatchPageCount =
+        const uint32_t kDispatchPageCount =
             kDispatchRamSize >> kDispatchPageShift;
         constexpr uint32_t kDispatchSlotsPerPage =
             (1u << kDispatchPageShift) / 4u;
@@ -1537,8 +1547,8 @@ static int psxrecomp_main(int argc, char** argv) {
             if (phys >= kDispatchRamSize || (phys & 3u) != 0u) {
                 fmt::print(stderr,
                            "FATAL: dispatch entry 0x{:08X} is outside aligned "
-                           "2 MiB main RAM\n",
-                           records[i].addr);
+                           "{} MiB main RAM\n",
+                           records[i].addr, main_ram_mib);
                 return 1;
             }
             const uint32_t page = phys >> kDispatchPageShift;

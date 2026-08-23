@@ -15,11 +15,12 @@
  */
 
 #include "dirty_ram_interp.h"
+#include "psx_memory.h"
 
 #include <stdint.h>
 #include <string.h>
 
-#define TEXT_RAM_SIZE       (2u * 1024u * 1024u)
+#define TEXT_RAM_SIZE       PSX_MAIN_RAM_BYTES
 #define TEXT_PAGE_SHIFT     12u
 #define TEXT_PAGE_COUNT     (TEXT_RAM_SIZE >> TEXT_PAGE_SHIFT)
 #define TEXT_BITMAP_WORDS   ((TEXT_PAGE_COUNT + 31u) / 32u)

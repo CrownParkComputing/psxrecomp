@@ -795,6 +795,7 @@ function(psxrecomp_add_runtime_target target)
         EXE_NAME
         GAME_VERSION
         MAX_PLAYERS
+        MAIN_RAM_MIB
         APP_ICON
     )
     # GAME_GENERATED_FULL_C is a list (not a single value): the split-TU build
@@ -813,6 +814,18 @@ function(psxrecomp_add_runtime_target target)
     endif()
     if(NOT PSXRT_WINDOW_TITLE)
         set(PSXRT_WINDOW_TITLE "${target}")
+    endif()
+    if(NOT PSXRT_MAIN_RAM_MIB)
+        set(PSXRT_MAIN_RAM_MIB 2)
+    endif()
+    if(PSXRT_MAIN_RAM_MIB STREQUAL "8")
+        set(_psxrt_main_ram_bytes 0x00800000u)
+    elseif(PSXRT_MAIN_RAM_MIB STREQUAL "2")
+        set(_psxrt_main_ram_bytes 0x00200000u)
+    else()
+        message(FATAL_ERROR
+            "psxrecomp ${target}: MAIN_RAM_MIB must be 2 or 8, got "
+            "'${PSXRT_MAIN_RAM_MIB}'")
     endif()
     # The baked default BIOS path must never be absolute: an absolute path is a
     # build-machine path, and a promoted/release exe carrying it will silently
@@ -1191,6 +1204,7 @@ function(psxrecomp_add_runtime_target target)
         PSX_DEFAULT_GAME_CONFIG_PATH="${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
         PSX_MAX_PLAYERS=${PSXRT_MAX_PLAYERS}
+        PSX_MAIN_RAM_BYTES=${_psxrt_main_ram_bytes}
         FMT_HEADER_ONLY=1
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>

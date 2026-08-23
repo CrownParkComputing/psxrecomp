@@ -9,6 +9,7 @@
 #include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
 #include "debug_server.h"
 #include "crash_trace.h"
+#include "psx_memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1209,7 +1210,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                 int hits = 0;
                 pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
                                 "\n  RAM scan for 0x%08X:\n", needles[n]);
-                for (uint32_t off = 0; off + 4 <= 2u * 1024u * 1024u; off += 4) {
+                for (uint32_t off = 0; off + 4 <= PSX_MAIN_RAM_BYTES; off += 4) {
                     uint32_t word;
                     memcpy(&word, ram + off, sizeof(word));
                     if (word != needles[n]) continue;
@@ -1220,7 +1221,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                 }
                 if (!hits)
                     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                                    "    (not found in 2MB PSX RAM)\n");
+                                    "    (not found in active PSX RAM)\n");
             }
         }
 

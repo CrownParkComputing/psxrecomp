@@ -9,6 +9,7 @@
 #include "overlay_loader.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
+#include "psx_memory.h"
 #include "pst_wire.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -38,7 +39,7 @@ static double boot_state_mono_ms(void) {
 /* Compress payloads at/above this size (RAM/VRAM/SPU/dirty dominate I/O). */
 #define BOOT_STATE_ZLIB_MIN 256u
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
+#define RAM_SIZE   PSX_MAIN_RAM_BYTES
 #define SPAD_SIZE  (1024u)
 #define VRAM_W     1024
 #define VRAM_H     512
@@ -519,7 +520,8 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
     memset(&o, 0, sizeof o);
     o.no_zlib = no_zlib ? 1 : 0;
     /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (RAM+VRAM+SPU). */
-    o.cap = no_zlib ? (5u * 1024u * 1024u) : (2u * 1024u * 1024u);
+    o.cap = no_zlib ? (PSX_MAIN_RAM_BYTES + 3u * 1024u * 1024u)
+                    : (2u * 1024u * 1024u);
     o.data = (uint8_t*)malloc(o.cap);
     if (!o.data) return 0;
     if (!boot_state_save_to(&o, cpu, bios_checksum, entry_pc)) {

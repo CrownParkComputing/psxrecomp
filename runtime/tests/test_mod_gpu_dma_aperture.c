@@ -28,6 +28,12 @@ int main(void) {
     check(psx_mod_gpu_dma_resolve_address_for(0x001ABCDEu, 0x20000u) ==
               0x001ABCDCu,
           "ordinary main RAM remains word-aligned and unchanged");
+    check(psx_mod_gpu_dma_resolve_address_for_geometry(
+              0x00730000u, 0u, 0x007FFFFFu) == 0x00730000u,
+          "expanded main RAM retains all 23 decoded address bits");
+    check(psx_mod_gpu_dma_resolve_address_for_geometry(
+              0x00730000u, 0u, 0x001FFFFFu) == 0x00130000u,
+          "retail main RAM keeps four-way 2 MiB folding");
     check(psx_mod_gpu_dma_aperture_offset_for(
               0x00F1FFFCu, 4u, 0x20000u, &off) &&
               off == 0x1FFFCu,

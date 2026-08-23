@@ -16,6 +16,7 @@
 #include "gpu.h"
 #include "mdec.h"
 #include "mod_memory.h"
+#include "psx_memory.h"
 #include "sio.h"
 #include "spu.h"
 #include "timers.h"
@@ -29,13 +30,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RAM_SIZE        (2 * 1024 * 1024)
+#define RAM_SIZE        PSX_MAIN_RAM_BYTES
 #define SCRATCHPAD_SIZE 1024
 #define BIOS_ROM_SIZE   (512 * 1024)
 #define MOD_MEMORY_BASE 0x1F000000u
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
-static uint8_t ram[RAM_SIZE];
+static uint8_t ram[PSX_MAIN_RAM_BACKING_BYTES];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 static uint8_t mod_memory[MOD_MEMORY_SIZE];
@@ -89,12 +90,14 @@ static int mod_gpu_dma_memory_offset(uint32_t phys, uint32_t width,
 }
 
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address) {
-    return psx_mod_gpu_dma_resolve_address_for(
-        address, mod_gpu_dma_memory_used);
+    return psx_mod_gpu_dma_resolve_address_for_geometry(
+        address, mod_gpu_dma_memory_used, PSX_MAIN_RAM_MASK);
 }
 
 /* Exposed for inlined main-RAM load helpers in psx_cyc.h (VLC/decode hot path). */
 uint8_t *g_psx_ram = ram;
+const uint32_t g_psx_ram_size = PSX_MAIN_RAM_BYTES;
+const uint32_t g_psx_ram_mask = PSX_MAIN_RAM_MASK;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
@@ -107,12 +110,17 @@ int g_psx_load_delay = -1;
  * guest's stack silently vanished and $ra came back as 0). */
 static inline uint32_t psx_phys_addr(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys < 0x00800000u) phys &= (uint32_t)(RAM_SIZE - 1);
+    if (phys < PSX_MAIN_RAM_EXPANDED_BYTES) phys &= PSX_MAIN_RAM_MASK;
     return phys;
 }
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
+uint32_t memory_get_ram_size(void) { return PSX_MAIN_RAM_BYTES; }
+uint32_t memory_get_ram_backing_size(void) { return PSX_MAIN_RAM_BACKING_BYTES; }
+int memory_has_expanded_ram(void) {
+    return PSX_MAIN_RAM_BYTES == PSX_MAIN_RAM_EXPANDED_BYTES;
+}
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
 void memory_clear_low_boot_scratch(void) {

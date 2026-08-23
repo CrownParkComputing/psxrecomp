@@ -137,6 +137,12 @@ static inline int psx_sdl_get_current_display_mode(
     return 0;
 }
 
+static inline int psx_sdl_set_window_display_mode(
+    SDL_Window *window, const SDL_DisplayMode *mode)
+{
+    return SDL_SetWindowFullscreenMode(window, mode) ? 0 : -1;
+}
+
 static inline const Uint8 *psx_sdl_get_keyboard_state(int *count)
 {
     return (const Uint8 *)(const void *)SDL_GetKeyboardState(count);
@@ -219,6 +225,8 @@ static inline int psx_sdl_cond_wait_timeout(
 #define SDL_GetDisplayUsableBounds psx_sdl_get_display_usable_bounds
 #undef SDL_GetCurrentDisplayMode
 #define SDL_GetCurrentDisplayMode psx_sdl_get_current_display_mode
+#undef SDL_SetWindowDisplayMode
+#define SDL_SetWindowDisplayMode psx_sdl_set_window_display_mode
 #undef SDL_GetKeyboardState
 #define SDL_GetKeyboardState psx_sdl_get_keyboard_state
 #define SDL_NumJoysticks psx_sdl_num_joysticks

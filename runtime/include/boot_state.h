@@ -41,10 +41,12 @@ extern "C" {
  * v4 = v3 + optional zlib on large sections (section pad bit0 = compressed);
  * v5 = v4 + CD-ROM Sub-Q replacement state;
  * v6 = exact CPU-overclock clock domain + rational CRTC phase/config identity
- *      + CPU GTE/muldiv/load-interlock timing pipeline. */
-#define BOOT_STATE_VERSION 6u
-/* v6 intentionally rejects states that lack the 900% fractional clock carry. */
-#define BOOT_STATE_VERSION_MIN_READ 6u
+ *      + CPU GTE/muldiv/load-interlock timing pipeline;
+ * v7 = immutable 2/8 MiB main-RAM geometry in the config identity and RAM
+ *      section length. */
+#define BOOT_STATE_VERSION 7u
+/* v7 rejects states whose RAM geometry was implicit. */
+#define BOOT_STATE_VERSION_MIN_READ 7u
 /* Section pad bit0: payload is u32 LE uncompressed_len + zlib deflate bytes. */
 #define BOOT_STATE_SEC_ZLIB 1u
 
@@ -81,7 +83,7 @@ typedef struct {
  */
 enum {
     BS_SEC_CPU    = 0x01,  /* CPU registers + GTE/muldiv/load timing pipeline     */
-    BS_SEC_RAM    = 0x02,  /* 2 MB main RAM                                       */
+    BS_SEC_RAM    = 0x02,  /* complete active main RAM (2 or 8 MiB)              */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */
     BS_SEC_IRQ    = 0x04,  /* IRQ + exact rational CRTC phase/config (24B in v6)  */
     BS_SEC_TIMER  = 0x05,  /* 3 root counters (counter/mode/target/irq/frac)      */
