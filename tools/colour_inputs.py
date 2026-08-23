@@ -326,6 +326,23 @@ def main(argv=None):
                 ra_ = ram[lo:hi]
                 rb_ = read_ram_range(ds, 0x80000000 | lo, hi - lo)
                 doc["region"] = [f"0x{lo:08X}", f"0x{hi:08X}"]
+
+                # Is the region even STABLE? "Compare the whole region instead"
+                # only escapes phase if the region is not itself being written.
+                # Measured: with the effect off it is byte-identical between the
+                # two and does not change at all; with the effect running it
+                # differed by 2747 bytes. That difference is the finding, but
+                # only if it is not just two sides caught mid-write.
+                time.sleep(0.4)
+                again = read_ram_range(native, 0x80000000 | lo, hi - lo)
+                churn = sum(1 for x, y in zip(ra_, again) if x != y)
+                doc["region_churn_bytes"] = churn
+                doc["region_static"] = (churn == 0)
+                if churn:
+                    print(f"  note: {churn} byte(s) of this region changed on "
+                          f"psx-runtime within 0.4s — it is being written while "
+                          f"the effect runs, so a difference here is not "
+                          f"automatically phase-independent.", file=sys.stderr)
                 if len(ra_) != len(rb_):
                     doc["verdict"] = "unreadable"
                     doc["note"] = "region reads returned different lengths"
@@ -342,14 +359,28 @@ def main(argv=None):
                           f"table — it is in the scale, the arithmetic, or "
                           f"which entry each side selects.")
                 else:
-                    doc["verdict"] = "region-differs"
                     first = next(i for i, (x, y) in enumerate(zip(ra_, rb_))
                                  if x != y)
                     doc["region_first_difference"] = f"0x{lo + first:08X}"
-                    print(f"\nVERDICT: {nd}/{len(ra_)} bytes of the region "
-                          f"differ, first at 0x{lo + first:08X}. That is a real "
-                          f"data divergence — it does not depend on where either "
-                          f"pointer happened to be.")
+                    if churn:
+                        doc["verdict"] = "region-differs-while-written"
+                        print(f"\nVERDICT: {nd}/{len(ra_)} bytes differ, first "
+                              f"at 0x{lo + first:08X} — but {churn} byte(s) of "
+                              f"this region changed within 0.4s, so it is being "
+                              f"written as the effect runs. The two sides may "
+                              f"simply be caught at different moments.\n\n"
+                              f"What IS solid: with the effect off this region "
+                              f"is byte-identical between the emulators. So the "
+                              f"base data agrees and the divergence is in what "
+                              f"the effect WRITES here — trace the writers of "
+                              f"0x{lo:08X}..0x{hi:08X}.")
+                    else:
+                        doc["verdict"] = "region-differs"
+                        print(f"\nVERDICT: {nd}/{len(ra_)} bytes of the region "
+                              f"differ, first at 0x{lo + first:08X}, and the "
+                              f"region is not changing — so this is a real data "
+                              f"divergence, independent of where either pointer "
+                              f"happened to be.")
                 return _finish(doc, args, 0)
 
             same = a == b
