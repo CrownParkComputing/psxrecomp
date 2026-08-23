@@ -136,6 +136,13 @@ def signature(prims):
         "peak_channel": peak,
         "y_span": (max(ys) - min(ys)) if ys else 0,
         "top_colours": [list(c) for c, _ in colours.most_common(6)],
+        # The full set, not just the top few: the union across samples is the
+        # only phase-free way to compare two emulators sweeping the same fade.
+        # At any one instant they are at different points of the ramp, so the
+        # sets differ for reasons that are not the bug -- but over the WHOLE
+        # effect both traverse the same scales over the same sources, so a
+        # colour one side never produces at any point is a real difference.
+        "all_colours": sorted(list(c) for c in colours),
     }
 
 
@@ -178,8 +185,21 @@ def merge(sigs):
         g["peak_min"] = peak if g["peak_min"] is None else min(g["peak_min"],
                                                                peak)
         g["samples"] += 1
+        g.setdefault("union", set()).update(
+            tuple(c) for c in sig.get("all_colours", []))
+    for g in groups.values():
+        g["union_size"] = len(g.get("union", ()))
     return {"groups": groups, "samples": len(sigs),
             "samples_with_quads": len(live)}
+
+
+def union_compare(nat, orc, key):
+    """Colours each side produced at ANY point, and what only one side has."""
+    a = nat["groups"].get(key, {}).get("union", set())
+    b = orc["groups"].get(key, {}).get("union", set())
+    return {"native_only": sorted(a - b), "oracle_only": sorted(b - a),
+            "shared": sorted(a & b), "native_total": len(a),
+            "oracle_total": len(b)}
 
 
 def common_groups(nat, orc):
@@ -449,6 +469,21 @@ def main():
     doc["verdict"], doc["explanation"] = v, why
     if which:
         doc["compared_object"] = {"quads": which[0], "y_span": which[1]}
+        u = union_compare(nat, orc, which)
+        doc["union"] = {k: ([list(c) for c in v_] if isinstance(v_, list)
+                            else v_) for k, v_ in u.items()}
+        print(f"\nunion over all samples on {which[0]}q/{which[1]}ln:")
+        print(f"  psx-runtime produced {u['native_total']} distinct colour(s) "
+              f"at some point")
+        print(f"  oracle produced      {u['oracle_total']}")
+        print(f"  shared               {len(u['shared'])}")
+        print(f"  ONLY psx-runtime     {len(u['native_only'])}  "
+              f"{[list(c) for c in u['native_only'][:6]]}")
+        print(f"  ONLY oracle          {len(u['oracle_only'])}  "
+              f"{[list(c) for c in u['oracle_only'][:6]]}")
+        print("\nBoth sweep the same fade over the same sources, so a colour "
+              "only one side ever produces is a real difference; a colour "
+              "merely absent from one SAMPLE is just phase.")
 
     print(f"\n{'object':>16}  {'side':<12}{'colours':>9}{'saturated':>11}"
           f"{'dimmest':>9}{'peak':>7}{'samples':>9}")

@@ -351,3 +351,44 @@ class WindowSafetyTest(unittest.TestCase):
         """The measured span is the reason the default is off."""
         lo, hi = 0x0363B0, 0x1B23E0
         self.assertGreater(hi - lo, 0x100000)
+
+
+class UnionTest(unittest.TestCase):
+    """Union across samples is the phase-free comparison.
+
+    At any one instant the two emulators sit at different points of the fade,
+    so their colour sets differ for reasons that are not the bug. Over the
+    whole effect both traverse the same scales over the same sources, so a
+    colour one side NEVER produces is a real difference.
+    """
+
+    def sig(self, colours, quads=64, span=599):
+        return {"quads": quads, "y_span": span,
+                "distinct_colours": len(colours), "saturated_colours": 0,
+                "peak_channel": max((max(c) for c in colours), default=0),
+                "all_colours": [list(c) for c in colours]}
+
+    def test_union_accumulates_across_samples(self):
+        m = ep.merge([self.sig([(1, 1, 1)]), self.sig([(2, 2, 2)])])
+        self.assertEqual(m["groups"][(64, 599)]["union_size"], 2)
+
+    def test_phase_only_difference_shows_as_shared(self):
+        """Different samples, same colours overall -> nothing one-sided."""
+        nat = ep.merge([self.sig([(1, 1, 1)]), self.sig([(2, 2, 2)])])
+        orc = ep.merge([self.sig([(2, 2, 2)]), self.sig([(1, 1, 1)])])
+        u = ep.union_compare(nat, orc, (64, 599))
+        self.assertEqual(u["native_only"], [])
+        self.assertEqual(u["oracle_only"], [])
+        self.assertEqual(len(u["shared"]), 2)
+
+    def test_real_difference_survives_the_union(self):
+        nat = ep.merge([self.sig([(117, 0, 0), (1, 1, 1)])])
+        orc = ep.merge([self.sig([(1, 1, 1)])])
+        u = ep.union_compare(nat, orc, (64, 599))
+        self.assertEqual(u["native_only"], [(117, 0, 0)])
+        self.assertEqual(u["oracle_only"], [])
+
+    def test_missing_group_is_empty_not_error(self):
+        u = ep.union_compare(ep.merge([]), ep.merge([]), (64, 599))
+        self.assertEqual(u["native_total"], 0)
+        self.assertEqual(u["oracle_total"], 0)
