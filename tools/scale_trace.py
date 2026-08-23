@@ -80,6 +80,8 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
     windows = search_windows(pc, 0x400)
     leader = None
     misses = 0
+    still_on, drawing_now = True, {}
+    any_fired = False
     try:
         for i in range(n):
             cands = [leader] if leader else windows[i % len(windows)]
@@ -99,6 +101,8 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
                 return vals, str(e)
 
             hit = [x for x in rep.get("slots", []) if int(x.get("count", 0)) > 0]
+            if hit:
+                any_fired = True
             got = None
             if hit:
                 lead = max((x for x in hit
@@ -114,6 +118,15 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
             else:
                 misses += 1
                 leader = None      # re-sweep next frame
+        # Check the scene while still PARKED. Doing it after the resume below
+        # reports what is on screen seconds later, which is a different
+        # question -- and reliably says "not on screen" for a brief effect that
+        # was there the whole time we were sampling.
+        if not vals:
+            try:
+                still_on, drawing_now = class_on_screen(conn, "PolyG4+semi")
+            except DebugError:
+                still_on, drawing_now = True, {}
     finally:
         try:
             conn.cmd("pc_probe_clear")
@@ -126,20 +139,25 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
         # different responses: nothing on screen means get the game to the
         # scene, while a covered range means the block starts further back.
         covered = min(len(windows), n) * MAX_PROBE_PCS * 4
-        try:
-            on, drawing = class_on_screen(conn, "PolyG4+semi")
-        except DebugError:
-            on, drawing = True, {}
+        on, drawing = still_on, drawing_now
         if not on:
             top = ", ".join(f"{k} x{v}" for k, v in
                             sorted(drawing.items(), key=lambda kv: -kv[1])[:4])
             return vals, (f"the effect is not on screen on psx-runtime, so this "
                           f"code never ran. Currently drawing: "
                           f"{top or 'nothing'}.")
-        return vals, (f"the effect IS on screen but the block was not reached "
-                      f"on any of {n} stepped frame(s), searching 0x{covered:X} "
-                      f"bytes before 0x{pc:08X}. The enclosing block starts "
-                      f"further back than that.")
+        if any_fired:
+            # Some candidate WAS a block leader; the register sample just never
+            # came back with it. Different problem from never finding one.
+            return vals, (f"a block leader fired during {n} stepped frame(s) "
+                          f"but no register sample came with it — the probe "
+                          f"records at most a few samples per arm.")
+        return vals, (f"the effect IS on screen but NO candidate fired across "
+                      f"{n} stepped frame(s), searching 0x{covered:X} bytes "
+                      f"before 0x{pc:08X}. Either the enclosing block starts "
+                      f"further back, or this overlay code is not running "
+                      f"through compiled blocks at all — the probe only fires "
+                      f"at COMPILED block leaders.")
     if misses:
         print(f"  psx-runtime: {misses} of {n} frame(s) did not reach the block",
               file=out)
@@ -305,11 +323,32 @@ def main(argv=None):
         except DebugError as e:
             res[key] = ([], str(e))
 
+    def native_with_fallback(conn, pc_, count, gap_, reg_):
+        """Per-frame first; free-running if it captures nothing.
+
+        Per-frame gives the real animation increment and is the better
+        measurement, but it depends on the block-leader probe firing inside a
+        single stepped frame. The free-running probe demonstrably works on this
+        code -- it returned 4800 hits and real registers -- so falling back to
+        it produces data with a stated caveat instead of a fourth empty run.
+        """
+        vals, why = sample_per_frame(conn, pc_, count, reg_)
+        if vals:
+            return vals, why
+        print(f"  psx-runtime: per-frame captured nothing ({why}); retrying "
+              f"free-running — the steps will be aliased, but a measurement "
+              f"with a caveat beats none", file=sys.stderr)
+        vals2, why2 = sample_native(conn, pc_, count, gap_, reg_)
+        if vals2:
+            doc["native_sampling"] = "free-running-fallback"
+        return vals2, (why2 or why)
+
     if args.per_frame:
         print("  psx-runtime: stepping one frame between reads, so the deltas "
               "are the real per-frame increment")
-        nt = threading.Thread(target=go, args=("nat", n, sample_per_frame, n,
-                                               pc, args.samples, args.reg))
+        nt = threading.Thread(target=go, args=("nat", n, native_with_fallback,
+                                               n, pc, args.samples, args.gap,
+                                               args.reg))
     else:
         nt = threading.Thread(target=go, args=("nat", n, sample_native, n, pc,
                                                args.samples, args.gap,
@@ -341,7 +380,8 @@ def main(argv=None):
     # phase enter into it. Requiring both sides here forced the operator to keep
     # two emulators inside the same effect at once, which is the hardest part of
     # this whole exercise and is not needed for this question.
-    if args.per_frame and a and a["samples"] >= 5 and not b:
+    if (args.per_frame and doc.get("native_sampling") != "free-running-fallback"
+            and a and a["samples"] >= 5 and not b):
         doc["verdict"] = "native-per-frame-only"
         smooth = a["max_step"] <= 8
         doc["native_smooth"] = smooth

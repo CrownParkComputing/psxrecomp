@@ -308,3 +308,49 @@ class TestNativeOnlyIsEnough(unittest.TestCase):
         # step can only overstate how finely it moves, never understate it.
         d = self.d([116, 120, 124, 128])
         self.assertEqual(d["max_step"], 4)
+
+
+class TestPerFrameFallback(unittest.TestCase):
+    """Per-frame is the better measurement; an empty result is not.
+
+    Reported: repeated runs capturing nothing from psx-runtime while the effect
+    was being replayed. The free-running probe demonstrably works on this code —
+    it returned 4800 hits and real register values — so per-frame capturing
+    nothing is a property of stepping, not of the code being unreachable.
+
+    Falling back produces data with a stated caveat instead of a fourth empty
+    run, and the report records WHICH method produced the numbers so a reader
+    does not treat aliased steps as an animation increment.
+    """
+
+    def test_the_fallback_is_recorded_not_silent(self):
+        import inspect
+        src = inspect.getsource(ST.main)
+        self.assertIn("free-running-fallback", src)
+
+    def test_a_fallback_result_does_not_claim_a_per_frame_verdict(self):
+        # The standalone per-frame verdict says "steps up to N is the real
+        # animation increment". That claim is false for aliased samples.
+        import inspect
+        src = inspect.getsource(ST.main)
+        i = src.index('native_sampling") != "free-running-fallback"')
+        j = src.index("native-per-frame-only")
+        self.assertLess(i, j, "the guard must precede the verdict it protects")
+
+    def test_the_scene_is_checked_before_resuming(self):
+        # Checking after the resume reports what is on screen seconds later,
+        # which reliably says "not on screen" for a brief effect that was there
+        # throughout sampling.
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        check = src.index("still_on, drawing_now = class_on_screen")
+        resume = src.index('conn.cmd("continue")')
+        self.assertLess(check, resume)
+
+    def test_a_leader_that_fired_is_distinguished_from_none_firing(self):
+        # "no candidate fired" and "one fired but gave no sample" have
+        # different causes and different fixes.
+        import inspect
+        src = inspect.getsource(ST.sample_per_frame)
+        self.assertIn("any_fired", src)
+        self.assertIn("NO candidate fired", src)
