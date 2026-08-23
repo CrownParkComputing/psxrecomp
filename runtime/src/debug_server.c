@@ -2317,6 +2317,15 @@ typedef struct {
     uint32_t depth;
     uint32_t ot_base;
     uint32_t ot_index;
+    /* Every GPR, not a hand-picked few.
+     *
+     * The named fields above were chosen for one investigation, and the next
+     * question always wants a different register -- most recently $s4 and $s6,
+     * which carry the source pointer and scale for the packet colour routine.
+     * 64 samples x 32 registers is 8 KB, so there is no reason to keep
+     * guessing. This also matches what the DuckStation oracle already returns
+     * from pc_hit_last, which makes the two directly comparable. */
+    uint32_t gpr[32];
 } PcProbeSample;
 static volatile int s_pc_probe_armed = 0;
 static int          s_pc_probe_n = 0;
@@ -2324,6 +2333,19 @@ static PcProbeSlot  s_pc_probe[PC_PROBE_MAX_PCS];
 static PcProbeSample s_pc_probe_samples[PC_PROBE_SAMPLE_CAP];
 static uint32_t     s_pc_probe_sample_n = 0;
 static uint32_t     s_pc_probe_sample_max = 32;
+
+/* MIPS register names, matching the oracle's s_reg_names ordering exactly. A
+ * mismatch here would be silent: every value would still be reported, just
+ * under the wrong name. */
+static const char *psx_gpr_name(int i)
+{
+    static const char *k[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3",
+        "t0","t1","t2","t3","t4","t5","t6","t7",
+        "s0","s1","s2","s3","s4","s5","s6","s7",
+        "t8","t9","k0","k1","gp","sp","fp","ra"};
+    return (i >= 0 && i < 32) ? k[i] : "?";
+}
 
 static void pc_probe_clear_state(void)
 {
@@ -10107,11 +10129,20 @@ static void handle_pc_probe_dump(int id, const char *json)
         snprintf(buf, sizeof(buf),
                  "%s{\"pc\":\"0x%08X\",\"frame\":%u,\"t0\":\"0x%08X\","
                  "\"fp\":\"0x%08X\",\"v0\":\"0x%08X\",\"mode\":\"0x%08X\","
-                 "\"depth\":\"0x%08X\",\"ot_base\":\"0x%08X\",\"ot_index\":\"0x%08X\"}",
+                 "\"depth\":\"0x%08X\",\"ot_base\":\"0x%08X\",\"ot_index\":\"0x%08X\","
+                 "\"regs\":{",
                  (i == 0) ? "" : ",",
                  sm->pc, sm->frame, sm->t0, sm->fp, sm->v0,
                  sm->mode, sm->depth, sm->ot_base, sm->ot_index);
         send_line(buf);
+        /* Named exactly as the DuckStation oracle names them in pc_hit_last, so
+         * the two sides can be compared without a translation table. */
+        for (int g = 0; g < 32; g++) {
+            snprintf(buf, sizeof(buf), "%s\"%s\":\"0x%08X\"",
+                     g ? "," : "", psx_gpr_name(g), sm->gpr[g]);
+            send_line(buf);
+        }
+        send_line("}}");
     }
     send_line("]}");
 }
