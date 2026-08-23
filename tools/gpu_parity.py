@@ -47,6 +47,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from psx_gpu_frame import wait_for_class  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -236,6 +237,12 @@ def main(argv=None):
     ap.add_argument("--disc", default=None,
                     help="disc image for --start-oracle; must be the same one "
                          "psx-runtime is running")
+    ap.add_argument("--wait-for", default="",
+                    help="wait for this primitive class on BOTH "
+                         "sides before comparing, e.g. PolyG4+semi. "
+                         "Comparing images of a scene without the "
+                         "effect answers a different question.")
+    ap.add_argument("--wait-secs", type=float, default=120.0)
     ap.add_argument("--dump-native", action="store_true",
                     help="also capture the native GP0 stream (no DuckStation counterpart)")
     args = ap.parse_args(argv)
@@ -265,6 +272,27 @@ def main(argv=None):
             # by run_to_frame. So the meeting point is whichever is further
             # ahead, and the one behind catches up. Both are parked when the
             # screenshots are taken.
+            # Wait for the effect on both sides before aligning. Comparing
+            # images of a scene that does not contain the effect answers a
+            # question nobody asked, and this tool has the same race every
+            # other one here had.
+            if args.wait_for:
+                for label, conn in (("psx-runtime", native), ("oracle", ds)):
+                    on, drawing = wait_for_class(conn, args.wait_for,
+                                                 args.wait_secs, out=sys.stderr)
+                    if not on:
+                        top = ", ".join(f"{k} x{v}" for k, v in
+                                        sorted(drawing.items(),
+                                               key=lambda kv: -kv[1])[:4])
+                        print(f"error: {args.wait_for} never appeared on "
+                              f"{label} within {args.wait_secs:.0f}s. Drawing "
+                              f"instead: {top or 'nothing'}.", file=sys.stderr)
+                        result["wait_error"] = label
+                        with open(os.path.join(outdir, "parity.json"), "w",
+                                  encoding="utf-8") as f:
+                            json.dump(result, f, indent=1)
+                        return 1
+
             aligned = align_frames(native, ds, args.frame, result)
             fa, fb = result["native_frame"], result["duckstation_frame"]
             if not aligned:
