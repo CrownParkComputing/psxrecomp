@@ -284,3 +284,57 @@ class TestPhaseIndependentRegion(unittest.TestCase):
         self.assertGreater(hi - lo, 0x1000,
                            "a zero-width region would compare nothing and "
                            "report a match")
+
+
+class TestDifferenceShape(unittest.TestCase):
+    """A count is not a finding.
+
+    "2747 of 23088 bytes differ" is compatible with several completely
+    different causes: one side has not written the data at all, one is writing
+    where the other does not, or both hold values that disagree. Each points
+    somewhere else, so the shape has to be reported alongside the number.
+    """
+
+    def test_zeros_on_one_side_are_called_out_as_not_written(self):
+        a = bytes(8)
+        b = bytes.fromhex("f8505000f8f8b000")
+        cl = CI.diff_clusters(a, b, 0xE0000)
+        self.assertIn("has not written this", CI.describe_difference(cl))
+
+    def test_zeros_on_the_other_side_are_distinguished(self):
+        a = bytes.fromhex("f8505000f8f8b000")
+        b = bytes(8)
+        self.assertIn("oracle holds zeros",
+                      CI.describe_difference(CI.diff_clusters(a, b, 0)))
+
+    def test_both_holding_data_is_reported_as_a_real_disagreement(self):
+        a = bytes.fromhex("f8505000")
+        b = bytes.fromhex("08080800")
+        self.assertIn("both sides hold data",
+                      CI.describe_difference(CI.diff_clusters(a, b, 0)))
+
+    def test_entry_alignment_is_noted(self):
+        # Differences on 4-byte boundaries mean whole colour entries changed,
+        # not stray bytes — which separates a data difference from corruption.
+        a = bytes.fromhex("00000000" + "f8505000")
+        b = bytes.fromhex("00000000" + "08080800")
+        self.assertIn("4-byte boundaries",
+                      CI.describe_difference(CI.diff_clusters(a, b, 0)))
+
+    def test_nearby_differing_bytes_become_one_cluster(self):
+        # A 4-byte entry usually differs in only some of its bytes; reporting
+        # that as three findings buries it.
+        a = bytes.fromhex("f8005000")
+        b = bytes.fromhex("08ff0800")
+        cl = CI.diff_clusters(a, b, 0)
+        self.assertEqual(len(cl), 1)
+
+    def test_distant_differences_stay_separate(self):
+        a = bytes.fromhex("ff" + "00" * 20 + "ff")
+        b = bytes.fromhex("00" + "00" * 20 + "00")
+        self.assertEqual(len(CI.diff_clusters(a, b, 0)), 2)
+
+    def test_identical_buffers_have_no_clusters(self):
+        a = bytes.fromhex("f8505000")
+        self.assertEqual(CI.diff_clusters(a, a, 0), [])
+        self.assertEqual(CI.describe_difference([]), "")

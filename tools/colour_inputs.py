@@ -58,6 +58,60 @@ SRC_OFFSET = -12          # lwr $t6,-12($s4): the source word's base
 DEFAULT_SPAN = 48         # enough to see the table around it
 
 
+def diff_clusters(a, b, base, gap=8, limit=12):
+    """Where two buffers differ, coalesced into runs.
+
+    A count is not a finding. "2747 of 23088 bytes differ" says nothing about
+    whether the two hold the same data shifted, one holds zeros where the other
+    holds values, or a handful of entries changed -- and those point at
+    completely different causes. Runs separated by fewer than `gap` matching
+    bytes are merged, because a differing 4-byte entry usually differs in only
+    some of its bytes and reporting it as three findings obscures it.
+    """
+    runs = []
+    i = 0
+    n = min(len(a), len(b))
+    while i < n:
+        if a[i] == b[i]:
+            i += 1
+            continue
+        start = i
+        last = i
+        while i < n:
+            if a[i] != b[i]:
+                last = i
+            elif i - last >= gap:
+                break
+            i += 1
+        runs.append((start, last))
+        if len(runs) >= limit * 4:
+            break
+    return [{"addr": f"0x{base + s:08X}", "length": e - s + 1,
+             "native": a[s:min(e + 1, s + 16)].hex(" "),
+             "oracle": b[s:min(e + 1, s + 16)].hex(" ")}
+            for s, e in runs[:limit]]
+
+
+def describe_difference(clusters):
+    """What KIND of difference is this? The shape narrows the cause."""
+    if not clusters:
+        return ""
+    nat_zero = sum(1 for c in clusters
+                   if set(c["native"].split()) <= {"00"})
+    orc_zero = sum(1 for c in clusters
+                   if set(c["oracle"].split()) <= {"00"})
+    if nat_zero == len(clusters):
+        return ("psx-runtime holds ZEROS everywhere the oracle holds data — it "
+                "has not written this, rather than written it differently.")
+    if orc_zero == len(clusters):
+        return ("the oracle holds zeros where psx-runtime holds data — "
+                "psx-runtime is writing somewhere the oracle does not.")
+    aligned = all(int(c["addr"], 16) % 4 == 0 for c in clusters)
+    return ("both sides hold data and it differs"
+            + (", on 4-byte boundaries — whole entries, not stray bytes"
+               if aligned else ", not aligned to entry boundaries"))
+
+
 def region_bounds(a, b, pad=0x2000, limit=0x200000):
     """A span covering both pointers, so the comparison is phase-independent.
 
@@ -351,6 +405,10 @@ def main(argv=None):
                 nd = sum(1 for x, y in zip(ra_, rb_) if x != y)
                 doc["region_differing_bytes"] = nd
                 doc["region_bytes"] = len(ra_)
+                if nd:
+                    cl = diff_clusters(ra_, rb_, lo)
+                    doc["region_clusters"] = cl
+                    doc["region_shape"] = describe_difference(cl)
                 if nd == 0:
                     doc["verdict"] = "region-matches"
                     print(f"\nVERDICT: the whole {len(ra_)}-byte region is "
@@ -381,6 +439,12 @@ def main(argv=None):
                               f"region is not changing — so this is a real data "
                               f"divergence, independent of where either pointer "
                               f"happened to be.")
+                        if doc.get("region_shape"):
+                            print(f"\n  {doc['region_shape']}")
+                        for c in doc.get("region_clusters", [])[:6]:
+                            print(f"    {c['addr']} ({c['length']} bytes)")
+                            print(f"      psx-runtime {c['native']}")
+                            print(f"      oracle      {c['oracle']}")
                 return _finish(doc, args, 0)
 
             same = a == b
