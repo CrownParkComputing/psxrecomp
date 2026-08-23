@@ -96,7 +96,7 @@ def search_windows(pc, max_back=0x400, slots=MAX_PCS):
 
 
 def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
-                    samples=32, wait=6.0, expect_class=None,
+                    samples=32, wait=6.0, expect_class=None, leader=None,
                     out=sys.stderr):
     """Registers at the block leader enclosing `pc`. Returns a dict.
 
@@ -108,10 +108,15 @@ def probe_registers(conn, pc, want=("s4", "s6"), back=0x100, step=0x10,
     slots = []
     rep = {}
     tried = 0
+    # A caller sampling repeatedly already knows the leader from the first
+    # call. Re-running the sweep every time is what limited a run to three
+    # samples, which is far too few to compare an animating quantity.
+    windows = ([[int(leader, 16) if isinstance(leader, str) else leader]]
+               if leader else search_windows(pc, max_back=max(back, 0x400)))
     # Sweep backwards until something fires. One window is a guess about where
     # the block starts; a wrong guess reports "not a block leader", which is
     # true and tells the operator nothing they can act on.
-    for cands in search_windows(pc, max_back=max(back, 0x400)):
+    for cands in windows:
         tried += 1
         res["candidates"] = [f"0x{c:08X}" for c in cands]
         try:

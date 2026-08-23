@@ -136,3 +136,44 @@ class TestOneSidedResults(unittest.TestCase):
             self.assertIn("return vals", src)
             self.assertIn("Returns (values", src,
                           f"{fn.__name__} does not document the reason it returns")
+
+
+class TestGranularity(unittest.TestCase):
+    """Both animating does not mean both animating the SAME WAY.
+
+    Measured: the oracle stepped 122/124/126/128 — by 2, across a 6-wide band —
+    while psx-runtime showed 28 and 128 with nothing between. A fade that sweeps
+    smoothly and one that jumps between extremes produce very different pictures
+    from identical geometry, and min/max alone cannot tell them apart.
+    """
+
+    def d(self, vals):
+        return ST.describe(vals, "x", out=io.StringIO())
+
+    def test_step_size_is_reported(self):
+        d = self.d([122, 124, 126, 128])
+        self.assertEqual(d["max_step"], 2)
+        self.assertEqual(d["median_step"], 2)
+
+    def test_a_jump_between_extremes_shows_a_large_step(self):
+        self.assertEqual(self.d([28, 128])["max_step"], 100)
+
+    def test_range_alone_would_not_separate_them(self):
+        # Same min and max, completely different behaviour.
+        smooth = self.d(list(range(28, 129, 4)))
+        jumpy = self.d([28, 128])
+        self.assertEqual((smooth["min"], smooth["max"]),
+                         (jumpy["min"], jumpy["max"]))
+        self.assertLess(smooth["max_step"], jumpy["max_step"])
+
+    def test_a_single_value_has_no_steps(self):
+        d = self.d([128] * 5)
+        self.assertEqual(d["max_step"], 0)
+        self.assertEqual(d["median_step"], 0)
+
+    def test_two_distinct_of_three_samples_is_not_evidence(self):
+        # Which is exactly what the first complete run produced. Sparse
+        # sampling of a smooth ramp looks identical to a genuine jump.
+        d = self.d([28, 128, 128])
+        self.assertEqual(d["samples"], 3)
+        self.assertEqual(d["distinct"], 2)

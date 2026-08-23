@@ -48,8 +48,14 @@ NEUTRAL = 128
 def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
     """Returns (values, reason-it-stopped-or-None)."""
     vals = []
-    for _ in range(n):
-        pr = probe_registers(conn, pc, want=(reg,), wait=1.2)
+    leader = None
+    for i in range(n):
+        # Find the block leader once, then reuse it. The sweep is the expensive
+        # part, and repeating it per sample capped an earlier run at three —
+        # not enough to say anything about a value that animates.
+        pr = probe_registers(conn, pc, want=(reg,), wait=(1.2 if leader else 1.5),
+                             leader=leader)
+        leader = leader or pr.get("block_leader")
         v = pr.get("regs", {}).get(reg)
         if v:
             vals.append(int(v, 16))
@@ -108,12 +114,21 @@ def describe(vals, label, out=sys.stdout):
         print(f"  {label:<12} no samples", file=out)
         return None
     uniq = sorted(set(vals))
+    # Granularity, not just range. The oracle stepped 122/124/126/128 -- by 2 --
+    # while psx-runtime showed 28 and 128 with nothing between. A fade that
+    # moves in fine steps and one that jumps between extremes look identical in
+    # min/max and produce very different pictures.
+    steps = [b - a for a, b in zip(uniq, uniq[1:])]
     d = {"samples": len(vals), "distinct": len(uniq), "min": min(vals),
-         "max": max(vals), "values": uniq[:12],
+         "max": max(vals), "values": uniq[:16],
          "constant": len(uniq) == 1,
-         "neutral_only": uniq == [NEUTRAL]}
+         "neutral_only": uniq == [NEUTRAL],
+         "median_step": statistics.median(steps) if steps else 0,
+         "max_step": max(steps) if steps else 0}
     print(f"  {label:<12} {len(vals):>3} sample(s), {len(uniq)} distinct, "
-          f"range {min(vals)}..{max(vals)}  {uniq[:8]}", file=out)
+          f"range {min(vals)}..{max(vals)}"
+          + (f", steps {min(steps)}..{max(steps)}" if steps else "")
+          + f"  {uniq[:8]}", file=out)
     return d
 
 
@@ -125,7 +140,9 @@ def main(argv=None):
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--pc", required=True)
     ap.add_argument("--reg", default="s6")
-    ap.add_argument("--samples", type=int, default=12)
+    ap.add_argument("--samples", type=int, default=24,
+                    help="more is better: comparing HOW a value "
+                         "animates needs more than a handful")
     ap.add_argument("--gap", type=float, default=0.5)
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", default=None)
@@ -197,6 +214,30 @@ def main(argv=None):
         print(f"\nVERDICT: both vary — psx-runtime {a['min']}..{a['max']}, "
               f"oracle {b['min']}..{b['max']}. The scale is animating on both, "
               f"so the fade is not simply missing.")
+        # Both animating does not mean both animating the SAME WAY.
+        if a["samples"] >= 8 and b["samples"] >= 8:
+            if a["max_step"] >= 4 * max(1, b["max_step"]):
+                doc["granularity"] = "native-coarser"
+                print(f"\n  But psx-runtime moves in far coarser steps (up to "
+                      f"{a['max_step']}) than the oracle (up to {b['max_step']}). "
+                      f"A fade that jumps between extremes and one that sweeps "
+                      f"smoothly produce very different pictures from identical "
+                      f"geometry.")
+            elif b["max_step"] >= 4 * max(1, a["max_step"]):
+                doc["granularity"] = "oracle-coarser"
+                print(f"\n  The ORACLE moves in coarser steps than psx-runtime, "
+                      f"which is the opposite of the expected fault.")
+            else:
+                doc["granularity"] = "similar"
+                print(f"\n  Step sizes are comparable "
+                      f"(psx-runtime max {a['max_step']}, oracle max "
+                      f"{b['max_step']}), so the fade granularity matches too.")
+        else:
+            doc["granularity"] = "too-few-samples"
+            print(f"\n  Too few samples ({a['samples']} vs {b['samples']}) to "
+                  f"compare HOW each one moves. Two distinct values out of "
+                  f"three is also what sparse sampling of a smooth ramp looks "
+                  f"like — raise --samples.")
     return _finish(doc, args, 0)
 
 
