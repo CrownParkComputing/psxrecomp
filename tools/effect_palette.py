@@ -137,69 +137,98 @@ def signature(prims):
     }
 
 
+def group_key(sig):
+    """Which on-screen object a sample is of.
+
+    Quad count and vertical span identify the object: the effect draws 64
+    quads across 599 lines, the land-placement glow draws 144 across 155.
+    Mixing them is not a detail -- taking maxima over both compared
+    psx-runtime's EFFECT against the oracle's PLACEMENT SCREEN, which is a
+    comparison of two different things that happens to produce a number.
+    """
+    return (sig["quads"], sig["y_span"])
+
+
 def merge(sigs):
-    """Combine per-sample signatures by taking maxima.
+    """Combine per-sample signatures by taking maxima, per object.
 
     Maxima, not means: a sample that caught the effect mid-build has fewer
     quads than one that caught it whole, and averaging those understates the
     frame that actually matters. This is the same reason class_census tracks
-    maxima.
+    maxima. Grouping first keeps that from averaging across objects.
     """
     live = [s for s in sigs if s["quads"] > 0]
-    if not live:
-        return {"quads": 0, "distinct_colours": 0, "saturated_colours": 0,
-                "y_span": 0, "samples_with_quads": 0, "samples": len(sigs)}
-    return {
-        "quads": max(s["quads"] for s in live),
-        "distinct_colours": max(s["distinct_colours"] for s in live),
-        "saturated_colours": max(s["saturated_colours"] for s in live),
-        "y_span": max(s["y_span"] for s in live),
-        "samples_with_quads": len(live),
-        "samples": len(sigs),
-    }
+    groups = {}
+    for sig in live:
+        k = group_key(sig)
+        g = groups.setdefault(k, {"quads": k[0], "y_span": k[1],
+                                  "distinct_colours": 0,
+                                  "saturated_colours": 0, "samples": 0})
+        g["distinct_colours"] = max(g["distinct_colours"],
+                                    sig["distinct_colours"])
+        g["saturated_colours"] = max(g["saturated_colours"],
+                                     sig["saturated_colours"])
+        g["samples"] += 1
+    return {"groups": groups, "samples": len(sigs),
+            "samples_with_quads": len(live)}
 
 
-def verdict(nat, orc, colour_ratio=4.0, span_ratio=2.0):
-    """Compare the two signatures.
+def common_groups(nat, orc):
+    """Objects both sides actually saw, largest first.
+
+    Only these can be compared. An object one side never sampled is a gap in
+    the evidence, not a difference between the emulators.
+    """
+    shared = set(nat["groups"]) & set(orc["groups"])
+    return sorted(shared, key=lambda k: -(k[0] * max(k[1], 1)))
+
+
+def verdict(nat, orc, colour_ratio=4.0):
+    """Compare the two signatures, object by object.
 
     Ratios, not absolute thresholds: what matters is whether one side builds
-    an order of magnitude more colour variety or geometry spread than the
-    other, which is scale-free and does not need calibrating against a frame
-    nobody has captured.
+    an order of magnitude more colour variety than the other, which is
+    scale-free and does not need calibrating against a frame nobody has
+    captured.
     """
     if not nat["samples_with_quads"]:
         return ("no-native-samples",
                 "psx-runtime's ring held no additive shaded quads -- the "
-                "effect did not play inside the scanned window.")
+                "effect did not play inside the scanned window.", None)
     if not orc["samples_with_quads"]:
         return ("no-oracle-samples",
                 "no oracle read caught the effect, so nothing is compared. "
-                "This is not evidence that its list is clean.")
-    dc_n, dc_o = nat["distinct_colours"], orc["distinct_colours"]
-    sp_n, sp_o = nat["y_span"], orc["y_span"]
-    colour_blowup = dc_o and (dc_n / max(dc_o, 1)) >= colour_ratio
-    span_blowup = sp_o and (sp_n / max(sp_o, 1)) >= span_ratio
-    if colour_blowup or span_blowup:
-        why = []
-        if colour_blowup:
-            why.append(f"{dc_n} distinct vertex colours against the oracle's "
-                       f"{dc_o}")
-        if span_blowup:
-            why.append(f"geometry spanning {sp_n} lines against the oracle's "
-                       f"{sp_o}")
-        return ("native-builds-different-geometry",
-                "psx-runtime BUILDS the wedges: " + "; ".join(why) +
-                ". The display list already differs, so the fault is upstream "
-                "of the renderer -- in the code that computes this effect.")
-    if dc_o / max(dc_n, 1) >= colour_ratio:
-        return ("oracle-builds-more",
-                "the ORACLE builds more colour variety than psx-runtime, "
-                "which is the reverse of the wedge symptom -- treat the "
-                "sampling as suspect before concluding anything.")
+                "This is not evidence that its list is clean.", None)
+    shared = common_groups(nat, orc)
+    if not shared:
+        return ("no-common-object",
+                "the two sides never sampled the same object: psx-runtime saw "
+                + ", ".join(f"{q} quads/{s} lines" for q, s in nat["groups"])
+                + "; the oracle saw "
+                + ", ".join(f"{q} quads/{s} lines" for q, s in orc["groups"])
+                + ". Replay the effect on BOTH and sample again.", None)
+    for k in shared:
+        n, o = nat["groups"][k], orc["groups"][k]
+        dn, do = n["distinct_colours"], o["distinct_colours"]
+        if dn / max(do, 1) >= colour_ratio:
+            return ("native-builds-different-geometry",
+                    f"on the same object ({k[0]} quads spanning {k[1]} lines), "
+                    f"psx-runtime builds {dn} distinct vertex colours against "
+                    f"the oracle's {do}. The display list already differs, so "
+                    f"the fault is upstream of the renderer -- in the code "
+                    f"that computes this effect's colours.", k)
+        if do / max(dn, 1) >= colour_ratio:
+            return ("oracle-builds-more",
+                    f"on {k[0]} quads/{k[1]} lines the ORACLE builds {do} "
+                    f"distinct colours against psx-runtime's {dn} -- the "
+                    f"reverse of the wedge symptom. Treat the sampling as "
+                    f"suspect before concluding anything.", k)
+    k = shared[0]
     return ("signatures-agree",
-            f"both sides build the same kind of geometry ({dc_n} vs {dc_o} "
-            f"distinct colours, {sp_n} vs {sp_o} line span). The lists agree, "
-            f"so the wedges are produced when this list is RASTERISED.")
+            f"on {k[0]} quads/{k[1]} lines both sides build the same colour "
+            f"variety ({nat['groups'][k]['distinct_colours']} vs "
+            f"{orc['groups'][k]['distinct_colours']}). The lists agree, so the "
+            f"wedges are produced when this list is RASTERISED.", k)
 
 
 def sample_native(conn, args, out=sys.stderr):
@@ -309,17 +338,27 @@ def main():
                              args)
 
     nat, orc = merge(nat_sigs), merge(orc_sigs)
-    doc["native"], doc["oracle"] = nat, orc
+    doc["native"] = {f"{k[0]}x{k[1]}": v for k, v in nat["groups"].items()}
+    doc["oracle"] = {f"{k[0]}x{k[1]}": v for k, v in orc["groups"].items()}
     doc["native_samples"], doc["oracle_samples"] = nat_sigs, orc_sigs
-    v, why = verdict(nat, orc)
+    v, why, which = verdict(nat, orc)
     doc["verdict"], doc["explanation"] = v, why
+    if which:
+        doc["compared_object"] = {"quads": which[0], "y_span": which[1]}
 
-    print(f"\n{'':<12}{'quads':>7}{'colours':>9}{'saturated':>11}{'y-span':>8}"
+    print(f"\n{'object':>16}  {'side':<12}{'colours':>9}{'saturated':>11}"
           f"{'samples':>9}")
-    for label, s in (("psx-runtime", nat), ("oracle", orc)):
-        print(f"{label:<12}{s['quads']:>7}{s['distinct_colours']:>9}"
-              f"{s['saturated_colours']:>11}{s['y_span']:>8}"
-              f"{s['samples_with_quads']:>9}")
+    seen = sorted(set(nat["groups"]) | set(orc["groups"]),
+                  key=lambda k: -(k[0] * max(k[1], 1)))
+    for k in seen:
+        label = f"{k[0]}q/{k[1]}ln"
+        for side, m in (("psx-runtime", nat), ("oracle", orc)):
+            g = m["groups"].get(k)
+            if not g:
+                print(f"{label:>16}  {side:<12}{'-':>9}{'-':>11}{0:>9}")
+            else:
+                print(f"{label:>16}  {side:<12}{g['distinct_colours']:>9}"
+                      f"{g['saturated_colours']:>11}{g['samples']:>9}")
     print(f"\nVERDICT: {v}\n{why}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

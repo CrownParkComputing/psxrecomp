@@ -72,15 +72,23 @@ class SignatureTest(unittest.TestCase):
 
 
 class MergeTest(unittest.TestCase):
-    def test_takes_maxima_not_means(self):
+    def test_takes_maxima_within_an_object(self):
+        sigs = [{"quads": 64, "distinct_colours": 151, "saturated_colours": 60,
+                 "y_span": 599},
+                {"quads": 64, "distinct_colours": 153, "saturated_colours": 68,
+                 "y_span": 599}]
+        m = ep.merge(sigs)
+        g = m["groups"][(64, 599)]
+        self.assertEqual(g["distinct_colours"], 153)
+        self.assertEqual(g["saturated_colours"], 68)
+
+    def test_distinct_objects_not_merged(self):
         sigs = [{"quads": 4, "distinct_colours": 10, "saturated_colours": 1,
                  "y_span": 100},
                 {"quads": 64, "distinct_colours": 151, "saturated_colours": 68,
                  "y_span": 599}]
         m = ep.merge(sigs)
-        self.assertEqual(m["quads"], 64)
-        self.assertEqual(m["distinct_colours"], 151)
-        self.assertEqual(m["y_span"], 599)
+        self.assertEqual(set(m["groups"]), {(4, 100), (64, 599)})
 
     def test_samples_without_quads_ignored_but_counted(self):
         sigs = [{"quads": 0, "distinct_colours": 0, "saturated_colours": 0,
@@ -93,31 +101,34 @@ class MergeTest(unittest.TestCase):
 
 
 class VerdictTest(unittest.TestCase):
-    def _sig(self, colours, span, n=1):
-        return {"distinct_colours": colours, "y_span": span,
-                "saturated_colours": 0, "quads": 10, "samples_with_quads": n,
-                "samples": n}
+    def _side(self, *sigs):
+        return ep.merge([{"quads": q, "y_span": sp, "distinct_colours": c,
+                          "saturated_colours": 0} for q, sp, c in sigs])
 
     def test_blowup_is_named_upstream(self):
-        v, _ = ep.verdict(self._sig(151, 599), self._sig(5, 155))
+        v, _, k = ep.verdict(self._side((64, 599, 151)),
+                             self._side((64, 599, 5)))
         self.assertEqual(v, "native-builds-different-geometry")
+        self.assertEqual(k, (64, 599))
 
     def test_agreement_points_at_rasterisation(self):
-        v, why = ep.verdict(self._sig(6, 160), self._sig(5, 155))
+        v, why, _ = ep.verdict(self._side((64, 599, 6)),
+                               self._side((64, 599, 5)))
         self.assertEqual(v, "signatures-agree")
         self.assertIn("RASTERISED", why)
 
     def test_no_oracle_samples_is_not_evidence_of_clean(self):
-        v, why = ep.verdict(self._sig(151, 599), self._sig(0, 0, n=0))
+        v, why, _ = ep.verdict(self._side((64, 599, 151)), ep.merge([]))
         self.assertEqual(v, "no-oracle-samples")
         self.assertIn("not evidence", why)
 
     def test_no_native_samples_refuses(self):
-        v, _ = ep.verdict(self._sig(0, 0, n=0), self._sig(5, 155))
+        v, _, _ = ep.verdict(ep.merge([]), self._side((64, 599, 5)))
         self.assertEqual(v, "no-native-samples")
 
     def test_reverse_blowup_flagged_as_suspect(self):
-        v, why = ep.verdict(self._sig(5, 155), self._sig(151, 599))
+        v, why, _ = ep.verdict(self._side((64, 599, 5)),
+                               self._side((64, 599, 151)))
         self.assertEqual(v, "oracle-builds-more")
         self.assertIn("suspect", why)
 
@@ -169,3 +180,51 @@ class PrimShapeTest(unittest.TestCase):
         a, b = ep.signature([as_list]), ep.signature([as_str])
         for k in ("quads", "distinct_colours", "saturated_colours", "y_span"):
             self.assertEqual(a[k], b[k], k)
+
+
+class GroupingTest(unittest.TestCase):
+    """Samples must be compared object-for-object.
+
+    Taking maxima across every sample compared psx-runtime's EFFECT (64
+    quads / 599 lines) against the oracle's PLACEMENT SCREEN (144 / 155) --
+    two different things, producing a number that looked like an answer.
+    """
+
+    def sig(self, quads, span, colours, sat=0):
+        return {"quads": quads, "y_span": span, "distinct_colours": colours,
+                "saturated_colours": sat, "top_colours": []}
+
+    def test_groups_kept_separate(self):
+        m = ep.merge([self.sig(64, 599, 153), self.sig(144, 155, 4)])
+        self.assertEqual(m["groups"][(64, 599)]["distinct_colours"], 153)
+        self.assertEqual(m["groups"][(144, 155)]["distinct_colours"], 4)
+
+    def test_maxima_within_a_group(self):
+        m = ep.merge([self.sig(64, 599, 151), self.sig(64, 599, 153)])
+        self.assertEqual(m["groups"][(64, 599)]["distinct_colours"], 153)
+        self.assertEqual(m["groups"][(64, 599)]["samples"], 2)
+
+    def test_only_shared_objects_compared(self):
+        nat = ep.merge([self.sig(64, 599, 153)])
+        orc = ep.merge([self.sig(144, 155, 5)])
+        v, why, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "no-common-object")
+        self.assertIsNone(k)
+        self.assertIn("never sampled the same object", why)
+
+    def test_effect_object_drives_the_verdict(self):
+        """The real data: 153 vs 3 on the effect, 4 vs 5 on the placement glow."""
+        nat = ep.merge([self.sig(64, 599, 153), self.sig(144, 155, 4)])
+        orc = ep.merge([self.sig(64, 599, 3), self.sig(144, 155, 5)])
+        v, why, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "native-builds-different-geometry")
+        self.assertEqual(k, (64, 599))
+        self.assertIn("153", why)
+        self.assertIn("3", why)
+
+    def test_agreement_when_both_low(self):
+        nat = ep.merge([self.sig(144, 155, 4)])
+        orc = ep.merge([self.sig(144, 155, 5)])
+        v, _, k = ep.verdict(nat, orc)
+        self.assertEqual(v, "signatures-agree")
+        self.assertEqual(k, (144, 155))
