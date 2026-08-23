@@ -95,6 +95,19 @@ if(BUILD_TESTING)
         PSX_OVERLAY_DLL_BUILD=1)
     add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
 
+    add_executable(psx_generated_icache_fastpath_test
+        tests/test_psx_generated_icache_fastpath.c
+        src/psx_icache.c
+    )
+    target_include_directories(psx_generated_icache_fastpath_test PRIVATE include)
+    target_compile_definitions(psx_generated_icache_fastpath_test PRIVATE
+        PSX_ENABLE_BLOCK_CYCLES=1
+        PSX_GAME_GENERATED_FAST_CYC=1
+        PSX_GENERATED_ICACHE_DIRECT_TEST=1
+        PSX_OVERLAY_DLL_BUILD=1)
+    add_test(NAME psx_generated_icache_fastpath_test
+             COMMAND psx_generated_icache_fastpath_test)
+
     add_executable(boot_state_transaction_test
         tests/test_boot_state_transaction.c
         src/boot_state.c)

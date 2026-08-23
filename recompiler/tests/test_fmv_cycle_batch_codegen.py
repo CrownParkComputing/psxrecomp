@@ -127,6 +127,10 @@ def main():
         failures.append("timing-run A/B gate was not emitted")
     if "psx_cyc_step_slow(cpu," not in source:
         failures.append("exceptional modes lost instruction-boundary fallback")
+    if "psx_icache_fetch_generated(cpu, 0x80010000u);" not in source:
+        failures.append("generated I-cache leaders do not use the inline hit gate")
+    if "psx_icache_fetch(cpu," in source:
+        failures.append("generated code still calls the out-of-line I-cache wrapper")
     if failures:
         for failure in failures:
             print(f"FAIL: {failure}", file=sys.stderr)
