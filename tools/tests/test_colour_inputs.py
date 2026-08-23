@@ -248,3 +248,39 @@ class TestNoNullsInReports(unittest.TestCase):
                if pr.get(k) is not None}
         self.assertIn("leader_after_target", doc)
         self.assertIs(doc["leader_after_target"], False)
+
+
+class TestPhaseIndependentRegion(unittest.TestCase):
+    """$s4 moves with the animation, so a window at each side's own $s4 is not
+    a comparison.
+
+    Measured across two samples: psx-runtime's $s4 went 0x800E2634 -> 0x800E4634
+    while $s6 went 72 -> 128. The pointer tracks the effect. Comparing 48 bytes
+    at each side's own pointer therefore compares different ENTRIES of the same
+    array whenever the two emulators are at different moments — which they
+    always are — and it reported "source-differs" twice for no guest reason.
+    """
+
+    def test_the_region_covers_both_pointers(self):
+        lo, hi = CI.region_bounds(0x000E4628, 0x000E2BF8)
+        self.assertLess(lo, 0x000E2BF8)
+        self.assertGreater(hi, 0x000E4628)
+
+    def test_the_region_is_order_independent(self):
+        self.assertEqual(CI.region_bounds(0x1000, 0x9000),
+                         CI.region_bounds(0x9000, 0x1000))
+
+    def test_it_is_word_aligned(self):
+        lo, _ = CI.region_bounds(0x000E4629, 0x000E2BFB)
+        self.assertEqual(lo & 3, 0)
+
+    def test_it_is_clamped_to_ram(self):
+        lo, hi = CI.region_bounds(0x10, 0x1FFFF0)
+        self.assertGreaterEqual(lo, 0)
+        self.assertLessEqual(hi, 0x200000)
+
+    def test_identical_pointers_still_give_a_usable_span(self):
+        lo, hi = CI.region_bounds(0x000E4000, 0x000E4000)
+        self.assertGreater(hi - lo, 0x1000,
+                           "a zero-width region would compare nothing and "
+                           "report a match")

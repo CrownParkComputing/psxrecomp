@@ -58,6 +58,24 @@ SRC_OFFSET = -12          # lwr $t6,-12($s4): the source word's base
 DEFAULT_SPAN = 48         # enough to see the table around it
 
 
+def region_bounds(a, b, pad=0x2000, limit=0x200000):
+    """A span covering both pointers, so the comparison is phase-independent.
+
+    $s4 MOVES: measured across two samples it went 0x800E2634 -> 0x800E4634
+    while $s6 went 72 -> 128. The pointer tracks the animation, so comparing a
+    small window at each side's own $s4 compares different ENTRIES of the same
+    array whenever the two emulators are at different moments -- which they
+    always are. That produced "source-differs" twice for no guest reason.
+
+    Comparing the whole enclosing region instead does not care about phase: if
+    the arrays are identical the data is fine wherever each pointer happens to
+    be, and if they are not, that is a real divergence.
+    """
+    lo = max(0, (min(a, b) - pad) & ~3)
+    hi = min(limit, max(a, b) + pad)
+    return lo, hi
+
+
 def looks_like_triplets(b, stride=4):
     """Does this block look like packed RGB entries rather than 16-bit values?
 
@@ -293,6 +311,47 @@ def main(argv=None):
                                f"compare.")
                 print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
                 return _finish(doc, args, 1)
+            # Phase check BEFORE claiming a difference. Different scales mean
+            # different moments in the animation, and $s4 moves with the scale.
+            nat_scale = int(pr.get("regs", {}).get("s6", "0x0"), 16)
+            doc["native_scale"] = nat_scale
+            doc["phase_aligned"] = (nat_scale == scale)
+            if nat_scale != scale:
+                lo, hi = region_bounds(nsrc, src)
+                print(f"\n  scales differ (psx-runtime {nat_scale}, oracle "
+                      f"{scale}), so the two are at different points in the "
+                      f"animation and $s4 has moved with it.")
+                print(f"  comparing the whole region 0x{lo:08X}..0x{hi:08X} "
+                      f"instead, which does not depend on phase …")
+                ra_ = ram[lo:hi]
+                rb_ = read_ram_range(ds, 0x80000000 | lo, hi - lo)
+                doc["region"] = [f"0x{lo:08X}", f"0x{hi:08X}"]
+                if len(ra_) != len(rb_):
+                    doc["verdict"] = "unreadable"
+                    doc["note"] = "region reads returned different lengths"
+                    print(f"\nVERDICT: {doc['note']}", file=sys.stderr)
+                    return _finish(doc, args, 1)
+                nd = sum(1 for x, y in zip(ra_, rb_) if x != y)
+                doc["region_differing_bytes"] = nd
+                doc["region_bytes"] = len(ra_)
+                if nd == 0:
+                    doc["verdict"] = "region-matches"
+                    print(f"\nVERDICT: the whole {len(ra_)}-byte region is "
+                          f"IDENTICAL on both. The colour data is fine wherever "
+                          f"each pointer sits, so the divergence is not in this "
+                          f"table — it is in the scale, the arithmetic, or "
+                          f"which entry each side selects.")
+                else:
+                    doc["verdict"] = "region-differs"
+                    first = next(i for i, (x, y) in enumerate(zip(ra_, rb_))
+                                 if x != y)
+                    doc["region_first_difference"] = f"0x{lo + first:08X}"
+                    print(f"\nVERDICT: {nd}/{len(ra_)} bytes of the region "
+                          f"differ, first at 0x{lo + first:08X}. That is a real "
+                          f"data divergence — it does not depend on where either "
+                          f"pointer happened to be.")
+                return _finish(doc, args, 0)
+
             same = a == b
             doc["source_identical"] = same
             print(f"\n  psx-runtime @ {doc['native_source_addr']}: {a[:16].hex(' ')}")
