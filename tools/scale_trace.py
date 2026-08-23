@@ -45,6 +45,51 @@ KIND = "psx-scale-trace"
 NEUTRAL = 128
 
 
+def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
+    """Sample the register on CONSECUTIVE frames, by stepping.
+
+    This is the measurement that actually answers "does the fade sweep or
+    jump", and it needs one emulator rather than two.
+
+    Free-running samples are taken about 1.5s apart -- ninety frames -- so the
+    difference between consecutive readings is aliasing, not the animation
+    increment. A fade stepping by 2 per frame sampled every ninety frames looks
+    like arbitrary jumps, which is exactly what psx-runtime's 48/94/128 could
+    be. Stepping one frame between reads removes the confound entirely: the
+    deltas ARE the increment.
+    """
+    vals = []
+    leader = None
+    try:
+        conn.cmd("pause")
+    except DebugError as e:
+        return vals, f"could not pause: {e}"
+    try:
+        for _ in range(n):
+            pr = probe_registers(conn, pc, want=(reg,), wait=0.8, leader=leader)
+            leader = pr.get("block_leader") or leader
+            v = pr.get("regs", {}).get(reg)
+            if v:
+                vals.append(int(v, 16))
+            else:
+                leader = None
+            f0 = conn.frame()
+            conn.cmd("step", n=1)
+            for _ in range(150):
+                st = conn.raw("pause_state")
+                if st.get("paused") and conn.frame() > f0:
+                    break
+                time.sleep(0.02)
+    except DebugError as e:
+        return vals, str(e)
+    finally:
+        try:
+            conn.cmd("continue")
+        except DebugError:
+            pass
+    return vals, (None if vals else "no samples were captured")
+
+
 def sample_native(conn, pc, n, gap, reg, out=sys.stderr):
     """Returns (values, reason-it-stopped-or-None)."""
     vals = []
@@ -149,6 +194,11 @@ def main(argv=None):
                     help="more is better: comparing HOW a value "
                          "animates needs more than a handful")
     ap.add_argument("--gap", type=float, default=0.5)
+    ap.add_argument("--per-frame", action="store_true",
+                    help="step ONE frame between psx-runtime samples, so the "
+                         "differences are the actual animation increment "
+                         "rather than aliasing of a value sampled ~90 frames "
+                         "apart")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
@@ -159,7 +209,12 @@ def main(argv=None):
 
     n = DebugConn(args.host, args.native_port, args.timeout)
     o = DebugConn(args.host, args.ds_port, args.timeout)
-    nat, nat_why = sample_native(n, pc, args.samples, args.gap, args.reg)
+    if args.per_frame:
+        print("  psx-runtime: stepping one frame between reads, so the deltas "
+              "are the real per-frame increment")
+        nat, nat_why = sample_per_frame(n, pc, args.samples, args.reg)
+    else:
+        nat, nat_why = sample_native(n, pc, args.samples, args.gap, args.reg)
     orc, orc_why = sample_oracle(o, pc, max(3, args.samples // 3), args.reg)
 
     print()
@@ -254,6 +309,15 @@ def main(argv=None):
                 print(f"\n  Step sizes are comparable "
                       f"(psx-runtime max {a['max_step']}, oracle max "
                       f"{b['max_step']}), so the fade granularity matches too.")
+        elif args.per_frame and a["samples"] >= 5:
+            doc["granularity"] = "native-measured-per-frame"
+            print(f"\n  psx-runtime, sampled on CONSECUTIVE frames, moves in "
+                  f"steps of up to {a['max_step']} (median "
+                  f"{a['median_step']}). That is its real animation increment. "
+                  f"The oracle's series is not frame-adjacent, so its apparent "
+                  f"step is an upper bound only — but a per-frame increment "
+                  f"this large is a coarse fade regardless of what the oracle "
+                  f"does.")
         else:
             doc["granularity"] = "too-few-samples"
             print(f"\n  Too few samples ({a['samples']} vs {b['samples']}) to "
