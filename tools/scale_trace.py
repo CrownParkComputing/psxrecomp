@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from probe_regs import probe_registers  # noqa: E402
 from psx_gpu_frame import (  # noqa: E402
     DEFAULT_DUCKSTATION_PORT, DEFAULT_NATIVE_PORT, DebugConn, DebugError,
-    ORACLE_PAUSED_POLL_S, oracle_resume,
+    ORACLE_PAUSED_POLL_S, class_on_screen, oracle_resume,
 )
 
 KIND = "psx-scale-trace"
@@ -61,7 +61,7 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
     ninety frames apart, so their differences are aliasing; these deltas are the
     real animation increment.
     """
-    from probe_regs import search_windows
+    from probe_regs import MAX_PCS as MAX_PROBE_PCS, search_windows
 
     vals, frames = [], []
     try:
@@ -69,12 +69,20 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
     except DebugError as e:
         return vals, f"could not pause: {e}"
 
+    # The probe can hold 16 addresses, and the enclosing block may start well
+    # before them. Flattening every window and taking the first 16 only ever
+    # armed the nearest 0x3C bytes, so a block starting earlier was never found
+    # and the run reported "the block was not reached" — true, and not the
+    # reason the reader would infer.
+    #
+    # Each stepped frame arms the NEXT window, so the sweep advances with the
+    # animation instead of being spent before it starts.
+    windows = search_windows(pc, 0x400)
     leader = None
     misses = 0
     try:
-        for _ in range(n):
-            cands = ([leader] if leader
-                     else [c for w in search_windows(pc, 0x400) for c in w][:16])
+        for i in range(n):
+            cands = [leader] if leader else windows[i % len(windows)]
             try:
                 conn.cmd("pc_probe_clear")
                 conn.cmd("pc_probe_arm", n=8,
@@ -114,8 +122,24 @@ def sample_per_frame(conn, pc, n, reg, out=sys.stderr):
             pass
 
     if not vals:
-        return vals, (f"the block was not reached on any of {n} stepped "
-                      f"frame(s) — is the effect actually drawing?")
+        # Do not ASK whether the effect is drawing — check. The two causes need
+        # different responses: nothing on screen means get the game to the
+        # scene, while a covered range means the block starts further back.
+        covered = min(len(windows), n) * MAX_PROBE_PCS * 4
+        try:
+            on, drawing = class_on_screen(conn, "PolyG4+semi")
+        except DebugError:
+            on, drawing = True, {}
+        if not on:
+            top = ", ".join(f"{k} x{v}" for k, v in
+                            sorted(drawing.items(), key=lambda kv: -kv[1])[:4])
+            return vals, (f"the effect is not on screen on psx-runtime, so this "
+                          f"code never ran. Currently drawing: "
+                          f"{top or 'nothing'}.")
+        return vals, (f"the effect IS on screen but the block was not reached "
+                      f"on any of {n} stepped frame(s), searching 0x{covered:X} "
+                      f"bytes before 0x{pc:08X}. The enclosing block starts "
+                      f"further back than that.")
     if misses:
         print(f"  psx-runtime: {misses} of {n} frame(s) did not reach the block",
               file=out)
@@ -286,6 +310,32 @@ def main(argv=None):
         doc["native_error"] = nat_why
     if orc_why:
         doc["oracle_error"] = orc_why
+
+    # A per-frame series from psx-runtime answers the question on its own.
+    #
+    # "Does OUR fade sweep or jump" needs one emulator: consecutive frames give
+    # the real animation increment, and no oracle, no alignment and no shared
+    # phase enter into it. Requiring both sides here forced the operator to keep
+    # two emulators inside the same effect at once, which is the hardest part of
+    # this whole exercise and is not needed for this question.
+    if args.per_frame and a and a["samples"] >= 5 and not b:
+        doc["verdict"] = "native-per-frame-only"
+        smooth = a["max_step"] <= 8
+        doc["native_smooth"] = smooth
+        doc["note"] = (
+            f"psx-runtime's ${args.reg} over {a['samples']} CONSECUTIVE frames: "
+            f"{a['values']}, steps up to {a['max_step']} (median "
+            f"{a['median_step']}). "
+            + ("That is a smooth sweep, so the fade is not coarse on our side "
+               "and the difference is elsewhere."
+               if smooth else
+               f"That is a coarse fade — jumping by up to {a['max_step']} per "
+               f"frame produces hard bands rather than a gradient, which is the "
+               f"reported symptom.")
+            + f" The oracle produced nothing this run ({orc_why or 'no reason'}), "
+              f"but this measurement does not need it.")
+        print(f"\nVERDICT: {doc['note']}")
+        return _finish(doc, args, 0)
 
     if not a or not b:
         doc["verdict"] = "incomplete"

@@ -275,3 +275,36 @@ class TestPerFrameOrder(unittest.TestCase):
         import inspect
         src = inspect.getsource(ST.sample_per_frame)
         self.assertIn("leader = None", src)
+
+
+class TestNativeOnlyIsEnough(unittest.TestCase):
+    """"Does OUR fade sweep or jump" needs one emulator, not two.
+
+    Consecutive frames give the real animation increment. No oracle, no
+    alignment, no shared phase. Requiring both sides forced the operator to keep
+    two emulators inside the same effect simultaneously — the hardest part of
+    this whole exercise, and unnecessary for this question.
+    """
+
+    def d(self, vals):
+        return ST.describe(vals, "x", out=io.StringIO())
+
+    def test_a_smooth_per_frame_sweep_is_recognisable(self):
+        d = self.d([128, 126, 124, 122, 120, 118])
+        self.assertLessEqual(d["max_step"], 8)
+        self.assertEqual(d["samples"], 6)
+
+    def test_a_coarse_per_frame_fade_is_recognisable(self):
+        d = self.d([128, 94, 48, 20, 128])
+        self.assertGreater(d["max_step"], 8)
+
+    def test_five_samples_is_the_floor_for_a_standalone_verdict(self):
+        # Fewer cannot distinguish a sweep from sparse sampling of one, which
+        # is the mistake this tool has already made twice.
+        self.assertEqual(self.d([128, 126, 124, 122, 120])["samples"], 5)
+
+    def test_the_oracle_series_remains_an_upper_bound(self):
+        # Free-running samples land ~90 frames apart, so the oracle's apparent
+        # step can only overstate how finely it moves, never understate it.
+        d = self.d([116, 120, 124, 128])
+        self.assertEqual(d["max_step"], 4)
