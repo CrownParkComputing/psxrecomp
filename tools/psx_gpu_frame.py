@@ -1235,38 +1235,93 @@ def class_on_screen(conn, op_name: str) -> Tuple[bool, Dict[str, int]]:
 
 
 def wait_for_class(conn, op_name: str, timeout: float = 120.0,
-                   poll: float = 0.6, out=None) -> Tuple[bool, Dict[str, int]]:
+                   poll: float = 0.6, out=None,
+                   check=None) -> Tuple[bool, Dict[str, int]]:
     """Block until a primitive class appears on screen, or time out.
 
-    Every tool here needs the effect to be RUNNING: a write trace over its
-    packets, a block probe at one of its instructions, a walk of the list it
-    builds. Requiring it to be on screen at the instant a button is clicked
-    means racing a transient animation, and losing that race produces a
-    different-looking failure in each tool -- no writes recorded, no candidate
-    fired, no table found, the block was not reached.
+    Every tool here needs the effect RUNNING, and requiring it to be on screen
+    at the instant a button is clicked means racing a transient animation.
+    Waiting inverts that: start the tool, then trigger the effect.
 
-    Waiting inverts it: start the tool, then trigger the effect. The cost is one
-    display-list walk per poll, which is cheap next to what follows it.
+    The cost of the check is the whole design problem. class_on_screen()
+    snapshots all 2 MB of RAM -- 128 reads -- and against a PAUSED oracle,
+    whose socket falls back to a ~1 Hz idle timer, that is 128 seconds for ONE
+    poll. A 120-second wait then completes a single partial read and reports
+    "nothing", which is exactly what it did.
+
+    So: resume first (the oracle may be parked from an earlier breakpoint), pay
+    for the full scan once, then re-read only the span the display list
+    occupies -- a couple of KB, one or two reads. A cached root that stops
+    walking means the list moved, and the next poll pays for a rescan.
     """
+    # `check` is a seam: a caller (or a test) can supply its own
+    # "what is drawing" probe. The default below is the expensive-then-cheap
+    # scan described above.
+    if check is not None:
+        deadline = time.time() + timeout
+        drawing: Dict[str, int] = {}
+        said = False
+        while time.time() < deadline:
+            try:
+                on, drawing = check(conn, op_name)
+                if on:
+                    return True, drawing
+            except DebugError:
+                pass
+            if out and not said:
+                said = True
+                print(f"  waiting for {op_name} to appear (up to {timeout:.0f}s) "
+                      f"— trigger the effect now", file=out)
+            time.sleep(poll)
+        return False, drawing
+
+    # A parked emulator answers about once a second; nothing below works at that
+    # rate, and a tool that parked it earlier is the usual reason.
+    try:
+        conn.cmd("continue")
+    except DebugError:
+        pass
+
     deadline = time.time() + timeout
     said = False
+    root: Optional[int] = None
+    span: Optional[Tuple[int, int]] = None
+    drawing: Dict[str, int] = {}
+
     while time.time() < deadline:
         try:
-            on, drawing = class_on_screen(conn, op_name)
+            if root is None:
+                ram = snapshot_ram(conn)
+                cands = find_display_lists(ram)
+                if cands:
+                    root = cands[0]["root"]
+                    span = (cands[0]["lo"], cands[0]["hi"])
+            else:
+                lo = max(0, (span[0] - 0x400) & ~3)
+                hi = min(RAM_SIZE, span[1] + 0x400)
+                blob = read_ram_range(conn, 0x80000000 + lo, hi - lo)
+                buf = bytearray(RAM_SIZE)
+                buf[lo:lo + len(blob)] = blob
+                ram = bytes(buf)
+
+            prims = (decode_entries(walk_ordering_table(ram, root))
+                     if root is not None else [])
+            if not prims:
+                root = span = None        # the list moved; rescan next poll
+            drawing = {}
+            for p in prims:
+                if p["kind"] == "poly":
+                    drawing[p["op_name"]] = drawing.get(p["op_name"], 0) + 1
+            if drawing.get(op_name, 0) > 0:
+                return True, drawing
         except DebugError:
-            time.sleep(poll)
-            continue
-        if on:
-            return True, drawing
+            root = span = None
         if out and not said:
             said = True
             print(f"  waiting for {op_name} to appear (up to {timeout:.0f}s) — "
                   f"trigger the effect now", file=out)
         time.sleep(poll)
-    try:
-        return False, class_on_screen(conn, op_name)[1]
-    except DebugError:
-        return False, {}
+    return False, drawing
 
 
 def dma_gpu_list_root(conn: "DebugConn") -> Optional[int]:
