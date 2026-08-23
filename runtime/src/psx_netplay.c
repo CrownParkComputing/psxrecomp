@@ -413,6 +413,7 @@ int  psx_netplay_active(void) { return 0; }
 int  psx_netplay_link_active(void) { return 0; }
 int  psx_netplay_link_base_seat(void) { return 0; }
 int  psx_netplay_link_hash_enforced(void) { return 1; }
+int  psx_netplay_link_desynced(void) { return 0; }
 void psx_netplay_apply_pad_blob(int port, const uint8_t row[8])
 { (void)port; (void)row; }
 int  psx_netplay_determinism_active(void)
