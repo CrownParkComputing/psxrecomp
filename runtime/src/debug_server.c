@@ -12177,6 +12177,52 @@ static void handle_cdrom_timing(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, stats);
 }
 
+/* cdrom_timing_dump: per-sector records from the L1.5 timing ring.
+ * Parameters: tail (default 1024), lba_lo / lba_hi (optional filter).
+ * One row per physical sector deadline: when it was due, when it landed in
+ * the buffer, when its INT1 was armed and presented to INTC, and the
+ * data/dma/pended/lost flags -- enough to see a single skipped sector and
+ * whether the guest or the drive was late around it. */
+static void handle_cdrom_timing_dump(int id, const char *json)
+{
+    int tail = json_get_int(json, "tail", 1024);
+    if (tail < 1) tail = 1;
+    if (tail > 4096) tail = 4096;
+    int lba_lo = json_get_int(json, "lba_lo", -1);
+    int lba_hi = json_get_int(json, "lba_hi", -1);
+
+    uint64_t total = cdrom_timing_total();
+    uint64_t start = total > (uint64_t)tail ? total - (uint64_t)tail : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+             id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        CdTimingPub r;
+        if (!cdrom_timing_record(seq, &r)) continue;
+        if (lba_lo >= 0 && r.lba < lba_lo) continue;
+        if (lba_hi >= 0 && r.lba > lba_hi) continue;
+        send_fmt("%s{\"seq\":%llu,\"lba\":%d,\"frame\":%u,"
+                 "\"due\":%llu,\"buffer\":%llu,\"irq_arm\":%llu,"
+                 "\"intc\":%llu,\"data\":%u,\"dma\":%u,"
+                 "\"pended\":%u,\"lost\":%u,\"irq_armed\":%u,"
+                 "\"intc_seen\":%u}",
+                 first ? "" : ",",
+                 (unsigned long long)r.seq, r.lba, r.frame,
+                 (unsigned long long)r.due_cycle,
+                 (unsigned long long)r.buffer_cycle,
+                 (unsigned long long)r.irq_arm_cycle,
+                 (unsigned long long)r.intc_cycle,
+                 (r.flags & 0x01u) ? 1 : 0,
+                 (r.flags & 0x02u) ? 1 : 0,
+                 (r.flags & 0x04u) ? 1 : 0,
+                 (r.flags & 0x08u) ? 1 : 0,
+                 (r.flags & 0x10u) ? 1 : 0,
+                 (r.flags & 0x20u) ? 1 : 0);
+        first = 0;
+    }
+    send_fmt("]}\n");
+}
+
 /* autocompile_status: variant-capture automation state — autocapture
  * enable/trigger counters + the background compile's state and output tail
  * (in-memory ring; no log files). */
@@ -13955,6 +14001,7 @@ static const CmdEntry s_commands[] = {
     { "wtrace_reset",        handle_wtrace_clear },
     { "wtrace_ranges",       handle_wtrace_ranges },
     { "wtrace_dump",         handle_wtrace_dump },
+    { "cdrom_timing_dump",   handle_cdrom_timing_dump },
     { "wtrace_stats",        handle_wtrace_stats },
     { "wtrace_boot_dump",    handle_wtrace_boot_dump },
     { "wtrace_boot_summary", handle_wtrace_boot_summary },

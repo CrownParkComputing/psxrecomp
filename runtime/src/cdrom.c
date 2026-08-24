@@ -971,6 +971,22 @@ void cdrom_timing_reset(void) {
     s_cd_probe_stop_count = s_cd_probe_stop_cycles = 0;
 }
 
+uint64_t cdrom_timing_total(void) { return s_cd_timing_total; }
+
+int cdrom_timing_record(uint64_t seq, CdTimingPub *out) {
+    CdTimingRecord *r = cd_timing_lookup(seq);
+    if (!r || !out) return 0;
+    out->seq = r->seq;
+    out->due_cycle = r->due_cycle;
+    out->buffer_cycle = r->buffer_cycle;
+    out->irq_arm_cycle = r->irq_arm_cycle;
+    out->intc_cycle = r->intc_cycle;
+    out->frame = r->frame;
+    out->lba = r->lba;
+    out->flags = r->flags;
+    return 1;
+}
+
 void cdrom_timing_stats_json(char *out, int cap) {
     if (!out || cap <= 0) return;
     uint64_t start = s_cd_timing_reset_seq;

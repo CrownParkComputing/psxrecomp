@@ -51,6 +51,21 @@ void cdrom_warm_route_stats_json(char* out, int cap);
  * Diagnostics only: recording never changes CD scheduling or delivery. */
 void cdrom_timing_reset(void);
 void cdrom_timing_stats_json(char* out, int cap);
+
+/* Per-record view of the same ring, for localising a single lost/skipped
+ * sector rather than summarising thousands. */
+typedef struct CdTimingPub {
+    uint64_t seq;
+    uint64_t due_cycle;
+    uint64_t buffer_cycle;
+    uint64_t irq_arm_cycle;
+    uint64_t intc_cycle;
+    uint32_t frame;
+    int32_t  lba;
+    uint8_t  flags;      /* CDT_* bits, mirrored in the JSON as named fields */
+} CdTimingPub;
+uint64_t cdrom_timing_total(void);
+int cdrom_timing_record(uint64_t seq, CdTimingPub* out);
 void debug_force_cd_reinsert(void);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
