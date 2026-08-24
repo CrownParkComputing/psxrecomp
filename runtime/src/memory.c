@@ -692,6 +692,11 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
+/* Forward declaration: the generated static overlay bundle is not registered
+ * through overlay_loader.c, but its memoized CRC identities still use these
+ * page generations for invalidation. */
+void overlay_watch_set_range(uint32_t phys, uint32_t len);
+
 /* The page watch above is deliberately broad: it tells the loader that a
  * page contains at least one registered overlay range.  It must not, however,
  * turn every data write in that page into a code mutation.  Replay buffers and
@@ -736,6 +741,14 @@ void dirty_ram_reset_for_boot(void) {
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
     memset(g_dirty_ram_dispatch_pc_bitmap, 0,
            sizeof(g_dirty_ram_dispatch_pc_bitmap));
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    /* The pinned high-RAM static bundle is generated from one exact DMA image
+     * at 0x00780000, 0x2004 bytes long. Arm precisely that image before guest
+     * writes begin so memoized static variants re-hash when the image is
+     * replaced. This is invalidation bookkeeping only; admission remains
+     * guarded by the generated address/range/CRC dispatcher. */
+    overlay_watch_set_range(0x00780000u, 0x2004u);
+#endif
     g_dirty_ram_code_gen++;
 }
 
