@@ -547,10 +547,6 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
     channels[3].madr = final_addr;
     cancel_async_transfer(3);
     complete_transfer(3);
-    /* The DMA that drained a sector slot is done: if the next slot already
-     * holds an unread sector, the controller re-announces it now (DS
-     * CheckForSectorBufferReadComplete). */
-    cdrom_notify_cd_dma_complete();
 }
 
 static void advance_mdec_channel(int ch, uint32_t cycles) {
