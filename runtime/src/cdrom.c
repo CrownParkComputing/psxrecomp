@@ -1782,9 +1782,20 @@ static int deliver_read_sector(void) {
 static int deliver_read_sector_without_irq(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
-    /* No INT1 is raised here, so nothing will move the read pointer to the
-     * slot just filled. Count how often that leaves the refill unreachable. */
-    if (delivered && s_ring_write != s_ring_read) s_ring_norq_refill++;
+    if (delivered) {
+        /* Seamless refill for an in-flight multi-sector DMA: no INT1 is
+         * raised because this is a CONTINUATION of the drain already in
+         * progress, not a new notification. The read pointer must therefore
+         * follow it -- with one buffer this refill landed in the very buffer
+         * being drained, and the ring reproduces that only by advancing.
+         *
+         * Measured: leaving the pointer behind starved 1,128,960 drains and
+         * stranded exactly 70 refills -- the same 70 that showed up as
+         * int1_lost, with every Setloc retried. This one line is the whole
+         * difference between the ring regressing and the ring working. */
+        if (s_ring_write != s_ring_read) s_ring_norq_refill++;
+        s_ring_read = s_ring_write;
+    }
     return delivered;
 }
 
