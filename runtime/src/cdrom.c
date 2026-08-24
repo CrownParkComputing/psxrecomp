@@ -167,6 +167,7 @@ static int s_ring_read_buf;
 static int s_ring_write_buf;
 static uint64_t s_ring_dropped;      /* unread slots overwritten (guest 8+ behind) */
 static uint64_t s_int1_redelivered;  /* missed-sector INT1s recovered at drain end */
+static uint64_t s_redeliver_due;     /* 0 = none; else cycle deadline for one */
 #define RB_ (s_sector_ring[s_ring_read_buf])
 static int rb_available(void) { return RB_.size > 0 && RB_.pos < RB_.size; }
 static uint8_t last_sector_buffer[SECTOR_BUFFER_SIZE];
@@ -1491,6 +1492,9 @@ static void cdrom_clear_pending_dataready(void) {
     pending_dataready = 0;
     pending_dataready_stat = 0;
     s_cd_timing_pending_seq = UINT64_MAX;
+    /* A scheduled missed-sector INT1 dies with the drive state too; DS's
+     * ClearAsyncInterrupt deactivates the same event. */
+    s_redeliver_due = 0;
 }
 
 static void start_read_stream(uint8_t cmd) {
@@ -2586,24 +2590,64 @@ static void present_pending_dataready(void) {
 }
 
 /* Drain of the current slot finished. Hardware re-announces a sector the
- * guest missed (DS CheckForSectorBufferReadComplete: "Redeliver missed
- * sector on DMA/read complete"): if the newest slot already holds an
- * unread sector, raise its data-ready now, or pend it behind a still
- * -asserted INT. Without this, a game that drains two sectors per
- * Setloc+ReadN cycle never hears about the second one -- the LoM palette
- * failure. During an active multi-sector DMA the ring advances inline in
- * cdrom_dma_read instead (the historical no-new-INT refill shape), and
- * dma.c calls cdrom_notify_cd_dma_complete() at the end. */
+ * guest missed -- DS CheckForSectorBufferReadComplete, "Redeliver missed
+ * sector on DMA/read complete" -- so a game that drains the requested
+ * sector and then its continuation learns the second one arrived. Without
+ * it, the continuation sits unread in its slot and the game's next Setloc
+ * skips past it: the Legend of Mana palette failure (sector 125112 never
+ * consumed; 125113's raw bytes rendered as vertex colours).
+ *
+ * THE GUARDS MATTER MORE THAN THE MECHANISM. A first attempt raised this
+ * INT1 immediately and unconditionally; the game began retrying every
+ * Setloc and lost 70 sectors, because an INT1 landing mid-handshake
+ * overwrites the response FIFO that was about to serve a command's INT3.
+ * DuckStation blocks exactly this (SetAsyncInterrupt / DeliverAsyncInterrupt
+ * / the ack path at cdrom.cpp:1244):
+ *
+ *   - never while a command is pending or queued  (their HasPendingCommand)
+ *   - never while an INT is unacknowledged        (their HasPendingInterrupt)
+ *   - never stack a second one                    (their pending_async == 0)
+ *   - only while actually reading                 (their IsReading)
+ *   - and DELAYED, never immediate                (MISSED_INT1_DELAY_CYCLES)
+ *
+ * The delay is the load-bearing part: it gives the guest time to read a
+ * response out before the next notification can replace it. */
+#define CDROM_MISSED_INT1_DELAY_CYCLES 5000
+
+static int cdrom_command_in_flight(void) {
+    return pending.pending || queued_cmd.pending;
+}
+
 static void cdrom_ring_redeliver_check(void) {
+    if (!reading) return;                       /* IsReading */
+    if (pending_dataready) return;              /* one pending async, never two */
+    if (s_redeliver_due != 0) return;           /* already scheduled */
     if (s_ring_read_buf == s_ring_write_buf) return;
     CdSectorBuf *nb = &s_sector_ring[s_ring_write_buf];
-    if (nb->size > 0 && nb->pos == 0 && !pending_dataready) {
-        pending_dataready = 1;
-        pending_dataready_stat = stat_reg;
-        s_int1_redelivered++;
-        if (irq_flag == 0)
-            present_pending_dataready();
-    }
+    if (nb->size <= 0 || nb->pos != 0) return;  /* nothing unread waiting */
+    /* Schedule; the guards that can still change (command in flight, INT
+     * unacked) are re-checked at the deadline, exactly as DS re-checks in
+     * DeliverAsyncInterrupt. */
+    s_redeliver_due = psx_cycle_count + CDROM_MISSED_INT1_DELAY_CYCLES;
+}
+
+/* Deadline handler: re-check every guard, then hand the sector to the
+ * existing one-deep pend path so presentation follows the normal INT1
+ * route (response FIFO shape, INTC latch, timing ring). */
+static void cdrom_ring_redeliver_tick(void) {
+    if (s_redeliver_due == 0) return;
+    if (psx_cycle_count < s_redeliver_due) return;
+    s_redeliver_due = 0;
+    if (!reading || pending_dataready) return;
+    if (cdrom_command_in_flight()) return;      /* HasPendingCommand */
+    if (irq_flag != 0) return;                  /* HasPendingInterrupt */
+    if (s_ring_read_buf == s_ring_write_buf) return;
+    CdSectorBuf *nb = &s_sector_ring[s_ring_write_buf];
+    if (nb->size <= 0 || nb->pos != 0) return;
+    pending_dataready = 1;
+    pending_dataready_stat = stat_reg;
+    s_int1_redelivered++;
+    present_pending_dataready();
 }
 
 static void cdrom_ring_drain_complete(void) {
@@ -2819,6 +2863,12 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             irq_flag &= ~(val & 0x1F);
             if (had_active_irq && (irq_flag & 0x1F) == 0) {
                 cdrom_intc_request_latched = 0;
+                /* Guest just freed the INT line. If a sector is sitting
+                 * unread in the newest slot, schedule its notification now
+                 * (DS: ack path -> QueueDeliverAsyncInterrupt). Scheduled,
+                 * not raised: the delay is what keeps it out of the next
+                 * command's handshake. */
+                cdrom_ring_redeliver_check();
             }
             if (val & 0x40) {
                 param_count = 0;
@@ -2879,6 +2929,10 @@ void cdrom_advance(uint32_t cycles) {
     process_pending(cycles);
     try_execute_queued_command();
     process_read_stream(cycles);
+    /* After commands have had their turn this step: a missed-sector INT1 may
+     * now be due, and its guards (command in flight, INT unacked) are
+     * re-checked at the deadline. */
+    cdrom_ring_redeliver_tick();
     process_cdda_stream(cycles);
     refresh_cdrom_irq_line();
 }
@@ -3160,6 +3214,7 @@ static int cdrom_snap_emit(PstW *w) {
         WB(s_sector_ring[i].data); WI(s_sector_ring[i].size); WI(s_sector_ring[i].pos);
     }
     WI(s_ring_read_buf); WI(s_ring_write_buf);
+    WI(s_redeliver_due ? cycles_until_due(s_redeliver_due) : -1);
     WB(last_sector_buffer); WI(last_sector_lba); WI(last_sector_size);
     WB(last_valid_subq); WI(last_valid_subq_available);
     /* last_sector_frame is host s_frame_count — zero on the wire so netplay
@@ -3211,6 +3266,8 @@ static int cdrom_snap_parse(PstR *r) {
         RB(s_sector_ring[i].data); RI(s_sector_ring[i].size); RI(s_sector_ring[i].pos);
     }
     RI(s_ring_read_buf); RI(s_ring_write_buf);
+    { int rd; RI(rd);
+      s_redeliver_due = (rd < 0) ? 0 : (psx_cycle_count + (uint64_t)rd); }
     RB(last_sector_buffer); RI(last_sector_lba); RI(last_sector_size);
     RB(last_valid_subq); RI(last_valid_subq_available);
     RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
