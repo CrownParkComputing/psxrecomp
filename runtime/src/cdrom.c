@@ -3222,11 +3222,23 @@ static int cdrom_snap_emit(PstW *w) {
     WU(cdrom_intc_latched_generation); WI(irq_present_rem_cycles());
     WB(param_fifo); WI(param_count);
     WB(response_fifo); WI(response_read); WI(response_count);
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        WB(s_sector_ring[i].data); WI(s_sector_ring[i].size); WI(s_sector_ring[i].pos);
-    }
-    WI(s_ring_read); WI(s_ring_write); WI(pending_dataready_slot);
-    WI(pending_present_due ? cycles_until_due(pending_present_due) : -1);
+    /* WIRE FORMAT IS UNCHANGED, deliberately: only the slot the guest is
+     * draining goes out, in the exact layout the single-buffer version used
+     * (bytes, read position, available flag, size).
+     *
+     * Serialising all eight slots grew the section, so every previously saved
+     * state failed its size check -- and boot_state applies sections as it
+     * goes with no rollback, so RAM/CPU/GPU were already overwritten by the
+     * time the CD section was rejected. The load reported failure and left a
+     * half-restored machine that ran to the frame and froze.
+     *
+     * The other slots hold sectors the drive has read ahead; dropping them
+     * costs a re-read the game already knows how to ask for, which is what
+     * the single-buffer version effectively did across a load anyway. */
+    WB(s_sector_ring[s_ring_read].data);
+    WI(RB_.pos);
+    WI(rb_available());
+    WI(RB_.size);
     WB(last_sector_buffer); WI(last_sector_lba); WI(last_sector_size);
     WB(last_valid_subq); WI(last_valid_subq_available);
     /* last_sector_frame is host s_frame_count — zero on the wire so netplay
@@ -3234,7 +3246,7 @@ static int cdrom_snap_emit(PstW *w) {
     WU(0u); W8(last_sector_mode); W8(last_sector_have_raw);
     W8(last_sector_raw_mode); W8(last_sector_xa_file); W8(last_sector_xa_channel);
     W8(last_sector_xa_submode); W8(last_sector_xa_coding);
-    W8(seek_min); W8(seek_sec); W8(seek_sect); WI(s_setloc_lba); WI(setloc_seek_far); WI(setloc_pending);
+    W8(seek_min); W8(seek_sec); W8(seek_sect); WI(s_setloc_lba); WI(setloc_seek_far);
     WI(reading); WI(read_min); WI(read_sec); WI(read_sect); W8(mode_reg);
     W8(read_cmd); WI(read_delay); W8(filter_file); W8(filter_channel); W8(cd_muted);
     WI(cdda_playing); WI(cdda_track); WU(cdda_lba); WI(cdda_delay);
@@ -3274,18 +3286,33 @@ static int cdrom_snap_parse(PstR *r) {
     RU(cdrom_intc_latched_generation); RI(present_rem);
     RB(param_fifo); RI(param_count);
     RB(response_fifo); RI(response_read); RI(response_count);
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        RB(s_sector_ring[i].data); RI(s_sector_ring[i].size); RI(s_sector_ring[i].pos);
+    /* Restore into slot 0 and start the ring clean. See the emitter: the wire
+     * format is the single-buffer one, so states written before the ring
+     * existed still load. */
+    RB(s_sector_ring[0].data);
+    RI(s_sector_ring[0].pos);
+    { int avail; RI(avail); (void)avail; }   /* derived from pos < size now */
+    RI(s_sector_ring[0].size);
+    for (int slot = 1; slot < CDROM_NUM_SECTOR_BUFFERS; slot++) {
+        s_sector_ring[slot].size = 0;
+        s_sector_ring[slot].pos = 0;
     }
-    RI(s_ring_read); RI(s_ring_write); RI(pending_dataready_slot);
-    { int pd; RI(pd);
-      pending_present_due = (pd < 0) ? 0 : (psx_cycle_count + (uint64_t)pd); }
+    s_ring_read = 0;
+    s_ring_write = 0;
+    pending_dataready_slot = 0;
+    pending_present_due = 0;
+    /* A size off the wire indexes this buffer: clamp before anything uses it. */
+    if (s_sector_ring[0].size < 0 || s_sector_ring[0].size > SECTOR_BUFFER_SIZE)
+        s_sector_ring[0].size = 0;
+    if (s_sector_ring[0].pos < 0 || s_sector_ring[0].pos > s_sector_ring[0].size)
+        s_sector_ring[0].pos = 0;
+
     RB(last_sector_buffer); RI(last_sector_lba); RI(last_sector_size);
     RB(last_valid_subq); RI(last_valid_subq_available);
     RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
     R8(last_sector_raw_mode); R8(last_sector_xa_file); R8(last_sector_xa_channel);
     R8(last_sector_xa_submode); R8(last_sector_xa_coding);
-    R8(seek_min); R8(seek_sec); R8(seek_sect); RI(s_setloc_lba); RI(setloc_seek_far); RI(setloc_pending);
+    R8(seek_min); R8(seek_sec); R8(seek_sect); RI(s_setloc_lba); RI(setloc_seek_far); setloc_pending = 0;
     RI(reading); RI(read_min); RI(read_sec); RI(read_sect); R8(mode_reg);
     R8(read_cmd); RI(read_delay); R8(filter_file); R8(filter_channel); R8(cd_muted);
     RI(cdda_playing); RI(cdda_track); RU(cdda_lba); RI(cdda_delay);
