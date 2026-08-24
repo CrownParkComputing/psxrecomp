@@ -208,10 +208,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..32d39195
+index 00000000..3cf6eedd
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1353 @@
+@@ -0,0 +1,1367 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -511,6 +511,15 @@ index 00000000..32d39195
 +
 +void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data)
 +{
++  // Mirror psx-runtime's cd_dma_log_push exactly: transfers to 0x1C0000+ are
++  // FMV / streaming buffers and are NOT logged. Without this the oracle's
++  // ring floods -- FMV runs ~3 DMAs per sector and had evicted the palette
++  // load (LBA 125111/125113) while native, which applies the exclusion, still
++  // held it. An asymmetric log is worse than no log: it looks like the oracle
++  // never loaded the file.
++  if (dest >= 0x1C0000u)
++    return;
++
 +  CdDmaEntry& e = s_cd_dma_log[s_cd_dma_log_seq++ % CD_DMA_LOG_CAP];
 +  e.dest = dest;
 +  e.size = size_bytes;
@@ -1302,6 +1311,11 @@ index 00000000..32d39195
 +      rx_data & 0xFF, stat & 0xFFFF, mode & 0xFFFF, ctrl & 0xFFFF, baud & 0xFFFF));
 +  }
 +  // ---- screenshot ----
++  else if (std::strcmp(cmd, "cd_read_log_clear") == 0)
++  {
++    s_cd_dma_log_seq = 0;
++    SendJSON(fmt::format(R"({{"id":{},"ok":true}})", s_request_id));
++  }
 +  else if (std::strcmp(cmd, "cd_read_log") == 0)
 +  {
 +    // Filter SERVER-SIDE. Write() goes through BufferedStreamSocket, whose
