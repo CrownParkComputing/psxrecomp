@@ -113,7 +113,11 @@ def main():
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--lba-lo", type=int, default=125104)
-    ap.add_argument("--lba-hi", type=int, default=125120)
+    ap.add_argument("--lba-hi", type=int, default=125117,
+                    help="last sector of the load. The game issues Pause "
+                         "after 125117; sectors past it are read-ahead it "
+                         "never consumes, so THEIR notifications are lost by "
+                         "design and must not be read as degradation")
     ap.add_argument("--ds-offset", type=int, default=150,
                     help="the oracle counts LBA from disc start; subtract the "
                          "2-second pregap to match psx-runtime's game LBAs")
@@ -147,11 +151,15 @@ def main():
     # `lost` set, or a sector read more than once, is the degraded state, not
     # the clean one. Refuse rather than diff it -- the first run of this tool
     # compared a stale 2x-experiment session against a healthy oracle.
-    dirty = [lba for lba, r in nat.items() if r["lost"]]
+    # Loss only counts inside the load itself. Past its last sector the drive
+    # keeps reading until the game's Pause, and those notifications are lost
+    # by design -- flagging them made a clean session look degraded.
+    dirty = sorted(lba for lba, r in nat.items()
+                   if r["lost"] and lba <= args.lba_hi)
     if dirty:
-        print(f"psx-runtime's most recent pass is DEGRADED: {len(dirty)} "
-              f"sector(s) lost their notification (e.g. LBA {min(dirty)}). "
-              f"That is the failure state, not the baseline.\n"
+        print(f"psx-runtime's most recent pass is DEGRADED inside the load: "
+              f"sector(s) {dirty} lost their notification. That is the "
+              f"failure state, not the baseline.\n"
               f"Restart psx-runtime -- it picks up the reverted authentic-1x "
               f"game.toml -- replay the scene, and rerun.", file=sys.stderr)
         return 1

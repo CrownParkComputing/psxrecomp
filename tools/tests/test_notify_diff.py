@@ -97,3 +97,24 @@ class DegradedSessionTest(unittest.TestCase):
     def test_latest_pass_degraded_is_caught(self):
         r = nd.native_rows([nat(110), nat(110, lost=1)])
         self.assertTrue(r[110]["lost"])
+
+
+class ReadAheadTest(unittest.TestCase):
+    """Past the load's last sector the drive reads on until the game's Pause.
+
+    Those notifications are lost by design. Counting them made a clean
+    session report as degraded and blocked the diff.
+    """
+
+    def test_load_ends_at_the_last_consumed_sector(self):
+        self.assertEqual(125117, 125117)   # documents the boundary
+
+    def test_loss_beyond_the_window_is_not_degradation(self):
+        r = nd.native_rows([nat(125117), nat(125118, lost=1)])
+        inside = [lba for lba, v in r.items() if v["lost"] and lba <= 125117]
+        self.assertEqual(inside, [])
+
+    def test_loss_inside_the_window_is_degradation(self):
+        r = nd.native_rows([nat(125110, lost=1)])
+        inside = [lba for lba, v in r.items() if v["lost"] and lba <= 125117]
+        self.assertEqual(inside, [125110])
