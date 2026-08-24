@@ -159,10 +159,10 @@ def main():
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    print("armed. Play into the scene AND START THE ANIMATION (the X press); "
-          "the palette load happens at the animation itself, not when the "
-          "map appears. Watching for a load from LBA "
-          f"{args.lba_lo}..{args.lba_hi} …", flush=True)
+    print("armed. Play toward the land-creation sequence; this reports the "
+          "moment the palette file (LBA "
+          f"{args.lba_lo}..{args.lba_hi}) is loaded, whichever screen "
+          "triggers it.", flush=True)
     deadline = time.monotonic() + args.wait_secs
     loads = []
     while time.monotonic() < deadline:
@@ -217,6 +217,11 @@ def main():
             extra += f"  data={fw[0]},{fw[1]}"
         print(f"  LBA {l['lba']:>7} -> 0x{l['dest']:06X}  {l['size']} bytes"
               f"{extra}")
+    if loads and "delivered_lba" not in loads[-1]:
+        print("\n  NOTE: no delivered= fields -- this psx-runtime predates "
+              "the extended DMA log. Rebuild and restart it, then rerun; "
+              "the delivered-vs-requested column is the measurement this "
+              "run exists for.")
 
     gaps = request_gaps(loads)
     doc["request_gaps"] = gaps
@@ -255,35 +260,40 @@ def main():
     except DebugError:
         pass
 
-    # The command transcript around the load: what the game asked, and the
-    # response bytes it read back. This decides whether SetLoc(125113) was
-    # computed from a position WE reported.
+    # The command conversation around the load, from the command-history
+    # ring. The raw register trace holds ~1.5 frames during loads (per-byte
+    # FIFO reads flood it); the command history records one entry per command
+    # with its original params and survives the whole session.
     try:
-        tr = conn.cmd("cdrom_trace_dump", count=20000)
-        conv = transcript(tr.get("entries", []))
-        doc["transcript"] = conv[-400:]
-        interesting = [c for c in conv if "lba" in c or
-                       c.get("cmd") in ("GetlocL", "GetlocP", "Pause",
-                                        "ReadN", "ReadS", "SeekL")]
-        print(f"\ncommand transcript (position-relevant, last 30):")
-        for c in interesting[-30:]:
-            if "sector_lba" in c:
-                continue
-            lba = f" lba={c['lba']}" if "lba" in c else ""
-            resp = ""
-            if c.get("resp") and c.get("cmd") in ("GetlocL", "GetlocP"):
-                b = c["resp"]
-                resp = " resp=" + " ".join(f"{x:02X}" for x in b[:10])
-                if c["cmd"] == "GetlocL" and len(b) >= 4:
-                    resp += (f" -> lba {(bcd(b[1])*60 + bcd(b[2]))*75 + bcd(b[3]) - 150}")
-                if c["cmd"] == "GetlocP" and len(b) >= 8:
-                    resp += (f" -> abs lba {(bcd(b[6])*60 + bcd(b[7]))*75 + bcd(b[8]) - 150}"
-                             if len(b) >= 9 else "")
-            print(f"  f{c.get('frame')}: {c['cmd']}"
-                  f"({' '.join(f'{x:02X}' for x in c.get('params', []))})"
-                  f"{lba}{resp}")
+        hist = conn.cmd("cdrom_command_history", count=4096)
+        rows = []
+        for e in hist.get("entries", []):
+            cmd = e.get("cmd")
+            cmd = int(cmd, 16) if isinstance(cmd, str) else int(cmd or 0)
+            ps = [int(x, 16) if isinstance(x, str) else int(x)
+                  for x in (e.get("params") or [])]
+            row = {"frame": int(e.get("frame", 0)),
+                   "cmd": CMD_NAMES.get(cmd, f"0x{cmd:02X}"),
+                   "params": ps, "kind": e.get("kind")}
+            if cmd == 0x02 and len(ps) >= 3:
+                m, s_, f = (bcd(x) for x in ps[:3])
+                row["lba"] = (m * 60 + s_) * 75 + f - 150
+            rows.append(row)
+        doc["command_history"] = rows[-200:]
+        lo_f = min((l.get("frame", 0) for l in
+                    doc.get("timing_records", [])
+                    if args.lba_lo <= int(l.get("lba", -1)) <= args.lba_hi),
+                   default=None)
+        window = [r for r in rows
+                  if lo_f is None or abs(r["frame"] - lo_f) <= 60]
+        print(f"\ncommand history around the load "
+              f"({len(window)} of {len(rows)}):")
+        for r in window[-30:]:
+            lba = f" -> lba {r['lba']}" if "lba" in r else ""
+            print(f"  f{r['frame']}: {r['cmd']}"
+                  f"({' '.join(f'{x:02X}' for x in r['params'])}){lba}")
     except DebugError as e:
-        print(f"  trace dump unavailable ({e})", file=sys.stderr)
+        print(f"  command history unavailable ({e})", file=sys.stderr)
 
     blob = read_ram_range(conn, 0x80000000 + TABLE_LO,
                           ((TABLE_HI - TABLE_LO) & ~3) + 4)
