@@ -24,7 +24,7 @@ index e2d0294b..b290bd35 100644
    settings.cpp
    settings.h
 diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
-index c36b9341..ea7956da 100644
+index c36b9341..78e66fa8 100644
 --- a/src/core/cdrom.cpp
 +++ b/src/core/cdrom.cpp
 @@ -2,6 +2,7 @@
@@ -58,7 +58,35 @@ index c36b9341..ea7956da 100644
  bool CDROM::HasPendingCommand()
  {
    return s_state.command != Command::None;
-@@ -1850,6 +1860,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
+@@ -1371,12 +1381,16 @@ void CDROM::SetAsyncInterrupt(Interrupt interrupt)
+   if (s_state.interrupt_flag_register == static_cast<u8>(interrupt))
+   {
+     DEV_LOG("Not setting async interrupt {} because there is already one unacknowledged", static_cast<u8>(interrupt));
++    if (interrupt == Interrupt::DataReady)
++      PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_DROPPED);
+     s_state.async_response_fifo.Clear();
+     return;
+   }
+ 
+   Assert(s_state.pending_async_interrupt == 0);
+   s_state.pending_async_interrupt = static_cast<u8>(interrupt);
++  if (interrupt == Interrupt::DataReady)
++    PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_QUEUED);
+   if (!HasPendingInterrupt())
+   {
+     // Pending interrupt should block INT1 from going through. But pending command needs to as well, for games like
+@@ -1442,7 +1456,10 @@ void CDROM::DeliverAsyncInterrupt(void*, TickCount ticks, TickCount ticks_late)
+ 
+     // This is the HC05 setting the read position from the decoder.
+     if (s_state.pending_async_interrupt == static_cast<u8>(Interrupt::DataReady))
++    {
+       s_state.current_read_sector_buffer = s_state.current_write_sector_buffer;
++      PSXRecompDebug::FlagCdSector(s_state.current_read_sector_buffer, PSXRecompDebug::CDSE_DELIVERED);
++    }
+ 
+     s_state.response_fifo.Clear();
+     s_state.response_fifo.PushFromQueue(&s_state.async_response_fifo);
+@@ -1850,6 +1867,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
      s_state.response_fifo.Clear();
    }
  
@@ -76,14 +104,32 @@ index c36b9341..ea7956da 100644
    // Stop command event first, reduces our chances of ending up with out-of-order events.
    s_state.command_event.Deactivate();
  
-@@ -3495,6 +3516,7 @@ ALWAYS_INLINE_RELEASE void CDROM::ProcessDataSector(const u8* raw_sector, const
+@@ -3495,7 +3523,9 @@ ALWAYS_INLINE_RELEASE void CDROM::ProcessDataSector(const u8* raw_sector, const
    }
  
    sb->position = 0;
 +  sb->lba = static_cast<s32>(s_state.current_lba);
    s_state.current_write_sector_buffer = sb_num;
++  PSXRecompDebug::RecordCdSector(sb->lba, sb_num);
  
    // Deliver to CPU
+   if (HasPendingAsyncInterrupt())
+@@ -4001,6 +4031,7 @@ void CDROM::CheckForSectorBufferReadComplete()
+   // Buffer complete?
+   if (sb.position >= sb.size)
+   {
++    PSXRecompDebug::FlagCdSector(s_state.current_read_sector_buffer, PSXRecompDebug::CDSE_DRAINED);
+     sb.position = 0;
+     sb.size = 0;
+   }
+@@ -4014,6 +4045,7 @@ void CDROM::CheckForSectorBufferReadComplete()
+   if (next_sb.position == 0 && next_sb.size > 0 && !HasPendingAsyncInterrupt() && IsReading())
+   {
+     DEV_LOG("Sending additional INT1 for missed sector in buffer {}", s_state.current_write_sector_buffer);
++    PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_REDELIVERED);
+     s_state.async_response_fifo.Push(s_state.secondary_status.bits);
+     s_state.pending_async_interrupt = static_cast<u8>(Interrupt::DataReady);
+     s_state.async_interrupt_event.Schedule(
 diff --git a/src/core/cdrom.h b/src/core/cdrom.h
 index 02f27f5e..108043bf 100644
 --- a/src/core/cdrom.h
@@ -208,10 +254,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..3cf6eedd
+index 00000000..aeed3ae5
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1367 @@
+@@ -0,0 +1,1447 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -531,6 +577,53 @@ index 00000000..3cf6eedd
 +    std::memcpy(&e.first_words[0], data, 4);
 +    std::memcpy(&e.first_words[1], static_cast<const u8*>(data) + 4, 4);
 +  }
++}
++
++// ---- per-sector notification accounting -----------------------------------
++namespace {
++struct CdSectorEvent
++{
++  u64 seq;
++  s32 lba;
++  u32 frame;
++  u32 buffer;
++  u8 flags;
++};
++constexpr u32 CD_SECTOR_LOG_CAP = 4096;
++CdSectorEvent s_cd_sector_log[CD_SECTOR_LOG_CAP];
++u64 s_cd_sector_seq = 0;
++// Newest entry index per buffer slot, so a later notification can be
++// attributed to the sector it concerns rather than to whatever is newest.
++u64 s_cd_buf_last[16] = {};
++bool s_cd_buf_valid[16] = {};
++} // namespace
++
++void RecordCdSector(s32 lba, u32 buffer)
++{
++  const u64 seq = s_cd_sector_seq++;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  e.seq = seq;
++  e.lba = lba;
++  e.frame = s_frame_counter;
++  e.buffer = buffer;
++  e.flags = CDSE_DATA;
++  if (buffer < 16)
++  {
++    s_cd_buf_last[buffer] = seq;
++    s_cd_buf_valid[buffer] = true;
++  }
++}
++
++void FlagCdSector(u32 buffer, u8 bits)
++{
++  if (buffer >= 16 || !s_cd_buf_valid[buffer])
++    return;
++  const u64 seq = s_cd_buf_last[buffer];
++  if (s_cd_sector_seq - seq > CD_SECTOR_LOG_CAP)
++    return;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  if (e.seq == seq)
++    e.flags |= bits;
 +}
 +
 +void RecordCdCommand(u8 command, const u8* params, u32 param_count)
@@ -1311,6 +1404,39 @@ index 00000000..3cf6eedd
 +      rx_data & 0xFF, stat & 0xFFFF, mode & 0xFFFF, ctrl & 0xFFFF, baud & 0xFFFF));
 +  }
 +  // ---- screenshot ----
++  else if (std::strcmp(cmd, "cd_sector_events") == 0)
++  {
++    int tail = json_get_int(json, "tail", 256);
++    if (tail < 1) tail = 1;
++    if (tail > 400) tail = 400;   // BufferedStreamSocket truncates large replies
++    const int lba_lo = json_get_int(json, "lba_lo", -1);
++    const int lba_hi = json_get_int(json, "lba_hi", -1);
++    const u64 total = s_cd_sector_seq;
++    u64 start = (total > static_cast<u64>(tail)) ? total - static_cast<u64>(tail) : 0;
++    if (total > CD_SECTOR_LOG_CAP && start < total - CD_SECTOR_LOG_CAP)
++      start = total - CD_SECTOR_LOG_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    for (u64 seq = start; seq < total; seq++)
++    {
++      const CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++      if (e.seq != seq)
++        continue;
++      if (lba_lo >= 0 && e.lba < lba_lo)
++        continue;
++      if (lba_hi >= 0 && e.lba > lba_hi)
++        continue;
++      resp += fmt::format(
++        R"({}{{"lba":{},"frame":{},"buffer":{},"data":{},"dropped":{},"queued":{},"delivered":{},"redelivered":{},"drained":{}}})",
++        first ? "" : ",", e.lba, e.frame, e.buffer, (e.flags & CDSE_DATA) ? 1 : 0,
++        (e.flags & CDSE_DROPPED) ? 1 : 0, (e.flags & CDSE_QUEUED) ? 1 : 0,
++        (e.flags & CDSE_DELIVERED) ? 1 : 0, (e.flags & CDSE_REDELIVERED) ? 1 : 0,
++        (e.flags & CDSE_DRAINED) ? 1 : 0);
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
 +  else if (std::strcmp(cmd, "cd_read_log_clear") == 0)
 +  {
 +    s_cd_dma_log_seq = 0;
@@ -1581,10 +1707,10 @@ index 00000000..3cf6eedd
 +}
 diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
 new file mode 100644
-index 00000000..4f266dae
+index 00000000..be76188a
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,66 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371
 +// Same protocol as the PSXRecomp runner debug server.
@@ -1632,6 +1758,23 @@ index 00000000..4f266dae
 +/// Record one channel-3 DMA into RAM (called from DMA::TransferMemoryBlock).
 +/// Mirrors psx-runtime's cd_read_log so the two slot maps can be diffed.
 +void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data);
++
++/// Per-sector notification accounting, mirroring psx-runtime's per-sector
++/// delivery records ([D]ata / [P]ended / [L]ost). psx-runtime delivers an
++/// immediate INT1 for a sector arriving with the flag clear; DuckStation may
++/// instead DROP it and re-announce after the guest drains. Which of those
++/// happens to the sectors the guest misses is the open question.
++enum : u8
++{
++  CDSE_DATA = 1,        // sector stored in a buffer
++  CDSE_DROPPED = 2,     // INT1 not raised: one was already unacknowledged
++  CDSE_QUEUED = 4,      // INT1 became the pending async interrupt
++  CDSE_DELIVERED = 8,   // INT1 actually presented to the guest
++  CDSE_REDELIVERED = 16,// re-announced by the missed-sector path
++  CDSE_DRAINED = 32,    // guest read the buffer to completion
++};
++void RecordCdSector(s32 lba, u32 buffer);
++void FlagCdSector(u32 buffer, u8 bits);
 +
 +} // namespace PSXRecompDebug
 diff --git a/src/core/system.cpp b/src/core/system.cpp
