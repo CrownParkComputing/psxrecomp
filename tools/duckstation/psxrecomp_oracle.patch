@@ -24,7 +24,7 @@ index e2d0294b..b290bd35 100644
    settings.cpp
    settings.h
 diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
-index c36b9341..a9ea26ab 100644
+index c36b9341..ea7956da 100644
 --- a/src/core/cdrom.cpp
 +++ b/src/core/cdrom.cpp
 @@ -2,6 +2,7 @@
@@ -35,7 +35,30 @@ index c36b9341..a9ea26ab 100644
  #include "cdrom_async_reader.h"
  #include "cdrom_subq_replacement.h"
  #include "dma.h"
-@@ -1850,6 +1851,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
+@@ -395,6 +396,9 @@ struct SectorBuffer
+   FixedHeapArray<u8, RAW_SECTOR_OUTPUT_SIZE> data;
+   u32 position;
+   u32 size;
++  // PSXRecomp oracle: which sector these bytes came from, so a DMA drain can
++  // be attributed to an LBA the same way psx-runtime's cd_read_log does.
++  s32 lba;
+ };
+ 
+ struct CDROMState
+@@ -1345,6 +1349,12 @@ void CDROM::DMARead(u32* words, u32 word_count)
+   CheckForSectorBufferReadComplete();
+ }
+ 
++s32 CDROM::GetCurrentReadBufferLBA()
++{
++  const SectorBuffer& sb = s_state.sector_buffers[s_state.current_read_sector_buffer];
++  return (sb.size > 0) ? sb.lba : -1;
++}
++
+ bool CDROM::HasPendingCommand()
+ {
+   return s_state.command != Command::None;
+@@ -1850,6 +1860,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
      s_state.response_fifo.Clear();
    }
  
@@ -53,6 +76,27 @@ index c36b9341..a9ea26ab 100644
    // Stop command event first, reduces our chances of ending up with out-of-order events.
    s_state.command_event.Deactivate();
  
+@@ -3495,6 +3516,7 @@ ALWAYS_INLINE_RELEASE void CDROM::ProcessDataSector(const u8* raw_sector, const
+   }
+ 
+   sb->position = 0;
++  sb->lba = static_cast<s32>(s_state.current_lba);
+   s_state.current_write_sector_buffer = sb_num;
+ 
+   // Deliver to CPU
+diff --git a/src/core/cdrom.h b/src/core/cdrom.h
+index 02f27f5e..108043bf 100644
+--- a/src/core/cdrom.h
++++ b/src/core/cdrom.h
+@@ -42,6 +42,8 @@ void CPUClockChanged();
+ u8 ReadRegister(u32 offset);
+ void WriteRegister(u32 offset, u8 value);
+ void DMARead(u32* words, u32 word_count);
++/// PSXRecomp oracle: LBA of the sector currently being drained, or -1.
++s32 GetCurrentReadBufferLBA();
+ 
+ // Render statistics debug window.
+ void DrawDebugWindow(float scale);
 diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
 index c78acbf3..d991249e 100644
 --- a/src/core/cpu_core.cpp
@@ -112,6 +156,32 @@ index c78acbf3..d991249e 100644
    MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::Word, addr, value);
  
    if (!DoAlignmentCheck<MemoryAccessType::Write, MemoryAccessSize::Word>(addr))
+diff --git a/src/core/dma.cpp b/src/core/dma.cpp
+index 3aa6c404..e95eb8b6 100644
+--- a/src/core/dma.cpp
++++ b/src/core/dma.cpp
+@@ -4,6 +4,7 @@
+ #include "dma.h"
+ #include "bus.h"
+ #include "cdrom.h"
++#include "psxrecomp_debug_server.h"
+ #include "cpu_code_cache.h"
+ #include "cpu_core.h"
+ #include "gpu.h"
+@@ -926,8 +927,12 @@ TickCount DMA::TransferDeviceToMemory(u32 address, u32 increment, u32 word_count
+       break;
+ 
+     case Channel::CDROM:
++    {
++      const s32 cd_lba = CDROM::GetCurrentReadBufferLBA();
+       CDROM::DMARead(dest_pointer, word_count);
+-      break;
++      PSXRecompDebug::RecordCdDma(address, word_count * 4u, cd_lba, dest_pointer);
++    }
++    break;
+ 
+     case Channel::SPU:
+       SPU::DMARead(dest_pointer, word_count);
 diff --git a/src/core/gpu.h b/src/core/gpu.h
 index 975f8d5d..05fa3600 100644
 --- a/src/core/gpu.h
@@ -138,10 +208,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..e2c3ee2c
+index 00000000..82736e1c
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1276 @@
+@@ -0,0 +1,1332 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -414,6 +484,40 @@ index 00000000..e2c3ee2c
 +CdCmdEntry s_cd_cmd_history[CD_CMD_HISTORY_CAP];
 +u64 s_cd_cmd_history_seq = 0;
 +} // namespace
++
++// ---- CD DMA log (mirror of psx-runtime's cd_read_log) ----------------------
++// One entry per channel-3 DMA into RAM: destination, size, the LBA of the
++// sector actually drained, and the head of the transferred data. This is the
++// half that was missing: native's slot map was known in detail, the oracle's
++// only inferred, and the palette reaches its table through one of these.
++namespace {
++struct CdDmaEntry
++{
++  u32 dest;
++  u32 size;
++  s32 lba;
++  u32 frame;
++  u32 first_words[2];
++};
++constexpr u32 CD_DMA_LOG_CAP = 4096;
++CdDmaEntry s_cd_dma_log[CD_DMA_LOG_CAP];
++u64 s_cd_dma_log_seq = 0;
++} // namespace
++
++void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data)
++{
++  CdDmaEntry& e = s_cd_dma_log[s_cd_dma_log_seq++ % CD_DMA_LOG_CAP];
++  e.dest = dest;
++  e.size = size_bytes;
++  e.lba = lba;
++  e.frame = s_frame_counter;
++  e.first_words[0] = e.first_words[1] = 0;
++  if (data && size_bytes >= 8)
++  {
++    std::memcpy(&e.first_words[0], data, 4);
++    std::memcpy(&e.first_words[1], static_cast<const u8*>(data) + 4, 4);
++  }
++}
 +
 +void RecordCdCommand(u8 command, const u8* params, u32 param_count)
 +{
@@ -1193,6 +1297,28 @@ index 00000000..e2c3ee2c
 +      rx_data & 0xFF, stat & 0xFFFF, mode & 0xFFFF, ctrl & 0xFFFF, baud & 0xFFFF));
 +  }
 +  // ---- screenshot ----
++  else if (std::strcmp(cmd, "cd_read_log") == 0)
++  {
++    int tail = json_get_int(json, "tail", 512);
++    if (tail < 1) tail = 1;
++    if (tail > static_cast<int>(CD_DMA_LOG_CAP)) tail = CD_DMA_LOG_CAP;
++    const u64 total = s_cd_dma_log_seq;
++    u64 start = (total > static_cast<u64>(tail)) ? total - static_cast<u64>(tail) : 0;
++    if (total > CD_DMA_LOG_CAP && start < total - CD_DMA_LOG_CAP)
++      start = total - CD_DMA_LOG_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    for (u64 seq = start; seq < total; seq++)
++    {
++      const CdDmaEntry& e = s_cd_dma_log[seq % CD_DMA_LOG_CAP];
++      resp += fmt::format(
++        R"({}{{"lba":{},"delivered_lba":{},"dest":"0x{:08X}","size":{},"frame":{},"first_words":["0x{:08X}","0x{:08X}"]}})",
++        first ? "" : ",", e.lba, e.lba, e.dest, e.size, e.frame, e.first_words[0], e.first_words[1]);
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
 +  else if (std::strcmp(cmd, "cd_history") == 0)
 +  {
 +    int count = json_get_int(json, "count", 512);
@@ -1420,10 +1546,10 @@ index 00000000..e2c3ee2c
 +}
 diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
 new file mode 100644
-index 00000000..ae268f96
+index 00000000..4f266dae
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,49 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371
 +// Same protocol as the PSXRecomp runner debug server.
@@ -1467,6 +1593,10 @@ index 00000000..ae268f96
 +/// Mana's land-creation palette load (native requests sector 125113 where
 +/// the oracle requests 125112; every layer below the game measures clean).
 +void RecordCdCommand(u8 command, const u8* params, u32 param_count);
++
++/// Record one channel-3 DMA into RAM (called from DMA::TransferMemoryBlock).
++/// Mirrors psx-runtime's cd_read_log so the two slot maps can be diffed.
++void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data);
 +
 +} // namespace PSXRecompDebug
 diff --git a/src/core/system.cpp b/src/core/system.cpp
