@@ -85,17 +85,27 @@ def main():
     conn = DebugConn(args.host, args.port, args.timeout)
 
     # Arm the trace for the whole watch so any traceable writer is captured
-    # retroactively; the ring holds entries until dumped.
+    # retroactively. The oracle has no wtrace; transitions still report, just
+    # unattributed -- which is fine, since the oracle side only needs the
+    # TIMELINE to compare against native's.
+    have_trace = True
     try:
         conn.cmd("wtrace_reset")
         conn.cmd("wtrace_add", lo=f"0x{lo & 0x1FFFFFFF:08X}",
                  hi=f"0x{(lo & 0x1FFFFFFF) + length:08X}")
     except DebugError as e:
-        print(f"warning: write trace unavailable ({e}); transitions will "
-              f"still be seen, but not attributed", file=sys.stderr)
+        have_trace = False
+        print(f"note: write trace unavailable here ({e}); transitions will "
+              f"be reported without attribution", file=sys.stderr)
 
     doc = {"kind": KIND, "version": 1, "lo": args.lo, "hi": args.hi,
-           "transitions": []}
+           "port": args.port, "attributed": have_trace, "transitions": []}
+
+    def flush():
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump(doc, f, indent=1)
+
     last_fp = None
     last_n = None
     last_seq = 0
@@ -103,59 +113,70 @@ def main():
           f"can (title screen onward); every content change is reported",
           flush=True)
     deadline = time.monotonic() + args.watch_secs
-    while time.monotonic() < deadline:
-        try:
-            blob = read_ram_range(conn, lo, length)
-            frame = conn.frame()
-        except DebugError as e:
-            print(f"  read failed ({e}); retrying", flush=True)
-            time.sleep(args.poll)
-            continue
-        fp = fingerprint(blob)
-        n = distinct_colours(blob)
-        if fp != last_fp:
-            writes = []
-            seq_hi = 0
+    try:
+        while time.monotonic() < deadline:
             try:
-                rep = conn.cmd("wtrace_dump",
-                               addr_lo=f"0x{lo & 0x1FFFFFFF:08X}",
-                               addr_hi=f"0x{(lo & 0x1FFFFFFF) + length:08X}",
-                               count=2048, newest=1)
-                for e in rep.get("entries", []):
-                    seq_hi = max(seq_hi, int(e.get("seq", 0)))
-                    if int(e.get("seq", 0)) > last_seq:
-                        writes.append({"pc": e.get("pc"),
-                                       "dma_ch": e.get("dma_ch"),
-                                       "frame": e.get("frame")})
+                blob = read_ram_range(conn, lo, length)
+            except DebugError as e:
+                print(f"  read failed ({e}); retrying", flush=True)
+                time.sleep(args.poll)
+                continue
+            try:
+                frame = conn.frame()
             except DebugError:
-                pass
-            kind, meaning = classify(len(writes))
-            if last_fp is not None:
-                by_pc = collections.Counter(
-                    (w["pc"], w["dma_ch"]) for w in writes)
-                t = {"frame": frame, "from_colours": last_n, "to_colours": n,
-                     "kind": kind, "traced_writes": len(writes),
-                     "writers": [{"pc": p, "dma_ch": d, "count": c}
-                                 for (p, d), c in by_pc.most_common(8)]}
-                doc["transitions"].append(t)
-                print(f"  CHANGE at frame {frame}: {last_n} -> {n} distinct "
-                      f"colours [{kind}: {len(writes)} traced write(s)]",
-                      flush=True)
-                for (p, d), c in by_pc.most_common(4):
-                    tag = f" dma_ch={d}" if d is not None and d >= 0 else ""
-                    print(f"      writer {p}{tag}  x{c}", flush=True)
-                print(f"      {meaning}", flush=True)
-            else:
-                print(f"  baseline at frame {frame}: {n} distinct colours, "
-                      f"fingerprint {fp}", flush=True)
-            last_fp, last_n, last_seq = fp, n, max(seq_hi, last_seq)
-        time.sleep(args.poll)
+                frame = -1
+            fp = fingerprint(blob)
+            n = distinct_colours(blob)
+            if fp != last_fp:
+                writes = []
+                seq_hi = last_seq
+                if have_trace:
+                    try:
+                        rep = conn.cmd(
+                            "wtrace_dump",
+                            addr_lo=f"0x{lo & 0x1FFFFFFF:08X}",
+                            addr_hi=f"0x{(lo & 0x1FFFFFFF) + length:08X}",
+                            count=2048, newest=1)
+                        for e in rep.get("entries", []):
+                            seq_hi = max(seq_hi, int(e.get("seq", 0)))
+                            if int(e.get("seq", 0)) > last_seq:
+                                writes.append({"pc": e.get("pc"),
+                                               "dma_ch": e.get("dma_ch"),
+                                               "frame": e.get("frame")})
+                    except DebugError:
+                        pass
+                if last_fp is not None:
+                    kind, meaning = classify(len(writes)) if have_trace \
+                        else ("unattributed", "no write trace on this side")
+                    by_pc = collections.Counter(
+                        (w["pc"], w["dma_ch"]) for w in writes)
+                    t = {"frame": frame, "from_colours": last_n,
+                         "to_colours": n, "kind": kind,
+                         "traced_writes": len(writes),
+                         "writers": [{"pc": p, "dma_ch": d, "count": c}
+                                     for (p, d), c in by_pc.most_common(8)]}
+                    doc["transitions"].append(t)
+                    flush()          # survive a Ctrl-C at any moment
+                    print(f"  CHANGE at frame {frame}: {last_n} -> {n} "
+                          f"distinct colours [{kind}: {len(writes)} traced "
+                          f"write(s)]", flush=True)
+                    for (p, d), c in by_pc.most_common(4):
+                        tag = f" dma_ch={d}" if d is not None and d >= 0 else ""
+                        print(f"      writer {p}{tag}  x{c}", flush=True)
+                else:
+                    doc["baseline"] = {"frame": frame, "colours": n,
+                                       "fingerprint": fp}
+                    flush()
+                    print(f"  baseline at frame {frame}: {n} distinct "
+                          f"colours, fingerprint {fp}", flush=True)
+                last_fp, last_n, last_seq = fp, n, seq_hi
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        print("\nstopped", flush=True)
 
     doc["final_colours"] = last_n
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w") as f:
-        json.dump(doc, f, indent=1)
-    print(f"\nreport: {args.out}")
+    flush()
+    print(f"report: {args.out}")
     return 0
 
 
