@@ -132,6 +132,28 @@ def main():
     try:
         tim = conn.cmd("cdrom_timing_dump", tail=4096,
                        lba_lo=args.lba_lo - 4, lba_hi=args.lba_hi)
+        # These rings span the WHOLE session and are not reset here (cd_verify
+        # arms them; this tool reads them after the fact). A sector read in
+        # several passes therefore carries records from all of them, and an
+        # earlier degraded pass looks exactly like current behaviour. Refuse
+        # rather than analyse a mixture: a timeline built from one was read as
+        # the baseline once, and a fix was written against a failure mode the
+        # clean pass does not have.
+        per_lba = {}
+        for e in tim.get("entries", []):
+            per_lba.setdefault(int(e.get("lba", -1)), []).append(e)
+        multi = {k: v for k, v in per_lba.items() if len(v) > 1}
+        lost = {k for k, v in per_lba.items() if any(int(x.get("lost", 0))
+                                                     for x in v)}
+        if multi or lost:
+            print(f"these rings hold {len(multi)} sector(s) with several "
+                  f"records and {len(lost)} with a lost notification -- more "
+                  f"than one pass, possibly including a degraded one. Mixing "
+                  f"them produces a timeline that belongs to no single pass.\n"
+                  f"Run `python3 tools/cd_verify.py` first (it resets the "
+                  f"timing ring), replay the load once, then rerun this.",
+                  file=sys.stderr)
+            return 1
         hist = conn.cmd("cdrom_command_history", count=4096)
     except DebugError as e:
         print(f"error: {e}", file=sys.stderr)
