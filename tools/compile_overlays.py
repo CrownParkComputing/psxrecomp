@@ -442,6 +442,27 @@ HOSTED_UNIQUE_GUARDED_BYTE_CAP = 1024 * 1024
 PSX_RAM_SIZE = 2 * 1024 * 1024
 
 
+def runtime_ram_size_from_config(config: dict) -> int:
+    """Return the runtime's immutable 2/8 MiB RAM decode geometry.
+
+    Overlay manifests are validated and indexed in physical RAM coordinates.
+    The compiler must therefore use the same geometry as the generated game
+    and runtime instead of assuming retail 2 MiB RAM.  Keep 2 MiB as the
+    backwards-compatible default for existing configs, and fail closed for
+    every unsupported or non-integer value.
+    """
+    runtime = config.get('runtime', {})
+    if not isinstance(runtime, dict):
+        raise ValueError('[runtime] must be a TOML table')
+    main_ram_mib = runtime.get('main_ram_mib', 2)
+    if (isinstance(main_ram_mib, bool) or
+            not isinstance(main_ram_mib, int) or
+            main_ram_mib not in (2, 8)):
+        raise ValueError(
+            '[runtime].main_ram_mib must be the integer 2 or 8')
+    return main_ram_mib * 1024 * 1024
+
+
 class ShardCandidateCapacityError(RuntimeError):
     """A cache publication would exceed the runtime's fixed F-record table."""
 
@@ -1542,6 +1563,18 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     suppression_passes = 0
     all_branch_targets = set()
     kernel_window = (load_addr & 0x1FFFFFFF) < 0x10000
+    # A runtime-captured high-RAM region can contain only dispatch evidence:
+    # there is no callable prologue for the entry classifier to promote, yet
+    # the capture still proves that the region is executed code.  Keep the
+    # conservative interior classification when a rooted owner exists, but
+    # allow one unified walk-root promotion when the region would otherwise
+    # have no native body at all.  This is deliberately narrower than the
+    # kernel orphan rule: it requires explicit dispatch evidence and an empty
+    # initial root set, so ordinary data captures and established owners are
+    # unchanged.  The promoted roots share the normal region compiler/DLL and
+    # are not sent through the isolated interior-fragment pass.
+    capture_only_dispatch_region = (
+        not known and bool(dispatch_entry_pcs) and not producer_ranges)
 
     while True:
         # Recompute call/branch evidence from the CURRENT partition. Evidence is
@@ -1661,7 +1694,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             known = normalized
             derived_reasons = next_reasons
 
-        if not kernel_window:
+        if not kernel_window and not capture_only_dispatch_region:
             break
 
         # Orphan promotion (see DISPATCH_ROOT in INCLUDE_REASONS): a kernel
@@ -1677,7 +1710,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 allow_cross_producer_calls)
             covered |= walk['visited']
         promoted = sorted(a for a, r in included.items()
-                          if r == 'DISPATCH_INTERIOR' and a not in covered
+                          if r == 'DISPATCH_INTERIOR' and a in dispatch_entry_pcs
+                          and a not in covered
                           and _is_valid_mips_word(_word_at(data, load_addr, a)))
         if not promoted:
             break
@@ -1764,6 +1798,11 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'excluded_counts': excluded_counts,
         'producer_ranges': producer_ranges,
         'static_alias_ranges': static_alias_ranges,
+        # A high-RAM capture with dispatch evidence but no callable seed needs
+        # one canonical CPS region bundle.  Supplemental interior shards must
+        # never satisfy this demand, because they leave the rest of the region
+        # interpreted and recreate the replay bottleneck.
+        'unified_dynamic_capture': capture_only_dispatch_region,
         # Every strong walk root is an exact-entry demand. These roots come from
         # decoder/control-flow, callable-boundary, explicit TOML, or dispatch
         # proof rather than an arbitrary observed PC. If a shared-region build
@@ -2266,7 +2305,33 @@ def generate_overlay_dispatch(variants: list) -> str:
             f'static const uint32_t {variant["range_symbol"]}[] = '
             '{ ' + ', '.join(flat) + ' };')
 
+    entry_values = ', '.join(f'0x{addr:08X}u' for addr in sorted(by_addr))
+    if not entry_values:
+        entry_values = '0u'
+
     lines += [
+        '',
+        '/* Compact, read-only admission index for hot local-flow probes.  Keep',
+        ' * misses out of the large validating dispatch switch; exact live-code',
+        ' * validation still happens in psx_overlay_dispatch on every admitted',
+        ' * entry. */',
+        'static const uint32_t psx_ov_static_entries[] = {',
+        f'    {entry_values}',
+        '};',
+        '',
+        'int psx_overlay_static_has_entry(uint32_t addr) {',
+        '    const uint32_t key = (addr & 0x1FFFFFFFu) | 0x80000000u;',
+        '    uint32_t lo = 0u;',
+        f'    uint32_t hi = {len(by_addr)}u;',
+        '    while (lo < hi) {',
+        '        const uint32_t mid = lo + ((hi - lo) >> 1);',
+        '        const uint32_t candidate = psx_ov_static_entries[mid];',
+        '        if (key < candidate) hi = mid;',
+        '        else if (key > candidate) lo = mid + 1u;',
+        '        else return 1;',
+        '    }',
+        '    return 0;',
+        '}',
         '',
         'void psx_overlay_static_get_stats(uint64_t *checks, uint64_t *hits,',
         '                                  uint64_t *variant_misses,',
@@ -5004,6 +5069,37 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
     return True
 
 
+def _load_library_for_validation(dll_path: str):
+    """Map one candidate library without allowing Windows error-box UI.
+
+    Cache validation routinely probes incomplete, stale, or deliberately
+    malformed candidates.  ``LoadLibrary`` must report those as ordinary
+    validation failures; a system-modal ``Bad Image`` dialog would turn a
+    bounded command-line probe into an interactive hang.  Error mode is
+    thread-local and restored immediately after the mapping attempt.
+    """
+    import ctypes
+
+    if os.name != 'nt':
+        return ctypes.CDLL(dll_path)
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    set_thread_error_mode = kernel32.SetThreadErrorMode
+    set_thread_error_mode.argtypes = [ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_uint32)]
+    set_thread_error_mode.restype = ctypes.c_int
+    old_mode = ctypes.c_uint32()
+    # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+    changed = bool(set_thread_error_mode(0x00008001,
+                                         ctypes.byref(old_mode)))
+    try:
+        return ctypes.CDLL(dll_path)
+    finally:
+        if changed:
+            ignored = ctypes.c_uint32()
+            set_thread_error_mode(old_mode.value, ctypes.byref(ignored))
+
+
 def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
     """Read overlay_abi from one loaded image, then release it immediately."""
     import _ctypes
@@ -5013,7 +5109,7 @@ def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
         # Shards are generated as ordinary C (cdecl). ctypes.WinDLL selects
         # stdcall and can corrupt a 32-bit Windows caller's stack; CDLL is the
         # correct loader on every supported host (x64 merely masks the error).
-        library = ctypes.CDLL(dll_path)
+        library = _load_library_for_validation(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -5036,7 +5132,7 @@ def _dll_pair_id_matches(dll_path: str, expected_pair_id: int) -> bool:
     import ctypes
     library = None
     try:
-        library = ctypes.CDLL(dll_path)
+        library = _load_library_for_validation(dll_path)
         pair_fn = library.overlay_pair_id
         pair_fn.argtypes = []
         pair_fn.restype = ctypes.c_uint64
@@ -5061,7 +5157,7 @@ def _dll_runtime_exports_match(dll_path: str, expected_abi: int | None,
     import ctypes
     library = None
     try:
-        library = ctypes.CDLL(dll_path)
+        library = _load_library_for_validation(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -5161,6 +5257,8 @@ def cached_shard_manifest_status(dll_path: str, expected_abi: int | None,
 # ---------------------------------------------------------------------------
 
 def main():
+    global PSX_RAM_SIZE
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--captures',        default=None,
@@ -5286,8 +5384,13 @@ def main():
     with open(args.game_toml, 'rb') as f:
         raw = f.read().lstrip(b'\xef\xbb\xbf')  # UTF-8 BOM
     toml = tomllib.loads(raw.decode('utf-8'))
+    try:
+        PSX_RAM_SIZE = runtime_ram_size_from_config(toml)
+    except ValueError as exc:
+        ap.error(str(exc))
     game_id = toml.get('game', {}).get('id', 'UNKNOWN')
     print(f'Game ID: {game_id}')
+    print(f'Runtime RAM: {PSX_RAM_SIZE // (1024 * 1024)} MiB')
 
     # Stale-recompiler-binary guard — BOTH modes (static overlays are just as
     # wrong when emitted by a stale binary; they simply have no tag to hide in).
@@ -5461,7 +5564,18 @@ def main():
         if not args.static and not args.force:
             expected_abi = overlay_abi_tag(
                 args.runtime_include, args.flavor)
-            if cap.get('producer') == BIOS_RESIDENT_PRODUCER:
+            if seed_audit.get('unified_dynamic_capture'):
+                # Only the canonical region pair may satisfy a unified dynamic
+                # capture.  Do not aggregate supplemental/orphan fragments into
+                # the cache gate: they are precisely the fallback this path is
+                # replacing.
+                current_entries, _current_ranges = (
+                    current_variant_func_id_coverage(
+                        load_shard_func_ids(
+                            dll_path, expected_abi,
+                            include_supplemental=False),
+                        data, load_addr, size))
+            elif cap.get('producer') == BIOS_RESIDENT_PRODUCER:
                 # A resident fast-path needs one canonical preloadable bundle;
                 # aggregate fragment coverage is insufficient because the
                 # sidecar names exactly one DLL stem.

@@ -246,6 +246,85 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
     return pc_table_get_or_insert_in(g_dirty_ram_pc_table, pc);
 }
 
+enum { DIRTY_RAM_PERF_FLOW_CAP = 4096 };
+typedef struct {
+    uint32_t source;
+    uint32_t target;
+    uint64_t count;
+} DirtyRamPerfFlowEntry;
+static DirtyRamPerfFlowEntry s_perf_flows[DIRTY_RAM_PERF_FLOW_CAP];
+static int s_perf_flow_diag = 0;
+
+void dirty_ram_perf_flow_diag_enable(int enabled) {
+    s_perf_flow_diag = enabled ? 1 : 0;
+    if (!s_perf_flow_diag)
+        memset(s_perf_flows, 0, sizeof(s_perf_flows));
+}
+
+static inline void dirty_ram_perf_flow_note(uint32_t source, uint32_t target) {
+    if (!s_perf_flow_diag) return;
+    uint32_t hash = ((source >> 2) * 2654435761u) ^
+                    ((target >> 2) * 2246822519u);
+    for (uint32_t probe = 0; probe < 32u; ++probe) {
+        DirtyRamPerfFlowEntry *entry =
+            &s_perf_flows[(hash + probe) & (DIRTY_RAM_PERF_FLOW_CAP - 1u)];
+        if (entry->count == 0u) {
+            entry->source = source;
+            entry->target = target;
+            entry->count = 1u;
+            return;
+        }
+        if (entry->source == source && entry->target == target) {
+            entry->count++;
+            return;
+        }
+    }
+}
+
+uint32_t dirty_ram_perf_hot_flows(uint32_t *sources, uint32_t *targets,
+                                  uint64_t *counts, uint32_t capacity) {
+    uint32_t used = 0;
+    if (!sources || !targets || !counts) return 0;
+    if (capacity > 16u) capacity = 16u;
+    if (capacity == 0u) return 0;
+    for (uint32_t i = 0; i < capacity; ++i) counts[i] = 0;
+    for (uint32_t i = 0; i < DIRTY_RAM_PERF_FLOW_CAP; ++i) {
+        const DirtyRamPerfFlowEntry *entry = &s_perf_flows[i];
+        if (!entry->count) continue;
+        uint32_t pos = used < capacity ? used++ : capacity;
+        if (pos == capacity) {
+            pos = 0;
+            for (uint32_t j = 1; j < capacity; ++j)
+                if (counts[j] < counts[pos]) pos = j;
+            if (entry->count <= counts[pos]) continue;
+        }
+        sources[pos] = entry->source;
+        targets[pos] = entry->target;
+        counts[pos] = entry->count;
+    }
+    return used;
+}
+
+void dirty_ram_perf_hot_entry(uint32_t *pc, uint64_t *hits,
+                              uint64_t *insns, uint64_t *entry_hits) {
+    uint32_t best_pc = 0;
+    uint64_t best_hits = 0;
+    uint64_t best_insns = 0;
+    uint64_t best_entry_hits = 0;
+    for (uint32_t i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; i++) {
+        const DirtyRamPcEntry *e = &g_dirty_ram_pc_table[i];
+        if (e->pc == 0 || e->insns <= best_insns) continue;
+        best_pc = e->pc;
+        best_hits = e->hits;
+        best_insns = e->insns;
+        best_entry_hits = e->entry_hits;
+    }
+    if (pc) *pc = best_pc;
+    if (hits) *hits = best_hits;
+    if (insns) *insns = best_insns;
+    if (entry_hits) *entry_hits = best_entry_hits;
+}
+
 /* Record every PC the interpreter executes (not just block entries) so
  * overlay_capture can report execution-verified seeds for the region. A PSX
  * instruction is aligned, making this a single direct bitmap OR rather than a
@@ -796,6 +875,11 @@ static int is_local_dirty_target(uint32_t target) {
  * external entries (from native code) from the interpreter's own
  * block-to-block chaining. */
 static uint32_t g_dirty_interp_chain_target = 0;
+
+void dirty_ram_reset_capture_evidence(void) {
+    memset(g_dirty_ram_pc_table, 0, sizeof(g_dirty_ram_pc_table));
+    g_dirty_interp_chain_target = 0;
+}
 
 /* A dirty-RAM target only deserves interpretation if its first word decodes
  * as a plausible MIPS instruction.  A scatter-loaded overlay leaves data
@@ -2737,6 +2821,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #endif
 
+    /* User savestates preserve RAM but older state ABIs do not preserve the
+     * host-only dirty-page provenance established when streamed code overwrote
+     * the boot EXE.  A failed static-text identity check followed by a real
+     * control transfer is sufficient proof that this page now contains dynamic
+     * executable code.  Reconstruct that provenance before consulting the
+     * exact-byte overlay cache so a restored gameplay/replay overlay does not
+     * remain permanently interpreted.  This is intentionally dispatch-driven:
+     * untouched data pages in the restored text range stay clean. */
+    if (clean_game_text_miss && !dirty_ram_is_dirty(phys))
+        dirty_ram_mark_executable_range(phys, 4u);
+
     /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
      * Inert unless a game provides an overlays_static.c at build time. */
 #ifdef PSX_HAS_OVERLAY_DISPATCH
@@ -3074,6 +3169,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (g_rfe_escape_pending)
                 psx_rfe_escape_check(cpu);
             uint32_t target = cpu->pc;
+            dirty_ram_perf_flow_note(pc, target);
             if (target != 0u && dirty_ram_pump_boundary(cpu, target, 1)) {
                 g_dirty_ram_blocks_run++;
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -3134,7 +3230,27 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
-#ifdef PSX_HAS_GAME_DISPATCH
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+                /* Static CPS bundles can own a continuation reached from a
+                 * runtime-generated stub even when the destination page stays
+                 * dirty.  The top-level dispatcher normally validates and
+                 * enters those functions, but local dirty-flow chaining used
+                 * to bypass it indefinitely.  The generated compact index keeps
+                 * unrelated local transfers out of the large dispatch switch;
+                 * psx_overlay_dispatch then validates exact live bytes before
+                 * it runs an admitted entry natively. */
+                {
+                    extern int psx_overlay_static_has_entry(uint32_t addr);
+                    extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
+                    if (psx_overlay_static_has_entry(target) &&
+                        psx_overlay_dispatch(cpu, target)) {
+                        g_dirty_ram_native_handoffs++;
+                        g_dirty_ram_blocks_run++;
+                        if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                        g_dirty_interp_chain_target = cpu->pc;
+                        OV_FPLOG_RET1();
+                    }
+                }
                 /* A patched prologue can force entry through the interpreter,
                  * while the remaining static ranges at a later continuation
                  * are still safe to run as compiled code. */

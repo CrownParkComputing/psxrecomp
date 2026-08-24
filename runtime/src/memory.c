@@ -16,6 +16,7 @@
 #include "gpu.h"
 #include "mdec.h"
 #include "mod_memory.h"
+#include "pgxp.h"
 #include "psx_memory.h"
 #include "sio.h"
 #include "spu.h"
@@ -125,6 +126,7 @@ uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
 void memory_clear_low_boot_scratch(void) {
     dirty_ram_text_note_range_write(0u, 0x10u);
+    pgxp_external_write(0u, 0x10u);
     memset(ram, 0, 0x10u);
 }
 
@@ -690,6 +692,37 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
+/* The page watch above is deliberately broad: it tells the loader that a
+ * page contains at least one registered overlay range.  It must not, however,
+ * turn every data write in that page into a code mutation.  Replay buffers and
+ * object state commonly share a 4 KiB page with overlay text; treating those
+ * writes as code changes invalidates the lazy negative-dispatch cache and
+ * forces every unresolved PC back through the manifest index.
+ *
+ * MIPS instructions are four bytes, so a 4-byte bitmap is a cheap exact
+ * second-level watch.  It is 256 KiB for the expanded 8 MiB RAM image and is
+ * updated only when a manifest/range is registered.  A write overlapping one
+ * watched instruction word is conservatively treated as code; unrelated data
+ * in the same page leaves both the page generation and lazy-miss epoch alone.
+ */
+#define OVERLAY_CODE_BLOCK_SHIFT 2u
+#define OVERLAY_CODE_BLOCK_COUNT ((RAM_SIZE + (1u << OVERLAY_CODE_BLOCK_SHIFT) - 1u) >> OVERLAY_CODE_BLOCK_SHIFT)
+#define OVERLAY_CODE_BITMAP_WORDS ((OVERLAY_CODE_BLOCK_COUNT + 31u) / 32u)
+static uint32_t overlay_code_watch_bitmap[OVERLAY_CODE_BITMAP_WORDS];
+
+static inline int overlay_code_watch_intersects(uint32_t phys, uint32_t size) {
+    if (size == 0 || phys >= RAM_SIZE) return 0;
+    uint32_t end = phys + size - 1u;
+    if (end < phys || end >= RAM_SIZE) end = RAM_SIZE - 1u;
+    uint32_t first = phys >> OVERLAY_CODE_BLOCK_SHIFT;
+    uint32_t last = end >> OVERLAY_CODE_BLOCK_SHIFT;
+    for (uint32_t block = first; block <= last; block++) {
+        if ((overlay_code_watch_bitmap[block >> 5] >> (block & 31u)) & 1u)
+            return 1;
+    }
+    return 0;
+}
+
 void dirty_ram_reset_for_boot(void) {
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
@@ -698,6 +731,7 @@ void dirty_ram_reset_for_boot(void) {
     dirty_ram_text_cache_reset(1);
     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
+    memset(overlay_code_watch_bitmap, 0, sizeof(overlay_code_watch_bitmap));
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
     memset(g_dirty_ram_dispatch_pc_bitmap, 0,
@@ -713,6 +747,11 @@ void overlay_watch_set_range(uint32_t phys, uint32_t len) {
     uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t pg = fp; pg <= lp; pg++)
         overlay_watch_bitmap[pg >> 5] |= (1u << (pg & 31u));
+
+    uint32_t fb = phys >> OVERLAY_CODE_BLOCK_SHIFT;
+    uint32_t lb = end  >> OVERLAY_CODE_BLOCK_SHIFT;
+    for (uint32_t block = fb; block <= lb; block++)
+        overlay_code_watch_bitmap[block >> 5] |= (1u << (block & 31u));
 }
 
 void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
@@ -771,6 +810,9 @@ void overlay_watch_invalidate_after_ram_restore(void) {
 }
 
 static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
+    if (size == 0 || phys >= RAM_SIZE) return;
+    uint32_t end = phys + size - 1u;
+    if (end < phys || end >= RAM_SIZE) end = RAM_SIZE - 1u;
     uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
     if (pg >= DIRTY_RAM_PAGE_COUNT) return;
     /* Never attach pre-write PC evidence to post-write bytes, including for
@@ -786,13 +828,23 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
                (4096u / 4u / 32u) * sizeof(uint32_t));
         g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
     }
-    if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
-        overlay_page_gen[pg]++;
-        /* Also invalidate generation-aware negative overlay lookups: bytes in
-         * a manifested code page may now match a previously absent variant.
-         * Keep this separate from g_dirty_ram_code_gen: interpreter widescreen
-         * classifiers use that epoch and must not churn on every watched-page
-         * data write. */
+    uint32_t last_pg = end >> DIRTY_RAM_PAGE_SHIFT;
+    int watched = 0;
+    for (uint32_t p = pg; p <= last_pg; p++) {
+        if ((overlay_watch_bitmap[p >> 5] >> (p & 31u)) & 1u) {
+            watched = 1;
+            break;
+        }
+    }
+    if (watched && overlay_code_watch_intersects(phys, size)) {
+        /* Candidate validation and the lazy negative cache are invalidated
+         * only when the write overlaps a manifested instruction word.  A
+         * replay/data write elsewhere on this watched page is not a code
+         * mutation and must not trigger manifest rescans. */
+        for (uint32_t p = pg; p <= last_pg; p++) {
+            if ((overlay_watch_bitmap[p >> 5] >> (p & 31u)) & 1u)
+                overlay_page_gen[p]++;
+        }
         extern void overlay_loader_note_code_write(void);
         overlay_loader_note_code_write();
         /* Self-modification of a currently-executing native entry cannot be
@@ -991,6 +1043,7 @@ uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 void memory_init(const char* bios_path) {
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
+    pgxp_invalidate_all();
     /* Rematch re-enters without process exit — wipe sticky I/O regs that
      * live outside device *_init (I_STAT/I_MASK cleared in interrupts_init). */
     memset(mem_ctrl, 0, sizeof(mem_ctrl));
@@ -1676,6 +1729,10 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
 #endif
+        /* Raw-memory provenance boundary. Recompiled/interpreted CPU stores
+         * immediately install their tracked value via psx_pgxp_store after
+         * this write; DMA, MDEC and host/API writers deliberately do not. */
+        pgxp_external_write(addr, 4u);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -1706,6 +1763,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
           | ((uint32_t)scratchpad[off + 2] << 16)
           | ((uint32_t)scratchpad[off + 3] << 24),
             val, 4);
+        pgxp_external_write(addr, 4u);
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         scratchpad[off + 2] = (uint8_t)(val >> 16);
@@ -1804,6 +1862,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
 #endif
+        pgxp_external_write(addr, 2u);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -1830,6 +1889,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
             (uint32_t)val, 2);
+        pgxp_external_write(addr, 2u);
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         return;
@@ -2134,6 +2194,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
 #endif
+        pgxp_external_write(addr, 1u);
         ram[phys] = val;
         return;
     }
@@ -2155,6 +2216,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
                                        (uint32_t)val, 1);
+        pgxp_external_write(addr, 1u);
         scratchpad[phys - 0x1F800000u] = val;
         return;
     }

@@ -82,6 +82,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
+#include "presentation_bezel.h"
 
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
@@ -165,6 +166,12 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 
 extern "C" uint64_t gte_get_exec_count(void);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+extern "C" void psx_overlay_static_get_stats(uint64_t *checks,
+                                               uint64_t *hits,
+                                               uint64_t *variant_misses,
+                                               uint64_t *address_misses);
+#endif
 
 /* Cross-language globals defined in C translation units. Declared extern "C" at
  * file scope so MSVC gives them C linkage (matching the C definitions); without
@@ -332,6 +339,11 @@ SDL_Window* sdl_window = nullptr;
 }
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
+#ifndef PSX_SDL_NO_RENDER
+static SDL_Texture*  sdl_bezel_texture;
+static bool          sdl_bezel_texture_failed;
+#endif
+static PSXRecompV4::BezelLoadResult g_presentation_bezel;
 /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
  * [controller] settings the launcher writes; the runtime opens the matching
  * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
@@ -477,6 +489,14 @@ static int post_load_probe_env_on(void) {
 }
 static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
+/* The old on-screen "Game FPS" label was actually a one-second count of
+ * simulated VBlank callbacks. Keep a separate host-present count so a
+ * display-side stall/skip cannot be mistaken for guest cadence (or vice
+ * versa). The software/Vulkan count is emulation-thread-owned; OpenGL exposes
+ * its exact SwapWindow count separately because interpolation may swap from a
+ * presentation thread. */
+static uint64_t s_fps_last_present = 0;
+static uint64_t s_present_count = 0;
 static uint64_t s_fps_last_native_cycles = 0;
 static uint64_t s_fps_last_retired_cycles = 0;
 static uint64_t s_fps_last_cpu_native_cycles = 0;
@@ -537,6 +557,8 @@ static void present_session_reset(void) {
     s_sw_hold_valid = 0;
     s_fps_last_time = 0;
     s_fps_last_frame = 0;
+    s_fps_last_present = 0;
+    s_present_count = 0;
     s_fps_base_title.clear();
     s_frame_pacer = FramePacer{ 0 };
     s_turbo_present_skip = 0;
@@ -984,6 +1006,7 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
     mod_runtime_on_savestate_loaded();
+    overlay_capture_on_user_state_loaded();
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -1138,7 +1161,15 @@ static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
+static int           g_video_pgxp_vertex_cache     = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
+static int           g_video_pgxp_culling          = 1;
+static int           g_video_pgxp_color_correction = 0;
+static int           g_video_pgxp_depth_buffer     = 0;
+static int           g_video_pgxp_disable_2d       = 0;
+static int           g_video_pgxp_transparent_depth = 0;
+static int           g_video_pgxp_preserve_projection = 0;
+static float         g_video_pgxp_depth_clear_threshold = 4096.0f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
@@ -1672,6 +1703,100 @@ static int netplay_gl_dual_quality(void) {
 }
 
 #ifndef PSX_SDL_NO_RENDER
+static void destroy_sdl_bezel_texture() {
+    if (sdl_bezel_texture) SDL_DestroyTexture(sdl_bezel_texture);
+    sdl_bezel_texture = nullptr;
+    sdl_bezel_texture_failed = false;
+}
+
+static bool ensure_sdl_bezel_texture() {
+    if (!g_presentation_bezel.active() || !sdl_renderer)
+        return false;
+    if (sdl_bezel_texture) return true;
+    if (sdl_bezel_texture_failed) return false;
+    const auto& image = g_presentation_bezel.image;
+    sdl_bezel_texture = SDL_CreateTexture(
+        sdl_renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+        image.width, image.height);
+    bool upload_ok = false;
+    if (sdl_bezel_texture) {
+#if defined(PSX_SDL3)
+        upload_ok = SDL_UpdateTexture(sdl_bezel_texture, nullptr,
+                                      image.rgba.data(), image.width * 4);
+#else
+        upload_ok = SDL_UpdateTexture(sdl_bezel_texture, nullptr,
+                                      image.rgba.data(), image.width * 4) == 0;
+#endif
+    }
+    if (!upload_ok) {
+        std::fprintf(stderr,
+                     "psxrecomp: SDL presentation bezel upload failed (%s); black-margin fallback active\n",
+                     SDL_GetError());
+        if (sdl_bezel_texture) SDL_DestroyTexture(sdl_bezel_texture);
+        sdl_bezel_texture = nullptr;
+        sdl_bezel_texture_failed = true;
+        return false;
+    }
+    SDL_SetTextureBlendMode(sdl_bezel_texture, SDL_BLENDMODE_NONE);
+    SDL_SetTextureScaleMode(sdl_bezel_texture, SDL_ScaleModeLinear);
+    return true;
+}
+
+/* Draw artwork in physical output space so SDL's logical game viewport cannot
+ * trap it inside the game aspect. Restore the exact logical size before the
+ * caller draws game pixels, guaranteeing background-first composition. */
+static void sdl_render_presentation_background(SDL_Renderer* renderer) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    if (!ensure_sdl_bezel_texture()) {
+        SDL_RenderClear(renderer);
+        return;
+    }
+    int logical_w = 0, logical_h = 0, output_w = 0, output_h = 0;
+#if defined(PSX_SDL3)
+    SDL_RendererLogicalPresentation logical_mode =
+        SDL_LOGICAL_PRESENTATION_DISABLED;
+    const bool have_logical = SDL_GetRenderLogicalPresentation(
+        renderer, &logical_w, &logical_h, &logical_mode);
+    const bool have_output =
+        SDL_GetRenderOutputSize(renderer, &output_w, &output_h);
+#else
+    SDL_RenderGetLogicalSize(renderer, &logical_w, &logical_h);
+    const bool have_logical = logical_w > 0 && logical_h > 0;
+    const bool have_output =
+        SDL_GetRendererOutputSize(renderer, &output_w, &output_h) == 0;
+#endif
+    if (!have_logical || logical_w <= 0 || logical_h <= 0 ||
+        !have_output || output_w <= 0 || output_h <= 0) {
+        SDL_RenderClear(renderer);
+        return;
+    }
+#if defined(PSX_SDL3)
+    const bool physical_space = SDL_SetRenderLogicalPresentation(
+        renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+#else
+    const bool physical_space = SDL_RenderSetLogicalSize(renderer, 0, 0) == 0;
+#endif
+    if (!physical_space) {
+        SDL_RenderClear(renderer);
+        return;
+    }
+    SDL_RenderClear(renderer);
+    const auto rect = PSXRecompV4::presentation_bezel_fit_rect(
+        output_w, output_h, g_presentation_bezel.image.width,
+        g_presentation_bezel.image.height);
+    SDL_Rect destination{rect.x, rect.y, rect.width, rect.height};
+    if (destination.w > 0 && destination.h > 0)
+        SDL_RenderCopy(renderer, sdl_bezel_texture, nullptr, &destination);
+#if defined(PSX_SDL3)
+    if (have_logical && logical_w > 0 && logical_h > 0)
+        SDL_SetRenderLogicalPresentation(renderer, logical_w, logical_h,
+                                         logical_mode);
+#else
+    if (have_logical)
+        SDL_RenderSetLogicalSize(renderer, logical_w, logical_h);
+#endif
+}
+
 /* Create SDL_Renderer + streaming texture for software present. Used when
  * netplay runs without a live GL context (software renderer selected, or GL
  * init failed). CPU-auth + OpenGL present does not need this. */
@@ -2040,6 +2165,53 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
     // we never silently resolve against an unrelated cwd deeper in the tree.
     if (exe_dir.empty()) exe_dir = fs::path(".");
     return exe_dir;
+}
+
+/* "auto" is intentionally local and deterministic: inspect only the selected
+ * cue's immediate directory, and arm only when exactly one sibling directory
+ * starts with <cue stem>-texture-replacements. */
+static std::filesystem::path resolve_auto_hd_texture_pack(
+    const std::filesystem::path& cue_path, std::string& detail) noexcept {
+    namespace fs = std::filesystem;
+    try {
+        if (cue_path.empty()) {
+            detail = "selected cue path is empty";
+            return {};
+        }
+        const fs::path parent = cue_path.parent_path();
+        const std::string prefix =
+            cue_path.stem().string() + "-texture-replacements";
+        std::error_code ec;
+        fs::path selected;
+        unsigned matches = 0;
+        for (fs::directory_iterator it(parent, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            if (!it->is_directory(ec)) {
+                if (ec) break;
+                continue;
+            }
+            const std::string name = it->path().filename().string();
+            if (name.compare(0, prefix.size(), prefix) != 0) continue;
+            selected = it->path();
+            ++matches;
+            if (matches > 1) break;
+        }
+        if (ec) {
+            detail = "cue sibling directory could not be enumerated";
+            return {};
+        }
+        if (matches != 1) {
+            detail = matches == 0
+                ? "no matching cue-sibling replacement directory"
+                : "multiple matching cue-sibling replacement directories";
+            return {};
+        }
+        detail.clear();
+        return selected.lexically_normal();
+    } catch (...) {
+        detail = "cue sibling resolution failed";
+        return {};
+    }
 }
 
 static std::filesystem::path resolve_existing_runtime_path(const char* requested,
@@ -2849,6 +3021,9 @@ static void teardown_game_session_keep_lobby(void) {
         gl_renderer_shutdown();
         g_gl_active = false;
     }
+#ifndef PSX_SDL_NO_RENDER
+    destroy_sdl_bezel_texture();
+#endif
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
@@ -3098,9 +3273,22 @@ struct RuntimePerfSnapshot {
     uint32_t overlay_revalidations = 0;
     uint32_t overlay_hot_native_pc = 0;
     uint64_t overlay_hot_native_calls = 0;
+    uint32_t dirty_hot_entry_pc = 0;
+    uint64_t dirty_hot_entry_hits = 0;
+    uint64_t dirty_hot_entry_insns = 0;
+    uint64_t dirty_hot_entry_external = 0;
     uint64_t overlay_shadow_calls = 0;
     uint64_t overlay_shadow_divergences = 0;
     uint32_t overlay_first_divergence_pc = 0;
+    uint64_t static_checks = 0;
+    uint64_t static_hits = 0;
+    uint64_t static_variant_misses = 0;
+    uint64_t static_address_misses = 0;
+    uint64_t static_rehashes = 0;
+    uint64_t static_crc_misses = 0;
+    uint64_t static_gen_fastpath = 0;
+    PGXPStats pgxp = {};
+    PGXPHookHistogram pgxp_hooks = {};
     uint32_t capture_triggers = 0;
     uint64_t capture_last_dispatch_delta = 0;
     int capture_overlays = 0;
@@ -3147,6 +3335,14 @@ static void runtime_perf_init() {
     const char *enabled = std::getenv("PSX_RUNTIME_PERF_DIAG");
     g_runtime_perf.enabled = enabled && enabled[0] && enabled[0] != '0';
     if (!g_runtime_perf.enabled) return;
+    const char *pgxp_hooks = std::getenv("PSX_PGXP_HOOK_DIAG");
+    const bool pgxp_hook_diag =
+        pgxp_hooks && pgxp_hooks[0] && pgxp_hooks[0] != '0';
+    pgxp_set_perf_diag(pgxp_hook_diag ? 1 : 0);
+    const char *dirty_flows = std::getenv("PSX_DIRTY_FLOW_DIAG");
+    const bool dirty_flow_diag =
+        dirty_flows && dirty_flows[0] && dirty_flows[0] != '0';
+    dirty_ram_perf_flow_diag_enable(dirty_flow_diag ? 1 : 0);
 
     g_runtime_perf.frequency = SDL_GetPerformanceFrequency();
     if (!g_runtime_perf.frequency) g_runtime_perf.frequency = 1;
@@ -3174,8 +3370,11 @@ static void runtime_perf_init() {
                 "(expected start:end, start >= 1, end > start)\n", window);
         }
     }
-    std::fprintf(stdout, "psxrecomp: runtime perf diagnostics enabled: interval=%u ms",
-                 g_runtime_perf.interval_ms);
+    std::fprintf(stdout,
+                 "psxrecomp: runtime perf diagnostics enabled: interval=%u ms, "
+                 "PGXP hook histogram=%s, dirty-flow histogram=%s",
+                 g_runtime_perf.interval_ms, pgxp_hook_diag ? "on" : "off",
+                 dirty_flow_diag ? "on" : "off");
     if (g_runtime_perf.bench_configured)
         std::fprintf(stdout, ", bench=%llu:%llu",
                      (unsigned long long)g_runtime_perf.bench_start_frame,
@@ -3201,9 +3400,25 @@ static RuntimePerfSnapshot runtime_perf_snapshot(uint64_t now) {
                                 &s.overlay_revalidations);
     overlay_loader_take_hot_native(&s.overlay_hot_native_pc,
                                    &s.overlay_hot_native_calls);
+    dirty_ram_perf_hot_entry(&s.dirty_hot_entry_pc,
+                             &s.dirty_hot_entry_hits,
+                             &s.dirty_hot_entry_insns,
+                             &s.dirty_hot_entry_external);
     overlay_loader_get_shadow_summary(&s.overlay_shadow_calls,
                                       &s.overlay_shadow_divergences,
                                       &s.overlay_first_divergence_pc);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        psx_overlay_static_get_stats(&s.static_checks, &s.static_hits,
+                                     &s.static_variant_misses,
+                                     &s.static_address_misses);
+        overlay_loader_static_match_stats(&s.static_rehashes,
+                                          &s.static_crc_misses,
+                                          &s.static_gen_fastpath);
+    }
+#endif
+    pgxp_get_stats(&s.pgxp);
+    pgxp_get_hook_histogram(&s.pgxp_hooks);
     int capture_enabled = 0;
     overlay_autocapture_get_status(&capture_enabled, &s.capture_triggers,
                                    &s.capture_last_dispatch_delta);
@@ -3340,6 +3555,7 @@ static void runtime_perf_diag_tick() {
         "cpu=%.1f tex=%.1f draw=%.1f ms/s; "
         "work guest=%.1f pacer=%.1f autocapture=%.1f provider_poll=%.1f ms/s, "
         "dirty=%.0f insn/s %.0f dispatch/s; "
+        "hot_interp=0x%08X hits=%llu insns=%llu external=%llu; "
         "overlay native=+%llu interp=+%llu hot_native=0x%08X/+%llu "
         "shadow=+%llu div=+%llu first_div=0x%08X "
         "loads=+%u revalidations=+%u "
@@ -3364,6 +3580,10 @@ static void runtime_perf_diag_tick() {
         runtime_perf_ticks_ms(current.provider_poll_ticks - last.provider_poll_ticks) / dt,
         (double)(current.dirty_insns - last.dirty_insns) / dt,
         (double)(current.dirty_dispatches - last.dirty_dispatches) / dt,
+        current.dirty_hot_entry_pc,
+        (unsigned long long)current.dirty_hot_entry_hits,
+        (unsigned long long)current.dirty_hot_entry_insns,
+        (unsigned long long)current.dirty_hot_entry_external,
         (unsigned long long)(current.overlay_native - last.overlay_native),
         (unsigned long long)(current.overlay_interp - last.overlay_interp),
         current.overlay_hot_native_pc,
@@ -3380,6 +3600,103 @@ static void runtime_perf_diag_tick() {
         current.capture_triggers - last.capture_triggers,
         current.capture_overlays - last.capture_overlays,
         (unsigned long long)current.capture_last_dispatch_delta);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    std::fprintf(stdout,
+        "[STATIC] checks=%.0f/s hits=%.0f/s variant_miss=%.0f/s "
+        "address_miss=%.0f/s rehash=%.0f/s crc_miss=%.0f/s "
+        "generation_fast=%.0f/s\n",
+        (double)(current.static_checks - last.static_checks) / dt,
+        (double)(current.static_hits - last.static_hits) / dt,
+        (double)(current.static_variant_misses - last.static_variant_misses) / dt,
+        (double)(current.static_address_misses - last.static_address_misses) / dt,
+        (double)(current.static_rehashes - last.static_rehashes) / dt,
+        (double)(current.static_crc_misses - last.static_crc_misses) / dt,
+        (double)(current.static_gen_fastpath - last.static_gen_fastpath) / dt);
+#endif
+    if (pgxp_enabled()) {
+        std::fprintf(stdout,
+            "[PGXP] produced=%.0f/s lookups=%.0f/s dataflow=%.0f/s "
+            "fallback=%.0f/s native=%.0f/s w_valid=%.0f/s "
+            "value_mismatch=%.0f/s tolerance_reject=%.0f/s "
+            "nclip_precise=%.0f/s nclip_fallback=%.0f/s; "
+            "hooks alu=%.0f/s load=%.0f/s store=%.0f/s cop2=%.0f/s "
+            "gpr=%.0f/s muldiv=%.0f/s\n",
+            (double)(current.pgxp.produced - last.pgxp.produced) / dt,
+            (double)(current.pgxp.lookups - last.pgxp.lookups) / dt,
+            (double)(current.pgxp.dataflow_hit - last.pgxp.dataflow_hit) / dt,
+            (double)(current.pgxp.fallback_hit - last.pgxp.fallback_hit) / dt,
+            (double)(current.pgxp.native - last.pgxp.native) / dt,
+            (double)(current.pgxp.w_valid - last.pgxp.w_valid) / dt,
+            (double)(current.pgxp.value_mismatch - last.pgxp.value_mismatch) / dt,
+            (double)(current.pgxp.tolerance_reject - last.pgxp.tolerance_reject) / dt,
+            (double)(current.pgxp.nclip_precise - last.pgxp.nclip_precise) / dt,
+            (double)(current.pgxp.nclip_fallback - last.pgxp.nclip_fallback) / dt,
+            (double)(current.pgxp.hook_alu - last.pgxp.hook_alu) / dt,
+            (double)(current.pgxp.hook_load - last.pgxp.hook_load) / dt,
+            (double)(current.pgxp.hook_store - last.pgxp.hook_store) / dt,
+            (double)(current.pgxp.hook_cop2 - last.pgxp.hook_cop2) / dt,
+            (double)(current.pgxp.hook_gpr_written -
+                     last.pgxp.hook_gpr_written) / dt,
+            (double)(current.pgxp.hook_muldiv - last.pgxp.hook_muldiv) / dt);
+        auto print_top = [&](const char *name, const uint64_t *cur,
+                             const uint64_t *prev) {
+            uint64_t delta[64];
+            for (int i = 0; i < 64; ++i) delta[i] = cur[i] - prev[i];
+            std::fprintf(stdout, " %s=", name);
+            for (int rank = 0; rank < 5; ++rank) {
+                int best = -1;
+                for (int i = 0; i < 64; ++i)
+                    if (delta[i] && (best < 0 || delta[i] > delta[best])) best = i;
+                if (best < 0) break;
+                std::fprintf(stdout, "%s%02X:%.1fM/s", rank ? "," : "",
+                             best, (double)delta[best] / dt / 1.0e6);
+                delta[best] = 0;
+            }
+        };
+        std::fprintf(stdout, "[PGXP-HOOK-TOP]");
+        print_top("alu-op", current.pgxp_hooks.alu_op, last.pgxp_hooks.alu_op);
+        print_top("special", current.pgxp_hooks.alu_funct,
+                  last.pgxp_hooks.alu_funct);
+        print_top("load", current.pgxp_hooks.load_op, last.pgxp_hooks.load_op);
+        print_top("store", current.pgxp_hooks.store_op, last.pgxp_hooks.store_op);
+        print_top("cop2-rs", current.pgxp_hooks.cop2_rs,
+                  last.pgxp_hooks.cop2_rs);
+        std::fprintf(stdout, "\n");
+    }
+    if (current.dirty_hot_entry_pc) {
+        uint32_t sources[8] = {};
+        uint32_t targets[8] = {};
+        uint64_t counts[8] = {};
+        const uint32_t flow_count =
+            dirty_ram_perf_hot_flows(sources, targets, counts, 8u);
+        if (flow_count) {
+            std::fprintf(stdout, "[DIRTY-FLOW-TOP]");
+            for (uint32_t rank = 0; rank < flow_count; ++rank) {
+                uint32_t best = rank;
+                for (uint32_t i = rank + 1; i < flow_count; ++i)
+                    if (counts[i] > counts[best]) best = i;
+                if (best != rank) {
+                    std::swap(sources[rank], sources[best]);
+                    std::swap(targets[rank], targets[best]);
+                    std::swap(counts[rank], counts[best]);
+                }
+                std::fprintf(stdout, " %08X>%08X:%llu",
+                             sources[rank], targets[rank],
+                             (unsigned long long)counts[rank]);
+            }
+            std::fprintf(stdout, "\n");
+        }
+        char candidates[2048] = {0};
+        char lazy[2048] = {0};
+        overlay_loader_dump_candidates_at(current.dirty_hot_entry_pc,
+                                           candidates, sizeof(candidates));
+        overlay_loader_dump_lazy_at(current.dirty_hot_entry_pc,
+                                    lazy, sizeof(lazy));
+        std::fprintf(stdout,
+            "[OVERLAY-HOT] pc=0x%08X candidates=%s lazy=%s last=%s\n",
+            current.dirty_hot_entry_pc, candidates, lazy,
+            overlay_loader_last_msg());
+    }
     std::fflush(stdout);
     last = current;
     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
@@ -5365,8 +5682,7 @@ static void netplay_hold_last_present_tick(void) {
     if (g_gl_active) {
         did = gl_renderer_present_hold_last();
     } else if (!g_vk_active && sdl_renderer && sdl_texture && s_sw_hold_valid) {
-        SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-        SDL_RenderClear(sdl_renderer);
+        sdl_render_presentation_background(sdl_renderer);
         SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src, &s_sw_hold_dst);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
@@ -5374,6 +5690,7 @@ static void netplay_hold_last_present_tick(void) {
     }
 #endif
     if (did) {
+        ++s_present_count;
         netplay_note_present();
         s_hold_last_ms = now ? now : 1ull;
     }
@@ -5947,13 +6264,13 @@ static void rewind_pause_present(void) {
     } else if (g_vk_active) {
         vk_renderer_present_blank();
     } else if (sdl_renderer) {
-        SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-        SDL_RenderClear(sdl_renderer);
+        sdl_render_presentation_background(sdl_renderer);
         if (sdl_texture && s_sw_hold_valid)
             SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src,
                            &s_sw_hold_dst);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
+        ++s_present_count;
     }
 #endif
 }
@@ -6098,6 +6415,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         if (!s_fps_last_time) {
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_present = g_gl_active
+                ? gl_renderer_present_count() : s_present_count;
             s_fps_last_native_cycles = psx_cycle_count;
             s_fps_last_retired_cycles = psx_cpu_retired_cycles;
             s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
@@ -6153,10 +6472,19 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
-            const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
+            /* s_frame_count is the guest timeline: it advances once per
+             * simulated VBlank.  Host presentation is tracked separately so
+             * a renderer stall or a skipped present cannot masquerade as game
+             * speed. */
+            const double guest_hz =
+                (double)(s_frame_count - s_fps_last_frame) / seconds;
+            const uint64_t present_now = g_gl_active
+                ? gl_renderer_present_count() : s_present_count;
+            const double present_fps =
+                (double)(present_now - s_fps_last_present) / seconds;
             const double target_vblank_hz = interrupts_get_vblank_rate_hz();
             const double speed = target_vblank_hz
-                ? fps / target_vblank_hz : 0.0;
+                ? guest_hz / target_vblank_hz : 0.0;
             const uint64_t native_delta = psx_cycle_count - s_fps_last_native_cycles;
             const uint64_t retired_delta =
                 psx_cpu_retired_cycles - s_fps_last_retired_cycles;
@@ -6271,11 +6599,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char title[256];
                 if (display_fps > 0.0) {
                     snprintf(title, sizeof(title),
-                             "%s  [Game %.0f fps %.2fx | Display %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, display_fps);
+                             "%s  [Guest %.0f Hz %.2fx | Present %.0f fps | Display %.0f fps]",
+                             s_fps_base_title.c_str(), guest_hz, speed,
+                             present_fps, display_fps);
                 } else {
-                    snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
-                             s_fps_base_title.c_str(), fps, speed);
+                    snprintf(title, sizeof(title),
+                             "%s  [Guest %.0f Hz %.2fx | Present %.0f fps]",
+                             s_fps_base_title.c_str(), guest_hz, speed,
+                             present_fps);
                 }
                 SDL_SetWindowTitle(sdl_window, title);
             }
@@ -6283,11 +6614,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char osd[96];
                 if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
-                             "Game %.0f FPS  %.2fx | Display %.0f FPS",
-                             fps, speed, display_fps);
+                             "Guest %.0f Hz %.2fx | Present %.0f FPS | Display %.0f FPS",
+                             guest_hz, speed, present_fps, display_fps);
                 } else {
-                    snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
-                             fps, speed);
+                    snprintf(osd, sizeof(osd),
+                             "Guest %.0f Hz %.2fx | Present %.0f FPS",
+                             guest_hz, speed, present_fps);
                 }
                 host_osd_set_status(osd);
             }
@@ -6310,10 +6642,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
                 netplay_present_gap_stats(&gap_p95, &gap_max);
                 std::fprintf(stderr,
-                    "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
+                    "[FPS] guest: %.1f Hz (%.2fx) present: %.1f fps | frames: %llu | "
                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
                     "present_gap_p95=%u ms max=%u ms (n=%llu)\n",
-                    fps, speed, (unsigned long long)s_frame_count,
+                    guest_hz, speed, present_fps,
+                    (unsigned long long)s_frame_count,
                     guest_ms, admit_ms, replay_pct,
                     (unsigned)gap_p95, (unsigned)gap_max,
                     (unsigned long long)s_np_timing_frames);
@@ -6322,7 +6655,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_np_timing_frames = 0;
             } else {
                 std::fprintf(stderr,
-                             "[CLOCK] game=%.1f fps speed=%.2fx frames=%llu "
+                             "[CLOCK] guest=%.1f Hz speed=%.2fx present=%.1f fps frames=%llu "
                              "cpu_requested=%u%% cpu_effective=%.3fx "
                              "retired=%llu cpu_native=%llu device_clock=%llu "
                              "spu_frames=%llu spu_effective=%.1fHz "
@@ -6348,7 +6681,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              "text_exact_revalidations=%llu "
                              "mdec_decodes=%u "
                              "idle_skips=%llu idle_native=%llu carry=%u\n",
-                             fps, speed, (unsigned long long)s_frame_count,
+                             guest_hz, speed, present_fps,
+                             (unsigned long long)s_frame_count,
                              psx_get_cpu_overclock(), effective_cpu,
                              (unsigned long long)retired_delta,
                              (unsigned long long)cpu_native_delta,
@@ -6387,6 +6721,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             std::fflush(stderr);
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_present = present_now;
             s_fps_last_native_cycles = psx_cycle_count;
             s_fps_last_retired_cycles = psx_cpu_retired_cycles;
             s_fps_last_cpu_native_cycles = psx_cpu_native_cycles;
@@ -6959,16 +7294,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_force_present_after_load = false;
                 if (g_gl_active) {
                     gl_renderer_present_blank();
+                    ++s_present_count;
                 } else if (g_vk_active) {
                     vk_renderer_present_blank();
+                    ++s_present_count;
                 } else {
                     if (!sdl_renderer && ensure_sw_sdl_present() != 0)
                         return ep;
                     if (sdl_renderer) {
-                        SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-                        SDL_RenderClear(sdl_renderer);
+                        sdl_render_presentation_background(sdl_renderer);
                         host_osd_draw_sdl(sdl_renderer);
                         SDL_RenderPresent(sdl_renderer);
+                        ++s_present_count;
                     }
                 }
             }
@@ -7092,6 +7429,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                          (fmv_frame || nw_pin) ? 1 : 0);
             }
             netplay_note_present();
+            ++s_present_count;
             return ep;
         }
 #endif
@@ -7245,6 +7583,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
                             (g_video_aa && !depth24_frame) ? 1 : 0,
                             pin_43 ? 1 : 0, 0 /* full width */);
+        ++s_present_count;
         netplay_note_present();
     } else {
     if ((!sdl_renderer || !sdl_texture) && ensure_sw_sdl_present() != 0)
@@ -7300,8 +7639,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Always clear black: hot-path RenderClear used to inherit the backend
      * default draw color (often white), so letterbox margins under short FMV
      * bands flashed as a bright strip on some X11 SDL drivers. */
-    SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-    SDL_RenderClear(sdl_renderer);
+    sdl_render_presentation_background(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
     host_osd_draw_sdl(sdl_renderer);
     /* §33: remember active rect for resim hold-last (not full 640x512). */
@@ -7321,6 +7659,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         latency_ring_mark(LAT_SWAP_BEGIN);
         const Uint64 t0 = SDL_GetPerformanceCounter();
         SDL_RenderPresent(sdl_renderer);
+        ++s_present_count;
         const Uint64 t1 = SDL_GetPerformanceCounter();
         latency_ring_mark(LAT_SWAP_END);
         netplay_note_present();
@@ -10758,7 +11097,29 @@ namespace {
         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
-        gi->has_geometry_precision = 1;
+        gi->has_geometry_precision = 0;
+        gi->pgxp_capabilities = 0;
+#if defined(PSX_PGXP)
+        if (wipeout_display_controls_b) {
+            /* Advertise the complete runtime paths in this PGXP flavour. The
+             * launcher independently masks unknown ABI bits. Vulkan refuses
+             * unsupported color/depth modes explicitly instead of degrading. */
+            gi->pgxp_capabilities =
+                RECOMP_LAUNCHER_PGXP_GEOMETRY |
+                RECOMP_LAUNCHER_PGXP_TEXTURE_CORRECTION |
+                RECOMP_LAUNCHER_PGXP_CPU_MODE |
+                RECOMP_LAUNCHER_PGXP_VERTEX_CACHE |
+                RECOMP_LAUNCHER_PGXP_TOLERANCE |
+                RECOMP_LAUNCHER_PGXP_CULLING |
+                RECOMP_LAUNCHER_PGXP_COLOR_CORRECTION |
+                RECOMP_LAUNCHER_PGXP_DEPTH_BUFFER |
+                RECOMP_LAUNCHER_PGXP_DISABLE_2D |
+                RECOMP_LAUNCHER_PGXP_TRANSPARENT_DEPTH |
+                RECOMP_LAUNCHER_PGXP_PRESERVE_PROJECTION |
+                RECOMP_LAUNCHER_PGXP_DEPTH_THRESHOLD;
+            gi->has_geometry_precision = 1; /* older recomp-ui compatibility */
+        }
+#endif
         gi->has_rewind_depth = 1;
         if (language_labels && num_languages > 0) {
             gi->language_labels = language_labels;
@@ -11018,6 +11379,9 @@ int main(int argc, char** argv) {
     uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
+    std::string resolved_video_bezel;
+    std::string resolved_hd_texture_pack;
+    bool        hd_texture_pack_selected = false;
     std::vector<PSXRecompV4::RuntimeConfig::WarmCdRoute> warm_cd_routes;
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
@@ -11138,8 +11502,25 @@ int main(int argc, char** argv) {
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
+            g_video_pgxp_vertex_cache =
+                gc.runtime.video_pgxp_vertex_cache ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
+            g_video_pgxp_culling = gc.runtime.video_pgxp_culling ? 1 : 0;
+            g_video_pgxp_color_correction =
+                gc.runtime.video_pgxp_color_correction ? 1 : 0;
+            g_video_pgxp_depth_buffer =
+                gc.runtime.video_pgxp_depth_buffer ? 1 : 0;
+            g_video_pgxp_disable_2d =
+                gc.runtime.video_pgxp_disable_2d ? 1 : 0;
+            g_video_pgxp_transparent_depth =
+                gc.runtime.video_pgxp_transparent_depth ? 1 : 0;
+            g_video_pgxp_preserve_projection =
+                gc.runtime.video_pgxp_preserve_projection ? 1 : 0;
+            g_video_pgxp_depth_clear_threshold =
+                (float)gc.runtime.video_pgxp_depth_clear_threshold;
             g_video_renderer   = gc.runtime.video_renderer;
+            resolved_video_bezel = gc.runtime.video_bezel;
+            resolved_hd_texture_pack = gc.runtime.video_hd_texture_pack;
             if (gc.runtime.runtime_cpu_overclock != 100u) {
                 psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
                 std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
@@ -11385,6 +11766,8 @@ int main(int argc, char** argv) {
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
+            std::fprintf(stdout, "psxrecomp: game entry_pc=0x%08X load=0x%08X text=0x%X\n",
+                         game_entry_pc, gc.load_address, gc.text_size);
             fast_boot     = gc.runtime.fast_boot;
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
@@ -11464,6 +11847,33 @@ int main(int argc, char** argv) {
 
     if (!game_name.empty()) s_picker_game_name = game_name;
     const bool wipeout_display_controls = (game_id == "SCES-02845");
+#if defined(PSX_PGXP)
+    const bool pgxp_controls_offered = wipeout_display_controls;
+#else
+    const bool pgxp_controls_offered = false;
+#endif
+
+#if defined(PSX_PGXP)
+    /* GooseStation's SCES-02845 compatibility profile forces CPU mode and
+     * excludes 2D polygons. psxrecomp's renderer only consumes address-proven
+     * 3D packet provenance, so the latter is an invariant rather than a user
+     * switch. These are product defaults; settings.toml below remains the
+     * player's explicit override for every exposed control. */
+    if (wipeout_display_controls) {
+        g_video_geometry_correction = 1;
+        g_video_perspective_texturing = 1;
+        g_video_pgxp_cpu_mode = 1;
+        g_video_pgxp_vertex_cache = 0;
+        g_video_pgxp_tolerance = -1.0f;
+        g_video_pgxp_culling = 1;
+        g_video_pgxp_color_correction = 0;
+        g_video_pgxp_depth_buffer = 0;
+        g_video_pgxp_disable_2d = 1;
+        g_video_pgxp_transparent_depth = 0;
+        g_video_pgxp_preserve_projection = 0;
+        g_video_pgxp_depth_clear_threshold = 4096.0f;
+    }
+#endif
 
     /* Layer the launcher-written settings.toml (next to the exe) over the
      * bundled game.toml. Any field present there overrides the config value;
@@ -11474,6 +11884,16 @@ int main(int argc, char** argv) {
     std::string netplay_player_name;     /* [netplay] player_name from settings.toml */
     bool has_netplay_player_name = false;
     bool user_settings_has_renderer = false;
+    bool user_settings_has_pgxp_cpu_mode = false;
+    bool user_settings_has_pgxp_vertex_cache = false;
+    bool user_settings_has_pgxp_tolerance = false;
+    bool user_settings_has_pgxp_culling = false;
+    bool user_settings_has_pgxp_color_correction = false;
+    bool user_settings_has_pgxp_depth_buffer = false;
+    bool user_settings_has_pgxp_disable_2d = false;
+    bool user_settings_has_pgxp_transparent_depth = false;
+    bool user_settings_has_pgxp_preserve_projection = false;
+    bool user_settings_has_pgxp_depth_clear_threshold = false;
     {
         std::filesystem::path settings_path =
             exe_dir_from_argv(argv[0]) / "settings.toml";
@@ -11483,6 +11903,20 @@ int main(int argc, char** argv) {
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
         user_settings_has_renderer = us.has_renderer;
+        user_settings_has_pgxp_cpu_mode = us.has_pgxp_cpu_mode;
+        user_settings_has_pgxp_vertex_cache = us.has_pgxp_vertex_cache;
+        user_settings_has_pgxp_tolerance = us.has_pgxp_tolerance;
+        user_settings_has_pgxp_culling = us.has_pgxp_culling;
+        user_settings_has_pgxp_color_correction =
+            us.has_pgxp_color_correction;
+        user_settings_has_pgxp_depth_buffer = us.has_pgxp_depth_buffer;
+        user_settings_has_pgxp_disable_2d = us.has_pgxp_disable_2d;
+        user_settings_has_pgxp_transparent_depth =
+            us.has_pgxp_transparent_depth;
+        user_settings_has_pgxp_preserve_projection =
+            us.has_pgxp_preserve_projection;
+        user_settings_has_pgxp_depth_clear_threshold =
+            us.has_pgxp_depth_clear_threshold;
         if (us.parse_error) {
             /* The file exists but is not valid TOML: every setting in it (the
              * user's renderer choice, BIOS/disc paths, ...) is being ignored,
@@ -11536,6 +11970,29 @@ int main(int argc, char** argv) {
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
             g_video_perspective_texturing = us.perspective_texturing ? 1 : 0;
+        if (us.has_pgxp_cpu_mode)
+            g_video_pgxp_cpu_mode = us.pgxp_cpu_mode ? 1 : 0;
+        if (us.has_pgxp_vertex_cache)
+            g_video_pgxp_vertex_cache = us.pgxp_vertex_cache ? 1 : 0;
+        if (us.has_pgxp_tolerance)
+            g_video_pgxp_tolerance = (float)us.pgxp_tolerance;
+        if (us.has_pgxp_culling)
+            g_video_pgxp_culling = us.pgxp_culling ? 1 : 0;
+        if (us.has_pgxp_color_correction)
+            g_video_pgxp_color_correction = us.pgxp_color_correction ? 1 : 0;
+        if (us.has_pgxp_depth_buffer)
+            g_video_pgxp_depth_buffer = us.pgxp_depth_buffer ? 1 : 0;
+        if (us.has_pgxp_disable_2d)
+            g_video_pgxp_disable_2d = us.pgxp_disable_2d ? 1 : 0;
+        if (us.has_pgxp_transparent_depth)
+            g_video_pgxp_transparent_depth =
+                us.pgxp_transparent_depth ? 1 : 0;
+        if (us.has_pgxp_preserve_projection)
+            g_video_pgxp_preserve_projection =
+                us.pgxp_preserve_projection ? 1 : 0;
+        if (us.has_pgxp_depth_clear_threshold)
+            g_video_pgxp_depth_clear_threshold =
+                (float)us.pgxp_depth_clear_threshold;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         /* turbo_loads is deliberately NOT restored from settings.toml. It is a
@@ -11968,6 +12425,40 @@ int main(int argc, char** argv) {
             seed.has_geometry_correction = true;
             seed.perspective_texturing = (g_video_perspective_texturing != 0);
             seed.has_perspective_texturing = true;
+            seed.pgxp_cpu_mode = (g_video_pgxp_cpu_mode != 0);
+            seed.has_pgxp_cpu_mode = pgxp_controls_offered ||
+                                     user_settings_has_pgxp_cpu_mode;
+            seed.pgxp_vertex_cache = (g_video_pgxp_vertex_cache != 0);
+            seed.has_pgxp_vertex_cache = pgxp_controls_offered ||
+                                         user_settings_has_pgxp_vertex_cache;
+            seed.pgxp_tolerance = (double)g_video_pgxp_tolerance;
+            seed.has_pgxp_tolerance = pgxp_controls_offered ||
+                                      user_settings_has_pgxp_tolerance;
+            seed.pgxp_culling = g_video_pgxp_culling != 0;
+            seed.has_pgxp_culling = pgxp_controls_offered ||
+                                    user_settings_has_pgxp_culling;
+            seed.pgxp_color_correction =
+                g_video_pgxp_color_correction != 0;
+            seed.has_pgxp_color_correction = pgxp_controls_offered ||
+                user_settings_has_pgxp_color_correction;
+            seed.pgxp_depth_buffer = g_video_pgxp_depth_buffer != 0;
+            seed.has_pgxp_depth_buffer = pgxp_controls_offered ||
+                user_settings_has_pgxp_depth_buffer;
+            seed.pgxp_disable_2d = g_video_pgxp_disable_2d != 0;
+            seed.has_pgxp_disable_2d = pgxp_controls_offered ||
+                user_settings_has_pgxp_disable_2d;
+            seed.pgxp_transparent_depth =
+                g_video_pgxp_transparent_depth != 0;
+            seed.has_pgxp_transparent_depth = pgxp_controls_offered ||
+                user_settings_has_pgxp_transparent_depth;
+            seed.pgxp_preserve_projection =
+                g_video_pgxp_preserve_projection != 0;
+            seed.has_pgxp_preserve_projection = pgxp_controls_offered ||
+                user_settings_has_pgxp_preserve_projection;
+            seed.pgxp_depth_clear_threshold =
+                (uint32_t)g_video_pgxp_depth_clear_threshold;
+            seed.has_pgxp_depth_clear_threshold = pgxp_controls_offered ||
+                user_settings_has_pgxp_depth_clear_threshold;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);
             seed.has_auto_skip_fmv = skip_fmv_offered;
@@ -12157,6 +12648,23 @@ int main(int argc, char** argv) {
             ls.texture_filter     = seed.texture_filter;
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
+            ls.pgxp_cpu_mode         = seed.pgxp_cpu_mode ? 1 : 0;
+            ls.pgxp_vertex_cache     = seed.pgxp_vertex_cache ? 1 : 0;
+            ls.pgxp_tolerance_milli  =
+                seed.pgxp_tolerance < 0.0
+                    ? -1000
+                    : (int)(seed.pgxp_tolerance * 1000.0 + 0.5);
+            ls.pgxp_culling = seed.pgxp_culling ? 1 : 0;
+            ls.pgxp_color_correction =
+                seed.pgxp_color_correction ? 1 : 0;
+            ls.pgxp_depth_buffer = seed.pgxp_depth_buffer ? 1 : 0;
+            ls.pgxp_disable_2d = seed.pgxp_disable_2d ? 1 : 0;
+            ls.pgxp_transparent_depth =
+                seed.pgxp_transparent_depth ? 1 : 0;
+            ls.pgxp_preserve_projection =
+                seed.pgxp_preserve_projection ? 1 : 0;
+            ls.pgxp_depth_clear_threshold =
+                (int)seed.pgxp_depth_clear_threshold;
             ls.screen_kind        = seed.screen_kind;
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
@@ -12396,6 +12904,35 @@ int main(int argc, char** argv) {
                 seed.has_geometry_correction = true;
                 seed.perspective_texturing = ls.perspective_texturing != 0;
                 seed.has_perspective_texturing = true;
+                if (pgxp_controls_offered) {
+                    seed.pgxp_cpu_mode = ls.pgxp_cpu_mode != 0;
+                    seed.has_pgxp_cpu_mode = true;
+                    seed.pgxp_vertex_cache = ls.pgxp_vertex_cache != 0;
+                    seed.has_pgxp_vertex_cache = true;
+                    seed.pgxp_tolerance =
+                        ls.pgxp_tolerance_milli < 0
+                            ? -1.0
+                            : (double)ls.pgxp_tolerance_milli / 1000.0;
+                    seed.has_pgxp_tolerance = true;
+                    seed.pgxp_culling = ls.pgxp_culling != 0;
+                    seed.has_pgxp_culling = true;
+                    seed.pgxp_color_correction =
+                        ls.pgxp_color_correction != 0;
+                    seed.has_pgxp_color_correction = true;
+                    seed.pgxp_depth_buffer = ls.pgxp_depth_buffer != 0;
+                    seed.has_pgxp_depth_buffer = true;
+                    seed.pgxp_disable_2d = ls.pgxp_disable_2d != 0;
+                    seed.has_pgxp_disable_2d = true;
+                    seed.pgxp_transparent_depth =
+                        ls.pgxp_transparent_depth != 0;
+                    seed.has_pgxp_transparent_depth = true;
+                    seed.pgxp_preserve_projection =
+                        ls.pgxp_preserve_projection != 0;
+                    seed.has_pgxp_preserve_projection = true;
+                    seed.pgxp_depth_clear_threshold =
+                        (uint32_t)ls.pgxp_depth_clear_threshold;
+                    seed.has_pgxp_depth_clear_threshold = true;
+                }
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
                 seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
@@ -12600,6 +13137,24 @@ int main(int argc, char** argv) {
                 g_video_texfilter = seed.texture_filter;
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
+                if (pgxp_controls_offered) {
+                    g_video_pgxp_cpu_mode = seed.pgxp_cpu_mode ? 1 : 0;
+                    g_video_pgxp_vertex_cache = seed.pgxp_vertex_cache ? 1 : 0;
+                    g_video_pgxp_tolerance = (float)seed.pgxp_tolerance;
+                    g_video_pgxp_culling = seed.pgxp_culling ? 1 : 0;
+                    g_video_pgxp_color_correction =
+                        seed.pgxp_color_correction ? 1 : 0;
+                    g_video_pgxp_depth_buffer =
+                        seed.pgxp_depth_buffer ? 1 : 0;
+                    g_video_pgxp_disable_2d =
+                        seed.pgxp_disable_2d ? 1 : 0;
+                    g_video_pgxp_transparent_depth =
+                        seed.pgxp_transparent_depth ? 1 : 0;
+                    g_video_pgxp_preserve_projection =
+                        seed.pgxp_preserve_projection ? 1 : 0;
+                    g_video_pgxp_depth_clear_threshold =
+                        (float)seed.pgxp_depth_clear_threshold;
+                }
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled =
@@ -12963,15 +13518,50 @@ session_reboot:
         g_video_perspective_texturing = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PGXP_CPU_MODE"))
         g_video_pgxp_cpu_mode = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_VERTEX_CACHE"))
+        g_video_pgxp_vertex_cache = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_CULLING"))
+        g_video_pgxp_culling = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_COLOR_CORRECTION"))
+        g_video_pgxp_color_correction = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_DEPTH_BUFFER"))
+        g_video_pgxp_depth_buffer = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_DISABLE_2D"))
+        g_video_pgxp_disable_2d = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_TRANSPARENT_DEPTH"))
+        g_video_pgxp_transparent_depth = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_PGXP_PRESERVE_PROJECTION"))
+        g_video_pgxp_preserve_projection = (*e && *e != '0') ? 1 : 0;
     gte_geometry_correction_set(g_video_geometry_correction);
     gpu_texture_correction_set(g_video_perspective_texturing);
     pgxp_set_cpu_mode(g_video_pgxp_cpu_mode);
+    pgxp_set_vertex_cache(g_video_pgxp_vertex_cache);
     pgxp_set_tolerance(g_video_pgxp_tolerance);
+    pgxp_set_culling(g_video_pgxp_culling);
+    pgxp_set_color_correction(g_video_pgxp_color_correction);
+    pgxp_set_depth_buffer(g_video_pgxp_depth_buffer);
+    pgxp_set_disable_2d(g_video_pgxp_disable_2d);
+    pgxp_set_transparent_depth(g_video_pgxp_transparent_depth);
+    pgxp_set_preserve_projection(g_video_pgxp_preserve_projection);
+    pgxp_set_depth_clear_threshold(g_video_pgxp_depth_clear_threshold);
     if (g_video_geometry_correction || g_video_perspective_texturing) {
         std::fprintf(stdout,
-                     "psxrecomp: geometry correction %s, perspective texturing %s%s\n",
+                     "psxrecomp: PGXP geometry %s, texture %s, CPU %s, "
+                     "vertex cache %s, tolerance %.3g, culling %s, color %s, "
+                     "depth %s, exclude-2D %s, transparent-depth %s, "
+                     "preserve-projection %s, depth-threshold %.0f%s\n",
                      g_video_geometry_correction ? "on" : "off",
                      g_video_perspective_texturing ? "on" : "off",
+                     g_video_pgxp_cpu_mode ? "on" : "off",
+                     g_video_pgxp_vertex_cache ? "on" : "off",
+                     (double)g_video_pgxp_tolerance,
+                     g_video_pgxp_culling ? "on" : "off",
+                     g_video_pgxp_color_correction ? "on" : "off",
+                     g_video_pgxp_depth_buffer ? "on" : "off",
+                     g_video_pgxp_disable_2d ? "on" : "off",
+                     g_video_pgxp_transparent_depth ? "on" : "off",
+                     g_video_pgxp_preserve_projection ? "on" : "off",
+                     (double)g_video_pgxp_depth_clear_threshold,
                      (g_video_geometry_correction && requested_scale < 2)
                          ? " (needs [video] supersampling >= 2 to be visible)" : "");
     }
@@ -13156,9 +13746,61 @@ session_reboot:
     if (game_entry_pc != 0)
         fntrace_set_game_range(game_entry_pc, 0);
 
+    if (resolved_hd_texture_pack.empty()) {
+        gl_renderer_set_hd_texture_root(nullptr); /* retain environment support */
+        const char* environment_root = std::getenv("WIPEOUT3SE_HD_ASSET_ROOT");
+        hd_texture_pack_selected = environment_root && environment_root[0];
+    } else if (resolved_hd_texture_pack == "off") {
+        gl_renderer_set_hd_texture_root("");
+        std::fprintf(stdout, "psxrecomp: external HD texture pack disabled by config\n");
+    } else if (resolved_hd_texture_pack == "auto") {
+        std::string detail;
+        const auto selected = resolve_auto_hd_texture_pack(resolved_disc, detail);
+        if (selected.empty()) {
+            gl_renderer_set_hd_texture_root(""); /* fail closed, never fall through to env */
+            std::fprintf(stdout,
+                         "psxrecomp: HD texture pack auto-selection disabled (%s)\n",
+                         detail.c_str());
+        } else {
+            const std::string selected_string = selected.string();
+            gl_renderer_set_hd_texture_root(selected_string.c_str());
+            hd_texture_pack_selected = true;
+            std::fprintf(stdout,
+                         "psxrecomp: OpenGL HD texture root auto-selected cue sibling %s\n",
+                         selected_string.c_str());
+        }
+    } else {
+        gl_renderer_set_hd_texture_root(resolved_hd_texture_pack.c_str());
+        hd_texture_pack_selected = true;
+        std::fprintf(stdout, "psxrecomp: OpenGL HD texture root configured at %s\n",
+                     resolved_hd_texture_pack.c_str());
+    }
+    if (g_video_renderer != 1 && hd_texture_pack_selected) {
+        std::fprintf(stdout,
+                     "psxrecomp: external HD textures are OpenGL-only; selected backend uses native PS1 textures\n");
+    }
+
   if (g_headless) {
     std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
   } else {
+    g_presentation_bezel = PSXRecompV4::load_presentation_bezel(
+        exe_dir_from_argv(argv[0]), resolved_video_bezel);
+    if (g_presentation_bezel.active()) {
+        std::fprintf(stdout,
+                     "psxrecomp: presentation bezel loaded %dx%d from %s\n",
+                     g_presentation_bezel.image.width,
+                     g_presentation_bezel.image.height,
+                     g_presentation_bezel.image.source.string().c_str());
+        if (g_video_renderer == 2) {
+            std::fprintf(stdout,
+                         "psxrecomp: Vulkan does not support presentation bezels; black-margin fallback active\n");
+        }
+    } else if (g_presentation_bezel.status !=
+               PSXRecompV4::BezelLoadStatus::disabled) {
+        std::fprintf(stderr,
+                     "psxrecomp: presentation bezel disabled (%s); black-margin fallback active\n",
+                     g_presentation_bezel.detail.c_str());
+    }
     /* ---- SDL init ---- */
     /* Scale quality governs SDL's logical-size -> window scaling. Linear when
      * antialiasing is on so the (super)sampled frame stays smooth when the
@@ -13302,7 +13944,22 @@ session_reboot:
     if (g_video_renderer == 1) {
         gl_renderer_set_swap_interval(present_effective_swap_interval()); /* applied at context init */
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        if (g_gl_active && g_presentation_bezel.active()) {
+            const auto& image = g_presentation_bezel.image;
+            if (!gl_renderer_set_presentation_bezel(
+                    image.rgba.data(), image.width, image.height)) {
+                std::fprintf(stderr,
+                             "psxrecomp: OpenGL presentation bezel upload failed; black-margin fallback active\n");
+            } else {
+                std::fprintf(stdout,
+                             "psxrecomp: OpenGL presentation bezel active (background-first composition)\n");
+            }
+        }
         if (!g_gl_active) {
+            if (hd_texture_pack_selected) {
+                std::fprintf(stdout,
+                             "psxrecomp: OpenGL unavailable; SDL fallback uses native PS1 textures\n");
+            }
             gr_set_backend(GR_BACKEND_SOFTWARE);
             gl_renderer_set_cpu_auth_dual(0);
             g_gl_fbo_present = 0;
@@ -13938,6 +14595,9 @@ session_reboot:
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
     if (g_vk_active) vk_renderer_shutdown();
+#ifndef PSX_SDL_NO_RENDER
+    destroy_sdl_bezel_texture();
+#endif
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
@@ -13988,6 +14648,22 @@ soft_return_lobby:
         ls.texture_filter = g_video_texfilter;
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
+        ls.pgxp_cpu_mode = g_video_pgxp_cpu_mode ? 1 : 0;
+        ls.pgxp_vertex_cache = g_video_pgxp_vertex_cache ? 1 : 0;
+        ls.pgxp_tolerance_milli = g_video_pgxp_tolerance < 0.0f
+            ? -1000
+            : (int)(g_video_pgxp_tolerance * 1000.0f + 0.5f);
+        ls.pgxp_culling = g_video_pgxp_culling ? 1 : 0;
+        ls.pgxp_color_correction =
+            g_video_pgxp_color_correction ? 1 : 0;
+        ls.pgxp_depth_buffer = g_video_pgxp_depth_buffer ? 1 : 0;
+        ls.pgxp_disable_2d = g_video_pgxp_disable_2d ? 1 : 0;
+        ls.pgxp_transparent_depth =
+            g_video_pgxp_transparent_depth ? 1 : 0;
+        ls.pgxp_preserve_projection =
+            g_video_pgxp_preserve_projection ? 1 : 0;
+        ls.pgxp_depth_clear_threshold =
+            (int)g_video_pgxp_depth_clear_threshold;
         ls.screen_kind = g_video_screen;
         ls.frame_interp = g_frame_interpolation ? 1 : 0;
         ls.frame_interp_fps = g_frame_interpolation_fps;
@@ -14244,6 +14920,34 @@ soft_return_lobby:
                 us.has_geometry_correction = true;
                 us.perspective_texturing = ls.perspective_texturing != 0;
                 us.has_perspective_texturing = true;
+                if (pgxp_controls_offered) {
+                    us.pgxp_cpu_mode = ls.pgxp_cpu_mode != 0;
+                    us.has_pgxp_cpu_mode = true;
+                    us.pgxp_vertex_cache = ls.pgxp_vertex_cache != 0;
+                    us.has_pgxp_vertex_cache = true;
+                    us.pgxp_tolerance = ls.pgxp_tolerance_milli < 0
+                        ? -1.0
+                        : (double)ls.pgxp_tolerance_milli / 1000.0;
+                    us.has_pgxp_tolerance = true;
+                    us.pgxp_culling = ls.pgxp_culling != 0;
+                    us.has_pgxp_culling = true;
+                    us.pgxp_color_correction =
+                        ls.pgxp_color_correction != 0;
+                    us.has_pgxp_color_correction = true;
+                    us.pgxp_depth_buffer = ls.pgxp_depth_buffer != 0;
+                    us.has_pgxp_depth_buffer = true;
+                    us.pgxp_disable_2d = ls.pgxp_disable_2d != 0;
+                    us.has_pgxp_disable_2d = true;
+                    us.pgxp_transparent_depth =
+                        ls.pgxp_transparent_depth != 0;
+                    us.has_pgxp_transparent_depth = true;
+                    us.pgxp_preserve_projection =
+                        ls.pgxp_preserve_projection != 0;
+                    us.has_pgxp_preserve_projection = true;
+                    us.pgxp_depth_clear_threshold =
+                        (uint32_t)ls.pgxp_depth_clear_threshold;
+                    us.has_pgxp_depth_clear_threshold = true;
+                }
                 us.screen_kind = ls.screen_kind;
                 us.has_screen_kind = true;
                 us.frame_interpolation = ls.frame_interp != 0;
@@ -14302,6 +15006,24 @@ soft_return_lobby:
             g_video_texfilter = ls.texture_filter;
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
+            if (pgxp_controls_offered) {
+                g_video_pgxp_cpu_mode = ls.pgxp_cpu_mode ? 1 : 0;
+                g_video_pgxp_vertex_cache = ls.pgxp_vertex_cache ? 1 : 0;
+                g_video_pgxp_tolerance = ls.pgxp_tolerance_milli < 0
+                    ? -1.0f
+                    : (float)ls.pgxp_tolerance_milli / 1000.0f;
+                g_video_pgxp_culling = ls.pgxp_culling ? 1 : 0;
+                g_video_pgxp_color_correction =
+                    ls.pgxp_color_correction ? 1 : 0;
+                g_video_pgxp_depth_buffer = ls.pgxp_depth_buffer ? 1 : 0;
+                g_video_pgxp_disable_2d = ls.pgxp_disable_2d ? 1 : 0;
+                g_video_pgxp_transparent_depth =
+                    ls.pgxp_transparent_depth ? 1 : 0;
+                g_video_pgxp_preserve_projection =
+                    ls.pgxp_preserve_projection ? 1 : 0;
+                g_video_pgxp_depth_clear_threshold =
+                    (float)ls.pgxp_depth_clear_threshold;
+            }
             g_video_screen = ls.screen_kind;
             /* Load acceleration and FMV skipping are mod-owned on PSX, and the
              * launcher struct these come from was snapshotted BEFORE

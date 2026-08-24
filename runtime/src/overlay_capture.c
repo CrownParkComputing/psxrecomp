@@ -339,6 +339,28 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
         if (page < win_hi_page) {
             uint32_t word = bitmap[page >> 5];
             dirty = (word >> (page & 31u)) & 1u;
+            /* A restored state may preserve executable RAM without the
+             * host-only dirty-page bitmap.  Dispatch/execution evidence is
+             * still authoritative for the page: include it in the snapshot
+             * so the next compiler pass can see the live bytes and its exact
+             * dispatch roots.  This scan runs only when the ordinary dirty
+             * bit is clear (and only at capture flush), so it is not on the
+             * emulation hot path. */
+            if (!dirty) {
+                const uint32_t words_per_page = 4096u / sizeof(uint32_t);
+                const uint32_t first_word = page * words_per_page;
+                const uint32_t last_word = first_word + words_per_page;
+                for (uint32_t wi = first_word; wi < last_word; wi++) {
+                    if (dispatch_pc_bitmap[wi >> 5] & (1u << (wi & 31u))) {
+                        dirty = 1;
+                        break;
+                    }
+                    if (exec_pc_bitmap[wi >> 5] & (1u << (wi & 31u))) {
+                        dirty = 1;
+                        break;
+                    }
+                }
+            }
         }
 
         if (dirty && !in_run) {
@@ -813,6 +835,118 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
     }
 }
 
+/* The compact dispatch bitmap is intentionally presence-only, while the
+ * diagnostic table retains the richer entry/insn counts.  A restored state
+ * can resume inside a hot interpreted block, before the normal dispatch
+ * bitmap sees the block's original entry.  Preserve only the single current
+ * hot entry when its page has fresh execution evidence; this gives the
+ * overlay compiler one bounded root without promoting every executed word
+ * (which would turn data tails and delay slots into false function seeds). */
+static void capture_promote_hot_dispatch(uint32_t *dispatch_pc_bitmap,
+                                         const uint32_t *exec_pc_bitmap,
+                                         uint32_t *page_bitmap,
+                                         uint32_t bitmap_words,
+                                         uint32_t scope_lo,
+                                         uint32_t scope_hi)
+{
+#define CAPTURE_HOT_ROOT_CAP 32u
+#define CAPTURE_HOT_RUN_CAP  256u
+    uint32_t pc = 0;
+    uint64_t hits = 0, insns = 0, entry_hits = 0;
+    dirty_ram_perf_hot_entry(&pc, &hits, &insns, &entry_hits);
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (!pc || phys >= PSX_MAIN_RAM_BYTES || (phys & 3u) != 0u ||
+        phys < scope_lo || phys >= scope_hi)
+        return;
+    uint32_t page = phys >> 12;
+    uint32_t first_word = page * (4096u / 4u);
+    int page_observed = 0;
+    for (uint32_t b = 0; b < 4096u / 4u / 32u; ++b) {
+        if (exec_pc_bitmap[(first_word >> 5) + b]) {
+            page_observed = 1;
+            break;
+        }
+    }
+    /* A DMA can clear the compact execution bitmap after the last observed
+     * dispatch, while the diagnostic entry still identifies the block that
+     * was just doing the work.  The state-load reset makes this bounded
+     * promotion current to the restored epoch; retain its page so shutdown
+     * capture cannot lose the live bytes merely because the page was evicted
+     * between the last dispatch and the flush. */
+    if (!page_observed && (page >> 5) >= bitmap_words)
+        return;
+    if ((page >> 5) < bitmap_words)
+        page_bitmap[page >> 5] |= 1u << (page & 31u);
+    uint32_t word = phys >> 2;
+    dispatch_pc_bitmap[word >> 5] |= 1u << (word & 31u);
+
+    /* A restored replay can enter the same page at several nearby PCs. Keep
+     * the hot root above, then add only the highest-work entries the
+     * interpreter actually dispatched in that page (including chained block
+     * entries). This is a bounded dispatch-root set, not a promotion of all
+     * executed words (which would make data tails look like functions). */
+    uint32_t roots[CAPTURE_HOT_ROOT_CAP];
+    uint64_t root_scores[CAPTURE_HOT_ROOT_CAP];
+    uint32_t root_count = 0;
+    extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+    for (uint32_t i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; ++i) {
+        const DirtyRamPcEntry *entry = &g_dirty_ram_pc_table[i];
+        uint32_t entry_phys = entry->pc & 0x1FFFFFFFu;
+        if (!entry->pc || entry_phys >= PSX_MAIN_RAM_BYTES ||
+            (entry_phys & 3u) != 0u || (entry_phys >> 12) != page ||
+            entry_phys < scope_lo || entry_phys >= scope_hi ||
+            entry->hits == 0 || entry_phys == phys)
+            continue;
+        uint32_t pos = root_count;
+        if (pos < CAPTURE_HOT_ROOT_CAP) {
+            roots[pos] = entry_phys;
+            root_scores[pos] = entry->insns;
+            root_count++;
+        } else {
+            pos = 0;
+            for (uint32_t j = 1; j < CAPTURE_HOT_ROOT_CAP; ++j)
+                if (root_scores[j] < root_scores[pos]) pos = j;
+            if (entry->insns <= root_scores[pos]) continue;
+            roots[pos] = entry_phys;
+            root_scores[pos] = entry->insns;
+        }
+    }
+    for (uint32_t i = 0; i < root_count; ++i) {
+        uint32_t root_word = roots[i] >> 2;
+        dispatch_pc_bitmap[root_word >> 5] |= 1u << (root_word & 31u);
+    }
+
+    /* Some PSX GTE-heavy routines are split into one-instruction interpreter
+     * blocks. If the hot entry is itself present in a single contiguous run
+     * of execution evidence, retain that run as bounded dispatch roots so a
+     * restored state may resume at any block in the routine. Disconnected
+     * islands (common when a page also contains tables/data) remain excluded. */
+    const uint32_t run_first_word = page * (4096u / 4u);
+    const uint32_t run_last_word = run_first_word + (4096u / 4u);
+    const uint32_t hot_word = phys >> 2;
+    uint32_t run_start = 0, run_len = 0;
+    int hot_in_run = 0;
+    for (uint32_t wi = run_first_word; wi <= run_last_word; ++wi) {
+        int observed = wi < run_last_word &&
+            ((exec_pc_bitmap[wi >> 5] >> (wi & 31u)) & 1u);
+        if (observed) {
+            if (!run_len) run_start = wi;
+            ++run_len;
+            if (wi == hot_word) hot_in_run = 1;
+            continue;
+        }
+        if (run_len && hot_in_run && run_len <= CAPTURE_HOT_RUN_CAP) {
+            for (uint32_t rw = run_start; rw < run_start + run_len; ++rw)
+                dispatch_pc_bitmap[rw >> 5] |= 1u << (rw & 31u);
+        }
+        run_start = 0;
+        run_len = 0;
+        hot_in_run = 0;
+    }
+#undef CAPTURE_HOT_ROOT_CAP
+#undef CAPTURE_HOT_RUN_CAP
+}
+
 static uint64_t overlay_capture_write_current(const char *reason,
                                               uint32_t scope_lo,
                                               uint32_t scope_hi,
@@ -821,19 +955,31 @@ static uint64_t overlay_capture_write_current(const char *reason,
     extern uint8_t *memory_get_ram_ptr(void);
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     uint32_t *bitmap;
+    uint32_t *dispatch_pc_bitmap;
     uint64_t sig;
     if (!s_active) return 0;
     bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
-    if (!bitmap) return 0;
+    dispatch_pc_bitmap = (uint32_t *)malloc(sizeof(g_dirty_ram_dispatch_pc_bitmap));
+    if (!bitmap || !dispatch_pc_bitmap) {
+        free(bitmap);
+        free(dispatch_pc_bitmap);
+        return 0;
+    }
+    memcpy(dispatch_pc_bitmap, g_dirty_ram_dispatch_pc_bitmap,
+           sizeof(g_dirty_ram_dispatch_pc_bitmap));
     capture_executed_pages(bitmap, bw, g_dirty_ram_exec_pc_bitmap,
                            scope_lo, scope_hi, include_halo);
+    capture_promote_hot_dispatch(dispatch_pc_bitmap,
+                                 g_dirty_ram_exec_pc_bitmap,
+                                 bitmap, bw, scope_lo, scope_hi);
     sig = write_and_commit_snapshot(bw, bitmap,
-                                    g_dirty_ram_dispatch_pc_bitmap,
+                                    dispatch_pc_bitmap,
                                     g_dirty_ram_exec_pc_bitmap,
                                     memory_get_ram_ptr(),
                                     reason,
                                     capture_next_sequence());
     free(bitmap);
+    free(dispatch_pc_bitmap);
     return sig;
 }
 
@@ -1016,6 +1162,27 @@ static int s_preserve_stop;
 
 void overlay_autocapture_set_enabled(int on) {
     s_autocap_enabled = on ? 1 : 0;
+}
+
+void overlay_capture_on_user_state_loaded(void) {
+    extern uint64_t s_frame_count;
+    if (!s_enabled) return;
+    s_active = 1;
+    dirty_ram_reset_capture_evidence();
+    memset(g_dirty_ram_dispatch_pc_bitmap, 0,
+           sizeof(g_dirty_ram_dispatch_pc_bitmap));
+    memset(g_dirty_ram_exec_pc_bitmap, 0,
+           sizeof(g_dirty_ram_exec_pc_bitmap));
+    memset(g_dirty_ram_exec_page_bitmap, 0,
+           sizeof(g_dirty_ram_exec_page_bitmap));
+    s_autocap_last_check = s_frame_count;
+    s_autocap_last_check_ms = autocap_now_ms();
+    s_autocap_last_disp = g_dirty_window_dispatches;
+    s_autocap_last_insns = g_dirty_ram_insns_run;
+    s_autocap_last_delta = 0;
+    s_autocap_last_insns_delta = 0;
+    fprintf(stdout,
+            "psxrecomp: overlay capture activated from restored user state\n");
 }
 
 void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
@@ -1208,6 +1375,11 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
             job->bitmap[i] = dirty_ram_get_bitmap_word(i);
     }
     job->bitmap_words = bw;
+    capture_promote_hot_dispatch(job->dispatch_pc_bitmap,
+                                 job->exec_pc_bitmap,
+                                 job->bitmap, bw,
+                                 scoped ? scope_lo : 0u,
+                                 scoped ? scope_hi : PSX_MAIN_RAM_BYTES);
     job->sequence = capture_next_sequence();
     return job;
 }

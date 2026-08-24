@@ -137,6 +137,9 @@ void     dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count);
 /* Rematch / session_reboot: wipe host dirty tracking so dig0 matches a cold
  * process (memory_init clears RAM but used to leave these bitmaps sticky). */
 void     dirty_ram_reset_for_boot(void);
+/* Reset per-PC interpreter evidence after a user-state restore so hot/capture
+ * diagnostics describe the restored scene rather than pre-state boot history. */
+void     dirty_ram_reset_capture_evidence(void);
 /* After bulk RAM restore (savestate): bump overlay page gens + lazy-miss epoch
  * so native overlays re-hash against restored bytes; also drop sticky
  * text_diverged/modified bitmaps (host-only — restored RAM may match ref). */
@@ -239,6 +242,19 @@ typedef struct {
                           * is the evidence stream for interior-alias seeds. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+
+/* Production-safe perf diagnostic: report the interpreted block entry that
+ * has accumulated the most guest instructions.  The counters already exist
+ * for overlay capture/debug telemetry, so this adds no interpreter hot-path
+ * work; callers pay one bounded table scan only when diagnostics are enabled. */
+void dirty_ram_perf_hot_entry(uint32_t *pc, uint64_t *hits,
+                              uint64_t *insns, uint64_t *entry_hits);
+/* Opt-in edge histogram for diagnosing local-flow interpreter hotspots.  It is
+ * disabled in normal runs; when enabled, callers can retrieve the most common
+ * taken control-flow edges without the full debug instruction recorder. */
+void dirty_ram_perf_flow_diag_enable(int enabled);
+uint32_t dirty_ram_perf_hot_flows(uint32_t *sources, uint32_t *targets,
+                                  uint64_t *counts, uint32_t capacity);
 /* Every aligned main-RAM word is a possible instruction PC.  Execution
  * coverage only needs presence, not a hit count, so record it in a direct
  * bitmap instead of probing a large hash table for every retired instruction.
