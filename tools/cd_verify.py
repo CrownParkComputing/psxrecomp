@@ -67,6 +67,57 @@ def request_gaps(loads):
     return gaps
 
 
+CMD_NAMES = {
+    0x01: "Getstat", 0x02: "Setloc", 0x03: "Play", 0x06: "ReadN",
+    0x08: "Stop", 0x09: "Pause", 0x0A: "Init", 0x0B: "Mute",
+    0x0C: "Demute", 0x0D: "Setfilter", 0x0E: "Setmode", 0x0F: "Getparam",
+    0x10: "GetlocL", 0x11: "GetlocP", 0x13: "GetTN", 0x14: "GetTD",
+    0x15: "SeekL", 0x16: "SeekP", 0x19: "Test", 0x1A: "GetID",
+    0x1B: "ReadS", 0x1E: "ReadTOC",
+}
+
+
+def bcd(v):
+    return (v >> 4) * 10 + (v & 0x0F)
+
+
+def transcript(entries):
+    """The game's CD conversation, reconstructed from the register trace.
+
+    'W' to 0x1F801802 while gathering = param bytes; 'C' = command issue with
+    the code in val; 'R' from 0x1F801801 afterwards = the response bytes the
+    game actually READ. This is the ground truth for what the game asked and
+    what the runtime told it -- the thing that decides whether the game's
+    SetLoc(125113) was computed from a number we gave it.
+    """
+    out = []
+    params = []
+    cur = None
+    for e in entries:
+        k = e.get("kind")
+        addr = int(e.get("addr", "0x0"), 16) if isinstance(e.get("addr"), str) \
+            else int(e.get("addr", 0))
+        val = int(e.get("val", "0x0"), 16) if isinstance(e.get("val"), str) \
+            else int(e.get("val", 0))
+        if k == "write" and (addr & 0xF) == 2:
+            params.append(val & 0xFF)
+        elif k == "cmd":
+            cmd = val & 0xFF
+            cur = {"cmd": CMD_NAMES.get(cmd, f"0x{cmd:02X}"),
+                   "params": params[-8:], "resp": [],
+                   "frame": e.get("frame")}
+            if cmd == 0x02 and len(params) >= 3:
+                m, s_, f = (bcd(x) for x in params[-3:])
+                cur["lba"] = (m * 60 + s_) * 75 + f - 150
+            params = []
+            out.append(cur)
+        elif k == "read" and (addr & 0xF) == 1 and cur is not None:
+            cur["resp"].append(val & 0xFF)
+        elif k == "sector":
+            out.append({"sector_lba": val, "frame": e.get("frame")})
+    return out
+
+
 def analyse_records(entries):
     """Delivery-side view: which LBAs were read, pended, lost."""
     seen = {}
@@ -183,6 +234,36 @@ def main():
               f"pended={agg.get('pended')} over_sector={agg.get('exposure_over_sector', agg.get('over_sector'))}")
     except DebugError:
         pass
+
+    # The command transcript around the load: what the game asked, and the
+    # response bytes it read back. This decides whether SetLoc(125113) was
+    # computed from a position WE reported.
+    try:
+        tr = conn.cmd("cdrom_trace_dump", count=20000)
+        conv = transcript(tr.get("entries", []))
+        doc["transcript"] = conv[-400:]
+        interesting = [c for c in conv if "lba" in c or
+                       c.get("cmd") in ("GetlocL", "GetlocP", "Pause",
+                                        "ReadN", "ReadS", "SeekL")]
+        print(f"\ncommand transcript (position-relevant, last 30):")
+        for c in interesting[-30:]:
+            if "sector_lba" in c:
+                continue
+            lba = f" lba={c['lba']}" if "lba" in c else ""
+            resp = ""
+            if c.get("resp") and c.get("cmd") in ("GetlocL", "GetlocP"):
+                b = c["resp"]
+                resp = " resp=" + " ".join(f"{x:02X}" for x in b[:10])
+                if c["cmd"] == "GetlocL" and len(b) >= 4:
+                    resp += (f" -> lba {(bcd(b[1])*60 + bcd(b[2]))*75 + bcd(b[3]) - 150}")
+                if c["cmd"] == "GetlocP" and len(b) >= 8:
+                    resp += (f" -> abs lba {(bcd(b[6])*60 + bcd(b[7]))*75 + bcd(b[8]) - 150}"
+                             if len(b) >= 9 else "")
+            print(f"  f{c.get('frame')}: {c['cmd']}"
+                  f"({' '.join(f'{x:02X}' for x in c.get('params', []))})"
+                  f"{lba}{resp}")
+    except DebugError as e:
+        print(f"  trace dump unavailable ({e})", file=sys.stderr)
 
     blob = read_ram_range(conn, 0x80000000 + TABLE_LO,
                           ((TABLE_HI - TABLE_LO) & ~3) + 4)

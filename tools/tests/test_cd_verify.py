@@ -70,3 +70,45 @@ class TableStateTest(unittest.TestCase):
         ws = {int.from_bytes(blob[i:i + 4], "little") & 0xFFFFFF
               for i in range(0, len(blob) - 3, 4)}
         self.assertNotIn(0x0888F8, ws)
+
+
+class TranscriptTest(unittest.TestCase):
+    """Reconstructing the game's CD conversation from the register trace."""
+
+    @staticmethod
+    def b2(v):
+        return ((v // 10) << 4) | (v % 10)
+
+    def setloc(self, lba, frame=1):
+        t = lba + 150
+        m, s, f = t // 4500, (t // 75) % 60, t % 75
+        return ([{"kind": "write", "addr": "0x1F801802",
+                  "val": hex(self.b2(x))} for x in (m, s, f)]
+                + [{"kind": "cmd", "addr": "0x0", "val": "0x02",
+                    "frame": frame}])
+
+    def test_setloc_lba_decoded_from_bcd_params(self):
+        t = cv.transcript(self.setloc(125113))
+        self.assertEqual(t[0]["cmd"], "Setloc")
+        self.assertEqual(t[0]["lba"], 125113)
+
+    def test_response_bytes_attach_to_the_command_that_earned_them(self):
+        entries = [{"kind": "cmd", "addr": "0x0", "val": "0x10", "frame": 2},
+                   {"kind": "read", "addr": "0x1F801801", "val": "0x27"},
+                   {"kind": "read", "addr": "0x1F801801", "val": "0x50"}]
+        t = cv.transcript(entries)
+        self.assertEqual(t[0]["cmd"], "GetlocL")
+        self.assertEqual(t[0]["resp"], [0x27, 0x50])
+
+    def test_unrelated_register_reads_ignored(self):
+        entries = [{"kind": "cmd", "addr": "0x0", "val": "0x10", "frame": 2},
+                   {"kind": "read", "addr": "0x1F801803", "val": "0xFF"}]
+        t = cv.transcript(entries)
+        self.assertEqual(t[0]["resp"], [])
+
+    def test_params_do_not_leak_across_commands(self):
+        entries = self.setloc(100) + [{"kind": "cmd", "addr": "0x0",
+                                       "val": "0x06", "frame": 3}]
+        t = cv.transcript(entries)
+        self.assertEqual(t[1]["cmd"], "ReadN")
+        self.assertEqual(t[1]["params"], [])
