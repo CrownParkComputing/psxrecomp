@@ -51,6 +51,16 @@ def normalise(entries):
     return out
 
 
+def setloc_runs(rows, lo, hi):
+    """Indexes of Setloc commands whose LBA falls inside the target file."""
+    return [i for i, r in enumerate(rows)
+            if r["cmd"] == "Setloc" and lo <= r.get("lba", -1) <= hi]
+
+
+def lba_sequence(rows, lo, hi):
+    return [rows[i]["lba"] for i in setloc_runs(rows, lo, hi)]
+
+
 def command_key(row):
     return (row["cmd"], row.get("lba", tuple(row["params"])))
 
@@ -91,6 +101,12 @@ def main():
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--count", type=int, default=2048)
+    ap.add_argument("--lba-lo", type=int, default=125000)
+    ap.add_argument("--lba-hi", type=int, default=125200,
+                    help="the palette file's LBA neighbourhood; alignment "
+                         "anchors on Setlocs into this range, because generic "
+                         "alignment latches onto the periodic Getstat "
+                         "heartbeat and forks on unrelated journey points")
     ap.add_argument("--window", type=int, default=6,
                     help="minimum matching run to anchor the alignment")
     ap.add_argument("--out", default="analysis/frames/cd_diff.json")
@@ -121,38 +137,60 @@ def main():
     doc["native_count"], doc["oracle_count"] = len(nat), len(orc)
     print(f"native: {len(nat)} commands; oracle: {len(orc)} commands")
 
-    fork = find_fork(nat, orc, args.window)
-    doc["fork"] = fork
-    if not fork:
-        print("no common run found to align on -- were both histories "
-              "captured over the same scene?")
+    # Anchor on the palette file itself. Generic longest-common-run
+    # alignment latched onto the periodic Getstat heartbeat (every 30
+    # frames, identical everywhere) and reported a fork between two
+    # unrelated journey points.
+    na = setloc_runs(nat, args.lba_lo, args.lba_hi)
+    ob = setloc_runs(orc, args.lba_lo, args.lba_hi)
+    seq_n = lba_sequence(nat, args.lba_lo, args.lba_hi)
+    seq_o = lba_sequence(orc, args.lba_lo, args.lba_hi)
+    doc["native_lbas"], doc["oracle_lbas"] = seq_n, seq_o
+    for label, seq in (("psx-runtime", seq_n), ("oracle", seq_o)):
+        if not seq:
+            print(f"\n{label}: NO Setloc into LBA {args.lba_lo}.."
+                  f"{args.lba_hi} in its history -- the palette load is not "
+                  f"captured there. Play the scene on {label} (through the "
+                  f"land-creation moment) and rerun.")
+    if not seq_n or not seq_o:
         _save(doc, args)
         return 1
 
-    ia, ib, n = fork["a_fork"], fork["b_fork"], fork["common"]
-    print(f"\naligned on a common run of {n} commands; showing the fork:")
+    print(f"\nSetloc sequences into the palette file:")
+    print(f"  psx-runtime: {seq_n}")
+    print(f"  oracle:      {seq_o}")
+    fork_at = next((k for k in range(min(len(seq_n), len(seq_o)))
+                    if seq_n[k] != seq_o[k]), None)
+    if fork_at is None and len(seq_n) != len(seq_o):
+        fork_at = min(len(seq_n), len(seq_o))
+    doc["lba_fork_index"] = fork_at
 
-    def show(rows, idx, label):
-        print(f"\n  {label}:")
-        for k in range(max(0, idx - 6), min(len(rows), idx + 8)):
+    def show(rows, idxs, label, upto):
+        print(f"\n  {label} (full command window):")
+        lo_i = max(0, idxs[0] - 4)
+        hi_i = min(len(rows), idxs[-1] + 10)
+        fork_row = idxs[upto] if upto is not None and upto < len(idxs) else None
+        for k in range(lo_i, hi_i):
             r = rows[k]
             lba = f" -> lba {r['lba']}" if "lba" in r else ""
-            mark = "  <<< FIRST DIVERGED" if k == idx else ""
+            mark = "  <<< FIRST DIVERGED LBA" if k == fork_row else ""
             print(f"    f{r['frame']}: {r['cmd']}"
                   f"({' '.join(f'{x:02X}' for x in r['params'])}){lba}{mark}")
 
-    show(nat, ia, "psx-runtime")
-    show(orc, ib, "oracle")
+    show(nat, na, "psx-runtime", fork_at)
+    show(orc, ob, "oracle", fork_at)
 
-    if ia < len(nat) and ib < len(orc):
-        a, b = nat[ia], orc[ib]
-        print(f"\nFORK: native issued {a['cmd']}"
-              f"{'(lba ' + str(a.get('lba')) + ')' if 'lba' in a else ''} "
-              f"where the oracle issued {b['cmd']}"
-              f"{'(lba ' + str(b.get('lba')) + ')' if 'lba' in b else ''}.")
-        print("The game computes its requests from what the emulator tells "
-              "it, so the runtime's divergence happened in the traffic just "
-              "before this point.")
+    if fork_at is None:
+        print("\nThe two request sequences into the palette file are "
+              "IDENTICAL. The divergence is not in which sectors were "
+              "requested -- re-examine what was DELIVERED for them.")
+    else:
+        a = seq_n[fork_at] if fork_at < len(seq_n) else None
+        b = seq_o[fork_at] if fork_at < len(seq_o) else None
+        print(f"\nFORK at request #{fork_at} into the file: native asked "
+              f"lba {a}, oracle asked lba {b}. The game computes these from "
+              f"what the emulator told it during the requests BEFORE this "
+              f"one -- that is where the runtime diverges.")
     _save(doc, args)
     return 0
 

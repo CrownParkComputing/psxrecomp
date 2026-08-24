@@ -66,3 +66,28 @@ class ForkTest(unittest.TestCase):
         a = cd.normalise([setloc(1), readn()])
         b = cd.normalise([setloc(9), readn()])
         self.assertIsNone(cd.find_fork(a, b, 2))
+
+
+class LbaAnchorTest(unittest.TestCase):
+    """Alignment must anchor on the palette file's own Setlocs.
+
+    Generic longest-common-run alignment latched onto the periodic Getstat
+    heartbeat -- identical everywhere -- and reported a fork between two
+    unrelated journey points (native mid-scene vs oracle at boot)."""
+
+    def test_sequence_extraction(self):
+        rows = cd.normalise([setloc(304), readn(), setloc(125105), readn(),
+                             setloc(125111), readn()])
+        self.assertEqual(cd.lba_sequence(rows, 125000, 125200),
+                         [125105, 125111])
+
+    def test_boot_loads_excluded(self):
+        rows = cd.normalise([setloc(304), setloc(2864), setloc(12422)])
+        self.assertEqual(cd.lba_sequence(rows, 125000, 125200), [])
+
+    def test_fork_index_by_position(self):
+        nat = [125105, 125106, 125111, 125113]
+        orc = [125105, 125106, 125110, 125111]
+        fork = next((k for k in range(min(len(nat), len(orc)))
+                     if nat[k] != orc[k]), None)
+        self.assertEqual(fork, 2)
