@@ -1514,35 +1514,10 @@ static int      pending_dataready_slot;   /* ring slot THIS INT1 announces */
 #define CDROM_PEND_PRESENT_DELAY 500
 static uint64_t pending_present_due;
 static uint64_t s_int1_pended;            /* INT1s that had to wait for ack */
-static uint64_t s_int1_lost;              /* pended INT1s replaced unseen (must stay 0) */
-static uint64_t s_int1_deferred;          /* sectors held for a later announcement */
+static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
 
 /* Drive-state changes (Read/Play/Pause/Stop/Seek) cancel a pended
  * notification, matching Beetle's ClearAIP in every such command. */
-/* The guest finished the slot that was announced to it. If a later sector is
- * sitting unread in a following slot, announce that one now -- delayed and
- * guarded exactly like the ack path, so the notification never lands inside
- * the guest's command handshake. This is what replaces the destructive
- * one-deep pend: nothing is dropped, order is preserved, and the guest is
- * told about every sector exactly once. */
-static void cdrom_announce_next_held(void) {
-    if (!reading || pending_dataready) return;
-    int slot = s_ring_read;
-    for (int i = 1; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        int cand = (s_ring_read + i) % CDROM_NUM_SECTOR_BUFFERS;
-        if (s_sector_ring[cand].size > 0 && s_sector_ring[cand].pos == 0) {
-            slot = cand;
-            break;
-        }
-    }
-    if (slot == s_ring_read) return;          /* nothing waiting */
-    pending_dataready = 1;
-    pending_dataready_stat = stat_reg;
-    pending_dataready_slot = slot;
-    if (pending_present_due == 0)
-        pending_present_due = psx_cycle_count + CDROM_PEND_PRESENT_DELAY;
-}
-
 static void cdrom_clear_pending_dataready(void) {
     pending_dataready = 0;
     pending_dataready_stat = 0;
@@ -2627,34 +2602,17 @@ static void process_read_stream(uint32_t cycles) {
             if (delivered) {
                 cd_timing_flag(timing_seq, CDT_DATA | CDT_PENDED);
                 if (pending_dataready) {
-                    /* An older data-ready is still waiting. Do NOT replace
-                     * it: that destroyed the first sector's notification
-                     * outright, and the guest -- never told the sector had
-                     * arrived -- timed out and re-issued Setloc+ReadN about
-                     * 1.6M cycles later. Measured on the palette load:
-                     *
-                     *   689,540  SECTOR 125111  pend=1 lost=1
-                     *   915,332  SECTOR 125112  pend=1 lost=1
-                     * 2,273,594  CMD Setloc(125111)   <- the retry
-                     *
-                     * The whole 2.5M-cycle gap before every individually
-                     * requested sector was that timeout. With the ring both
-                     * sectors are safe in their own slots, so the newer one
-                     * simply waits its turn and is announced once the guest
-                     * has drained the one already announced. Announcements
-                     * stay in arrival order, and none is ever dropped. */
-                    s_int1_deferred++;
+                    s_int1_lost++;
                     trace_cdrom('P', 0, (uint32_t)last_sector_lba, 0);
-                } else {
-                    pending_dataready = 1;
-                    pending_dataready_stat = stat_reg;
-                    /* Capture the slot NOW. By presentation time the drive
-                     * will have moved on -- latching "newest" there is what
-                     * handed the guest a sector seven ahead of the one it
-                     * asked for. */
-                    pending_dataready_slot = s_ring_write;
-                    s_cd_timing_pending_seq = timing_seq;
+                    cd_timing_flag(s_cd_timing_pending_seq, CDT_LOST);
                 }
+                pending_dataready = 1;
+                pending_dataready_stat = stat_reg;
+                /* Capture the slot NOW. By presentation time the drive will
+                 * have moved on -- latching "newest" there is what handed the
+                 * guest a sector seven ahead of the one it asked for. */
+                pending_dataready_slot = s_ring_write;
+                s_cd_timing_pending_seq = timing_seq;
                 s_int1_pended++;
             }
         }
@@ -2812,7 +2770,6 @@ uint32_t cdrom_read(uint32_t addr) {
     case 0x1F801802:
         if (data_fifo_ready()) {
             ret = RB_.data[RB_.pos++];
-            if (RB_.pos >= RB_.size) cdrom_announce_next_held();
         }
         break;
 
@@ -2980,7 +2937,6 @@ uint32_t cdrom_dma_read(void) {
         RB_.pos + 4 <= RB_.size) {
         memcpy(&val, RB_.data + RB_.pos, 4);
         RB_.pos += 4;
-        if (RB_.pos >= RB_.size) cdrom_announce_next_held();
         got = 1;
     }
     /* Per-word DMA data reads flood the CD trace ring (hundreds per sector) and
@@ -3056,7 +3012,6 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->read_hold_events = s_read_hold_events;
     out->int1_pended = s_int1_pended;
     out->int1_lost = s_int1_lost;
-    out->int1_deferred = s_int1_deferred;
     out->ring_starved = s_ring_starved;
     out->ring_dropped = s_ring_dropped;
     out->accel_consumer_waits = s_accel_consumer_waits;

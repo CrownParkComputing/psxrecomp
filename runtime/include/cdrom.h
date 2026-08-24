@@ -194,9 +194,6 @@ typedef struct CDROMDebugState {
     /* One-deep pended data-ready INT1 accounting (Beetle SetAIP analog). */
     uint64_t int1_pended;
     uint64_t int1_lost;
-    /* Sectors whose announcement was held until the guest drained the one
-     * already announced. Replaces the destructive one-deep pend. */
-    uint64_t int1_deferred;
     /* Accelerated-read flow control: holds where a faster-than-hardware
      * sector was deferred rather than allowed to clobber an unconsumed one.
      * Nonzero is healthy (the guest was busy and the enhancement waited);
