@@ -199,6 +199,26 @@ def main():
     fresh = entries[max(0, len(entries) - (total - base_total)):]
     loads = table_loads(fresh)
     doc["loads"] = loads
+    # The COMPLETE tail-load slot map, not just the table window. The game
+    # places one request per consecutive destination slot; reconstructing
+    # where its LBA cursor first diverged needs every slot of the load,
+    # including the ones below the table.
+    tail_all = [{"lba": int(e["lba"]),
+                 "delivered": int(e.get("delivered_lba", -1)),
+                 "dest": int(e["dest"], 16) & 0x1FFFFF,
+                 "size": int(e["size"]),
+                 "frame": int(e.get("frame", -1)),
+                 "data": e.get("first_words")}
+                for e in fresh
+                if args.lba_lo - 12 <= int(e["lba"]) <= args.lba_hi]
+    doc["tail_load_map"] = tail_all
+    if tail_all:
+        print(f"\ncomplete tail-load slot map ({len(tail_all)} DMA(s)):")
+        for t in sorted(tail_all, key=lambda x: x["dest"]):
+            d = f" delivered={t['delivered']}" if t["delivered"] >= 0 else ""
+            fw = f"  data={t['data'][0]},{t['data'][1]}" if t.get("data") else ""
+            print(f"  0x{t['dest']:06X} <- LBA {t['lba']}{d}  "
+                  f"{t['size']}B  f{t['frame']}{fw}")
     print(f"\n{len(loads)} load(s) into the table region this run:")
     for l in loads:
         # delivered_lba and first_words exist once psx-runtime is rebuilt with
