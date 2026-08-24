@@ -109,21 +109,34 @@ def main():
         # Distinguish "never loaded it" from "loaded it, then the ring
         # scrolled past" -- the second is what happens when the effect is
         # followed by FMV, and it needs a different response from the user.
-        for label, m, raw in (("native", nat, sides["native"]),
-                              ("oracle", orc, sides["oracle"])):
-            if m:
+        for label, port in (("native", args.port), ("oracle", args.ds_port)):
+            if (nat if label == "native" else orc):
                 continue
-            lbas = [int(e.get("delivered_lba", e.get("lba", -1)))
-                    for e in raw]
-            lbas = [v for v in lbas if v >= 0]
+            # The window query was filtered SERVER-side, so an empty reply
+            # says nothing about whether a log exists. Ask again unfiltered
+            # before reporting -- otherwise "hasn't loaded this file yet"
+            # reads as "isn't running the patched build".
+            lbas = []
+            try:
+                probe = DebugConn(args.host, port, args.timeout).cmd(
+                    "cd_read_log", tail=65536, max_entries=400)
+                lbas = [int(e.get("delivered_lba", e.get("lba", -1)))
+                        for e in probe.get("entries", [])]
+                lbas = [v for v in lbas if v >= 0]
+                total = probe.get("total", 0)
+            except DebugError:
+                total = 0
             if lbas and min(lbas) > args.lba_hi:
                 print(f"  {label}: the log holds LBA {min(lbas)}..{max(lbas)} "
                       f"-- entirely PAST the palette load, so the ring "
                       f"scrolled. Replay the scene and run this promptly, "
                       f"before FMV or further loading flushes it.")
             elif lbas:
-                print(f"  {label}: the log holds LBA {min(lbas)}..{max(lbas)}, "
-                      f"which does not reach {args.lba_lo}..{args.lba_hi}.")
+                print(f"  {label}: {total} logged DMA(s) spanning LBA "
+                      f"{min(lbas)}..{max(lbas)}, but none in "
+                      f"{args.lba_lo}..{args.lba_hi} -- this side has not "
+                      f"loaded the palette file yet. Play it to the same "
+                      f"screen (the artifact/map screen) there.")
             else:
                 print(f"  {label} has no CD DMA log at all -- is it running "
                       f"the patched build?")
