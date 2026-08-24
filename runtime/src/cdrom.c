@@ -171,8 +171,41 @@ static CdSectorBuf s_sector_ring[CDROM_NUM_SECTOR_BUFFERS];
 static int s_ring_read;      /* slot the guest is draining */
 static int s_ring_write;     /* slot most recently filled */
 static uint64_t s_ring_dropped;   /* unread slot overwritten: guest a ring behind */
+
+
 #define RB_ (s_sector_ring[s_ring_read])
 static int rb_available(void) { return RB_.size > 0 && RB_.pos < RB_.size; }
+
+/* ---- DIAGNOSTIC INSTRUMENTATION (this build is a probe, not a fix) -------
+ * Three ring attempts failed with byte-identical numbers, so the notification
+ * path -- the only thing that differed between them -- was never the cause.
+ * The remaining suspect is deliver_read_sector_without_irq(): it raises NO
+ * INT1 by design, existing purely to refill the buffer so an in-flight
+ * multi-sector DMA keeps draining. With one buffer the refill lands in the
+ * buffer the DMA is reading and the transfer flows. With a ring it lands in a
+ * NEW slot, and nothing moves the read pointer there, so the DMA starves
+ * mid-transfer and the guest retries -- which is what the duplicated Setlocs
+ * and 2-7 repeated reads look like.
+ *
+ * s_ring_starved is the decisive number. Non-zero = confirmed. Zero = the
+ * ring fails for some other reason and this hypothesis is dead too. */
+static uint64_t s_ring_starved;      /* drain blocked while a newer slot had data */
+static uint64_t s_ring_norq_refill;  /* no-IRQ refills that landed off the read slot */
+static uint64_t s_ring_read_moves;   /* times an INT1 moved the read pointer */
+
+static int ring_other_slot_has_data(void) {
+    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
+        if (i == s_ring_read) continue;
+        if (s_sector_ring[i].size > 0 && s_sector_ring[i].pos < s_sector_ring[i].size)
+            return 1;
+    }
+    return 0;
+}
+
+static void ring_note_starved(void) {
+    if (!rb_available() && ring_other_slot_has_data()) s_ring_starved++;
+}
+
 static uint8_t last_sector_buffer[SECTOR_BUFFER_SIZE];
 static int last_sector_lba;
 static int last_sector_size;
@@ -1724,6 +1757,7 @@ static void process_cdda_stream(uint32_t cycles) {
 }
 
 static int data_fifo_ready(void) {
+    if (request_reg & CDROM_REQUEST_BFRD) ring_note_starved();
     return (request_reg & CDROM_REQUEST_BFRD) && rb_available();
 }
 
@@ -1737,6 +1771,7 @@ static int deliver_read_sector(void) {
     response_clear();
     response_push(stat_reg);
     /* Delivered immediately: this INT1 announces the slot just filled. */
+    if (s_ring_read != s_ring_write) s_ring_read_moves++;
     s_ring_read = s_ring_write;
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
@@ -1747,6 +1782,9 @@ static int deliver_read_sector(void) {
 static int deliver_read_sector_without_irq(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
+    /* No INT1 is raised here, so nothing will move the read pointer to the
+     * slot just filled. Count how often that leaves the refill unreachable. */
+    if (delivered && s_ring_write != s_ring_read) s_ring_norq_refill++;
     return delivered;
 }
 
@@ -2580,6 +2618,7 @@ static void present_pending_dataready(void) {
     s_cd_timing_pending_seq = UINT64_MAX;
     response_clear();
     response_push(pending_dataready_stat);
+    if (s_ring_read != pending_dataready_slot) s_ring_read_moves++;
     s_ring_read = pending_dataready_slot;   /* the slot this INT1 announced */
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
@@ -2879,6 +2918,7 @@ uint32_t cdrom_dma_read(void) {
 }
 
 int cdrom_dma_ready(void) {
+    if (request_reg & CDROM_REQUEST_BFRD) ring_note_starved();
     return (request_reg & CDROM_REQUEST_BFRD) && rb_available() &&
            (RB_.pos + 4 <= RB_.size);
 }
@@ -2935,6 +2975,10 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->read_hold_events = s_read_hold_events;
     out->int1_pended = s_int1_pended;
     out->int1_lost = s_int1_lost;
+    out->ring_starved = s_ring_starved;
+    out->ring_norq_refill = s_ring_norq_refill;
+    out->ring_read_moves = s_ring_read_moves;
+    out->ring_dropped = s_ring_dropped;
     out->accel_consumer_waits = s_accel_consumer_waits;
     out->accel_consumer_wait_cycles = s_accel_consumer_wait_cycles;
     out->int1_pending_now = pending_dataready;
