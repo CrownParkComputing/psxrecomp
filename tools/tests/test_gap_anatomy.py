@@ -71,3 +71,37 @@ class VerdictTest(unittest.TestCase):
 
     def test_no_rows_refuses(self):
         self.assertEqual(g.verdict_of([])[0], "no-data")
+
+
+class SteadyStateTest(unittest.TestCase):
+    """After the fix, requests that continue a read cost no restart.
+
+    Gaps collapse to one 2x sector period (225,792). The old verdict still
+    subtracted a fixed read-start constant and reported "451,584 of read-start
+    delay" for a 215,394-cycle interval -- arithmetic that cannot be true.
+    """
+
+    def test_steady_cadence_is_healthy(self):
+        rows = [{"lba": 1, "gap": 225_792, "silence": 10_475,
+                 "after_issue": 215_317}]
+        v, why = g.verdict_of(rows)
+        self.assertEqual(v, "streaming")
+        self.assertIn("2x cadence", why)
+
+    def test_read_start_only_claimed_when_it_fits(self):
+        rows = [{"lba": 1, "gap": 600_000, "silence": 10_000,
+                 "after_issue": 590_000}]
+        v, why = g.verdict_of(rows)
+        self.assertEqual(v, "emulator-latency")
+        self.assertIn("read-start", why)
+
+    def test_small_gap_is_not_the_cadence(self):
+        """An arbitrarily small gap is a different situation, not streaming."""
+        rows = [{"lba": 1, "gap": 1000, "silence": 900, "after_issue": 100}]
+        self.assertEqual(g.verdict_of(rows)[0], "guest-silence")
+
+    def test_no_impossible_read_start_claim(self):
+        rows = [{"lba": 1, "gap": 300_000, "silence": 10_000,
+                 "after_issue": 290_000}]
+        _, why = g.verdict_of(rows)
+        self.assertNotIn("451,584", why)

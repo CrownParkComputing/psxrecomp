@@ -92,6 +92,9 @@ def anatomy(sectors, setlocs, lo, hi):
     return rows
 
 
+STEADY_2X = 225792   # one sector period at double speed
+
+
 def verdict_of(rows):
     if not rows:
         return ("no-data", "no individually-requested sector had both a "
@@ -99,22 +102,34 @@ def verdict_of(rows):
     tot = sum(r["gap"] for r in rows)
     sil = sum(r["silence"] for r in rows)
     aft = sum(r["after_issue"] for r in rows)
-    start = READ_START_2X * len(rows)
-    queue = max(0, aft - start)
+    n = len(rows)
+    per_gap = tot / n
+
+    # Healthy: the drive is streaming and a request that continues it costs
+    # nothing extra, so sectors arrive one steady period apart.
+    # A WINDOW, not a ceiling: an arbitrarily small gap is not "the cadence",
+    # it is a different situation entirely.
+    if STEADY_2X * 0.9 <= per_gap <= STEADY_2X * 1.1:
+        return ("streaming",
+                f"sectors arrive {per_gap:,.0f} cycles apart -- the 2x "
+                f"cadence ({STEADY_2X:,}). Requests that continue the current "
+                f"read cost no restart, so there is no per-request read-start "
+                f"penalty left in the gap.")
     if sil > aft:
         return ("guest-silence",
                 f"{sil/tot:.0%} of the gap is the guest issuing nothing after "
-                f"the previous sector arrived ({sil/len(rows):,.0f} cycles "
-                f"each). The drive is idle and waiting on the game, so the "
-                f"cost is guest-side -- either it is doing real work, or it "
-                f"never acted on the notification.")
+                f"the previous sector arrived ({sil/n:,.0f} cycles each). The "
+                f"drive is idle and waiting on the game.")
+    # Only claim a read-start when the gap is actually big enough to hold one.
+    start = READ_START_2X if aft / n >= READ_START_2X else 0
+    queue = max(0, aft / n - start)
+    detail = (f"about {start:,} of read-start delay and {queue:,.0f} of "
+              f"command queueing" if start else
+              f"{queue:,.0f} of it beyond the steady cadence")
     return ("emulator-latency",
             f"{aft/tot:.0%} of the gap falls AFTER the guest asked "
-            f"({aft/len(rows):,.0f} cycles each): about "
-            f"{start/len(rows):,.0f} of read-start delay and "
-            f"{queue/len(rows):,.0f} of command queueing. That part is ours, "
-            f"not the game's -- a queued Setloc/ReadN waits for irq_flag to "
-            f"clear before it can even run.")
+            f"({aft/n:,.0f} cycles each): {detail}. That part is ours, not "
+            f"the game's.")
 
 
 def main():
