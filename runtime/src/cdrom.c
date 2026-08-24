@@ -1777,21 +1777,22 @@ static int deliver_read_sector(void) {
     return 1;
 }
 
-/* Fill a slot with no INT1. `advance_read` distinguishes the two callers,
- * which need OPPOSITE behaviour and must not share one function's semantics:
+/* Both callers advance the read pointer, and that is DELIBERATE.
  *
- *   1 = seamless refill for an in-flight multi-sector DMA. This is a
- *       CONTINUATION of the drain already running -- with one buffer it
- *       landed in the very buffer being drained, so the read pointer must
- *       follow it or the transfer starves mid-sector.
- *   0 = the guest has not acked the previous INT. The sector is parked in
- *       its slot and the pend records which slot; moving the read pointer
- *       here would redirect a drain the guest is still working through.
- */
-static int deliver_read_sector_no_irq(int advance_read) {
+ * Splitting them -- so the "guest has not acked" path parked the sector
+ * without advancing -- looked obviously correct (why redirect a drain the
+ * guest is still working through?) and regressed hard: int1_lost went 0 -> 70
+ * and the game retried every Setloc. Without the advance, sectors pile up
+ * behind an unacked INT, each new one replaces the pended notification, and
+ * the guest is never told. The reasoning was sound and the measurement said
+ * otherwise; it was committed without a verification run, which is how it
+ * survived long enough to confuse three later experiments.
+ *
+ * Do not re-split this without a cd_verify run showing int1_lost stays 0. */
+static int deliver_read_sector_without_irq(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
-    if (delivered && advance_read) {
+    if (delivered) {
         /* Seamless refill for an in-flight multi-sector DMA: no INT1 is
          * raised because this is a CONTINUATION of the drain already in
          * progress, not a new notification. The read pointer must therefore
@@ -2591,14 +2592,13 @@ static void process_read_stream(uint32_t cycles) {
              * asserted: refill the buffer so the DMA keeps draining, no new
              * INT (the historical shape; games start the DMA inside the
              * data-ready callback before acking). */
-            if (deliver_read_sector_no_irq(1))   /* DMA continuation */
+            if (deliver_read_sector_without_irq())
                 cd_timing_flag(timing_seq, CDT_DATA | CDT_DMA);
         } else {
             /* Guest hasn't acked the previous INT yet. Read the sector on
              * schedule (XA audio + buffer overwrite happen inside), and
              * pend its data-ready INT1 one deep. */
-            int delivered = deliver_read_sector_no_irq(0);  /* park, do not
-                                                            * redirect a drain */
+            int delivered = deliver_read_sector_without_irq();
             if (delivered) {
                 cd_timing_flag(timing_seq, CDT_DATA | CDT_PENDED);
                 if (pending_dataready) {
