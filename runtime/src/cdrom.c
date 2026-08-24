@@ -2391,12 +2391,71 @@ static int warm_route_consumer_blocked(void) {
     return 0;
 }
 
+/* ---- Flow control for ACCELERATED data reads (speed divisor / instant) ----
+ *
+ * At authentic cadence the guest is guaranteed a full sector period
+ * (~6.6 ms at 2x) to ack each data-ready INT1 before the next sector can
+ * clobber the buffer; hardware losing a sector there means the game really
+ * was too slow, and the one-deep pend-then-lose below is Beetle-faithful.
+ * Accelerated pacing destroys that guarantee: sectors arrive in a fraction
+ * of the period, so a guest that is merely BUSY (not slow) gets sectors
+ * overwritten that real hardware would have delivered. That is a silent
+ * stream corruption manufactured by the enhancement -- Legend of Mana's
+ * land-creation palette (one sector, LBA 125112, of a multi-sector scene
+ * load) was skipped exactly this way and the raw file bytes that landed in
+ * its place were rendered as vertex colours.
+ *
+ * Rule: run the disc as fast as configured, but never overwrite a sector
+ * the guest has not consumed while running FASTER than hardware. The wait
+ * is capped at the authentic sector period: if the guest still has not
+ * acked after the time real hardware would have given it, fall through to
+ * the faithful clobber semantics. Accelerated mode is therefore never
+ * slower than hardware and never lossier than hardware; loads stay
+ * near-instant while the guest keeps up and degrade toward guest speed
+ * when it does not.
+ *
+ * XA/streaming modes are excluded by the same gates as apply_read_speed:
+ * those paths run at authentic cadence anyway, and pausing fictional disc
+ * time is only sound when the cadence IS fictional. */
+static uint64_t s_accel_consumer_waits;
+static uint64_t s_accel_consumer_wait_cycles;
+static int      s_accel_block_accum;
+
+static int authentic_sector_period(void) {
+    return (mode_reg & 0x80) ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES / 2)
+                             : CDROM_SINGLE_SPEED_SECTOR_CYCLES;
+}
+
+static int accelerated_read_active(void) {
+    if (xa_stream_active || (mode_reg & 0x68u)) return 0;
+    return g_disc_speed_divisor != 1;   /* 0 = instant, >1 = divided */
+}
+
+static int accelerated_consumer_blocked(void) {
+    if (!accelerated_read_active()) return 0;
+    if (pending_dataready) return 1;
+    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return 1;
+    return 0;
+}
+
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
     if (warm_route_consumer_blocked()) {
         s_warm_route_consumer_waits++;
         s_warm_route_consumer_wait_cycles += cycles;
+        return;
+    }
+
+    if (accelerated_consumer_blocked() &&
+        s_accel_block_accum < authentic_sector_period()) {
+        /* Hold the sector back rather than clobber it: see the flow-control
+         * comment above. The accumulator caps the hold at the authentic
+         * sector period, after which delivery proceeds with hardware
+         * semantics. */
+        s_accel_block_accum += (int)cycles;
+        s_accel_consumer_waits++;
+        s_accel_consumer_wait_cycles += cycles;
         return;
     }
 
@@ -2445,6 +2504,8 @@ static void process_read_stream(uint32_t cycles) {
                 s_int1_pended++;
             }
         }
+        s_accel_block_accum = 0;   /* the pipeline advanced; the next hold
+                                    * starts a fresh authentic-period budget */
         read_delay += sector_delay_cycles();
         /* Clamp pathological underflow to one sector period: never replay a
          * catch-up burst of missed sectors, never leave a huge negative debt. */
@@ -2827,6 +2888,8 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->read_hold_events = s_read_hold_events;
     out->int1_pended = s_int1_pended;
     out->int1_lost = s_int1_lost;
+    out->accel_consumer_waits = s_accel_consumer_waits;
+    out->accel_consumer_wait_cycles = s_accel_consumer_wait_cycles;
     out->int1_pending_now = pending_dataready;
     out->pending_pending = pending.pending;
     out->pending_delay = pending_rem_cycles();

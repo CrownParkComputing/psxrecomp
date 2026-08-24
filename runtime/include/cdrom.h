@@ -178,6 +178,12 @@ typedef struct CDROMDebugState {
     /* One-deep pended data-ready INT1 accounting (Beetle SetAIP analog). */
     uint64_t int1_pended;
     uint64_t int1_lost;
+    /* Accelerated-read flow control: holds where a faster-than-hardware
+     * sector was deferred rather than allowed to clobber an unconsumed one.
+     * Nonzero is healthy (the guest was busy and the enhancement waited);
+     * int1_lost rising while the speed divisor != 1 is the regression. */
+    uint64_t accel_consumer_waits;
+    uint64_t accel_consumer_wait_cycles;
     uint8_t  int1_pending_now;
 } CDROMDebugState;
 
