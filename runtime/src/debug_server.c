@@ -5790,10 +5790,11 @@ static void handle_cdrom_command_history(int id, const char *json)
         if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
 
         pos += snprintf(buf + pos, bufsz - pos,
-                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\","
+                        "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"kind\":\"%s\","
                         "\"cmd\":\"0x%02X\",\"param_count\":%u,\"params\":[",
                         emitted ? "," : "",
-                        (unsigned long long)e->seq, e->frame,
+                        (unsigned long long)e->seq,
+                        (unsigned long long)e->cycle, e->frame,
                         cdrom_command_kind_name(e->kind),
                         e->cmd, e->param_count);
         for (uint8_t i = 0; i < e->param_count && i < 16 && pos < bufsz - 96; i++) {

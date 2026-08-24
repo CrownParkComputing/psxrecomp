@@ -782,6 +782,7 @@ static void record_command_history(uint8_t kind, uint8_t cmd,
         &command_history[command_history_seq % CDROM_COMMAND_HISTORY_CAP];
     memset(e, 0, sizeof(*e));
     e->seq = command_history_seq++;
+    e->cycle = psx_cycle_count;
     e->frame = (uint32_t)s_frame_count;
     e->func = g_debug_current_func_addr;
     e->pc = g_debug_last_store_pc;

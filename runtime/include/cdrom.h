@@ -256,6 +256,10 @@ typedef struct CDROMTraceEntry {
 
 typedef struct CDROMCommandHistoryEntry {
     uint64_t seq;
+    /* Guest cycle at which this command was issued/executed. Frame numbers
+     * cannot separate "the guest had not asked yet" from "the command was
+     * queued behind an unacked INT" -- both look like one frame. */
+    uint64_t cycle;
     uint32_t frame;
     uint32_t func;
     uint32_t pc;
