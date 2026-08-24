@@ -1,0 +1,76 @@
+{
+ "kind": "psx-scale-within-frame",
+ "version": 1,
+ "pc": "0x8006844C",
+ "reg": "v0",
+ "frames": [
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "155": 8,
+    "85": 12,
+    "5": 8,
+    "939873691": 8
+   }
+  },
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "147": 8,
+    "80": 12,
+    "4": 8,
+    "939806867": 8
+   }
+  },
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "139": 8,
+    "76": 12,
+    "4": 8,
+    "939805835": 8
+   }
+  },
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "131": 8,
+    "72": 12,
+    "4": 8,
+    "939804803": 8
+   }
+  },
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "124": 8,
+    "68": 12,
+    "4": 8,
+    "939803772": 8
+   }
+  },
+  {
+   "distinct": 6,
+   "values": {
+    "136": 12,
+    "8": 16,
+    "116": 8,
+    "63": 12,
+    "3": 8,
+    "939736948": 8
+   }
+  }
+ ],
+ "verdict": "varies-within-frame",
+ "explanation": "$v0 took 6 DIFFERENT values inside one frame ([5, 8, 85, 136, 155, 939873691]). The fade is one level per frame, so every vertex should see the same value. A per-vertex scale multiplies the same source colours by different amounts -- which is exactly the extra colour variety psx-runtime shows and DuckStation does not."
+}

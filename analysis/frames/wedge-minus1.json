@@ -1,0 +1,23 @@
+{
+ "kind": "psx-gpu-frame",
+ "version": 1,
+ "label": "wedge-minus1",
+ "frame": 32880,
+ "source": {
+  "host": "127.0.0.1",
+  "port": 4370
+ },
+ "ring": {
+  "oldest": 21965,
+  "newest": 33067,
+  "total": 14022834,
+  "capacity": 1048576,
+  "max_words": 12
+ },
+ "raw_count": 0,
+ "requested": 20000,
+ "capped": false,
+ "max_words": 12,
+ "prims": [],
+ "funcs": {}
+}

@@ -1,0 +1,45 @@
+{
+ "kind": "psx-slice-check",
+ "version": 1,
+ "colour_words": 256,
+ "frames": {
+  "21817": {
+   "colour_words_written": 256,
+   "distinct_values": 152,
+   "values": [
+    "0x000000",
+    "0x000002",
+    "0x000005",
+    "0x000007",
+    "0x00000B",
+    "0x00000E",
+    "0x00000F",
+    "0x000012",
+    "0x000015",
+    "0x000018",
+    "0x000019",
+    "0x00001A"
+   ]
+  },
+  "21819": {
+   "colour_words_written": 256,
+   "distinct_values": 153,
+   "values": [
+    "0x000000",
+    "0x000002",
+    "0x000005",
+    "0x000007",
+    "0x00000A",
+    "0x00000D",
+    "0x00000F",
+    "0x000011",
+    "0x000014",
+    "0x000017",
+    "0x000018",
+    "0x000019"
+   ]
+  }
+ },
+ "verdict": "full-rewrite",
+ "explanation": "~256 of 256 colour words are rewritten every frame. The buffer cannot hold stale scales, so the amortisation hypothesis is dead and the extra colours must enter somewhere else."
+}

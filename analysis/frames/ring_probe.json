@@ -1,0 +1,14 @@
+{
+ "kind": "psx-ring-probe",
+ "version": 1,
+ "counters": {
+  "ring_starved": 1128960,
+  "ring_norq_refill": 70,
+  "ring_read_moves": 1760,
+  "ring_dropped": 1456,
+  "int1_lost": 70,
+  "int1_pended": 80
+ },
+ "verdict": "starvation-confirmed",
+ "explanation": "1128960 drain(s) found the read slot exhausted while another slot held unread data, and 70 no-IRQ refill(s) landed off the read slot. That is the regression: a multi-sector DMA stalls because its continuation was filed in a slot nothing announces. The fix is that the no-IRQ refill must advance the read pointer -- it is a continuation of the drain already in progress, not a new notification."
+}

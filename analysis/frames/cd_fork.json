@@ -1,0 +1,67 @@
+{
+ "kind": "psx-cd-fork",
+ "version": 1,
+ "lo": "0x000E25F0",
+ "hi": "0x000E2C60",
+ "log_total": 50878,
+ "loads": [
+  {
+   "lba": 126793,
+   "dest": 925464,
+   "size": 2048,
+   "disc_distinct_colours": 73,
+   "disc_first_bytes": "0f22fd00011f1fe1310230d2fb35ed34eb5fd0001f40cf043102ed609150e21d"
+  },
+  {
+   "lba": 126793,
+   "dest": 927512,
+   "size": 2048,
+   "disc_distinct_colours": 200,
+   "disc_first_bytes": "414b414fc8000000000000000000000000310600c06500008000000020000000"
+  },
+  {
+   "lba": 126836,
+   "dest": 925464,
+   "size": 2048,
+   "disc_distinct_colours": 74,
+   "disc_first_bytes": "3ee31c29bbe41d4c3802eff4d403f13fff102f120203c002190234f5f2e1bd30"
+  },
+  {
+   "lba": 126836,
+   "dest": 927512,
+   "size": 2048,
+   "disc_distinct_colours": 76,
+   "disc_first_bytes": "414b414f0c00000000000000000000000031000040f403002000000060000000"
+  },
+  {
+   "lba": 123049,
+   "dest": 925464,
+   "size": 2048,
+   "disc_distinct_colours": 25,
+   "disc_first_bytes": "0000000000005165666615000000000000000000000000000000000000000000"
+  },
+  {
+   "lba": 123049,
+   "dest": 927512,
+   "size": 2048,
+   "disc_distinct_colours": 118,
+   "disc_first_bytes": "10000000080000000c0200000002f0011000100000002561a6516869085eab71"
+  },
+  {
+   "lba": 125111,
+   "dest": 925464,
+   "size": 2048,
+   "disc_distinct_colours": 4,
+   "disc_first_bytes": "00000000f8f8b030f8f8b000f8f8f800000000000000000000000000f8880838"
+  },
+  {
+   "lba": 125113,
+   "dest": 927512,
+   "size": 2004,
+   "disc_distinct_colours": 211,
+   "disc_first_bytes": "0100000008000000b00002013d000200dc00000043000300dc00000040001200"
+  }
+ ],
+ "verdict": "disc-holds-the-raw-data",
+ "explanation": "the ISO's own sectors at the logged LBAs contain the many-colour raw data. psx-runtime delivered exactly what was asked: the divergence is UPSTREAM -- in why the game requested this load or where it pointed the DMA -- not in the CD stack's data path."
+}

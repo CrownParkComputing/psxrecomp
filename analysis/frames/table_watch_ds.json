@@ -1,0 +1,96 @@
+{
+ "kind": "psx-table-watch",
+ "version": 1,
+ "lo": "0x800E25F0",
+ "hi": "0x800E2C60",
+ "port": 4371,
+ "attributed": false,
+ "transitions": [
+  {
+   "frame": 60542,
+   "from_colours": 25,
+   "to_colours": 129,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61479,
+   "from_colours": 129,
+   "to_colours": 1,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61576,
+   "from_colours": 1,
+   "to_colours": 389,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61648,
+   "from_colours": 389,
+   "to_colours": 344,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61672,
+   "from_colours": 344,
+   "to_colours": 196,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61720,
+   "from_colours": 196,
+   "to_colours": 119,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61745,
+   "from_colours": 119,
+   "to_colours": 1,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 61961,
+   "from_colours": 1,
+   "to_colours": 5,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 63165,
+   "from_colours": 5,
+   "to_colours": 252,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  },
+  {
+   "frame": 63499,
+   "from_colours": 252,
+   "to_colours": 129,
+   "kind": "unattributed",
+   "traced_writes": 0,
+   "writers": []
+  }
+ ],
+ "baseline": {
+  "frame": 60277,
+  "colours": 25,
+  "fingerprint": "579be6863b364b13"
+ },
+ "final_colours": 129
+}

@@ -1,0 +1,233 @@
+{
+ "kind": "psx-notify-diff",
+ "version": 1,
+ "native": {
+  "125104": {
+   "passes": 1,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125105": {
+   "passes": 2,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125106": {
+   "passes": 3,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125107": {
+   "passes": 4,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125108": {
+   "passes": 5,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125109": {
+   "passes": 6,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125110": {
+   "passes": 6,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125111": {
+   "passes": 7,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125112": {
+   "passes": 7,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125113": {
+   "passes": 7,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125114": {
+   "passes": 6,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125115": {
+   "passes": 5,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125116": {
+   "passes": 4,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  },
+  "125117": {
+   "passes": 3,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0
+  }
+ },
+ "oracle": {
+  "125104": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125105": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125106": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125107": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125108": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125109": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125110": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125111": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125112": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125113": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125114": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125115": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125116": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  },
+  "125117": {
+   "passes": 1,
+   "data": 1,
+   "dropped": 0,
+   "queued": 1,
+   "delivered": 1,
+   "redelivered": 0,
+   "drained": 0
+  }
+ },
+ "notes": []
+}

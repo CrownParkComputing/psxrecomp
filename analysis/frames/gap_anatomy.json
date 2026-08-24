@@ -1,0 +1,50 @@
+{
+ "kind": "psx-gap-anatomy",
+ "version": 1,
+ "rows": [
+  {
+   "lba": 125105,
+   "gap": 225792,
+   "silence": 10475,
+   "after_issue": 215317
+  },
+  {
+   "lba": 125106,
+   "gap": 225792,
+   "silence": 10273,
+   "after_issue": 215519
+  },
+  {
+   "lba": 125107,
+   "gap": 225792,
+   "silence": 10141,
+   "after_issue": 215651
+  },
+  {
+   "lba": 125108,
+   "gap": 225792,
+   "silence": 10480,
+   "after_issue": 215312
+  },
+  {
+   "lba": 125109,
+   "gap": 225792,
+   "silence": 10674,
+   "after_issue": 215118
+  },
+  {
+   "lba": 125111,
+   "gap": 225792,
+   "silence": 10273,
+   "after_issue": 215519
+  },
+  {
+   "lba": 125113,
+   "gap": 225792,
+   "silence": 10473,
+   "after_issue": 215319
+  }
+ ],
+ "verdict": "emulator-latency",
+ "explanation": "95% of the gap falls AFTER the guest asked (215,394 cycles each): about 451,584 of read-start delay and 0 of command queueing. That part is ours, not the game's -- a queued Setloc/ReadN waits for irq_flag to clear before it can even run."
+}

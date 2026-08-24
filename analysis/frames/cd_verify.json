@@ -1,0 +1,2279 @@
+{
+ "kind": "psx-cd-verify",
+ "version": 1,
+ "loads": [
+  {
+   "lba": 126793,
+   "dest": 925464,
+   "size": 2048,
+   "delivered_lba": 126803,
+   "first_words": [
+    "0xF11E002A",
+    "0x1F310102"
+   ]
+  },
+  {
+   "lba": 126793,
+   "dest": 927512,
+   "size": 2048,
+   "delivered_lba": 126804,
+   "first_words": [
+    "0xDECE002A",
+    "0xEEC1CFDE"
+   ]
+  },
+  {
+   "lba": 126836,
+   "dest": 925464,
+   "size": 2048,
+   "delivered_lba": 126846,
+   "first_words": [
+    "0x10EB0245",
+    "0xD0345321"
+   ]
+  },
+  {
+   "lba": 126836,
+   "dest": 927512,
+   "size": 2048,
+   "delivered_lba": 126847,
+   "first_words": [
+    "0x40020225",
+    "0x1FDBD446"
+   ]
+  },
+  {
+   "lba": 123049,
+   "dest": 925464,
+   "size": 2048,
+   "delivered_lba": 123059,
+   "first_words": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 123049,
+   "dest": 927512,
+   "size": 2048,
+   "delivered_lba": 123060,
+   "first_words": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125111,
+   "dest": 925464,
+   "size": 2048,
+   "delivered_lba": 125111,
+   "first_words": [
+    "0x00000001",
+    "0x00000008"
+   ]
+  },
+  {
+   "lba": 125113,
+   "dest": 927512,
+   "size": 2004,
+   "delivered_lba": 125112,
+   "first_words": [
+    "0x000888F8",
+    "0x00B0F8F8"
+   ]
+  }
+ ],
+ "tail_load_map": [
+  {
+   "lba": 125088,
+   "delivered": 125087,
+   "dest": 1651264,
+   "size": 128,
+   "frame": 3529,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125088,
+   "dest": 1652288,
+   "size": 2048,
+   "frame": 3529,
+   "data": [
+    "0x00000010",
+    "0x00000008"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125089,
+   "dest": 1654336,
+   "size": 2048,
+   "frame": 3529,
+   "data": [
+    "0x00000000",
+    "0x10110000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125090,
+   "dest": 1656384,
+   "size": 2048,
+   "frame": 3530,
+   "data": [
+    "0x11110000",
+    "0x33222211"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125091,
+   "dest": 1658432,
+   "size": 2048,
+   "frame": 3530,
+   "data": [
+    "0x00000000",
+    "0x11111110"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125092,
+   "dest": 1660480,
+   "size": 2048,
+   "frame": 3531,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125093,
+   "dest": 1662528,
+   "size": 2048,
+   "frame": 3531,
+   "data": [
+    "0x00000000",
+    "0x01110000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125094,
+   "dest": 1664576,
+   "size": 2048,
+   "frame": 3531,
+   "data": [
+    "0x11110000",
+    "0x33222211"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125095,
+   "dest": 1666624,
+   "size": 2048,
+   "frame": 3532,
+   "data": [
+    "0x00000000",
+    "0x11111100"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125096,
+   "dest": 1668672,
+   "size": 2048,
+   "frame": 3532,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125097,
+   "dest": 1670720,
+   "size": 2048,
+   "frame": 3533,
+   "data": [
+    "0x00000000",
+    "0x10110000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125098,
+   "dest": 1672768,
+   "size": 2048,
+   "frame": 3533,
+   "data": [
+    "0x11110000",
+    "0x33222211"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125099,
+   "dest": 1674816,
+   "size": 2048,
+   "frame": 3533,
+   "data": [
+    "0x00000000",
+    "0x11111110"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125100,
+   "dest": 1676864,
+   "size": 2048,
+   "frame": 3534,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125101,
+   "dest": 1678912,
+   "size": 2048,
+   "frame": 3534,
+   "data": [
+    "0x00000000",
+    "0x10110000"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125102,
+   "dest": 1680960,
+   "size": 2048,
+   "frame": 3535,
+   "data": [
+    "0x11110000",
+    "0x33222211"
+   ]
+  },
+  {
+   "lba": 125088,
+   "delivered": 125103,
+   "dest": 1683008,
+   "size": 2048,
+   "frame": 3535,
+   "data": [
+    "0x00000000",
+    "0x11111110"
+   ]
+  },
+  {
+   "lba": 125105,
+   "delivered": 125104,
+   "dest": 1685056,
+   "size": 64,
+   "frame": 3535,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125106,
+   "delivered": 125105,
+   "dest": 1176888,
+   "size": 684,
+   "frame": 3536,
+   "data": [
+    "0x009C0080",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125107,
+   "delivered": 125106,
+   "dest": 1168696,
+   "size": 1268,
+   "frame": 3536,
+   "data": [
+    "0x00C00080",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125108,
+   "delivered": 125107,
+   "dest": 1185080,
+   "size": 804,
+   "frame": 3537,
+   "data": [
+    "0x00C00080",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125109,
+   "delivered": 125108,
+   "dest": 1193272,
+   "size": 364,
+   "frame": 3537,
+   "data": [
+    "0x00000080",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125109,
+   "delivered": 125109,
+   "dest": 933656,
+   "size": 2048,
+   "frame": 3537,
+   "data": [
+    "0x00000001",
+    "0x00000008"
+   ]
+  },
+  {
+   "lba": 125111,
+   "delivered": 125110,
+   "dest": 935704,
+   "size": 2004,
+   "frame": 3538,
+   "data": [
+    "0x005050F8",
+    "0x00B0F8F8"
+   ]
+  },
+  {
+   "lba": 125111,
+   "delivered": 125111,
+   "dest": 925464,
+   "size": 2048,
+   "frame": 3538,
+   "data": [
+    "0x00000001",
+    "0x00000008"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125112,
+   "dest": 927512,
+   "size": 2004,
+   "frame": 3539,
+   "data": [
+    "0x000888F8",
+    "0x00B0F8F8"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125113,
+   "dest": 904984,
+   "size": 2048,
+   "frame": 3539,
+   "data": [
+    "0x00000001",
+    "0x00000008"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125114,
+   "dest": 907032,
+   "size": 2048,
+   "frame": 3539,
+   "data": [
+    "0x00300000",
+    "0x00460044"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125115,
+   "dest": 909080,
+   "size": 2048,
+   "frame": 3540,
+   "data": [
+    "0x00000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125116,
+   "dest": 911128,
+   "size": 2048,
+   "frame": 3540,
+   "data": [
+    "0x30000000",
+    "0x00000000"
+   ]
+  },
+  {
+   "lba": 125113,
+   "delivered": 125117,
+   "dest": 913176,
+   "size": 2000,
+   "frame": 3541,
+   "data": [
+    "0x0010D0F8",
+    "0x00000000"
+   ]
+  }
+ ],
+ "request_gaps": [
+  {
+   "from": {
+    "lba": 125111,
+    "dest": 925464,
+    "size": 2048,
+    "delivered_lba": 125111,
+    "first_words": [
+     "0x00000001",
+     "0x00000008"
+    ]
+   },
+   "to": {
+    "lba": 126793,
+    "dest": 927512,
+    "size": 2048,
+    "delivered_lba": 126804,
+    "first_words": [
+     "0xDECE002A",
+     "0xEEC1CFDE"
+    ]
+   },
+   "dest_sectors": 1,
+   "lba_sectors": 1682
+  }
+ ],
+ "timing_records": [
+  {
+   "seq": 2883,
+   "lba": 125100,
+   "frame": 3534,
+   "due": 1995040231,
+   "buffer": 1995040231,
+   "irq_arm": 1995040231,
+   "intc": 1995045231,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2884,
+   "lba": 125101,
+   "frame": 3534,
+   "due": 1995266023,
+   "buffer": 1995266023,
+   "irq_arm": 1995266023,
+   "intc": 1995271023,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2885,
+   "lba": 125102,
+   "frame": 3535,
+   "due": 1995491815,
+   "buffer": 1995491815,
+   "irq_arm": 1995491815,
+   "intc": 1995496815,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2886,
+   "lba": 125103,
+   "frame": 3535,
+   "due": 1995717607,
+   "buffer": 1995717607,
+   "irq_arm": 1995717607,
+   "intc": 1995722607,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2887,
+   "lba": 125104,
+   "frame": 3535,
+   "due": 1995943399,
+   "buffer": 1995943399,
+   "irq_arm": 1995943399,
+   "intc": 1995948399,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2888,
+   "lba": 125105,
+   "frame": 3536,
+   "due": 1996169191,
+   "buffer": 1996169191,
+   "irq_arm": 1996169191,
+   "intc": 1996174191,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2889,
+   "lba": 125106,
+   "frame": 3536,
+   "due": 1996394983,
+   "buffer": 1996394983,
+   "irq_arm": 1996394983,
+   "intc": 1996399983,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2890,
+   "lba": 125107,
+   "frame": 3537,
+   "due": 1996620775,
+   "buffer": 1996620775,
+   "irq_arm": 1996620775,
+   "intc": 1996625775,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2891,
+   "lba": 125108,
+   "frame": 3537,
+   "due": 1996846567,
+   "buffer": 1996846567,
+   "irq_arm": 1996846567,
+   "intc": 1996851567,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2892,
+   "lba": 125109,
+   "frame": 3537,
+   "due": 1997072359,
+   "buffer": 1997072359,
+   "irq_arm": 1997072359,
+   "intc": 1997077359,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2893,
+   "lba": 125110,
+   "frame": 3538,
+   "due": 1997298151,
+   "buffer": 1997298151,
+   "irq_arm": 1997298151,
+   "intc": 1997303151,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2894,
+   "lba": 125111,
+   "frame": 3538,
+   "due": 1997523943,
+   "buffer": 1997523943,
+   "irq_arm": 1997523943,
+   "intc": 1997528943,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2895,
+   "lba": 125112,
+   "frame": 3539,
+   "due": 1997749735,
+   "buffer": 1997749735,
+   "irq_arm": 1997749735,
+   "intc": 1997754735,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2896,
+   "lba": 125113,
+   "frame": 3539,
+   "due": 1997975527,
+   "buffer": 1997975527,
+   "irq_arm": 1997975527,
+   "intc": 1997980527,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2897,
+   "lba": 125114,
+   "frame": 3539,
+   "due": 1998201319,
+   "buffer": 1998201319,
+   "irq_arm": 1998201319,
+   "intc": 1998206319,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2898,
+   "lba": 125115,
+   "frame": 3540,
+   "due": 1998427111,
+   "buffer": 1998427111,
+   "irq_arm": 1998427111,
+   "intc": 1998432111,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2899,
+   "lba": 125116,
+   "frame": 3540,
+   "due": 1998652903,
+   "buffer": 1998652903,
+   "irq_arm": 1998652903,
+   "intc": 1998657903,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  },
+  {
+   "seq": 2900,
+   "lba": 125117,
+   "frame": 3541,
+   "due": 1998878695,
+   "buffer": 1998878695,
+   "irq_arm": 1998878695,
+   "intc": 1998883695,
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "irq_armed": 1,
+   "intc_seen": 1
+  }
+ ],
+ "delivery": {
+  "125100": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125101": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125102": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125103": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125104": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125105": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125106": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125107": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125108": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125109": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125110": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125111": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125112": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125113": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125114": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125115": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125116": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  },
+  "125117": {
+   "data": 1,
+   "dma": 0,
+   "pended": 0,
+   "lost": 0,
+   "records": 1
+  }
+ },
+ "timing_stats": {
+  "stream_starts": 16,
+  "records": 546,
+  "dropped": 0,
+  "data_sectors": 546,
+  "schedule_exact": 546,
+  "schedule_early": 0,
+  "schedule_late": 0,
+  "late_cycles_avg": 0,
+  "late_cycles_max": 0,
+  "late_bins": [
+   546,
+   0,
+   0,
+   0,
+   0
+  ],
+  "irq_armed": 546,
+  "arm_delay_avg": 0,
+  "arm_delay_max": 0,
+  "intc_exposed": 546,
+  "exposure_delay_avg": 5000,
+  "exposure_delay_max": 5000,
+  "exposure_over_1x_sector": 0,
+  "pended": 0,
+  "lost": 0,
+  "dma_refills": 0,
+  "data_span_cycles": 316117023,
+  "window_cycles": 493908353,
+  "read_start_count": 16,
+  "read_start_cycles": 7225344,
+  "pause_count": 16,
+  "pause_cycles": 35781066,
+  "seek_count": 0,
+  "seek_cycles": 0,
+  "motor_count": 0,
+  "motor_cycles": 0,
+  "stop_count": 0,
+  "stop_cycles": 0,
+  "latency_upper_cycles": 43006410
+ },
+ "command_history": [
+  {
+   "frame": 3515,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3503,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3473,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3443,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3413,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3383,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3348,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3346,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3346,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    35,
+    1
+   ],
+   "kind": "exec",
+   "lba": 123076
+  },
+  {
+   "frame": 3342,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3340,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3340,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    34,
+    102
+   ],
+   "kind": "exec",
+   "lba": 123066
+  },
+  {
+   "frame": 3336,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3335,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3335,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    34,
+    101
+   ],
+   "kind": "exec",
+   "lba": 123065
+  },
+  {
+   "frame": 3331,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3325,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3325,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    34,
+    73
+   ],
+   "kind": "exec",
+   "lba": 123049
+  },
+  {
+   "frame": 3323,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3323,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    34,
+    71
+   ],
+   "kind": "exec",
+   "lba": 123047
+  },
+  {
+   "frame": 3319,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3310,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3310,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    34,
+    38
+   ],
+   "kind": "exec",
+   "lba": 123026
+  },
+  {
+   "frame": 3306,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3286,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3286,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    33,
+    81
+   ],
+   "kind": "exec",
+   "lba": 122976
+  },
+  {
+   "frame": 3282,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3266,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3266,
+   "cmd": "Setloc",
+   "params": [
+    39,
+    33,
+    19
+   ],
+   "kind": "exec",
+   "lba": 122938
+  },
+  {
+   "frame": 3262,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3249,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3249,
+   "cmd": "Setloc",
+   "params": [
+    41,
+    54,
+    23
+   ],
+   "kind": "exec",
+   "lba": 133067
+  },
+  {
+   "frame": 3245,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3243,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3243,
+   "cmd": "Setloc",
+   "params": [
+    40,
+    20,
+    100
+   ],
+   "kind": "exec",
+   "lba": 126964
+  },
+  {
+   "frame": 3243,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3237,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3185,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3185,
+   "cmd": "Setloc",
+   "params": [
+    40,
+    19,
+    17
+   ],
+   "kind": "exec",
+   "lba": 126836
+  },
+  {
+   "frame": 3181,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3175,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3175,
+   "cmd": "Setloc",
+   "params": [
+    40,
+    18,
+    67
+   ],
+   "kind": "exec",
+   "lba": 126793
+  },
+  {
+   "frame": 3171,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3170,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3170,
+   "cmd": "Setloc",
+   "params": [
+    40,
+    18,
+    0
+   ],
+   "kind": "exec",
+   "lba": 126750
+  },
+  {
+   "frame": 3165,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3165,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3165,
+   "cmd": "Setloc",
+   "params": [
+    40,
+    9,
+    87
+   ],
+   "kind": "exec",
+   "lba": 126582
+  },
+  {
+   "frame": 3165,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3143,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3089,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3089,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    22,
+    34
+   ],
+   "kind": "exec",
+   "lba": 1072
+  },
+  {
+   "frame": 3089,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3083,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3053,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 3023,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2993,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2963,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2933,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2903,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2873,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2843,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2813,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2783,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2753,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2723,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2690,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2634,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2634,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    83,
+    71
+   ],
+   "kind": "exec",
+   "lba": 3872
+  },
+  {
+   "frame": 2634,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2624,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2594,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2564,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2534,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2504,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2474,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2444,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2414,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2384,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2354,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2324,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2294,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2264,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2234,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2204,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2174,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2144,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2114,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2084,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2054,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 2024,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1994,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1964,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1934,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1904,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1874,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1844,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1814,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1782,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1781,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1781,
+   "cmd": "Setloc",
+   "params": [
+    2,
+    71,
+    71
+   ],
+   "kind": "exec",
+   "lba": 12422
+  },
+  {
+   "frame": 1781,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1763,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1755,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1755,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    64,
+    20
+   ],
+   "kind": "exec",
+   "lba": 2864
+  },
+  {
+   "frame": 1753,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1675,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1675,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    6,
+    4
+   ],
+   "kind": "exec",
+   "lba": 304
+  },
+  {
+   "frame": 1675,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1675,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1645,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1615,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1585,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1552,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1522,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1492,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1462,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1432,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1402,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1372,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1342,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1310,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1259,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1259,
+   "cmd": "Setloc",
+   "params": [
+    1,
+    2,
+    55
+   ],
+   "kind": "exec",
+   "lba": 4537
+  },
+  {
+   "frame": 1257,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1249,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1249,
+   "cmd": "Setloc",
+   "params": [
+    1,
+    1,
+    87
+   ],
+   "kind": "exec",
+   "lba": 4482
+  },
+  {
+   "frame": 1249,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1230,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1175,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1175,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    41,
+    113
+   ],
+   "kind": "exec",
+   "lba": 2096
+  },
+  {
+   "frame": 1175,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1175,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 1169,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 529,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 529,
+   "cmd": "Setloc",
+   "params": [
+    48,
+    71,
+    7
+   ],
+   "kind": "exec",
+   "lba": 138382
+  },
+  {
+   "frame": 529,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 509,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 508,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 508,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    73,
+    17
+   ],
+   "kind": "exec",
+   "lba": 3536
+  },
+  {
+   "frame": 508,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 506,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 476,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 446,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 416,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 386,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 356,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 326,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 296,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 263,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 254,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 254,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    85,
+    87
+   ],
+   "kind": "exec",
+   "lba": 4032
+  },
+  {
+   "frame": 252,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 251,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 251,
+   "cmd": "Setloc",
+   "params": [
+    2,
+    71,
+    73
+   ],
+   "kind": "exec",
+   "lba": 12424
+  },
+  {
+   "frame": 249,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 240,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 240,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    36
+   ],
+   "kind": "exec",
+   "lba": 24
+  },
+  {
+   "frame": 240,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 91,
+   "cmd": "Setmode",
+   "params": [
+    160
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 91,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 91,
+   "cmd": "Demute",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 91,
+   "cmd": "Init",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 91,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 88,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 50,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 50,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 50,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 50,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    72
+   ],
+   "kind": "exec",
+   "lba": 48
+  },
+  {
+   "frame": 50,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 48,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 48,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 47,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 44,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 44,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    71
+   ],
+   "kind": "exec",
+   "lba": 47
+  },
+  {
+   "frame": 44,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 44,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 31,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 30,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 30,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 30,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 30,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    35
+   ],
+   "kind": "exec",
+   "lba": 23
+  },
+  {
+   "frame": 30,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 28,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 27,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 27,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 27,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 27,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    34
+   ],
+   "kind": "exec",
+   "lba": 22
+  },
+  {
+   "frame": 27,
+   "cmd": "Getstat",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 25,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 24,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 24,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 24,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 24,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    24
+   ],
+   "kind": "exec",
+   "lba": 18
+  },
+  {
+   "frame": 22,
+   "cmd": "Pause",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 21,
+   "cmd": "ReadN",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 21,
+   "cmd": "Setmode",
+   "params": [
+    128
+   ],
+   "kind": "exec"
+  },
+  {
+   "frame": 18,
+   "cmd": "SeekL",
+   "params": [],
+   "kind": "exec"
+  },
+  {
+   "frame": 18,
+   "cmd": "Setloc",
+   "params": [
+    0,
+    2,
+    22
+   ],
+   "kind": "exec",
+   "lba": 16
+  },
+  {
+   "frame": 14,
+   "cmd": "Init",
+   "params": [],
+   "kind": "exec"
+  }
+ ],
+ "table_distinct_colours": 5,
+ "table_state": "CORRECT: the 5-colour palette is in place"
+}

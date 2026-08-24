@@ -1,0 +1,258 @@
+{
+ "kind": "psx-wedge-scan",
+ "version": 1,
+ "ring": {
+  "oldest": 21745,
+  "newest": 32881,
+  "total": 13910771,
+  "capacity": 1048576,
+  "max_words": 12
+ },
+ "big": 120,
+ "profiled": 60,
+ "ranking": [
+  {
+   "frame": 32881,
+   "prims": 1055,
+   "additive": 96,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    68,
+    459,
+    667
+   ],
+   "distinct_colours": 213
+  },
+  {
+   "frame": 32877,
+   "prims": 1055,
+   "additive": 96,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    68,
+    459,
+    667
+   ],
+   "distinct_colours": 216
+  },
+  {
+   "frame": 32873,
+   "prims": 1055,
+   "additive": 96,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    68,
+    459,
+    667
+   ],
+   "distinct_colours": 217
+  },
+  {
+   "frame": 32869,
+   "prims": 1057,
+   "additive": 96,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    68,
+    459,
+    667
+   ],
+   "distinct_colours": 217
+  },
+  {
+   "frame": 32865,
+   "prims": 1057,
+   "additive": 96,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    68,
+    459,
+    667
+   ],
+   "distinct_colours": 218
+  },
+  {
+   "frame": 32861,
+   "prims": 959,
+   "additive": 0,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    238,
+    400,
+    478
+   ],
+   "distinct_colours": 5
+  },
+  {
+   "frame": 32857,
+   "prims": 959,
+   "additive": 0,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    238,
+    400,
+    478
+   ],
+   "distinct_colours": 5
+  },
+  {
+   "frame": 32853,
+   "prims": 959,
+   "additive": 0,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    238,
+    400,
+    478
+   ],
+   "distinct_colours": 5
+  },
+  {
+   "frame": 32849,
+   "prims": 959,
+   "additive": 0,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    238,
+    400,
+    478
+   ],
+   "distinct_colours": 5
+  },
+  {
+   "frame": 32845,
+   "prims": 959,
+   "additive": 0,
+   "subtractive": 360,
+   "big_untextured": 4,
+   "big_textured": 8,
+   "max_span": 202,
+   "fan_hub": [
+    39,
+    464
+   ],
+   "fan_hub_count": 2,
+   "extent": [
+    -260,
+    238,
+    400,
+    478
+   ],
+   "distinct_colours": 5
+  }
+ ],
+ "saved": [
+  {
+   "frame": 32881,
+   "dump": "analysis/frames/wedge.json",
+   "summary": "analysis/frames/wedge.summary.json",
+   "context_dumps": [
+    "analysis/frames/wedge-minus1.json",
+    "analysis/frames/wedge-minus2.json"
+   ],
+   "metrics": {
+    "frame": 32881,
+    "prims": 1055,
+    "additive": 96,
+    "subtractive": 360,
+    "big_untextured": 4,
+    "big_textured": 8,
+    "max_span": 202,
+    "fan_hub": [
+     39,
+     464
+    ],
+    "fan_hub_count": 2,
+    "extent": [
+     -260,
+     68,
+     459,
+     667
+    ],
+    "distinct_colours": 213
+   }
+  }
+ ],
+ "note": "ranking is relative; a flat ranking means the packet lists are ordinary and the fault is in rasterisation, not submission"
+}

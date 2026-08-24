@@ -188,7 +188,32 @@ def main(argv=None):
     doc["classes"] = rows
     absent = [r for r in rows
               if r["oracle_max"] >= 20 and r["native_max"] * 3 < r["oracle_max"]]
+    # The verdict must look BOTH ways.
+    #
+    # It only checked for classes the oracle draws and psx-runtime does not,
+    # then announced "no systematic absence — the differences were phase" over
+    # its own table showing a 254-primitive asymmetry the other way. Drawing far
+    # too many additive primitives is as much a fault as drawing too few, and
+    # with additive blending it is the one that washes a scene out.
+    extra = [r for r in rows
+             if r["native_max"] >= 20 and r["oracle_max"] * 3 < r["native_max"]]
     doc["absent_on_native"] = [r["key"] for r in absent]
+    doc["extra_on_native"] = [r["key"] for r in extra]
+
+    if extra and not absent:
+        total = sum(r["native_max"] - r["oracle_max"] for r in extra)
+        print(f"\nFINDING: psx-runtime draws {total} primitive(s) the oracle "
+              f"never does, across {args.samples} captures: "
+              f"{', '.join(r['key'] for r in extra)}.")
+        print(f"\nThese are SEMI-TRANSPARENT classes, and every other class "
+              f"matches exactly — so both sides were at the same scene and the "
+              f"difference is not phase. Additively blended primitives "
+              f"accumulate: several hundred extra ones brighten everything "
+              f"they cover until detail underneath is drowned, which is what "
+              f"the screenshots show.")
+        doc["verdict"] = "extra-on-native"
+        return _finish(doc, args, 0)
+
     if absent:
         total = sum(r["oracle_max"] - r["native_max"] for r in absent)
         for r in absent:
@@ -215,11 +240,15 @@ def main(argv=None):
               f"fault in the guest code that builds them — not in the "
               f"renderer.")
         doc["verdict"] = "classes-absent-on-native"
+    elif not extra:
+        print("\nNo class differs systematically in either direction: every one "
+              "psx-runtime draws fewer of at some moment, it also reaches "
+              "comparable counts at another. The single-capture differences "
+              "were phase.")
+        doc["verdict"] = "no-systematic-difference"
     else:
-        print("\nNo class is systematically absent: every one psx-runtime draws "
-              "fewer of at some moment, it also reaches comparable counts at "
-              "another. The single-capture differences were phase.")
-        doc["verdict"] = "no-systematic-absence"
+        print("\nClasses differ in BOTH directions; see the table.")
+        doc["verdict"] = "mixed"
     return _finish(doc, args, 0)
 
 
