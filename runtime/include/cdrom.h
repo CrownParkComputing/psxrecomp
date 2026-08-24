@@ -52,6 +52,7 @@ void cdrom_warm_route_stats_json(char* out, int cap);
 void cdrom_timing_reset(void);
 void cdrom_timing_stats_json(char* out, int cap);
 int cdrom_get_delivered_lba(void);
+void cdrom_notify_cd_dma_complete(void);
 
 /* Per-record view of the same ring, for localising a single lost/skipped
  * sector rather than summarising thousands. */
@@ -200,6 +201,11 @@ typedef struct CDROMDebugState {
      * int1_lost rising while the speed divisor != 1 is the regression. */
     uint64_t accel_consumer_waits;
     uint64_t accel_consumer_wait_cycles;
+    /* 8-slot sector ring: sectors dropped because the guest fell a full
+     * ring behind (hardware does this too), and missed-sector INT1s
+     * re-announced when a drain completed with another sector waiting. */
+    uint64_t ring_dropped;
+    uint64_t int1_redelivered;
     uint8_t  int1_pending_now;
 } CDROMDebugState;
 
