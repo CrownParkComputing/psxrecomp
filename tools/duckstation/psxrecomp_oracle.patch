@@ -23,6 +23,36 @@ index e2d0294b..b290bd35 100644
    save_state_version.h
    settings.cpp
    settings.h
+diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
+index c36b9341..a9ea26ab 100644
+--- a/src/core/cdrom.cpp
++++ b/src/core/cdrom.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "cdrom.h"
++#include "psxrecomp_debug_server.h"
+ #include "cdrom_async_reader.h"
+ #include "cdrom_subq_replacement.h"
+ #include "dma.h"
+@@ -1850,6 +1851,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
+     s_state.response_fifo.Clear();
+   }
+ 
++  // PSXRecomp oracle: record the command with its original params before the
++  // handlers consume the FIFO, mirroring psx-runtime's cdrom_command_history.
++  {
++    u8 rec_params[8];
++    u32 rec_n = 0;
++    const u32 fifo_n = s_state.param_fifo.GetSize();
++    for (u32 i = 0; i < fifo_n && rec_n < 8; i++)
++      rec_params[rec_n++] = s_state.param_fifo.Peek(i);
++    PSXRecompDebug::RecordCdCommand(static_cast<u8>(s_state.command), rec_params, rec_n);
++  }
++
+   // Stop command event first, reduces our chances of ending up with out-of-order events.
+   s_state.command_event.Deactivate();
+ 
 diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
 index c78acbf3..d991249e 100644
 --- a/src/core/cpu_core.cpp
@@ -108,10 +138,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..a3e4c16f
+index 00000000..e2c3ee2c
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1222 @@
+@@ -0,0 +1,1276 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -367,6 +397,34 @@ index 00000000..a3e4c16f
 +
 +// Frame counter & control
 +static u32 s_frame_counter = 0;
++
++// ---- CD command history (mirror of psx-runtime's cdrom_command_history) ----
++// One entry per command as it begins execution; flood-immune (no per-byte
++// FIFO traffic). Exists so the two emulators' request streams can be diffed.
++namespace {
++struct CdCmdEntry
++{
++  u64 seq;
++  u32 frame;
++  u8 command;
++  u8 param_count;
++  u8 params[8];
++};
++constexpr u32 CD_CMD_HISTORY_CAP = 4096;
++CdCmdEntry s_cd_cmd_history[CD_CMD_HISTORY_CAP];
++u64 s_cd_cmd_history_seq = 0;
++} // namespace
++
++void RecordCdCommand(u8 command, const u8* params, u32 param_count)
++{
++  CdCmdEntry& e = s_cd_cmd_history[s_cd_cmd_history_seq % CD_CMD_HISTORY_CAP];
++  e.seq = s_cd_cmd_history_seq++;
++  e.frame = s_frame_counter;
++  e.command = command;
++  e.param_count = static_cast<u8>(std::min<u32>(param_count, 8));
++  for (u32 i = 0; i < e.param_count; i++)
++    e.params[i] = params[i];
++}
 +static int s_step_frames = 0;
 +static bool s_paused = false;
 +static int s_request_id = 0;
@@ -1135,6 +1193,32 @@ index 00000000..a3e4c16f
 +      rx_data & 0xFF, stat & 0xFFFF, mode & 0xFFFF, ctrl & 0xFFFF, baud & 0xFFFF));
 +  }
 +  // ---- screenshot ----
++  else if (std::strcmp(cmd, "cd_history") == 0)
++  {
++    int count = json_get_int(json, "count", 512);
++    if (count < 1) count = 1;
++    if (count > static_cast<int>(CD_CMD_HISTORY_CAP)) count = CD_CMD_HISTORY_CAP;
++    const u64 total = s_cd_cmd_history_seq;
++    u64 start = (total > static_cast<u64>(count)) ? total - static_cast<u64>(count) : 0;
++    if (total > CD_CMD_HISTORY_CAP && start < total - CD_CMD_HISTORY_CAP)
++      start = total - CD_CMD_HISTORY_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    for (u64 seq = start; seq < total; seq++)
++    {
++      const CdCmdEntry& e = s_cd_cmd_history[seq % CD_CMD_HISTORY_CAP];
++      if (e.seq != seq)
++        continue;
++      resp += fmt::format(R"({}{{"seq":{},"frame":{},"cmd":"0x{:02X}","params":[)", first ? "" : ",", e.seq,
++                          e.frame, e.command);
++      for (u32 i = 0; i < e.param_count; i++)
++        resp += fmt::format(R"({}"0x{:02X}")", i ? "," : "", e.params[i]);
++      resp += "]}";
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
 +  else if (std::strcmp(cmd, "screenshot") == 0)
 +  {
 +    char path[256] = {};
@@ -1336,10 +1420,10 @@ index 00000000..a3e4c16f
 +}
 diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
 new file mode 100644
-index 00000000..8f9ba960
+index 00000000..ae268f96
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,45 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371
 +// Same protocol as the PSXRecomp runner debug server.
@@ -1375,6 +1459,14 @@ index 00000000..8f9ba960
 +/// True when a client has armed fingerprinting. The store hook checks this
 +/// first so an unattached oracle pays almost nothing.
 +bool FingerprintArmed();
++
++/// Record one CDROM command as it begins execution (called from
++/// CDROM::ExecuteCommand). Mirrors psx-runtime's cdrom_command_history so
++/// the two emulators' command streams can be diffed directly -- the
++/// measurement that localises a game-side request divergence like Legend of
++/// Mana's land-creation palette load (native requests sector 125113 where
++/// the oracle requests 125112; every layer below the game measures clean).
++void RecordCdCommand(u8 command, const u8* params, u32 param_count);
 +
 +} // namespace PSXRecompDebug
 diff --git a/src/core/system.cpp b/src/core/system.cpp
