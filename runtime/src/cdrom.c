@@ -206,6 +206,7 @@ static uint64_t command_history_seq;
 static uint8_t seek_min, seek_sec, seek_sect;
 static int     s_setloc_lba = -1;  /* LBA captured at SetLoc time */
 static int     setloc_seek_far;
+static int     setloc_pending;   /* a Setloc has been issued and not consumed */
 
 /* Read state */
 static int reading;
@@ -1525,6 +1526,37 @@ static void cdrom_clear_pending_dataready(void) {
     s_cd_timing_pending_seq = UINT64_MAX;
 }
 
+/* A Read issued while the drive is ALREADY streaming the very sector the
+ * pending Setloc names is not a new read -- it is the game saying "keep
+ * going". DuckStation's Read handler does exactly this (cdrom.cpp: "Ignoring
+ * read command with pending/same setloc, already reading"), and only calls
+ * BeginReading -- the thing that clears the sector buffers and re-arms the
+ * read-start latency -- when the request actually moves the drive.
+ *
+ * Restarting instead costs two things, both measured on the palette load:
+ *
+ *   1. The un-drained sector is DESTROYED. start_read_stream clears the whole
+ *      ring, so sector 125110 -- delivered, announced, and not yet taken by
+ *      the guest -- was wiped when the guest issued Setloc(125111)+ReadN
+ *      ~10,800 cycles later. Its buffer then received 125111 instead, and the
+ *      effect's palette (125112) was lost the same way.
+ *   2. Every request pays initial_read_delay_cycles() again: 451,584 of the
+ *      456,000-cycle gap before each individually requested sector. That is
+ *      why this load takes 13 guest frames here and 2 on DuckStation.
+ *
+ * The drive is left running and the command is ACKed, exactly as when it is
+ * accepted -- the guest sees the same INT3, just without the restart. */
+static int read_continues_current_stream(void) {
+    if (!reading) return 0;
+    /* Next sector the stream will deliver. */
+    int next_lba = msf_to_lba(read_min, read_sec, read_sect);
+    if (setloc_pending && s_setloc_lba != next_lba) return 0;
+    setloc_pending = 0;
+    response_push(stat_reg);
+    set_irq(CDIRQ_ACK);
+    return 1;
+}
+
 static void start_read_stream(uint8_t cmd) {
     cdda_playing = 0;
     cdda_track = 0;
@@ -1539,6 +1571,7 @@ static void start_read_stream(uint8_t cmd) {
         xa_reset_decode();
         spu_cd_audio_reset();
     }
+    setloc_pending = 0;
     read_min = seek_min;
     read_sec = seek_sec;
     read_sect = seek_sect;
@@ -2000,6 +2033,7 @@ static void exec_command(uint8_t cmd) {
             seek_sec = bcd_to_bin(param_fifo[1]);
             seek_sect = bcd_to_bin(param_fifo[2]);
             s_setloc_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
+            setloc_pending = 1;
             setloc_seek_far = (abs(current_lba - s_setloc_lba) > 16) ? 1 : 0;
             warm_route_on_setloc(s_setloc_lba);
         }
@@ -2013,6 +2047,7 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
+        if (read_continues_current_stream()) break;   /* ACKed inside */
         start_read_stream(cmd);
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -2323,6 +2358,7 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
+        if (read_continues_current_stream()) break;   /* ACKed inside */
         start_read_stream(cmd);
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -2437,6 +2473,7 @@ static void process_pending(uint32_t cycles) {
     case 0x16: /* SeekP complete */
         stat_reg &= ~CDSTAT_SEEK;
         setloc_seek_far = 0;
+    setloc_pending = 0;
         response_push(stat_reg);
         set_irq(CDIRQ_COMPLETE);
         fire_cdrom_irq();
@@ -3197,7 +3234,7 @@ static int cdrom_snap_emit(PstW *w) {
     WU(0u); W8(last_sector_mode); W8(last_sector_have_raw);
     W8(last_sector_raw_mode); W8(last_sector_xa_file); W8(last_sector_xa_channel);
     W8(last_sector_xa_submode); W8(last_sector_xa_coding);
-    W8(seek_min); W8(seek_sec); W8(seek_sect); WI(s_setloc_lba); WI(setloc_seek_far);
+    W8(seek_min); W8(seek_sec); W8(seek_sect); WI(s_setloc_lba); WI(setloc_seek_far); WI(setloc_pending);
     WI(reading); WI(read_min); WI(read_sec); WI(read_sect); W8(mode_reg);
     W8(read_cmd); WI(read_delay); W8(filter_file); W8(filter_channel); W8(cd_muted);
     WI(cdda_playing); WI(cdda_track); WU(cdda_lba); WI(cdda_delay);
@@ -3248,7 +3285,7 @@ static int cdrom_snap_parse(PstR *r) {
     RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
     R8(last_sector_raw_mode); R8(last_sector_xa_file); R8(last_sector_xa_channel);
     R8(last_sector_xa_submode); R8(last_sector_xa_coding);
-    R8(seek_min); R8(seek_sec); R8(seek_sect); RI(s_setloc_lba); RI(setloc_seek_far);
+    R8(seek_min); R8(seek_sec); R8(seek_sect); RI(s_setloc_lba); RI(setloc_seek_far); RI(setloc_pending);
     RI(reading); RI(read_min); RI(read_sec); RI(read_sect); R8(mode_reg);
     R8(read_cmd); RI(read_delay); R8(filter_file); R8(filter_channel); R8(cd_muted);
     RI(cdda_playing); RI(cdda_track); RU(cdda_lba); RI(cdda_delay);
