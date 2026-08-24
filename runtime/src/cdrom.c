@@ -147,32 +147,10 @@ static int response_count;
 #define FALLBACK_SECTOR_HEADER_SIZE 12
 #define FALLBACK_WHOLE_SECTOR_SIZE (FALLBACK_SECTOR_HEADER_SIZE + SECTOR_SIZE)
 #define SECTOR_BUFFER_SIZE WHOLE_SECTOR_SIZE
-/* ---- sector buffer ring ------------------------------------------------
- * Hardware has eight rotating sector buffers. One buffer means a sector
- * arriving mid-drain clobbers the FIFO under the guest, and that is
- * measured, not assumed: at the artifact screen psx-runtime drains sector
- * 125113 into BOTH 0x0E2718 and 0x0DCF18 in one frame, while DuckStation
- * drains 125112 then 125113 into the same two buffers. Sector 125112 -- the
- * effect's colour palette -- is read here ([D], not lost) and then
- * overwritten by 125113 before the guest takes it, so raw file bytes end up
- * rendered as vertex colours.
- *
- * THE READ POINTER IS THE PART THAT MATTERS. An earlier attempt latched
- * read = write when an INT1 was PRESENTED, and regressed badly (70 lost
- * sectors, every Setloc retried): this drive free-runs, so by presentation
- * time `write` has advanced past the sector that INT1 was raised for, and
- * the guest was handed a sector seven ahead of the one it asked for. Each
- * INT1 therefore records the slot it announces AT RAISE TIME, and
- * presentation moves the read pointer to exactly that slot -- never to
- * "newest". */
-#define CDROM_NUM_SECTOR_BUFFERS 8
-typedef struct { uint8_t data[SECTOR_BUFFER_SIZE]; int size; int pos; } CdSectorBuf;
-static CdSectorBuf s_sector_ring[CDROM_NUM_SECTOR_BUFFERS];
-static int s_ring_read;      /* slot the guest is draining */
-static int s_ring_write;     /* slot most recently filled */
-static uint64_t s_ring_dropped;   /* unread slot overwritten: guest a ring behind */
-#define RB_ (s_sector_ring[s_ring_read])
-static int rb_available(void) { return RB_.size > 0 && RB_.pos < RB_.size; }
+static uint8_t sector_buffer[SECTOR_BUFFER_SIZE];
+static int sector_read_pos;
+static int sector_available;
+static int sector_size;
 static uint8_t last_sector_buffer[SECTOR_BUFFER_SIZE];
 static int last_sector_lba;
 static int last_sector_size;
@@ -752,9 +730,9 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->param_count = (uint8_t)param_count;
     e->response_read = (uint8_t)response_read;
     e->response_count = (uint8_t)response_count;
-    e->sector_available = (uint8_t)rb_available();
-    e->sector_read_pos = RB_.pos;
-    e->sector_size = RB_.size;
+    e->sector_available = (uint8_t)sector_available;
+    e->sector_read_pos = sector_read_pos;
+    e->sector_size = sector_size;
     e->pending_cmd = pending.cmd;
     e->pending_pending = (uint8_t)pending.pending;
     e->pending_delay = pending_rem_cycles();
@@ -1391,36 +1369,36 @@ static int read_sector_at(int min, int sec, int sect) {
         delivery.skip_reason = CDROM_SKIP_XA_AUDIO_REALTIME;
     }
 
-    CdSectorBuf *wb = NULL;
-    if (delivery.data_delivered) {
-        int wi = (s_ring_write + 1) % CDROM_NUM_SECTOR_BUFFERS;
-        wb = &s_sector_ring[wi];
-        if (wb->size > 0 && wb->pos < wb->size) s_ring_dropped++;
-        memset(wb->data, 0, sizeof(wb->data));
-        if (mode_reg & 0x20) {
-            if (have_raw) {
-                memcpy(wb->data, raw_data + WHOLE_SECTOR_OFFSET, WHOLE_SECTOR_SIZE);
-                wb->size = WHOLE_SECTOR_SIZE;
-            } else {
-                wb->data[0] = bin_to_bcd(min);
-                wb->data[1] = bin_to_bcd(sec);
-                wb->data[2] = bin_to_bcd(sect);
-                wb->data[3] = 0x02; /* Mode 2 sector. */
-                memcpy(wb->data + FALLBACK_SECTOR_HEADER_SIZE, user_data, SECTOR_SIZE);
-                wb->size = FALLBACK_WHOLE_SECTOR_SIZE;
-            }
+    memset(sector_buffer, 0, sizeof(sector_buffer));
+    if (delivery.data_delivered && (mode_reg & 0x20)) {
+        if (have_raw) {
+            memcpy(sector_buffer, raw_data + WHOLE_SECTOR_OFFSET, WHOLE_SECTOR_SIZE);
+            sector_size = WHOLE_SECTOR_SIZE;
+            history_bytes = sector_buffer;
+            history_size = sector_size;
         } else {
-            memcpy(wb->data, user_data, SECTOR_SIZE);
-            wb->size = SECTOR_SIZE;
+            sector_buffer[0] = bin_to_bcd(min);
+            sector_buffer[1] = bin_to_bcd(sec);
+            sector_buffer[2] = bin_to_bcd(sect);
+            sector_buffer[3] = 0x02; /* Mode 2 sector. */
+            memcpy(sector_buffer + FALLBACK_SECTOR_HEADER_SIZE, user_data, SECTOR_SIZE);
+            sector_size = FALLBACK_WHOLE_SECTOR_SIZE;
+            history_bytes = sector_buffer;
+            history_size = sector_size;
         }
-        wb->pos = 0;
-        s_ring_write = wi;
-        history_bytes = wb->data;
-        history_size = wb->size;
+    } else if (delivery.data_delivered) {
+        memcpy(sector_buffer, user_data, SECTOR_SIZE);
+        sector_size = SECTOR_SIZE;
+        history_bytes = sector_buffer;
+        history_size = sector_size;
+    } else {
+        sector_size = 0;
     }
 
+    sector_read_pos = 0;
+    sector_available = delivery.data_delivered ? 1 : 0;
     if (delivery.data_delivered) {
-        memcpy(last_sector_buffer, wb->data, (size_t)wb->size);
+        memcpy(last_sector_buffer, sector_buffer, (size_t)sector_size);
         burst_note_sector();
         if (s_warm_route_active) s_warm_route_sectors++;
     } else {
@@ -1432,7 +1410,7 @@ static int read_sector_at(int min, int sec, int sect) {
         }
     }
     last_sector_lba = lba;
-    last_sector_size = delivery.data_delivered ? wb->size : history_size;
+    last_sector_size = delivery.data_delivered ? sector_size : history_size;
     last_sector_frame = (uint32_t)s_frame_count;
     last_sector_mode = mode_reg;
     last_sector_have_raw = (uint8_t)(have_raw ? 1 : 0);
@@ -1462,12 +1440,9 @@ static void advance_msf(int* m, int* s, int* f) {
 }
 
 static void clear_sector_buffer(void) {
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        s_sector_ring[i].size = 0;
-        s_sector_ring[i].pos = 0;
-    }
-    s_ring_read = 0;
-    s_ring_write = 0;
+    sector_read_pos = 0;
+    sector_size = 0;
+    sector_available = 0;
     request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
 }
 
@@ -1481,7 +1456,6 @@ static void clear_sector_buffer(void) {
  * skipped" warning (counted, traced 'P'). */
 static uint8_t  pending_dataready;        /* 0/1: INT1 awaiting presentation */
 static uint8_t  pending_dataready_stat;   /* stat_reg snapshot at pend time */
-static int      pending_dataready_slot;   /* ring slot THIS INT1 announces */
 static uint64_t s_int1_pended;            /* INT1s that had to wait for ack */
 static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
 
@@ -1724,7 +1698,9 @@ static void process_cdda_stream(uint32_t cycles) {
 }
 
 static int data_fifo_ready(void) {
-    return (request_reg & CDROM_REQUEST_BFRD) && rb_available();
+    return (request_reg & CDROM_REQUEST_BFRD) &&
+           sector_available &&
+           sector_read_pos < sector_size;
 }
 
 static uint64_t s_dataready_fires;  /* INT1 (data-ready) raised per streamed sector — FMV dispatch probe */
@@ -1736,8 +1712,6 @@ static int deliver_read_sector(void) {
     if (!delivered) return 0;
     response_clear();
     response_push(stat_reg);
-    /* Delivered immediately: this INT1 announces the slot just filled. */
-    s_ring_read = s_ring_write;
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
     s_dataready_fires++;
@@ -2341,7 +2315,6 @@ static void process_pending(uint32_t cycles) {
             advance_msf(&read_min, &read_sec, &read_sect);
             if (delivered) {
                 response_push(stat_reg);
-                s_ring_read = s_ring_write;
                 set_irq(CDIRQ_DATA_READY);
                 fire_cdrom_irq();
             }
@@ -2522,8 +2495,8 @@ static void process_read_stream(uint32_t cycles) {
         uint64_t timing_seq = cd_timing_begin_sector(
             msf_to_lba(read_min, read_sec, read_sect));
         if (irq_flag == 0) {
-            if (rb_available()) {
-                trace_cdrom('O', 0, (uint32_t)RB_.pos, 0);
+            if (sector_available) {
+                trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
             }
             if (deliver_read_sector()) {
                 cd_timing_flag(timing_seq, CDT_DATA);
@@ -2550,10 +2523,6 @@ static void process_read_stream(uint32_t cycles) {
                 }
                 pending_dataready = 1;
                 pending_dataready_stat = stat_reg;
-                /* Capture the slot NOW. By presentation time the drive will
-                 * have moved on -- latching "newest" there is what handed the
-                 * guest a sector seven ahead of the one it asked for. */
-                pending_dataready_slot = s_ring_write;
                 s_cd_timing_pending_seq = timing_seq;
                 s_int1_pended++;
             }
@@ -2580,7 +2549,6 @@ static void present_pending_dataready(void) {
     s_cd_timing_pending_seq = UINT64_MAX;
     response_clear();
     response_push(pending_dataready_stat);
-    s_ring_read = pending_dataready_slot;   /* the slot this INT1 announced */
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
     cd_timing_arm_irq(timing_seq);
@@ -2590,9 +2558,7 @@ static void present_pending_dataready(void) {
 void cdrom_init(const char* cue_path) {
     memset(param_fifo, 0, sizeof(param_fifo));
     memset(response_fifo, 0, sizeof(response_fifo));
-    memset(s_sector_ring, 0, sizeof(s_sector_ring));
-    s_ring_read = 0;
-    s_ring_write = 0;
+    memset(sector_buffer, 0, sizeof(sector_buffer));
     memset(last_sector_buffer, 0, sizeof(last_sector_buffer));
 
     /* Rematch re-calls cdrom_init; boot must see 1x until game entry again. */
@@ -2609,6 +2575,9 @@ void cdrom_init(const char* cue_path) {
     param_count = 0;
     response_read = 0;
     response_count = 0;
+    sector_read_pos = 0;
+    sector_size = 0;
+    sector_available = 0;
     last_sector_lba = -1;
     last_sector_size = 0;
     last_sector_frame = 0;
@@ -2709,7 +2678,10 @@ uint32_t cdrom_read(uint32_t addr) {
 
     case 0x1F801802:
         if (data_fifo_ready()) {
-            ret = RB_.data[RB_.pos++];
+            ret = sector_buffer[sector_read_pos++];
+            if (sector_read_pos >= sector_size) {
+                sector_available = 0;
+            }
         }
         break;
 
@@ -2773,7 +2745,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
         } else if (index_reg == 0) {
             request_reg = val;
             if (!(request_reg & CDROM_REQUEST_BFRD)) {
-                RB_.pos = 0;
+                sector_read_pos = 0;
             }
         } else if (index_reg == 1) {
             /* Controller IRQ acknowledge. irq_flag is a single numeric response
@@ -2857,10 +2829,13 @@ void cdrom_tick(void) {
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
     int got = 0;
-    if ((request_reg & CDROM_REQUEST_BFRD) && rb_available() &&
-        RB_.pos + 4 <= RB_.size) {
-        memcpy(&val, RB_.data + RB_.pos, 4);
-        RB_.pos += 4;
+    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
+        sector_read_pos + 4 <= sector_size) {
+        memcpy(&val, sector_buffer + sector_read_pos, 4);
+        sector_read_pos += 4;
+        if (sector_read_pos >= sector_size) {
+            sector_available = 0;
+        }
         got = 1;
     }
     /* Per-word DMA data reads flood the CD trace ring (hundreds per sector) and
@@ -2879,12 +2854,13 @@ uint32_t cdrom_dma_read(void) {
 }
 
 int cdrom_dma_ready(void) {
-    return (request_reg & CDROM_REQUEST_BFRD) && rb_available() &&
-           (RB_.pos + 4 <= RB_.size);
+    return (request_reg & CDROM_REQUEST_BFRD) &&
+           sector_available &&
+           (sector_read_pos + 4 <= sector_size);
 }
 
 uint32_t cdrom_dma_sector_word_count(void) {
-    int size = RB_.size;
+    int size = sector_size;
 
     /* CD DMA BCR low half zero means transfer one sector-sized payload.
      * If DMA is armed just before the next sector becomes available, fall
@@ -2917,9 +2893,9 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->param_count = param_count;
     out->response_read = response_read;
     out->response_count = response_count;
-    out->sector_read_pos = RB_.pos;
-    out->sector_available = rb_available();
-    out->sector_size = RB_.size;
+    out->sector_read_pos = sector_read_pos;
+    out->sector_available = sector_available;
+    out->sector_size = sector_size;
     out->reading = reading;
     out->read_min = read_min;
     out->read_sec = read_sec;
@@ -2984,9 +2960,9 @@ uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
                                       CDROMSectorDebugState* state) {
     if (state) {
         memset(state, 0, sizeof(*state));
-        state->current_available = rb_available();
-        state->current_read_pos = RB_.pos;
-        state->current_size = RB_.size;
+        state->current_available = sector_available;
+        state->current_read_pos = sector_read_pos;
+        state->current_size = sector_size;
         state->last_lba = last_sector_lba;
         state->last_size = last_sector_size;
         state->last_frame = last_sector_frame;
@@ -3106,10 +3082,7 @@ static int cdrom_snap_emit(PstW *w) {
     WU(cdrom_intc_latched_generation); WI(irq_present_rem_cycles());
     WB(param_fifo); WI(param_count);
     WB(response_fifo); WI(response_read); WI(response_count);
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        WB(s_sector_ring[i].data); WI(s_sector_ring[i].size); WI(s_sector_ring[i].pos);
-    }
-    WI(s_ring_read); WI(s_ring_write); WI(pending_dataready_slot);
+    WB(sector_buffer); WI(sector_read_pos); WI(sector_available); WI(sector_size);
     WB(last_sector_buffer); WI(last_sector_lba); WI(last_sector_size);
     WB(last_valid_subq); WI(last_valid_subq_available);
     /* last_sector_frame is host s_frame_count — zero on the wire so netplay
@@ -3157,10 +3130,7 @@ static int cdrom_snap_parse(PstR *r) {
     RU(cdrom_intc_latched_generation); RI(present_rem);
     RB(param_fifo); RI(param_count);
     RB(response_fifo); RI(response_read); RI(response_count);
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        RB(s_sector_ring[i].data); RI(s_sector_ring[i].size); RI(s_sector_ring[i].pos);
-    }
-    RI(s_ring_read); RI(s_ring_write); RI(pending_dataready_slot);
+    RB(sector_buffer); RI(sector_read_pos); RI(sector_available); RI(sector_size);
     RB(last_sector_buffer); RI(last_sector_lba); RI(last_sector_size);
     RB(last_valid_subq); RI(last_valid_subq_available);
     RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
