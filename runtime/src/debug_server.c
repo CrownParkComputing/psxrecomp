@@ -12026,8 +12026,10 @@ static void handle_fn_exit_dump(int id, const char *json) {
 static void handle_cd_read_log(int id, const char *json)
 {
     extern uint32_t cd_dma_log_get_total(void);
-    extern void     cd_dma_log_get_entry(uint32_t idx, int *lba,
-                                         uint32_t *dest, uint32_t *size);
+    extern void     cd_dma_log_get_entry2(uint32_t idx, int *lba,
+                                          int *delivered_lba, uint32_t *dest,
+                                          uint32_t *size, uint32_t *frame,
+                                          uint32_t first_words[2]);
 
     int tail = json_get_int(json, "tail", 256);
     uint32_t total = cd_dma_log_get_total();
@@ -12041,11 +12043,14 @@ static void handle_cd_read_log(int id, const char *json)
              id, total, tail);
     int first = 1;
     for (uint32_t i = start_idx; i < total; i++) {
-        int lba; uint32_t dest, size;
-        cd_dma_log_get_entry(i, &lba, &dest, &size);
+        int lba, dlba; uint32_t dest, size, frame, fw[2];
+        cd_dma_log_get_entry2(i, &lba, &dlba, &dest, &size, &frame, fw);
         if (lba < 0) continue;
-        send_fmt("%s{\"lba\":%d,\"dest\":\"0x%08X\",\"size\":%u}",
-                 first ? "" : ",", lba, dest, size);
+        send_fmt("%s{\"lba\":%d,\"delivered_lba\":%d,\"dest\":\"0x%08X\","
+                 "\"size\":%u,\"frame\":%u,"
+                 "\"first_words\":[\"0x%08X\",\"0x%08X\"]}",
+                 first ? "" : ",", lba, dlba, dest, size, frame,
+                 fw[0], fw[1]);
         first = 0;
     }
     send_fmt("]}\n");

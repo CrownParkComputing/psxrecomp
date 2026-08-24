@@ -286,6 +286,13 @@ void cdrom_notify_game_started(void) {
 
 int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
 
+/* The sector most recently DELIVERED into the data buffer -- as opposed to
+ * the game's last SetLoc. During a streaming read with continuations these
+ * differ, and attributing a DMA to the SetLoc stamp alone is how a transfer
+ * carrying sector 125113's bytes was read as "the game asked for 125113"
+ * when the open question was precisely WHICH sector's data it drained. */
+int cdrom_get_delivered_lba(void) { return last_sector_lba; }
+
 /* Frontend XA-stream probe (FMV auto-skip / turbo-load gating in main.cpp). */
 int cdrom_xa_stream_active(void) { return xa_stream_active; }
 

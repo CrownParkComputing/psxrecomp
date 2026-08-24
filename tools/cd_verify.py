@@ -49,7 +49,12 @@ def table_loads(entries, lo=TABLE_LO, hi=TABLE_HI):
         dest = int(e["dest"], 16) & 0x1FFFFF
         size = int(e["size"])
         if dest < hi and dest + size > lo:
-            out.append({"lba": int(e["lba"]), "dest": dest, "size": size})
+            row = {"lba": int(e["lba"]), "dest": dest, "size": size}
+            if "delivered_lba" in e:
+                row["delivered_lba"] = int(e["delivered_lba"])
+            if "first_words" in e:
+                row["first_words"] = e["first_words"]
+            out.append(row)
     return out
 
 
@@ -196,7 +201,22 @@ def main():
     doc["loads"] = loads
     print(f"\n{len(loads)} load(s) into the table region this run:")
     for l in loads:
-        print(f"  LBA {l['lba']:>7} -> 0x{l['dest']:06X}  {l['size']} bytes")
+        # delivered_lba and first_words exist once psx-runtime is rebuilt with
+        # the extended log; older binaries just omit them.
+        src = next((e for e in fresh
+                    if (int(e["dest"], 16) & 0x1FFFFF) == l["dest"]
+                    and int(e["size"]) == l["size"]
+                    and int(e["lba"]) == l["lba"]), {})
+        dlv = src.get("delivered_lba")
+        fw = src.get("first_words")
+        extra = ""
+        if dlv is not None:
+            mark = "" if dlv == l["lba"] else "  <-- continuation/desync"
+            extra = f"  delivered={dlv}{mark}"
+        if fw:
+            extra += f"  data={fw[0]},{fw[1]}"
+        print(f"  LBA {l['lba']:>7} -> 0x{l['dest']:06X}  {l['size']} bytes"
+              f"{extra}")
 
     gaps = request_gaps(loads)
     doc["request_gaps"] = gaps

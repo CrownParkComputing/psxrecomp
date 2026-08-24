@@ -79,15 +79,32 @@ static DMAAsyncChannel cdrom_async;
  * Surfaced via the cd_read_log TCP command; pairs with overlay_dump to map
  * overlay regions back to disc positions for extract_overlays.py. */
 #define CD_DMA_LOG_CAP 65536
-typedef struct { int lba; uint32_t dest; uint32_t size; } CdDmaEntry;
+typedef struct {
+    int      lba;            /* game's last SetLoc at DMA time */
+    int      delivered_lba;  /* sector actually in the buffer (continuations differ) */
+    uint32_t dest;
+    uint32_t size;
+    uint32_t frame;
+    uint32_t first_words[2]; /* head of the transferred data, for ISO matching */
+} CdDmaEntry;
 static CdDmaEntry cd_dma_log[CD_DMA_LOG_CAP];
 static uint32_t   cd_dma_log_head  = 0;
 static uint32_t   cd_dma_log_total = 0;
 
-static void cd_dma_log_push(int lba, uint32_t dest, uint32_t size) {
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].lba  = lba;
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].dest = dest;
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].size = size;
+static void cd_dma_log_push(int lba, uint32_t dest, uint32_t size,
+                            const uint8_t *data) {
+    extern int cdrom_get_delivered_lba(void);
+    CdDmaEntry *e = &cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP];
+    e->lba  = lba;
+    e->delivered_lba = cdrom_get_delivered_lba();
+    e->dest = dest;
+    e->size = size;
+    e->frame = (uint32_t)s_frame_count;
+    e->first_words[0] = e->first_words[1] = 0;
+    if (data && size >= 8) {
+        memcpy(&e->first_words[0], data, 4);
+        memcpy(&e->first_words[1], data + 4, 4);
+    }
     cd_dma_log_head = (cd_dma_log_head + 1) % CD_DMA_LOG_CAP;
     cd_dma_log_total++;
 }
@@ -101,6 +118,22 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
     *lba  = cd_dma_log[slot].lba;
     *dest = cd_dma_log[slot].dest;
     *size = cd_dma_log[slot].size;
+}
+
+void cd_dma_log_get_entry2(uint32_t idx, int *lba, int *delivered_lba,
+                           uint32_t *dest, uint32_t *size, uint32_t *frame,
+                           uint32_t first_words[2]) {
+    uint32_t cap   = CD_DMA_LOG_CAP;
+    uint32_t oldest = cd_dma_log_total > cap ? cd_dma_log_total - cap : 0;
+    if (idx < oldest || idx >= cd_dma_log_total) { *lba = -1; return; }
+    CdDmaEntry *e = &cd_dma_log[idx % cap];
+    *lba = e->lba;
+    *delivered_lba = e->delivered_lba;
+    *dest = e->dest;
+    *size = e->size;
+    *frame = e->frame;
+    first_words[0] = e->first_words[0];
+    first_words[1] = e->first_words[1];
 }
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
@@ -492,6 +525,7 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
 
     /* Log and capture game-data transfers only.
      * Transfers to 0x1C0000+ are FMV/streaming buffers; skip them. */
+    extern uint8_t *memory_get_ram_ptr(void);
     if (!step && size > 0 && load_start < 0x1C0000u) {
         /* The DMA word loop wraps inside the live RAM mask; the capture
          * path below takes a flat ram+offset span and must not follow the
@@ -499,7 +533,8 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
         if (size > dma_ram_remain(load_start))
             size = dma_ram_remain(load_start);
         int lba = cdrom_get_setloc_lba();
-        if (lba >= 0) cd_dma_log_push(lba, load_start, size);
+        if (lba >= 0) cd_dma_log_push(lba, load_start, size,
+                                      memory_get_ram_ptr() + load_start);
 
         /* B-1: capture overlay bytes into the write-once capture set.
          * overlay_capture_on_dma auto-activates after game handoff and is a

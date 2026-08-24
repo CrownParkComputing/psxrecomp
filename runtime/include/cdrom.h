@@ -51,6 +51,7 @@ void cdrom_warm_route_stats_json(char* out, int cap);
  * Diagnostics only: recording never changes CD scheduling or delivery. */
 void cdrom_timing_reset(void);
 void cdrom_timing_stats_json(char* out, int cap);
+int cdrom_get_delivered_lba(void);
 
 /* Per-record view of the same ring, for localising a single lost/skipped
  * sector rather than summarising thousands. */
