@@ -198,11 +198,10 @@ typedef struct CDROMDebugState {
      * sector was deferred rather than allowed to clobber an unconsumed one.
      * Nonzero is healthy (the guest was busy and the enhancement waited);
      * int1_lost rising while the speed divisor != 1 is the regression. */
-    /* Ring diagnostics (probe build): starved = a drain found its slot
-     * exhausted while another slot held unread data. */
+    /* Sector-ring tripwires: starved = a drain found its slot exhausted
+     * while the writer had moved on (must stay 0); dropped = an unread slot
+     * was overwritten because the guest fell a full ring behind. */
     uint64_t ring_starved;
-    uint64_t ring_norq_refill;
-    uint64_t ring_read_moves;
     uint64_t ring_dropped;
     uint64_t accel_consumer_waits;
     uint64_t accel_consumer_wait_cycles;

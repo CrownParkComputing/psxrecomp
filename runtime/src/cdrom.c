@@ -176,34 +176,14 @@ static uint64_t s_ring_dropped;   /* unread slot overwritten: guest a ring behin
 #define RB_ (s_sector_ring[s_ring_read])
 static int rb_available(void) { return RB_.size > 0 && RB_.pos < RB_.size; }
 
-/* ---- DIAGNOSTIC INSTRUMENTATION (this build is a probe, not a fix) -------
- * Three ring attempts failed with byte-identical numbers, so the notification
- * path -- the only thing that differed between them -- was never the cause.
- * The remaining suspect is deliver_read_sector_without_irq(): it raises NO
- * INT1 by design, existing purely to refill the buffer so an in-flight
- * multi-sector DMA keeps draining. With one buffer the refill lands in the
- * buffer the DMA is reading and the transfer flows. With a ring it lands in a
- * NEW slot, and nothing moves the read pointer there, so the DMA starves
- * mid-transfer and the guest retries -- which is what the duplicated Setlocs
- * and 2-7 repeated reads look like.
- *
- * s_ring_starved is the decisive number. Non-zero = confirmed. Zero = the
- * ring fails for some other reason and this hypothesis is dead too. */
-static uint64_t s_ring_starved;      /* drain blocked while a newer slot had data */
-static uint64_t s_ring_norq_refill;  /* no-IRQ refills that landed off the read slot */
-static uint64_t s_ring_read_moves;   /* times an INT1 moved the read pointer */
-
-static int ring_other_slot_has_data(void) {
-    for (int i = 0; i < CDROM_NUM_SECTOR_BUFFERS; i++) {
-        if (i == s_ring_read) continue;
-        if (s_sector_ring[i].size > 0 && s_sector_ring[i].pos < s_sector_ring[i].size)
-            return 1;
-    }
-    return 0;
-}
+/* Regression tripwire. The ring once stranded a sector in a slot nothing
+ * could reach, starving over a million drains; this stays as an O(1) check
+ * so that can never come back silently. Non-zero means a drain found its
+ * slot exhausted while the writer had already moved on. */
+static uint64_t s_ring_starved;
 
 static void ring_note_starved(void) {
-    if (!rb_available() && ring_other_slot_has_data()) s_ring_starved++;
+    if (!rb_available() && s_ring_read != s_ring_write) s_ring_starved++;
 }
 
 static uint8_t last_sector_buffer[SECTOR_BUFFER_SIZE];
@@ -1515,6 +1495,23 @@ static void clear_sector_buffer(void) {
 static uint8_t  pending_dataready;        /* 0/1: INT1 awaiting presentation */
 static uint8_t  pending_dataready_stat;   /* stat_reg snapshot at pend time */
 static int      pending_dataready_slot;   /* ring slot THIS INT1 announces */
+/* Absolute cycle at which a pended data-ready may be PRESENTED, or 0.
+ *
+ * Presenting it synchronously inside the guest's ack write is what loses the
+ * sector. The ISR clears the interrupt and only then sets up its DMA; if the
+ * next INT1's response FIFO and read slot are installed in between, the
+ * transfer drains the WRONG sector. Measured: the guest acks sector 110's
+ * INT1, 111 is presented instantly, and 111 lands in the buffer meant for 110
+ * -- which is why psx-runtime fills 109,111,111,113,113 where DuckStation
+ * fills 109,110,111,112,113.
+ *
+ * DuckStation guards the same window (QueueDeliverAsyncInterrupt): after an
+ * ack, diff since the last interrupt is 0, so it always schedules rather than
+ * delivering inline, "give it enough time to read the response out ... the
+ * real console does something similar anyway, the INT1 task won't run
+ * immediately after the INT3 is cleared." */
+#define CDROM_PEND_PRESENT_DELAY 500
+static uint64_t pending_present_due;
 static uint64_t s_int1_pended;            /* INT1s that had to wait for ack */
 static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
 
@@ -1523,6 +1520,7 @@ static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
 static void cdrom_clear_pending_dataready(void) {
     pending_dataready = 0;
     pending_dataready_stat = 0;
+    pending_present_due = 0;
     s_cd_timing_pending_seq = UINT64_MAX;
 }
 
@@ -1771,7 +1769,6 @@ static int deliver_read_sector(void) {
     response_clear();
     response_push(stat_reg);
     /* Delivered immediately: this INT1 announces the slot just filled. */
-    if (s_ring_read != s_ring_write) s_ring_read_moves++;
     s_ring_read = s_ring_write;
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
@@ -1793,7 +1790,6 @@ static int deliver_read_sector_without_irq(void) {
          * stranded exactly 70 refills -- the same 70 that showed up as
          * int1_lost, with every Setloc retried. This one line is the whole
          * difference between the ring regressing and the ring working. */
-        if (s_ring_write != s_ring_read) s_ring_norq_refill++;
         s_ring_read = s_ring_write;
     }
     return delivered;
@@ -2624,12 +2620,12 @@ static void process_read_stream(uint32_t cycles) {
  * register clears). Called from the irq_flag ack write. */
 static void present_pending_dataready(void) {
     if (!pending_dataready || irq_flag != 0) return;
+    pending_present_due = 0;
     uint64_t timing_seq = s_cd_timing_pending_seq;
     pending_dataready = 0;
     s_cd_timing_pending_seq = UINT64_MAX;
     response_clear();
     response_push(pending_dataready_stat);
-    if (s_ring_read != pending_dataready_slot) s_ring_read_moves++;
     s_ring_read = pending_dataready_slot;   /* the slot this INT1 announced */
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
@@ -2656,6 +2652,7 @@ void cdrom_init(const char* cue_path) {
     cdrom_irq_generation = 0;
     cdrom_intc_latched_generation = 0;
     cdrom_irq_present_due = 0;
+    pending_present_due = 0;
     param_count = 0;
     response_read = 0;
     response_count = 0;
@@ -2840,10 +2837,14 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             if (val & 0x40) {
                 param_count = 0;
             }
-            /* A fully-acked INT presents any pended data-ready first
-             * (Beetle CheckAIP on IRQ-register clear); then a second-response
-             * that is already past due_cyc; a queued command waits behind. */
-            present_pending_dataready();
+            /* A fully-acked INT releases any pended data-ready -- but on a
+             * SCHEDULE, not inside this store. See CDROM_PEND_PRESENT_DELAY:
+             * installing the next response and read slot before the ISR has
+             * set up its DMA makes that DMA drain the wrong sector. Then a
+             * second-response already past due_cyc; a queued command waits
+             * behind. */
+            if (pending_dataready && pending_present_due == 0)
+                pending_present_due = psx_cycle_count + CDROM_PEND_PRESENT_DELAY;
             process_pending(0);
             try_execute_queued_command();
         }
@@ -2880,6 +2881,11 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
             best = 0u;
         }
     }
+    /* Scheduled release of a pended data-ready. */
+    if (pending_present_due != 0) {
+        uint32_t d = (uint32_t)cycles_until_due(pending_present_due);
+        if (d < best) best = d;
+    }
     /* Active sector read: next data-ready in read_delay cycles. */
     if (reading && !warm_route_consumer_blocked() &&
         read_delay > 0 && (uint32_t)read_delay < best)
@@ -2895,6 +2901,13 @@ void cdrom_advance(uint32_t cycles) {
     refresh_cdrom_irq_line();
     process_pending(cycles);
     try_execute_queued_command();
+    /* Release a scheduled data-ready once its delay has elapsed and the guest
+     * has genuinely finished with the previous INT. */
+    if (pending_present_due != 0 && psx_cycle_count >= pending_present_due) {
+        pending_present_due = 0;
+        if (pending_dataready && irq_flag == 0)
+            present_pending_dataready();
+    }
     process_read_stream(cycles);
     process_cdda_stream(cycles);
     refresh_cdrom_irq_line();
@@ -2987,8 +3000,6 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->int1_pended = s_int1_pended;
     out->int1_lost = s_int1_lost;
     out->ring_starved = s_ring_starved;
-    out->ring_norq_refill = s_ring_norq_refill;
-    out->ring_read_moves = s_ring_read_moves;
     out->ring_dropped = s_ring_dropped;
     out->accel_consumer_waits = s_accel_consumer_waits;
     out->accel_consumer_wait_cycles = s_accel_consumer_wait_cycles;
@@ -3165,6 +3176,7 @@ static int cdrom_snap_emit(PstW *w) {
         WB(s_sector_ring[i].data); WI(s_sector_ring[i].size); WI(s_sector_ring[i].pos);
     }
     WI(s_ring_read); WI(s_ring_write); WI(pending_dataready_slot);
+    WI(pending_present_due ? cycles_until_due(pending_present_due) : -1);
     WB(last_sector_buffer); WI(last_sector_lba); WI(last_sector_size);
     WB(last_valid_subq); WI(last_valid_subq_available);
     /* last_sector_frame is host s_frame_count — zero on the wire so netplay
@@ -3216,6 +3228,8 @@ static int cdrom_snap_parse(PstR *r) {
         RB(s_sector_ring[i].data); RI(s_sector_ring[i].size); RI(s_sector_ring[i].pos);
     }
     RI(s_ring_read); RI(s_ring_write); RI(pending_dataready_slot);
+    { int pd; RI(pd);
+      pending_present_due = (pd < 0) ? 0 : (psx_cycle_count + (uint64_t)pd); }
     RB(last_sector_buffer); RI(last_sector_lba); RI(last_sector_size);
     RB(last_valid_subq); RI(last_valid_subq_available);
     RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
