@@ -26,16 +26,18 @@ def orc(lba, **kw):
 
 
 class SummariseTest(unittest.TestCase):
-    def test_native_flags_accumulate_per_lba(self):
-        r = nd.native_rows([nat(1, pended=1), nat(1, lost=1)])
-        self.assertEqual(r[1]["records"], 2)
-        self.assertEqual(r[1]["pended"], 1)
-        self.assertEqual(r[1]["lost"], 1)
+    def test_latest_native_pass_wins(self):
+        """A degraded earlier pass must not poison the current one."""
+        r = nd.native_rows([nat(1, pended=1, lost=1), nat(1)])
+        self.assertEqual(r[1]["passes"], 2)
+        self.assertEqual(r[1]["lost"], 0)
+        self.assertEqual(r[1]["pended"], 0)
 
-    def test_oracle_flags_accumulate_per_lba(self):
-        r = nd.oracle_rows([orc(5, dropped=1), orc(5, redelivered=1)])
-        self.assertEqual(r[5]["dropped"], 1)
-        self.assertEqual(r[5]["redelivered"], 1)
+    def test_latest_oracle_pass_wins(self):
+        r = nd.oracle_rows([orc(5, dropped=1), orc(5, delivered=1, drained=1)])
+        self.assertEqual(r[5]["dropped"], 0)
+        self.assertEqual(r[5]["delivered"], 1)
+        self.assertEqual(r[5]["passes"], 2)
 
     def test_unknown_lba_skipped(self):
         self.assertEqual(nd.native_rows([{"data": 1}]), {})
@@ -43,6 +45,11 @@ class SummariseTest(unittest.TestCase):
     def test_marks_string(self):
         r = nd.oracle_rows([orc(5, dropped=1, drained=1)])
         self.assertEqual(nd.marks(r[5], nd.ORC_KEYS), "DD---D")
+
+    def test_repeated_clean_reads_are_not_degraded(self):
+        """Replaying the scene is normal; only a lost notification is not."""
+        r = nd.native_rows([nat(1), nat(1)])
+        self.assertEqual(r[1]["lost"], 0)
 
 
 class InterpretTest(unittest.TestCase):
@@ -81,11 +88,12 @@ class DegradedSessionTest(unittest.TestCase):
         r = nd.native_rows([nat(110, lost=1)])
         self.assertTrue(r[110]["lost"])
 
-    def test_repeated_reads_mark_degraded(self):
-        r = nd.native_rows([nat(110), nat(110)])
-        self.assertGreater(r[110]["records"], 1)
+    def test_degradation_is_loss_not_replay_count(self):
+        """Multiple passes are legitimate; the rings span the whole session."""
+        r = nd.native_rows([nat(110), nat(110), nat(110)])
+        self.assertEqual(r[110]["passes"], 3)
+        self.assertEqual(r[110]["lost"], 0)
 
-    def test_clean_session_has_single_records_and_no_loss(self):
-        r = nd.native_rows([nat(110), nat(111, pended=1)])
-        self.assertTrue(all(v["records"] == 1 and not v["lost"]
-                            for v in r.values()))
+    def test_latest_pass_degraded_is_caught(self):
+        r = nd.native_rows([nat(110), nat(110, lost=1)])
+        self.assertTrue(r[110]["lost"])

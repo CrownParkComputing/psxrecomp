@@ -38,34 +38,40 @@ KIND = "psx-notify-diff"
 
 
 def native_rows(entries):
-    """LBA -> flag summary, from psx-runtime's per-sector timing records."""
+    """LBA -> flags from the MOST RECENT record for that sector.
+
+    These rings accumulate for the whole session, so replaying the scene
+    legitimately produces several records per sector -- accumulating them
+    conflates passes, and one earlier degraded pass then poisons every
+    sector's summary. Entries arrive oldest-first, so the last one wins.
+    """
     out = {}
     for e in entries:
         lba = int(e.get("lba", -1))
         if lba < 0:
             continue
-        r = out.setdefault(lba, {"records": 0, "data": 0, "dma": 0,
-                                 "pended": 0, "lost": 0})
-        r["records"] += 1
-        for k in ("data", "dma", "pended", "lost"):
-            r[k] += int(e.get(k, 0))
+        prev = out.get(lba, {"passes": 0})
+        out[lba] = {"passes": prev["passes"] + 1,
+                    "data": int(e.get("data", 0)),
+                    "dma": int(e.get("dma", 0)),
+                    "pended": int(e.get("pended", 0)),
+                    "lost": int(e.get("lost", 0))}
     return out
 
 
 def oracle_rows(entries):
-    """LBA -> flag summary, from the oracle's per-sector notification events."""
+    """LBA -> flags from the MOST RECENT event for that sector. See above."""
     out = {}
     for e in entries:
         lba = int(e.get("lba", -1))
         if lba < 0:
             continue
-        r = out.setdefault(lba, {"records": 0, "data": 0, "dropped": 0,
-                                 "queued": 0, "delivered": 0,
-                                 "redelivered": 0, "drained": 0})
-        r["records"] += 1
+        prev = out.get(lba, {"passes": 0})
+        row = {"passes": prev["passes"] + 1}
         for k in ("data", "dropped", "queued", "delivered", "redelivered",
                   "drained"):
-            r[k] += int(e.get(k, 0))
+            row[k] = int(e.get(k, 0))
+        out[lba] = row
     return out
 
 
@@ -141,15 +147,13 @@ def main():
     # `lost` set, or a sector read more than once, is the degraded state, not
     # the clean one. Refuse rather than diff it -- the first run of this tool
     # compared a stale 2x-experiment session against a healthy oracle.
-    dirty = [lba for lba, r in nat.items()
-             if r["lost"] or r["records"] > 1]
+    dirty = [lba for lba, r in nat.items() if r["lost"]]
     if dirty:
-        print(f"psx-runtime's records are from a DEGRADED session: "
-              f"{len(dirty)} sector(s) show lost notifications or repeated "
-              f"reads (e.g. LBA {min(dirty)}). That is the failure state, not "
-              f"the baseline, so this diff would compare unlike things.\n"
-              f"Restart psx-runtime (it picks up the reverted authentic-1x "
-              f"game.toml), replay the scene, and rerun.", file=sys.stderr)
+        print(f"psx-runtime's most recent pass is DEGRADED: {len(dirty)} "
+              f"sector(s) lost their notification (e.g. LBA {min(dirty)}). "
+              f"That is the failure state, not the baseline.\n"
+              f"Restart psx-runtime -- it picks up the reverted authentic-1x "
+              f"game.toml -- replay the scene, and rerun.", file=sys.stderr)
         return 1
 
     if not nat or not orc:
@@ -164,8 +168,8 @@ def main():
           f"   oracle {'/'.join(k[:3] for k in ORC_KEYS)}")
     for lba in range(args.lba_lo, args.lba_hi + 1):
         n, o = nat.get(lba), orc.get(lba)
-        ns = f"{marks(n, NAT_KEYS)} x{n['records']}" if n else "--"
-        os_ = f"{marks(o, ORC_KEYS)} x{o['records']}" if o else "--"
+        ns = f"{marks(n, NAT_KEYS)} p{n['passes']}" if n else "--"
+        os_ = f"{marks(o, ORC_KEYS)} p{o['passes']}" if o else "--"
         print(f"{lba:>8}  {ns:>27}   {os_}")
 
     notes = interpret(nat, orc, args.lba_lo, args.lba_hi)
