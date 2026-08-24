@@ -12032,6 +12032,12 @@ static void handle_cd_read_log(int id, const char *json)
                                           uint32_t first_words[2]);
 
     int tail = json_get_int(json, "tail", 256);
+    /* Optional LBA window + output cap, matching the oracle's cd_read_log so
+     * one call shape returns the same span from both emulators. */
+    int lba_lo = json_get_int(json, "lba_lo", -1);
+    int lba_hi = json_get_int(json, "lba_hi", -1);
+    int max_entries = json_get_int(json, "max_entries", 65536);
+    int emitted_rows = 0;
     uint32_t total = cd_dma_log_get_total();
     uint32_t cap   = 65536;
     uint32_t avail = total < cap ? total : cap;
@@ -12046,6 +12052,10 @@ static void handle_cd_read_log(int id, const char *json)
         int lba, dlba; uint32_t dest, size, frame, fw[2];
         cd_dma_log_get_entry2(i, &lba, &dlba, &dest, &size, &frame, fw);
         if (lba < 0) continue;
+        if (emitted_rows >= max_entries) break;
+        if (lba_lo >= 0 && dlba < lba_lo && lba < lba_lo) continue;
+        if (lba_hi >= 0 && dlba > lba_hi && lba > lba_hi) continue;
+        emitted_rows++;
         send_fmt("%s{\"lba\":%d,\"delivered_lba\":%d,\"dest\":\"0x%08X\","
                  "\"size\":%u,\"frame\":%u,"
                  "\"first_words\":[\"0x%08X\",\"0x%08X\"]}",

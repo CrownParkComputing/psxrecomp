@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--ds-port", type=int, default=DEFAULT_DUCKSTATION_PORT)
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--tail", type=int, default=4096)
+    ap.add_argument("--max-entries", type=int, default=256,
+                    help="server-side cap; the oracle's socket buffer "
+                         "truncates a large reply and the read then hangs")
     ap.add_argument("--lba-lo", type=int, default=125080)
     ap.add_argument("--lba-hi", type=int, default=125130)
     ap.add_argument("--out", default="analysis/frames/slot_diff.json")
@@ -82,15 +85,20 @@ def main():
 
     sides = {}
     for label, port in (("native", args.port), ("oracle", args.ds_port)):
+        conn = DebugConn(args.host, port, args.timeout)
         try:
-            rep = DebugConn(args.host, port, args.timeout).cmd(
-                "cd_read_log", tail=args.tail)
+            # The oracle filters server-side (its socket buffer truncates a
+            # large reply and the read then hangs); psx-runtime ignores the
+            # extra fields harmlessly, so one call shape serves both.
+            rep = conn.cmd("cd_read_log", tail=args.tail,
+                           lba_lo=args.lba_lo, lba_hi=args.lba_hi,
+                           max_entries=args.max_entries)
             sides[label] = rep.get("entries", [])
         except DebugError as e:
             print(f"{label}: {e}", file=sys.stderr)
             if label == "oracle":
-                print("  (rebuild + reinstall the oracle so it has cd_read_log,"
-                      " then replay the scene there)", file=sys.stderr)
+                print("  (rebuild + reinstall the oracle, restart it, then "
+                      "replay the scene there)", file=sys.stderr)
             return 2
 
     nat = slot_map(sides["native"], args.lba_lo, args.lba_hi)

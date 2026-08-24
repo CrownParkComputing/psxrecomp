@@ -208,10 +208,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..82736e1c
+index 00000000..9a19bf0e
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1332 @@
+@@ -0,0 +1,1348 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -1299,30 +1299,46 @@ index 00000000..82736e1c
 +  // ---- screenshot ----
 +  else if (std::strcmp(cmd, "cd_read_log") == 0)
 +  {
++    // Filter SERVER-SIDE. Write() goes through BufferedStreamSocket, whose
++    // fixed buffer silently truncates a large reply -- the same limit that
++    // caps read_ram at 16 KB. An unfiltered dump of this log is ~570 KB, so
++    // the client received 64 KB and then waited forever. Callers pass the LBA
++    // window they care about; the reply stays a few KB.
 +    int tail = json_get_int(json, "tail", 512);
 +    if (tail < 1) tail = 1;
 +    if (tail > static_cast<int>(CD_DMA_LOG_CAP)) tail = CD_DMA_LOG_CAP;
++    const int lba_lo = json_get_int(json, "lba_lo", -1);
++    const int lba_hi = json_get_int(json, "lba_hi", -1);
++    const int max_out = json_get_int(json, "max_entries", 256);
 +    const u64 total = s_cd_dma_log_seq;
 +    u64 start = (total > static_cast<u64>(tail)) ? total - static_cast<u64>(tail) : 0;
 +    if (total > CD_DMA_LOG_CAP && start < total - CD_DMA_LOG_CAP)
 +      start = total - CD_DMA_LOG_CAP;
 +    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
 +    bool first = true;
-+    for (u64 seq = start; seq < total; seq++)
++    int emitted = 0;
++    for (u64 seq = start; seq < total && emitted < max_out; seq++)
 +    {
 +      const CdDmaEntry& e = s_cd_dma_log[seq % CD_DMA_LOG_CAP];
++      if (lba_lo >= 0 && e.lba < lba_lo)
++        continue;
++      if (lba_hi >= 0 && e.lba > lba_hi)
++        continue;
 +      resp += fmt::format(
 +        R"({}{{"lba":{},"delivered_lba":{},"dest":"0x{:08X}","size":{},"frame":{},"first_words":["0x{:08X}","0x{:08X}"]}})",
 +        first ? "" : ",", e.lba, e.lba, e.dest, e.size, e.frame, e.first_words[0], e.first_words[1]);
 +      first = false;
++      emitted++;
 +    }
-+    resp += "]}";
++    resp += fmt::format(R"(],"emitted":{}}})", emitted);
 +    SendJSON(resp);
 +  }
 +  else if (std::strcmp(cmd, "cd_history") == 0)
 +  {
 +    int count = json_get_int(json, "count", 512);
 +    if (count < 1) count = 1;
++    // Cap for the same BufferedStreamSocket reason as cd_read_log above.
++    if (count > 600) count = 600;
 +    if (count > static_cast<int>(CD_CMD_HISTORY_CAP)) count = CD_CMD_HISTORY_CAP;
 +    const u64 total = s_cd_cmd_history_seq;
 +    u64 start = (total > static_cast<u64>(count)) ? total - static_cast<u64>(count) : 0;
