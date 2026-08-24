@@ -890,6 +890,15 @@ function(psxrecomp_add_runtime_target target)
             set_property(SOURCE "${_full_src}" APPEND PROPERTY
                 COMPILE_DEFINITIONS
                     "$<$<CONFIG:Release>:PSX_GAME_GENERATED_FAST_CYC=1>")
+            # GCC 16.1.0 ICEs in psx_pgxp_fast_alu() for the current
+            # SCES-028.45 full_123 TU when fast cycles and PGXP meet at O2/O3.
+            # Keep this fallback local; do not lower optimization globally.
+            get_filename_component(_full_src_name "${_full_src}" NAME)
+            if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
+               _full_src_name STREQUAL "SCES_028.45_full_123.c")
+                set_property(SOURCE "${_full_src}" APPEND PROPERTY
+                    COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>")
+            endif()
             if(PSX_GAME_TIMING_RUNS)
                 set_property(SOURCE "${_full_src}" APPEND PROPERTY
                     COMPILE_DEFINITIONS
