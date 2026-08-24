@@ -137,7 +137,13 @@ def main() -> int:
         raise AssertionError("new reference image can reuse stale validity")
     reset = memory[
         memory.index("void dirty_ram_reset_for_boot("):
-        memory.index("void overlay_watch_set_range(")]
+        # memory.c has a forward declaration of overlay_watch_set_range above
+        # the boot-reset implementation.  Anchor the terminator after the
+        # reset start so the guard inspects the implementation, not that
+        # declaration.
+        memory.index(
+            "void overlay_watch_set_range(",
+            memory.index("void dirty_ram_reset_for_boot("))]
     if "dirty_ram_text_cache_reset(1);" not in reset:
         raise AssertionError("boot reset can reuse stale validity")
     low_clear = memory[
