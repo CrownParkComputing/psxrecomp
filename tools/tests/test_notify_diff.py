@@ -67,3 +67,25 @@ class InterpretTest(unittest.TestCase):
     def test_sector_missing_on_one_side_is_not_interpreted(self):
         n = nd.native_rows([nat(110)])
         self.assertEqual(nd.interpret(n, {}, 100, 120), [])
+
+
+class DegradedSessionTest(unittest.TestCase):
+    """A contaminated native session must not be diffed.
+
+    The first live run compared a stale disc_speed=2x session (lost
+    notifications, sectors read 2-7 times) against a healthy oracle and
+    concluded the notification patterns agreed.
+    """
+
+    def test_lost_flag_marks_degraded(self):
+        r = nd.native_rows([nat(110, lost=1)])
+        self.assertTrue(r[110]["lost"])
+
+    def test_repeated_reads_mark_degraded(self):
+        r = nd.native_rows([nat(110), nat(110)])
+        self.assertGreater(r[110]["records"], 1)
+
+    def test_clean_session_has_single_records_and_no_loss(self):
+        r = nd.native_rows([nat(110), nat(111, pended=1)])
+        self.assertTrue(all(v["records"] == 1 and not v["lost"]
+                            for v in r.values()))

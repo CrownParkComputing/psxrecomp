@@ -24,7 +24,7 @@ index e2d0294b..b290bd35 100644
    settings.cpp
    settings.h
 diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
-index c36b9341..78e66fa8 100644
+index c36b9341..39f7c5b9 100644
 --- a/src/core/cdrom.cpp
 +++ b/src/core/cdrom.cpp
 @@ -2,6 +2,7 @@
@@ -81,7 +81,7 @@ index c36b9341..78e66fa8 100644
      if (s_state.pending_async_interrupt == static_cast<u8>(Interrupt::DataReady))
 +    {
        s_state.current_read_sector_buffer = s_state.current_write_sector_buffer;
-+      PSXRecompDebug::FlagCdSector(s_state.current_read_sector_buffer, PSXRecompDebug::CDSE_DELIVERED);
++      PSXRecompDebug::FlagCdSectorDelivered(s_state.current_read_sector_buffer);
 +    }
  
      s_state.response_fifo.Clear();
@@ -118,7 +118,7 @@ index c36b9341..78e66fa8 100644
    // Buffer complete?
    if (sb.position >= sb.size)
    {
-+    PSXRecompDebug::FlagCdSector(s_state.current_read_sector_buffer, PSXRecompDebug::CDSE_DRAINED);
++    PSXRecompDebug::FlagCdSectorDrained();
      sb.position = 0;
      sb.size = 0;
    }
@@ -254,10 +254,10 @@ index 975f8d5d..05fa3600 100644
  
 diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
 new file mode 100644
-index 00000000..aeed3ae5
+index 00000000..33a95adc
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.cpp
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1476 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
 +// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
@@ -612,6 +612,35 @@ index 00000000..aeed3ae5
 +    s_cd_buf_last[buffer] = seq;
 +    s_cd_buf_valid[buffer] = true;
 +  }
++}
++
++// The sector whose INT1 was last presented -- i.e. the one the guest is
++// actually draining. Slot reuse (8 slots, many sectors) means looking a
++// sector up by buffer index attributes a later drain to a NEWER entry, which
++// is why every row reported drained=0.
++static u64 s_cd_delivered_seq = 0;
++static bool s_cd_delivered_valid = false;
++
++void FlagCdSectorDelivered(u32 buffer)
++{
++  if (buffer < 16 && s_cd_buf_valid[buffer])
++  {
++    s_cd_delivered_seq = s_cd_buf_last[buffer];
++    s_cd_delivered_valid = true;
++  }
++  FlagCdSector(buffer, CDSE_DELIVERED);
++}
++
++void FlagCdSectorDrained()
++{
++  if (!s_cd_delivered_valid)
++    return;
++  const u64 seq = s_cd_delivered_seq;
++  if (s_cd_sector_seq - seq > CD_SECTOR_LOG_CAP)
++    return;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  if (e.seq == seq)
++    e.flags |= CDSE_DRAINED;
 +}
 +
 +void FlagCdSector(u32 buffer, u8 bits)
@@ -1707,10 +1736,10 @@ index 00000000..aeed3ae5
 +}
 diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
 new file mode 100644
-index 00000000..be76188a
+index 00000000..4ac2ebe8
 --- /dev/null
 +++ b/src/core/psxrecomp_debug_server.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +// PSXRecomp TCP debug server for DuckStation
 +// JSON-over-newline protocol on localhost:4371
 +// Same protocol as the PSXRecomp runner debug server.
@@ -1775,6 +1804,8 @@ index 00000000..be76188a
 +};
 +void RecordCdSector(s32 lba, u32 buffer);
 +void FlagCdSector(u32 buffer, u8 bits);
++void FlagCdSectorDelivered(u32 buffer);
++void FlagCdSectorDrained();
 +
 +} // namespace PSXRecompDebug
 diff --git a/src/core/system.cpp b/src/core/system.cpp

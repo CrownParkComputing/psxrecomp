@@ -137,6 +137,21 @@ def main():
               "scene there)", file=sys.stderr)
         return 2
 
+    # A contaminated psx-runtime session invalidates the whole comparison:
+    # `lost` set, or a sector read more than once, is the degraded state, not
+    # the clean one. Refuse rather than diff it -- the first run of this tool
+    # compared a stale 2x-experiment session against a healthy oracle.
+    dirty = [lba for lba, r in nat.items()
+             if r["lost"] or r["records"] > 1]
+    if dirty:
+        print(f"psx-runtime's records are from a DEGRADED session: "
+              f"{len(dirty)} sector(s) show lost notifications or repeated "
+              f"reads (e.g. LBA {min(dirty)}). That is the failure state, not "
+              f"the baseline, so this diff would compare unlike things.\n"
+              f"Restart psx-runtime (it picks up the reverted authentic-1x "
+              f"game.toml), replay the scene, and rerun.", file=sys.stderr)
+        return 1
+
     if not nat or not orc:
         for label, m in (("psx-runtime", nat), ("oracle", orc)):
             if not m:
