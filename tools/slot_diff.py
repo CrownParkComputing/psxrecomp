@@ -106,10 +106,27 @@ def main():
     print(f"native: {len(nat)} slot(s) in LBA {args.lba_lo}..{args.lba_hi}; "
           f"oracle: {len(orc)}")
     if not nat or not orc:
-        for label, m in (("native", nat), ("oracle", orc)):
-            if not m:
-                print(f"  {label} has none -- play the palette load there and "
-                      f"rerun.")
+        # Distinguish "never loaded it" from "loaded it, then the ring
+        # scrolled past" -- the second is what happens when the effect is
+        # followed by FMV, and it needs a different response from the user.
+        for label, m, raw in (("native", nat, sides["native"]),
+                              ("oracle", orc, sides["oracle"])):
+            if m:
+                continue
+            lbas = [int(e.get("delivered_lba", e.get("lba", -1)))
+                    for e in raw]
+            lbas = [v for v in lbas if v >= 0]
+            if lbas and min(lbas) > args.lba_hi:
+                print(f"  {label}: the log holds LBA {min(lbas)}..{max(lbas)} "
+                      f"-- entirely PAST the palette load, so the ring "
+                      f"scrolled. Replay the scene and run this promptly, "
+                      f"before FMV or further loading flushes it.")
+            elif lbas:
+                print(f"  {label}: the log holds LBA {min(lbas)}..{max(lbas)}, "
+                      f"which does not reach {args.lba_lo}..{args.lba_hi}.")
+            else:
+                print(f"  {label} has no CD DMA log at all -- is it running "
+                      f"the patched build?")
         return 1
 
     rows = compare(nat, orc)
