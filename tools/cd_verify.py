@@ -103,8 +103,10 @@ def main():
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    print("armed. Play into the scene now (through the moment the map "
-          "appears); watching for the table load …", flush=True)
+    print("armed. Play into the scene AND START THE ANIMATION (the X press); "
+          "the palette load happens at the animation itself, not when the "
+          "map appears. Watching for a load from LBA "
+          f"{args.lba_lo}..{args.lba_hi} …", flush=True)
     deadline = time.monotonic() + args.wait_secs
     loads = []
     while time.monotonic() < deadline:
@@ -118,12 +120,20 @@ def main():
         fresh = entries[max(0, len(entries) - (total - base_total)):] \
             if total > base_total else []
         loads = table_loads(fresh)
-        if any(l["dest"] >= 0x0E2718 for l in loads):
+        # Trigger on the CRITICAL load -- the one from the palette's own LBA
+        # neighbourhood. Earlier scene loads also touch these addresses (the
+        # region is a general-purpose buffer); stopping at the first of those
+        # is how a previous run of this tool analysed the wrong load and
+        # called a zero-filled table 'CORRECT'.
+        if any(args.lba_lo <= l["lba"] <= args.lba_hi for l in loads):
             break
         time.sleep(1.0)
     else:
-        print("the table load never appeared in the CD log -- was the scene "
-              "entered?")
+        seen = sorted({l["lba"] for l in loads})
+        print(f"no load from LBA {args.lba_lo}..{args.lba_hi} appeared. "
+              f"Loads that did touch the region came from LBAs {seen} -- if "
+              f"the animation was played, the palette came from one of "
+              f"those; rerun with --lba-lo/--lba-hi around it.")
         return 1
 
     time.sleep(2.0)     # let the tail of the load finish
@@ -178,8 +188,21 @@ def main():
                           ((TABLE_HI - TABLE_LO) & ~3) + 4)
     n = distinct_colours(blob)
     doc["table_distinct_colours"] = n
-    print(f"\ntable region now holds {n} distinct colour word(s) "
-          f"({'CORRECT' if n <= 8 else 'still corrupt'})")
+    words = {int.from_bytes(blob[i:i + 4], "little") & 0xFFFFFF
+             for i in range(0, len(blob) - 3, 4)}
+    # The palette's own bright words, from the ISO's sector 125112. Presence
+    # decides -- a low count alone also matches a zero-filled buffer that has
+    # not been loaded yet, which a previous run miscalled 'CORRECT'.
+    has_palette = 0x0888F8 in words and 0xB0F8F8 in words
+    if has_palette and n <= 8:
+        state = "CORRECT: the 5-colour palette is in place"
+    elif n > 32:
+        state = "STILL CORRUPT: raw file data"
+    else:
+        state = ("NOT LOADED YET: neither the palette nor the corruption -- "
+                 "the reading happened at the wrong moment")
+    doc["table_state"] = state
+    print(f"\ntable region now holds {n} distinct colour word(s) -- {state}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:

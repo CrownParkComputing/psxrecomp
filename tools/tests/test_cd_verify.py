@@ -45,3 +45,28 @@ class DeliveryTest(unittest.TestCase):
         seen = cv.analyse_records([{"lba": 1, "data": 1, "dma": 0,
                                     "pended": 0, "lost": 0}])
         self.assertNotIn(2, seen)
+
+
+class TableStateTest(unittest.TestCase):
+    """1 distinct colour is a zero-filled buffer, not a correct palette.
+
+    A previous run analysed an earlier load into the same general-purpose
+    region, read the table before the palette arrived, and called it
+    CORRECT. Presence of the palette's own words decides, not a low count.
+    """
+
+    def words_blob(self, words):
+        return b"".join(w.to_bytes(4, "little") for w in words)
+
+    def test_palette_words_from_iso_sector(self):
+        blob = self.words_blob([0x0888F8, 0xB0F8F8, 0, 0x0888F8])
+        ws = {int.from_bytes(blob[i:i + 4], "little") & 0xFFFFFF
+              for i in range(0, len(blob) - 3, 4)}
+        self.assertIn(0x0888F8, ws)
+        self.assertIn(0xB0F8F8, ws)
+
+    def test_zero_fill_is_not_the_palette(self):
+        blob = self.words_blob([0] * 64)
+        ws = {int.from_bytes(blob[i:i + 4], "little") & 0xFFFFFF
+              for i in range(0, len(blob) - 3, 4)}
+        self.assertNotIn(0x0888F8, ws)
