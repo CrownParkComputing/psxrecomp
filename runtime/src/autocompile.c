@@ -2,6 +2,7 @@
  * platform); on other hosts the spawn is a graceful no-op and the manual
  * compile_overlays.py flow still works. */
 #include "autocompile.h"
+#include "overlay_api.h"
 #include "overlay_loader.h"
 
 #include <stdarg.h>   /* autocompile_set_degraded takes a format + varargs */

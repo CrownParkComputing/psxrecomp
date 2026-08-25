@@ -16,6 +16,7 @@ name = "8 MB Main RAM"
 description = "Disabled by default. Turn this on for titles whose patches use RAM above 2 MB (for example Wipeout 3 enhanced visuals). Registers the full high window as unique DRAM."
 group = "Hardware"
 default_enabled = false
+hidden = true
 
 [[plugin]]
 feature = "8mb-ram"
