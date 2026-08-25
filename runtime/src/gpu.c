@@ -2201,6 +2201,12 @@ static uint16_t vram_write_pixels[1024 * 512];
 /* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
  * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
 static uint32_t s_d24_upload_x1 = 0;
+/* Rows written by CPU->VRAM transfers during the current 24-bit stream.
+ * Short MDEC movies leave letterbox rows holding prior 15-bit bytes; reading
+ * those bytes as RGB888 produces the colored bars seen around the FMV. */
+static uint8_t s_d24_row_written[512];
+static uint32_t gpu_display_depth_bit(void);
+static int s_d24_mdec_was_streaming = 0;
 static int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */
 static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
 static void depth24_note_upload(uint32_t x, uint32_t w);
@@ -2214,6 +2220,11 @@ static void gp0_commit_cpu_to_vram(void) {
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
     depth24_note_upload(vram_write_x, vram_write_w);
+    if (gpu_display_depth_bit()) {
+        uint32_t row;
+        for (row = 0; row < vram_write_h && row < 512u; row++)
+            s_d24_row_written[(vram_write_y + row) & 511u] = 1u;
+    }
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -2319,6 +2330,7 @@ static uint32_t hres1;            /* bits 17-18: horizontal resolution 1 */
 static uint32_t vres;             /* bit 19: vertical resolution (0=240, 1=480) */
 static uint32_t video_mode;       /* bit 20: 0=NTSC, 1=PAL */
 static uint32_t display_depth;    /* bit 21: 0=15bit, 1=24bit */
+static uint32_t gpu_display_depth_bit(void) { return display_depth & 1u; }
 static uint32_t vertical_interlace; /* bit 22 */
 
 /* Display enable (set by GP1(03h)) */
@@ -2597,6 +2609,8 @@ static void gpu_reset_state(int clear_vram) {
     s_ws_fmv_frame_cache = 0xFFFFFFFFu;
     s_ws_fmv_cached = 0;
     s_d24_upload_x1 = 0;
+    memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
+    s_d24_mdec_was_streaming = 0;
     s_d24_present_hold = 0;
     s_d24_prev_disp_h = 0;
 }
@@ -3066,10 +3080,23 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
 void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
                              uint32_t count) {
     uint32_t vy = (di->display_y + y) & 511u;
+    if (y == 0) {   /* once per presented frame (row 0 leads every loop) */
+        const int streaming = mdec_recently_active(10u);
+        if (streaming && !s_d24_mdec_was_streaming)
+            memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
+        s_d24_mdec_was_streaming = streaming;
+    }
     uint32_t base_byte_x = (di->display_x & 1023u) * 2u;
     const uint16_t* row = vram + (size_t)vy * 1024u;
     uint32_t valid = 0u;
     uint32_t x;
+
+    if (!s_d24_row_written[vy]) {
+        /* This is a letterbox row, not a packed RGB888 image row. */
+        for (x = 0; x < count; x++)
+            out[x] = 0xFF000000u;
+        return;
+    }
 
     if (base_byte_x <= 2045u)
         valid = (2045u - base_byte_x) / 3u + 1u;
@@ -5377,8 +5404,11 @@ static void gp1_display_mode(uint32_t val) {
     hres1 = val & 3;
     vres = (val >> 2) & 1;
     video_mode = (val >> 3) & 1;
-    if (new_depth != display_depth)
+    if (new_depth != display_depth) {
         s_d24_upload_x1 = 0; /* rising/falling: drop stale coverage */
+        memset(s_d24_row_written, 0, sizeof(s_d24_row_written));
+        s_d24_mdec_was_streaming = 0;
+    }
     display_depth = new_depth;
     vertical_interlace = (val >> 5) & 1;
     /* GPUSTAT.13 holds the legacy constant 0 in progressive (see the vblank
@@ -5555,6 +5585,10 @@ static int gpu_snap_parse(PstR *r) {
     RI(vram_read_active); RH(vram_read_x); RH(vram_read_y); RH(vram_read_w); RH(vram_read_h);
     RH(vram_read_col); RH(vram_read_row);
     RU(s_d24_upload_x1); RI(s_d24_present_hold); RU(s_d24_prev_disp_h);
+    /* VRAM is restored as the authoritative snapshot before this section. */
+    memset(s_d24_row_written, 1, sizeof(s_d24_row_written));
+    s_d24_mdec_was_streaming = gpu_display_depth_bit()
+        ? mdec_recently_active(10u) : 0;
 #undef RU
 #undef RI
 #undef RH
