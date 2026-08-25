@@ -733,6 +733,9 @@ DISC_ABS=$(CDPATH= cd -- "$(dirname -- "$DISC")" && pwd)/$(basename -- "$DISC")
 DISC_BASENAME=$(basename -- "$DISC_ABS")
 case "$DISC" in
     *.cue|*.CUE) ;;
+    *.bin|*.BIN|*.img|*.IMG|*.iso|*.ISO|*.car|*.CAR)
+        echo "note: raw single-file image — prefer a Redump-style .cue for multitrack discs." >&2
+        ;;
     *)
         echo "warning: prefer a Redump-style .cue (with sibling .bin tracks)." >&2
         ;;
@@ -774,7 +777,7 @@ else
 fi
 
 case "$DISC_BASENAME" in
-    *.cue|*.CUE)
+    *.cue|*.CUE|*.bin|*.BIN|*.img|*.IMG|*.iso|*.ISO|*.car|*.CAR)
         echo "== Probing disc (identity + seeds + TOC fp) =="
         if python3 "$PROBE_DISC" "$PROBE_CUE" \
             --json-out "$ROOT/disc_probe.json" \
@@ -824,7 +827,7 @@ print(m.group(1) if m else "")
         fi
         ;;
     *)
-        echo "warning: --disc is not a .cue; skipped probe autofill." >&2
+        echo "warning: --disc is not a .cue or raw image (.bin/.img/.iso/.car); skipped probe autofill." >&2
         ;;
 esac
 

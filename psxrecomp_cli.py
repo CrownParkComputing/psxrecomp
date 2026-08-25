@@ -990,10 +990,7 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
     boot_path = project_root / out_rel / boot
     working_disc = disc
     # Normalize library dumps when boot EXE missing or source looks like ISO/raw.
-    need_prep = (not boot_path.is_file()) or disc.suffix.lower() in (
-        ".iso",
-        ".ISO",
-    )
+    need_prep = (not boot_path.is_file()) or disc.suffix.lower() == ".iso"
     if need_prep or args.force_prepare:
         try:
             working_disc = run_prepare_disc(project_root, config, disc, progress)

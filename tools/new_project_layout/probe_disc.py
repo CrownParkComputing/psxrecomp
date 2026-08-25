@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Probe a Redump-style PS1 .cue (+ bins) and emit identity for game.toml / catalog.
+"""Probe a PS1 disc image and emit identity for game.toml / catalog.
+
+Accepts a Redump-style .cue (+ sibling track bins) — preferred, since only a
+cue sheet can express multitrack layouts — or a raw single-file image
+(.bin/.img/.iso/.car). The .car spelling is the official Steam re-release
+payload (an extension-renamed raw image, e.g. Tomba! Special Edition's
+t_data_u.car).
 
 Used by tools/new_project_layout/setup_project.{sh,ps1}. Prefer probing the
 source cue in place (external dumps); optionally extract only the boot EXE
@@ -35,6 +41,10 @@ USER = 2048
 USER_OFF = 24
 EXE_HDR = 0x800
 SYNC = bytes([0x00] + [0xFF] * 10 + [0x00])
+
+# Raw single-file images accepted alongside .cue. Mirrors the runtime's
+# kImageExtensions (runtime/src/disc_path.cpp).
+RAW_IMAGE_SUFFIXES = (".bin", ".img", ".iso", ".car")
 
 
 @dataclass
@@ -199,6 +209,28 @@ def compute_disc_fp(cue_path: Path, tracks: list[CueTrack], files_order: list[st
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
+def compute_disc_fp_raw(image_path: Path) -> str:
+    """psxrecomp-toc-v1 SHA-256 for a raw single-file image.
+
+    Identical to compute_disc_fp() over a one-track cue with INDEX 01
+    00:00:00, so a bare .bin/.car fingerprints the same as its equivalent
+    single-track cue mount.
+    """
+    size = image_path.stat().st_size
+    raw = size % DST_SEC == 0 and size > 0
+    sec = DST_SEC if raw else USER
+    if size % sec != 0:
+        raise SystemExit(f"image size {size} not a multiple of {sec}: {image_path}")
+    leadout = size // sec
+    canonical = (
+        "psxrecomp-toc-v1\n"
+        "tracks=1\n"
+        f"leadout={leadout}\n"
+        "t=1,a=0,start=0,pregap=0\n"
+    )
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
 def scan_jal_seeds(exe: bytes) -> list[int]:
     """Entry PC + direct JAL targets inside the boot EXE text (MotK-style)."""
     if exe[:8] != b"PS-X EXE":
@@ -326,28 +358,55 @@ def display_name_from_cue(cue_path: Path, volume_id: str) -> str:
 
 def probe(cue_path: Path) -> DiscProbe:
     cue_path = cue_path.resolve()
-    if cue_path.suffix.lower() != ".cue":
-        raise SystemExit("probe_disc expects a .cue (Redump multi-track layout)")
-
-    tracks, files_order = parse_cue(cue_path)
-    bin_path = first_binary_bin(cue_path, files_order, tracks)
-    md5, sha1, size = file_hashes(bin_path)
+    suffix = cue_path.suffix.lower()
+    is_cue = suffix == ".cue"
+    if not is_cue and suffix not in RAW_IMAGE_SUFFIXES:
+        raise SystemExit(
+            "probe_disc expects a .cue (Redump multi-track layout) or a raw "
+            "single-file image (.bin/.img/.iso/.car)"
+        )
 
     warnings: list[str] = []
     notes: list[str] = []
-    if len(tracks) == 1:
-        warnings.append(
-            "cue has only 1 TRACK — Track-01-only dumps fail multi-track "
-            "netplay/catalog gates; prefer a full Redump cue."
-        )
-
     disc_fp = ""
-    try:
-        disc_fp = compute_disc_fp(cue_path, tracks, files_order)
-    except SystemExit as e:
-        warnings.append(f"TOC fingerprint skipped: {e}")
-    except OSError as e:
-        warnings.append(f"TOC fingerprint skipped: {e}")
+
+    if is_cue:
+        tracks, files_order = parse_cue(cue_path)
+        bin_path = first_binary_bin(cue_path, files_order, tracks)
+        md5, sha1, size = file_hashes(bin_path)
+        track_count = len(tracks)
+        if track_count == 1:
+            warnings.append(
+                "cue has only 1 TRACK — Track-01-only dumps fail multi-track "
+                "netplay/catalog gates; prefer a full Redump cue."
+            )
+        try:
+            disc_fp = compute_disc_fp(cue_path, tracks, files_order)
+        except SystemExit as e:
+            warnings.append(f"TOC fingerprint skipped: {e}")
+        except OSError as e:
+            warnings.append(f"TOC fingerprint skipped: {e}")
+    else:
+        # Raw single-file image (.bin/.img/.iso/.car): one data track, no cue
+        # sheet. A raw file cannot express multitrack; if this disc has audio
+        # tracks the cue path is the only correct source.
+        bin_path = cue_path
+        md5, sha1, size = file_hashes(bin_path)
+        track_count = 1
+        warnings.append(
+            f"raw single-file image ({suffix}) — treated as one data track. "
+            "Multitrack discs need a Redump-style .cue."
+        )
+        notes.append(
+            "probed from a raw image; require_cue is false so the runtime "
+            "mounts the bare image directly."
+        )
+        try:
+            disc_fp = compute_disc_fp_raw(bin_path)
+        except SystemExit as e:
+            warnings.append(f"TOC fingerprint skipped: {e}")
+        except OSError as e:
+            warnings.append(f"TOC fingerprint skipped: {e}")
 
     print(f"  reading data track {bin_path.name} ({size} bytes)…", file=sys.stderr)
     data = bin_path.read_bytes()
@@ -444,9 +503,9 @@ def probe(cue_path: Path) -> DiscProbe:
 
     return DiscProbe(
         cue_path=str(cue_path),
-        cue_name=cue_path.name,
+        cue_name=cue_path.name if is_cue else "",
         bin_name=bin_path.name,
-        track_count=len(tracks),
+        track_count=track_count,
         data_track_size=size,
         data_track_md5=md5,
         data_track_sha1=sha1,
@@ -461,7 +520,7 @@ def probe(cue_path: Path) -> DiscProbe:
         entry_pc=f"0x{pc0:08X}",
         text_size=f"0x{t_size:08X}",
         stack_base=f"0x{s_addr:08X}",
-        require_cue=True,
+        require_cue=is_cue,
         required_disc_fp=disc_fp,
         seed_count=len(seeds),
         seed_addrs=[f"0x{a:08X}" for a in seeds],
@@ -496,7 +555,11 @@ def render_game_toml(p: DiscProbe, *, disc_rel: str, out_dir: str, players: int)
         "[prepare_disc]",
         f'out_dir = "{toml_escape(out_dir)}"',
         f'bin_name = "{toml_escape(p.bin_name)}"',
-        f'cue_name = "{toml_escape(p.cue_name)}"',
+        (
+            f'cue_name = "{toml_escape(p.cue_name)}"'
+            if p.cue_name
+            else "# cue_name omitted — raw single-file image (.bin/.img/.iso/.car)"
+        ),
         f'boot_exe = "{toml_escape(p.boot_exe)}"',
         f"known_sizes = [{p.data_track_size}]",
         "known_md5 = [",
@@ -586,7 +649,11 @@ def catalog_identity(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cue", help="path to .cue (with sibling .bin tracks)")
+    ap.add_argument(
+        "cue",
+        help="path to .cue (with sibling .bin tracks) or a raw single-file "
+        "image (.bin/.img/.iso/.car)",
+    )
     ap.add_argument("--json-out", default="", help="write probe JSON here")
     ap.add_argument("--write-game-toml", default="", help="write autofilled game.toml")
     ap.add_argument(
@@ -638,7 +705,7 @@ def main() -> int:
     for w in p.warnings:
         print(f"  warning: {w}", file=sys.stderr)
 
-    disc_rel = args.disc_rel or f"{args.out_dir.rstrip('/')}/{p.cue_name}"
+    disc_rel = args.disc_rel or f"{args.out_dir.rstrip('/')}/{p.cue_name or p.bin_name}"
 
     # Drop bulky / binary fields from JSON dumps
     payload = asdict(p)

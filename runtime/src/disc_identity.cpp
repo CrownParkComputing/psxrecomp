@@ -130,6 +130,11 @@ void fill_toc_from_mount(DiscIdentity& v, const DiscPathResolution& resolved) {
     v.from_cue = resolved.from_cue;
     v.cue_fallback = resolved.cue_fallback;
     v.upgraded_to_cue = resolved.upgraded_to_cue;
+    {
+        std::string mext = resolved.mount.extension().string();
+        for (char& c : mext) c = (char)std::tolower((unsigned char)c);
+        v.selfcontained_image = (mext == ".car");
+    }
 
     PS1::ISOReader reader;
     if (!reader.Open(resolved.mount.string())) {
@@ -189,7 +194,15 @@ void apply_netplay_disc_expect(DiscIdentity& id, const NetplayDiscExpect& expect
         return;
     }
     if (expect.require_cue) {
-        if (id.cue_fallback || !id.from_cue) {
+        // require_cue guarantees the full multi-track TOC. A self-contained
+        // official raw image (.car, e.g. Steam Tomba!'s t_data_u.car) is the
+        // whole disc in one file: for a single-track disc it carries the
+        // complete TOC, and the track-count / lead-out / fingerprint checks
+        // below pin its identity exactly as a cue mount would.
+        const bool selfcontained_single_track =
+            id.selfcontained_image && id.track_count == 1 &&
+            expect.required_tracks <= 1;
+        if ((id.cue_fallback || !id.from_cue) && !selfcontained_single_track) {
             id.netplay_ok = false;
             id.netplay_detail =
                 "Netplay requires the full .cue (with all track files), "

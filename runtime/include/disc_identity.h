@@ -45,6 +45,8 @@ struct DiscIdentity {
     bool        from_cue       = false;  // mount path is a .cue
     bool        cue_fallback   = false;  // resolver fell back from a broken cue to a bin
     bool        upgraded_to_cue = false; // caller picked bin; mounted owning cue
+    bool        selfcontained_image = false; // mount is a .car (official re-release
+                                             // payload: whole disc in one raw file)
     bool        toc_opened     = false;  // ISOReader::Open succeeded on mount
     int         track_count    = 0;      // >= 1 when toc_opened
     uint32_t    leadout_lba    = 0;      // iso sector count (GetTD track 0)

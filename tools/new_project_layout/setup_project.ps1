@@ -492,7 +492,9 @@ if ($useCi) {
 
 $DiscAbs = (Resolve-Path -LiteralPath $Disc).Path
 $DiscBasename = Split-Path -Leaf $DiscAbs
-if ($DiscBasename -notmatch '\.cue$') {
+if ($DiscBasename -match '\.(bin|img|iso|car)$') {
+    Write-Host "note: raw single-file image -- prefer a Redump-style .cue for multitrack discs."
+} elseif ($DiscBasename -notmatch '\.cue$') {
     Write-Warning "Prefer a Redump-style .cue (with sibling .bin tracks)."
 }
 $DiscOut = Join-Path $Root "disc"
@@ -537,7 +539,7 @@ print("  disc staged under disc/ (gitignored -- never commit dumps)")
 
 $Probed = $false
 $SeedCount = 0
-if ($DiscBasename -match '\.cue$') {
+if ($DiscBasename -match '\.(cue|bin|img|iso|car)$') {
     Write-Host "== Probing disc (identity + seeds + TOC fp) =="
     try {
         python $ProbeDisc $ProbeCue `
@@ -589,7 +591,7 @@ print(m.group(1) if m else '')
         Write-Warning "Disc probe failed -- left template game.toml; fill by hand."
     }
 } else {
-    Write-Warning "-Disc is not a .cue; skipped probe autofill."
+    Write-Warning "-Disc is not a .cue or raw image (.bin/.img/.iso/.car); skipped probe autofill."
 }
 
 if ($doBoxart) {
