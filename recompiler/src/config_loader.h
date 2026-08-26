@@ -397,6 +397,7 @@ struct RuntimeConfig {
     //   grading  0 off, 1 vibrant (vibrance + gentle contrast)
     //   fxaa     luma-edge antialiasing over the finished frame
     double                video_bloom   = 0.0;
+    double                video_bloom_threshold = 0.80;
     int                   video_grading = 0;
     bool                  video_fxaa    = false;
 

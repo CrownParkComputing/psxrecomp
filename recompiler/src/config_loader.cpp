@@ -611,6 +611,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                     "[video] bloom out of range (0..4): {}", n));
             rt.video_bloom = n;
         }
+        if (video.contains("bloom_threshold")) {
+            const auto n = toml::find<double>(video, "bloom_threshold");
+            if (n <= 0.0 || n >= 1.0)
+                throw std::runtime_error(fmt::format(
+                    "[video] bloom_threshold must be in (0,1): {}", n));
+            rt.video_bloom_threshold = n;
+        }
         if (video.contains("grading")) {
             const auto mode = toml::find<std::string>(video, "grading");
             if      (mode == "off")     rt.video_grading = 0;

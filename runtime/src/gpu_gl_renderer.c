@@ -4080,6 +4080,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
  * earlier stage and composes with this one. */
 
 static float  s_postfx_bloom   = 0.0f;   /* 0 = off; sane range 0.1 .. 2.0 */
+static float  s_postfx_thresh  = 0.80f;  /* bright-pass cut; 2D UI sits just under */
 static int    s_postfx_grading = 0;      /* 0 off, 1 vibrant */
 static int    s_postfx_fxaa    = 0;
 static int    s_postfx_env_done = 0;
@@ -4174,12 +4175,13 @@ static const char *POST_FXAA_FS =
     "  frag = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);\n"
     "}\n";
 
-void gl_renderer_set_postfx(float bloom, int grading, int fxaa) {
+void gl_renderer_set_postfx(float bloom, int grading, int fxaa, float threshold) {
     if (!(bloom > 0.0f)) bloom = 0.0f;
     if (bloom > 4.0f)    bloom = 4.0f;
     s_postfx_bloom   = bloom;
     s_postfx_grading = grading ? 1 : 0;
     s_postfx_fxaa    = fxaa ? 1 : 0;
+    if (threshold > 0.0f && threshold < 1.0f) s_postfx_thresh = threshold;
 }
 
 /* Env overrides so the chain can be tuned without a rebuild:
@@ -4189,11 +4191,37 @@ static void postfx_env_once(void) {
     if (s_postfx_env_done) return;
     s_postfx_env_done = 1;
     if ((e = getenv("PSX_BLOOM")))   s_postfx_bloom = (float)atof(e);
+    if ((e = getenv("PSX_BLOOM_THRESHOLD"))) s_postfx_thresh = (float)atof(e);
     if ((e = getenv("PSX_GRADING")))
         s_postfx_grading = (strcmp(e, "off") && strcmp(e, "0")) ? 1 : 0;
     if ((e = getenv("PSX_FXAA")))    s_postfx_fxaa = atoi(e) != 0;
     if (s_postfx_bloom < 0.0f) s_postfx_bloom = 0.0f;
     if (s_postfx_bloom > 4.0f) s_postfx_bloom = 4.0f;
+}
+
+/* Live A/B of the whole chain. Cycles all-off -> the configured settings, so
+ * a title can be compared against its faithful look without a restart (the
+ * 2D-heavy screens are exactly where bloom and FXAA are worth questioning).
+ * Returns 1 when the chain is now on. */
+static float s_postfx_cfg_bloom = 0.0f;
+static int   s_postfx_cfg_grading = 0, s_postfx_cfg_fxaa = 0, s_postfx_cfg_saved = 0;
+
+int gl_renderer_cycle_postfx(void) {
+    postfx_env_once();
+    if (!s_postfx_cfg_saved) {
+        s_postfx_cfg_bloom = s_postfx_bloom;
+        s_postfx_cfg_grading = s_postfx_grading;
+        s_postfx_cfg_fxaa = s_postfx_fxaa;
+        s_postfx_cfg_saved = 1;
+    }
+    if (s_postfx_bloom > 0.0f || s_postfx_grading || s_postfx_fxaa) {
+        s_postfx_bloom = 0.0f; s_postfx_grading = 0; s_postfx_fxaa = 0;
+        return 0;
+    }
+    s_postfx_bloom = s_postfx_cfg_bloom;
+    s_postfx_grading = s_postfx_cfg_grading;
+    s_postfx_fxaa = s_postfx_cfg_fxaa;
+    return (s_postfx_bloom > 0.0f || s_postfx_grading || s_postfx_fxaa);
 }
 
 static int postfx_active(void) {
@@ -4307,8 +4335,8 @@ static void postfx_apply(int ww, int wh) {
         glViewport(0, 0, s_post_bw, s_post_bh);
         p_glUseProgram(s_post_bright_prog);
         p_glUniform1i(s_post_bright_uTex, 0);
-        p_glUniform1f(s_post_bright_uThr, 0.62f);
-        p_glUniform1f(s_post_bright_uKnee, 0.28f);
+        p_glUniform1f(s_post_bright_uThr, s_postfx_thresh);
+        p_glUniform1f(s_post_bright_uKnee, 0.18f);
         p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_post_scene_tex);
         post_draw_fullscreen();

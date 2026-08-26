@@ -1147,6 +1147,7 @@ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitr
 static float         g_video_bloom    = 0.0f;
 static int           g_video_grading  = 0;   /* 0=off, 1=vibrant */
 static int           g_video_fxaa     = 0;
+static float         g_video_bloom_thresh = 0.80f;
 static std::string   g_native_music_dir;   /* [audio] native_music_dir */
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
@@ -6235,6 +6236,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                                  (int)mod)) {
                     fps_telemetry_toggle();
                 }
+                else if (!key_repeat &&
+                         host_keymap_match_event(HOST_KEYMAP_POSTFX,
+                                                 (int)key, (int)scancode,
+                                                 (int)mod)) {
+                    const int on = gl_renderer_cycle_postfx();
+                    host_osd_push(on ? "Post-FX on" : "Post-FX off", 1200);
+                }
                 /* Host volume: config.ini [KeyMap] VolumeUp/VolumeDown
                  * (defaults: keypad +/-). 5% steps; shows right-side bar. */
                 else if (host_keymap_match_event(HOST_KEYMAP_VOLUME_UP,
@@ -10821,6 +10829,7 @@ int main(int argc, char** argv) {
             g_video_bloom      = (float)gc.runtime.video_bloom;
             g_video_grading    = gc.runtime.video_grading;
             g_video_fxaa       = gc.runtime.video_fxaa ? 1 : 0;
+            g_video_bloom_thresh = (float)gc.runtime.video_bloom_threshold;
             if (gc.runtime.has_audio_native_music_dir)
                 g_native_music_dir = gc.runtime.audio_native_music_dir;
             g_video_aspect_num = gc.runtime.video_aspect_num;
@@ -12673,7 +12682,8 @@ session_reboot:
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
-    gl_renderer_set_postfx(g_video_bloom, g_video_grading, g_video_fxaa);
+    gl_renderer_set_postfx(g_video_bloom, g_video_grading, g_video_fxaa,
+                           g_video_bloom_thresh);
     /* Native music pack, if the player generated one. Inert when absent:
      * xa_native_load returns 0 and cdrom.c keeps decoding CD-XA off the disc. */
     if (!g_native_music_dir.empty())

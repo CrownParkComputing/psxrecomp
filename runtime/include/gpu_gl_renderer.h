@@ -98,7 +98,11 @@ void gl_renderer_set_fmv_filter(int cfg_value);
  * costs nothing. bloom is an intensity (0 = off, ~0.1..2.0 useful);
  * grading is 0 (off) or 1 (vibrant); fxaa is a flag. Env PSX_BLOOM /
  * PSX_GRADING / PSX_FXAA override at startup for tuning without a rebuild. */
-void gl_renderer_set_postfx(float bloom, int grading, int fxaa);
+void gl_renderer_set_postfx(float bloom, int grading, int fxaa, float threshold);
+
+/* Toggle the whole post chain off/on at runtime (default F9). Returns 1 when
+ * it is now on. */
+int  gl_renderer_cycle_postfx(void);
 int  gl_renderer_cpu_auth_dual(void);
 
 /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).

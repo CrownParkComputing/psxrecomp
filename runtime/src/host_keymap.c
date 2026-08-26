@@ -97,6 +97,7 @@ static void apply_defaults(void) {
 #endif
     if (s_actions[HOST_KEYMAP_SAVE_STATE_MENU].count == 0)
         add_bind(HOST_KEYMAP_SAVE_STATE_MENU, (int)SDLK_F7, (int)SDL_SCANCODE_F7, 0);
+        add_bind(HOST_KEYMAP_POSTFX, (int)SDLK_F9, (int)SDL_SCANCODE_F9, 0);
 }
 
 /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
