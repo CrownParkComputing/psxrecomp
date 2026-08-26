@@ -65,6 +65,14 @@ void close_tracks() {
 extern "C" int xa_native_load(const char *dir) {
     xa_native_shutdown();
     if (!dir || !*dir) return 0;
+    /* Runtime kill-switch — same reasoning as PSX_FMV_NATIVE. */
+    {
+        const char* e = getenv("PSX_XA_NATIVE");
+        if (e && (*e == '0' || *e == 'n' || *e == 'N')) {
+            std::fprintf(stdout, "psxrecomp: native XA music disabled (PSX_XA_NATIVE=0)\n");
+            return 0;
+        }
+    }
 
     const fs::path root(dir);
     const fs::path manifest = root / "xa.toml";
@@ -177,10 +185,16 @@ extern "C" int xa_native_sector(int lba, int file, int channel,
                     (size_t)(frames - got) * 2 * sizeof(int16_t));
     tr.next_offset = offset + frames;
     g_served++;
-    if (getenv("PSX_XA_TRACE") &&
-        ((g_served % 20000) == 0 || (g_declined && (g_served % 5000) == 0)))
-        std::fprintf(stdout, "xa: served=%lu declined=%lu seekfail=%lu short=%lu\n",
-                     g_served, g_declined, g_seek_fail, g_short);
+    /* One XA sector is 2016 frames at 37800 Hz = 53.33 ms of audio. If the
+     * served rate exceeds ~18.75/s of guest time the same audio is being
+     * pushed more than once, which is what a doubled/echoing stream sounds
+     * like. Report the rate so that is measurable rather than guessed. */
+    if (getenv("PSX_XA_TRACE") && (g_served % 200) == 0)
+        std::fprintf(stdout,
+                     "xa: served=%lu declined=%lu seekfail=%lu short=%lu "
+                     "audio=%.2fs\n",
+                     g_served, g_declined, g_seek_fail, g_short,
+                     (double)g_served * 2352.0 / 44100.0);
     if (!g_reported) {
         g_reported = true;
         std::fprintf(stdout,

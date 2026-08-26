@@ -57,6 +57,7 @@ struct State {
     Decoder            dec;
     std::vector<uint32_t> composed;   /* movie centred in the guest's framing */
     int                composed_w = 0, composed_h = 0;
+    int                composed_for = -1;   /* frame currently composited */
     int                decoded_for = -1;
     bool               reported = false;
 };
@@ -147,6 +148,15 @@ bool seek_to(int frame) {
 extern "C" int fmv_native_load(const char* dir) {
     fmv_native_shutdown();
     if (!dir || !*dir) return 0;
+    /* Runtime kill-switch. Substitution quality is a judgement only a listener
+     * can make, so make it flippable without a rebuild or a config edit. */
+    {
+        const char* e = getenv("PSX_FMV_NATIVE");
+        if (e && (*e == '0' || *e == 'n' || *e == 'N')) {
+            std::fprintf(stdout, "psxrecomp: native FMV disabled (PSX_FMV_NATIVE=0)\n");
+            return 0;
+        }
+    }
     const fs::path root(dir);
     const fs::path manifest = root / "fmv.toml";
     std::error_code ec;
@@ -223,16 +233,26 @@ extern "C" int fmv_native_frame(int guest_w, int guest_h,
         const int out_h = guest_h * scale;
         if (out_h >= m.height) {
             if (g.composed_w != out_w || g.composed_h != out_h) {
+                /* The surround is static black and every rebuild overwrites
+                 * the movie rect in full, so this clear belongs to allocation
+                 * — not to each frame. */
                 g.composed.assign((size_t)out_w * out_h, 0xFF000000u);
                 g.composed_w = out_w;
                 g.composed_h = out_h;
+                g.composed_for = -1;
             }
-            std::fill(g.composed.begin(), g.composed.end(), 0xFF000000u);
-            const int y0 = (out_h - m.height) / 2;
-            for (int y = 0; y < m.height; y++)
-                std::memcpy(&g.composed[(size_t)(y0 + y) * out_w],
-                            &g.dec.rgb[(size_t)y * m.width],
-                            (size_t)m.width * sizeof(uint32_t));
+            /* Recomposite only when the frame actually changed. A 15 fps movie
+             * presented at 60 Hz repeats each frame four times, and rebuilding
+             * a 1280x960 buffer every present put ~490 MB/s of needless copy
+             * traffic on the thread that also feeds audio. */
+            if (g.composed_for != (int)g.want_frame) {
+                const int y0 = (out_h - m.height) / 2;
+                for (int y = 0; y < m.height; y++)
+                    std::memcpy(&g.composed[(size_t)(y0 + y) * out_w],
+                                &g.dec.rgb[(size_t)y * m.width],
+                                (size_t)m.width * sizeof(uint32_t));
+                g.composed_for = (int)g.want_frame;
+            }
             if (!g.reported) {
                 g.reported = true;
                 std::fprintf(stdout,
