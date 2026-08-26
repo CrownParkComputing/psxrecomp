@@ -3682,6 +3682,31 @@ static void gl_perf_present_exit(int wide) {
         s->fbo_creates     = s_pf_buf_cw[rd][4];
         s->wide            = s_pf_buf_wide[rd];
         s->frame           = s_pf_buf_frame[rd];
+        /* PSX_STALL_TRACE: a multi-second frame freezes the guest clock, and
+         * with it every timed device — a starved CD-audio ring is heard long
+         * before a dropped frame is seen. Log the outliers with the context
+         * that distinguishes drawing work from pipeline/allocation work. */
+        {
+            static int    trace = -1;
+            static double thresh = 100.0;
+            static Uint32 t0 = 0;
+            if (trace < 0) {
+                const char* e = getenv("PSX_STALL_TRACE");
+                trace = (e && *e && *e != '0') ? 1 : 0;
+                if (trace && atof(e) > 1.0) thresh = atof(e);
+                t0 = SDL_GetTicks();
+            }
+            if (trace && s->total_ms > thresh) {
+                fprintf(stdout,
+                        "stall: t=%.1fs frame=%llu total=%.1fms scene_gpu=%.1f "
+                        "present_gpu=%.1f prims=%.0f batches=%.0f fbo_creates=%.0f\n",
+                        (double)(SDL_GetTicks() - t0) / 1000.0,
+                        (unsigned long long)s->frame, s->total_ms,
+                        s->scene_gpu_ms, s->present_gpu_ms, s->prims,
+                        s->batches, s->fbo_creates);
+                fflush(stdout);
+            }
+        }
         s_pf_ring_seq++;
     }
     s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */

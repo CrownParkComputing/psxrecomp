@@ -1411,15 +1411,26 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
                  * repeats what it has, heard as a smear). */
                 SpuDebugInfo st;
                 spu_debug_info(&st);
+                /* Sector cadence is driven by the guest cycle clock, so the
+                 * only way to tell "CD delivering wrong" from "guest running
+                 * slow" is to measure that clock against the wall. The PS1
+                 * CPU is 33.8688 MHz; anything below means the emulation is
+                 * behind real time and every timed device is behind with it. */
+                static uint64_t last_cyc = 0;
+                const uint64_t cyc = psx_get_cycle_count();
+                const double mhz = last_cyc
+                    ? (double)(cyc - last_cyc) / secs / 1e6 : 0.0;
+                last_cyc = cyc;
                 fprintf(stdout,
                         "cdaud: %.0f frames/s pushed (expect 44100), "
                         "repeat-lba %d, ring %u frames, overflow %llu, "
-                        "underflow %llu, mode=0x%02X (%s speed)\n",
+                        "underflow %llu, mode=0x%02X (%s), "
+                        "guest %.2f MHz (expect 33.87)\n",
                         (double)frames_pushed / secs, repeats,
                         st.cd_frames,
                         (unsigned long long)st.cd_overflow_frames,
                         (unsigned long long)st.cd_underflow_frames,
-                        mode_reg, (mode_reg & 0x80) ? "2x" : "1x");
+                        mode_reg, (mode_reg & 0x80) ? "2x" : "1x", mhz);
                 fflush(stdout);
                 frames_pushed = 0; repeats = 0; last_report_us = now;
             }
