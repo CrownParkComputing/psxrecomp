@@ -1142,6 +1142,10 @@ static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+/* Present-time post-processing; all-off default keeps the faithful look. */
+static float         g_video_bloom    = 0.0f;
+static int           g_video_grading  = 0;   /* 0=off, 1=vibrant */
+static int           g_video_fxaa     = 0;
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -10812,6 +10816,9 @@ int main(int argc, char** argv) {
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
             g_video_screen     = gc.runtime.video_screen_kind;
+            g_video_bloom      = (float)gc.runtime.video_bloom;
+            g_video_grading    = gc.runtime.video_grading;
+            g_video_fxaa       = gc.runtime.video_fxaa ? 1 : 0;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
@@ -12662,6 +12669,11 @@ session_reboot:
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
+    gl_renderer_set_postfx(g_video_bloom, g_video_grading, g_video_fxaa);
+    if (g_video_bloom > 0.0f || g_video_grading || g_video_fxaa)
+        std::fprintf(stdout, "psxrecomp: post-FX bloom %.2f, grading %s, fxaa %s\n",
+                     g_video_bloom, g_video_grading ? "vibrant" : "off",
+                     g_video_fxaa ? "on" : "off");
     if (g_video_scale > 1 || g_video_texfilter)
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",

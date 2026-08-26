@@ -604,6 +604,23 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 "[video] crt_filter must be \"raw\"|\"crt\"|\"composite\"|\"trinitron\": {}",
                 mode));
         }
+        if (video.contains("bloom")) {
+            const auto n = toml::find<double>(video, "bloom");
+            if (n < 0.0 || n > 4.0)
+                throw std::runtime_error(fmt::format(
+                    "[video] bloom out of range (0..4): {}", n));
+            rt.video_bloom = n;
+        }
+        if (video.contains("grading")) {
+            const auto mode = toml::find<std::string>(video, "grading");
+            if      (mode == "off")     rt.video_grading = 0;
+            else if (mode == "vibrant") rt.video_grading = 1;
+            else throw std::runtime_error(fmt::format(
+                "[video] grading must be \"off\"|\"vibrant\": {}", mode));
+        }
+        if (video.contains("fxaa")) {
+            rt.video_fxaa = toml::find<bool>(video, "fxaa");
+        }
         if (video.contains("auto_skip_fmv")) {
             rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
         }

@@ -4063,11 +4063,305 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     p_glUseProgram(0);
 }
 
+/* ---- post-processing chain (bloom / grading / FXAA) ---------------------- *
+ * Present-time only, and OFF by default, so the faithful look stays the
+ * baseline and a disabled chain costs nothing (postfx_active() short-circuits
+ * before any GL call). It runs on the finished drawable — after letterboxing,
+ * before the OSD — so every present path (FBO, CPU 24bpp, interpolated,
+ * hold-last) gets the same treatment from one hook.
+ *
+ *   scene ── bright-pass ──> blur H ──> blur V ─┐
+ *     └──────────────────────────────────────── composite (bloom + grading)
+ *                                                     └──> FXAA ──> drawable
+ *
+ * Bloom is a screen blend of a quarter-res blurred bright-pass; grading is a
+ * vibrance + gentle-contrast curve; FXAA is the standard luma-edge variant.
+ * The 15-bit scanout LUT (color_lut.c, [video] crt_filter) is a different,
+ * earlier stage and composes with this one. */
+
+static float  s_postfx_bloom   = 0.0f;   /* 0 = off; sane range 0.1 .. 2.0 */
+static int    s_postfx_grading = 0;      /* 0 off, 1 vibrant */
+static int    s_postfx_fxaa    = 0;
+static int    s_postfx_env_done = 0;
+
+static GLuint s_post_scene_tex = 0, s_post_comp_tex = 0;
+static GLuint s_post_comp_fbo  = 0;
+static GLuint s_post_bloom_tex[2] = {0,0};
+static GLuint s_post_bloom_fbo[2] = {0,0};
+static int    s_post_w = 0, s_post_h = 0, s_post_bw = 0, s_post_bh = 0;
+static GLuint s_post_bright_prog = 0, s_post_blur_prog = 0;
+static GLuint s_post_comp_prog = 0, s_post_fxaa_prog = 0;
+static GLint  s_post_bright_uTex = -1, s_post_bright_uThr = -1, s_post_bright_uKnee = -1;
+static GLint  s_post_blur_uTex = -1, s_post_blur_uDir = -1;
+static GLint  s_post_comp_uScene = -1, s_post_comp_uBloom = -1;
+static GLint  s_post_comp_uAmt = -1, s_post_comp_uGrading = -1;
+static GLint  s_post_fxaa_uTex = -1, s_post_fxaa_uRcp = -1;
+static int    s_post_failed = 0;
+
+static const char *POST_VS =
+    "#version 330\n"
+    "out vec2 v_uv;\n"
+    "void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);\n"
+    "  v_uv = p; gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
+
+/* Soft-knee bright pass: below u_threshold nothing survives, and the squared
+ * ramp keeps the transition from ringing on near-threshold pixels. */
+static const char *POST_BRIGHT_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_tex;\n"
+    "uniform float u_threshold; uniform float u_knee; out vec4 frag;\n"
+    "void main(){\n"
+    "  vec3 c = texture(u_tex, v_uv).rgb;\n"
+    "  float l = max(max(c.r, c.g), c.b);\n"
+    "  float w = clamp((l - u_threshold) / max(u_knee, 1e-4), 0.0, 1.0);\n"
+    "  frag = vec4(c * w * w, 1.0);\n"
+    "}\n";
+
+/* Separable 9-tap Gaussian via 5 bilinear taps. */
+static const char *POST_BLUR_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_tex; uniform vec2 u_dir; out vec4 frag;\n"
+    "void main(){\n"
+    "  vec3 s = texture(u_tex, v_uv).rgb * 0.227027;\n"
+    "  s += (texture(u_tex, v_uv + u_dir*1.3846154).rgb\n"
+    "      + texture(u_tex, v_uv - u_dir*1.3846154).rgb) * 0.3162162;\n"
+    "  s += (texture(u_tex, v_uv + u_dir*3.2307692).rgb\n"
+    "      + texture(u_tex, v_uv - u_dir*3.2307692).rgb) * 0.0702703;\n"
+    "  frag = vec4(s, 1.0);\n"
+    "}\n";
+
+static const char *POST_COMP_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_scene; uniform sampler2D u_bloom;\n"
+    "uniform float u_bloom_amt; uniform int u_grading; out vec4 frag;\n"
+    "void main(){\n"
+    "  vec3 c = texture(u_scene, v_uv).rgb;\n"
+    "  if (u_bloom_amt > 0.0) {\n"
+    "    vec3 b = clamp(texture(u_bloom, v_uv).rgb * u_bloom_amt, 0.0, 1.0);\n"
+    "    c = 1.0 - (1.0 - c) * (1.0 - b);\n"   /* screen blend */
+    "  }\n"
+    "  if (u_grading == 1) {\n"
+    "    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    c = mix(vec3(l), c, 1.18);\n"
+    "    c = (c - 0.5) * 1.06 + 0.5;\n"
+    "  }\n"
+    "  frag = vec4(clamp(c, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+static const char *POST_FXAA_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_tex; uniform vec2 u_rcp; out vec4 frag;\n"
+    "float lum(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
+    "void main(){\n"
+    "  vec3 mM  = texture(u_tex, v_uv).rgb;\n"
+    "  vec3 mNW = texture(u_tex, v_uv + vec2(-1.0,-1.0)*u_rcp).rgb;\n"
+    "  vec3 mNE = texture(u_tex, v_uv + vec2( 1.0,-1.0)*u_rcp).rgb;\n"
+    "  vec3 mSW = texture(u_tex, v_uv + vec2(-1.0, 1.0)*u_rcp).rgb;\n"
+    "  vec3 mSE = texture(u_tex, v_uv + vec2( 1.0, 1.0)*u_rcp).rgb;\n"
+    "  float lM=lum(mM), lNW=lum(mNW), lNE=lum(mNE), lSW=lum(mSW), lSE=lum(mSE);\n"
+    "  float lMin = min(lM, min(min(lNW,lNE), min(lSW,lSE)));\n"
+    "  float lMax = max(lM, max(max(lNW,lNE), max(lSW,lSE)));\n"
+    "  if (lMax - lMin < max(0.0312, lMax * 0.125)) { frag = vec4(mM,1.0); return; }\n"
+    "  vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), ((lNW + lSW) - (lNE + lSE)));\n"
+    "  float red = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);\n"
+    "  float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + red);\n"
+    "  dir = clamp(dir * rcp, vec2(-8.0), vec2(8.0)) * u_rcp;\n"
+    "  vec3 a = 0.5 * (texture(u_tex, v_uv + dir * (1.0/3.0 - 0.5)).rgb\n"
+    "                + texture(u_tex, v_uv + dir * (2.0/3.0 - 0.5)).rgb);\n"
+    "  vec3 b = a * 0.5 + 0.25 * (texture(u_tex, v_uv + dir * -0.5).rgb\n"
+    "                           + texture(u_tex, v_uv + dir *  0.5).rgb);\n"
+    "  float lB = lum(b);\n"
+    "  frag = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);\n"
+    "}\n";
+
+void gl_renderer_set_postfx(float bloom, int grading, int fxaa) {
+    if (!(bloom > 0.0f)) bloom = 0.0f;
+    if (bloom > 4.0f)    bloom = 4.0f;
+    s_postfx_bloom   = bloom;
+    s_postfx_grading = grading ? 1 : 0;
+    s_postfx_fxaa    = fxaa ? 1 : 0;
+}
+
+/* Env overrides so the chain can be tuned without a rebuild:
+ *   PSX_BLOOM=<0..4>  PSX_GRADING=vibrant|off  PSX_FXAA=1|0 */
+static void postfx_env_once(void) {
+    const char *e;
+    if (s_postfx_env_done) return;
+    s_postfx_env_done = 1;
+    if ((e = getenv("PSX_BLOOM")))   s_postfx_bloom = (float)atof(e);
+    if ((e = getenv("PSX_GRADING")))
+        s_postfx_grading = (strcmp(e, "off") && strcmp(e, "0")) ? 1 : 0;
+    if ((e = getenv("PSX_FXAA")))    s_postfx_fxaa = atoi(e) != 0;
+    if (s_postfx_bloom < 0.0f) s_postfx_bloom = 0.0f;
+    if (s_postfx_bloom > 4.0f) s_postfx_bloom = 4.0f;
+}
+
+static int postfx_active(void) {
+    postfx_env_once();
+    if (!s_ctx || !s_present_vao || s_post_failed) return 0;
+    return (s_postfx_bloom > 0.0f) || s_postfx_grading || s_postfx_fxaa;
+}
+
+static GLuint post_make_tex(int w, int h) {
+    GLuint t = 0;
+    glGenTextures(1, &t);
+    if (!t) return 0;
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    return t;
+}
+
+static void postfx_free_targets(void) {
+    if (s_post_scene_tex) { glDeleteTextures(1, &s_post_scene_tex); s_post_scene_tex = 0; }
+    if (s_post_comp_tex)  { glDeleteTextures(1, &s_post_comp_tex);  s_post_comp_tex  = 0; }
+    if (s_post_comp_fbo)  { p_glDeleteFramebuffers(1, &s_post_comp_fbo); s_post_comp_fbo = 0; }
+    for (int i = 0; i < 2; i++) {
+        if (s_post_bloom_tex[i]) { glDeleteTextures(1, &s_post_bloom_tex[i]); s_post_bloom_tex[i] = 0; }
+        if (s_post_bloom_fbo[i]) { p_glDeleteFramebuffers(1, &s_post_bloom_fbo[i]); s_post_bloom_fbo[i] = 0; }
+    }
+    s_post_w = s_post_h = s_post_bw = s_post_bh = 0;
+}
+
+static int postfx_ensure(int w, int h) {
+    if (!s_post_bright_prog) {
+        s_post_bright_prog = build_program(POST_VS, POST_BRIGHT_FS);
+        s_post_blur_prog   = build_program(POST_VS, POST_BLUR_FS);
+        s_post_comp_prog   = build_program(POST_VS, POST_COMP_FS);
+        s_post_fxaa_prog   = build_program(POST_VS, POST_FXAA_FS);
+        if (!s_post_bright_prog || !s_post_blur_prog ||
+            !s_post_comp_prog || !s_post_fxaa_prog) {
+            fprintf(stdout, "psxrecomp: post-FX shaders failed; chain disabled\n");
+            s_post_failed = 1;
+            return 0;
+        }
+        s_post_bright_uTex  = p_glGetUniformLocation(s_post_bright_prog, "u_tex");
+        s_post_bright_uThr  = p_glGetUniformLocation(s_post_bright_prog, "u_threshold");
+        s_post_bright_uKnee = p_glGetUniformLocation(s_post_bright_prog, "u_knee");
+        s_post_blur_uTex    = p_glGetUniformLocation(s_post_blur_prog, "u_tex");
+        s_post_blur_uDir    = p_glGetUniformLocation(s_post_blur_prog, "u_dir");
+        s_post_comp_uScene  = p_glGetUniformLocation(s_post_comp_prog, "u_scene");
+        s_post_comp_uBloom  = p_glGetUniformLocation(s_post_comp_prog, "u_bloom");
+        s_post_comp_uAmt    = p_glGetUniformLocation(s_post_comp_prog, "u_bloom_amt");
+        s_post_comp_uGrading= p_glGetUniformLocation(s_post_comp_prog, "u_grading");
+        s_post_fxaa_uTex    = p_glGetUniformLocation(s_post_fxaa_prog, "u_tex");
+        s_post_fxaa_uRcp    = p_glGetUniformLocation(s_post_fxaa_prog, "u_rcp");
+    }
+    if (w == s_post_w && h == s_post_h && s_post_scene_tex) return 1;
+
+    postfx_free_targets();
+    s_post_bw = w / 4; if (s_post_bw < 4) s_post_bw = 4;
+    s_post_bh = h / 4; if (s_post_bh < 4) s_post_bh = 4;
+
+    s_post_scene_tex = post_make_tex(w, h);
+    s_post_comp_tex  = post_make_tex(w, h);
+    s_post_bloom_tex[0] = post_make_tex(s_post_bw, s_post_bh);
+    s_post_bloom_tex[1] = post_make_tex(s_post_bw, s_post_bh);
+    if (!s_post_scene_tex || !s_post_comp_tex ||
+        !s_post_bloom_tex[0] || !s_post_bloom_tex[1]) goto fail;
+    if (!make_fbo(&s_post_comp_fbo, s_post_comp_tex, 0)) goto fail;
+    if (!make_fbo(&s_post_bloom_fbo[0], s_post_bloom_tex[0], 0)) goto fail;
+    if (!make_fbo(&s_post_bloom_fbo[1], s_post_bloom_tex[1], 0)) goto fail;
+    s_post_w = w; s_post_h = h;
+    return 1;
+fail:
+    fprintf(stdout, "psxrecomp: post-FX targets failed; chain disabled\n");
+    postfx_free_targets();
+    s_post_failed = 1;
+    return 0;
+}
+
+static void post_draw_fullscreen(void) {
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+}
+
+/* Run the chain over the current drawable contents, writing the result back to
+ * the drawable. Called immediately before the OSD composite so overlays are
+ * never bloomed or blurred. */
+static void postfx_apply(int ww, int wh) {
+    if (ww < 8 || wh < 8) return;
+    if (!postfx_active()) return;
+    if (!postfx_ensure(ww, wh)) return;
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+
+    /* Snapshot the finished frame. The default framebuffer is the read source
+     * here: every present path has just drawn into it. */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_post_scene_tex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
+
+    if (s_postfx_bloom > 0.0f) {
+        /* bright pass -> bloom[0] */
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_post_bloom_fbo[0]);
+        glViewport(0, 0, s_post_bw, s_post_bh);
+        p_glUseProgram(s_post_bright_prog);
+        p_glUniform1i(s_post_bright_uTex, 0);
+        p_glUniform1f(s_post_bright_uThr, 0.62f);
+        p_glUniform1f(s_post_bright_uKnee, 0.28f);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_post_scene_tex);
+        post_draw_fullscreen();
+
+        /* blur H: bloom[0] -> bloom[1] */
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_post_bloom_fbo[1]);
+        p_glUseProgram(s_post_blur_prog);
+        p_glUniform1i(s_post_blur_uTex, 0);
+        p_glUniform2f(s_post_blur_uDir, 1.0f / (float)s_post_bw, 0.0f);
+        glBindTexture(GL_TEXTURE_2D, s_post_bloom_tex[0]);
+        post_draw_fullscreen();
+
+        /* blur V: bloom[1] -> bloom[0] */
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_post_bloom_fbo[0]);
+        p_glUniform2f(s_post_blur_uDir, 0.0f, 1.0f / (float)s_post_bh);
+        glBindTexture(GL_TEXTURE_2D, s_post_bloom_tex[1]);
+        post_draw_fullscreen();
+    }
+
+    /* composite -> comp target (FXAA next) or straight to the drawable */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_postfx_fxaa ? s_post_comp_fbo : 0);
+    glViewport(0, 0, ww, wh);
+    p_glUseProgram(s_post_comp_prog);
+    p_glUniform1i(s_post_comp_uScene, 0);
+    p_glUniform1i(s_post_comp_uBloom, 1);
+    p_glUniform1f(s_post_comp_uAmt, s_postfx_bloom);
+    p_glUniform1i(s_post_comp_uGrading, s_postfx_grading);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_post_scene_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_post_bloom_tex[0]);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    post_draw_fullscreen();
+
+    if (s_postfx_fxaa) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        glViewport(0, 0, ww, wh);
+        p_glUseProgram(s_post_fxaa_prog);
+        p_glUniform1i(s_post_fxaa_uTex, 0);
+        p_glUniform2f(s_post_fxaa_uRcp, 1.0f / (float)ww, 1.0f / (float)wh);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_post_comp_tex);
+        post_draw_fullscreen();
+    }
+    p_glUseProgram(0);
+}
+
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+        postfx_apply(ww, wh);
         if (ww > 0 && wh > 0) {
             const uint32_t *px = NULL;
             int ow = 0, oh = 0;

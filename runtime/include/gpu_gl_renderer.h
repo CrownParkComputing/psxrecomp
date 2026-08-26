@@ -92,6 +92,13 @@ void gl_renderer_set_cpu_auth_dual(int on);
  * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
  * Only consulted while video antialiasing is on; AA off is always nearest. */
 void gl_renderer_set_fmv_filter(int cfg_value);
+
+/* Present-time post-processing chain (bloom / grading / FXAA), settings.toml
+ * and game.toml [video] bloom / grading / fxaa. All-off is the default and
+ * costs nothing. bloom is an intensity (0 = off, ~0.1..2.0 useful);
+ * grading is 0 (off) or 1 (vibrant); fxaa is a flag. Env PSX_BLOOM /
+ * PSX_GRADING / PSX_FXAA override at startup for tuning without a rebuild. */
+void gl_renderer_set_postfx(float bloom, int grading, int fxaa);
 int  gl_renderer_cpu_auth_dual(void);
 
 /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).

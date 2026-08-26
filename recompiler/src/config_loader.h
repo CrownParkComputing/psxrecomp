@@ -391,6 +391,15 @@ struct RuntimeConfig {
     //               overall sharpness at the nearest level
     int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
 
+    // Present-time post-processing (gl_renderer_set_postfx). All-off is the
+    // default, so the faithful look is what a title gets unless it opts in.
+    //   bloom    intensity of the screen-blended bright-pass glow; 0 = off
+    //   grading  0 off, 1 vibrant (vibrance + gentle contrast)
+    //   fxaa     luma-edge antialiasing over the finished frame
+    double                video_bloom   = 0.0;
+    int                   video_grading = 0;
+    bool                  video_fxaa    = false;
+
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
     // fallback. Stored as VIDEO_RENDERER_*.
