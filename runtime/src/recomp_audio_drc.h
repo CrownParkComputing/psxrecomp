@@ -49,6 +49,16 @@ typedef struct {
     double err_lp_ms;       /* error low-pass time constant ms (default 75)    */
     double slew_pp_per_s;   /* correction slew, percent-points/sec (default 0.75) */
     double deadband_ms;     /* +/- band around target with no correction (1.0)  */
+    /* Sustained-rate adaptation. max_correction is a drift band: it assumes
+     * both clocks are nominally right and only wander. An emulator that
+     * cannot hold real time is a different case — it produces persistently
+     * fewer frames than the device consumes, the ring drains no matter how
+     * large it is, and the fast controller pins at its clamp. These let the
+     * base ratio follow that sustained shortfall so playback stays continuous
+     * (slightly slow and flat) instead of running dry and repeating.
+     * adapt_max 0 disables it and restores drift-only behaviour. */
+    double adapt_max;        /* max sustained deviation from nominal (0.30)    */
+    double adapt_rate_per_s; /* how fast the base ratio follows (0.20)         */
     double em_low_ms;       /* below this = underrun emergency (default 12)     */
     double em_high_ms;      /* above this = overflow emergency (default 235)    */
 } rab_config;
@@ -60,6 +70,7 @@ typedef struct {
     uint64_t overflow_drops;    /* source frames dropped on ring overflow     */
     double   last_fill_ms;
     double   last_correction;   /* applied ratio correction (signed)          */
+    double   last_base_ratio;   /* sustained-rate term (1.0 = nominal)        */
 } rab_stats;
 
 typedef struct rab_bridge {
@@ -83,6 +94,9 @@ typedef struct rab_bridge {
     /* fade / emergency */
     double gain;            /* 0..1 smooth gate for startup/underrun           */
     int    primed;          /* set once fill first reaches target              */
+    double base_ratio;      /* slow sustained production/consumption ratio     */
+    double prod_ema, cons_ema;  /* frames per update, long time constant       */
+    uint64_t last_in_count;
     float  last_out[2];     /* last emitted sample per channel (for holds)     */
 
     rab_stats stats;
@@ -161,6 +175,27 @@ void rab_config_defaults(rab_config *c) {
     c->err_lp_ms      = 75.0;
     c->slew_pp_per_s  = 0.75;
     c->deadband_ms    = 1.0;
+    /* OFF by default. Following a sustained shortfall keeps playback
+     * continuous, but it does so by stretching — the audio plays slow and
+     * flat, which is a worse artefact than the occasional gap it prevents.
+     * Opt in with PSXRECOMP_AUDIO_ADAPT=<max deviation>, e.g. 0.30. */
+    c->adapt_max         = 0.0;
+    c->adapt_rate_per_s  = 0.20;
+    {
+        const char* e = getenv("PSXRECOMP_AUDIO_ADAPT");
+        if (e && *e) { double v = atof(e); if (v >= 0.0 && v <= 0.5) c->adapt_max = v; }
+    }
+    /* PSXRECOMP_AUDIO_TARGET_MS / _RING_MS: a producer that delivers in
+     * bursts needs headroom, not a faster controller. Both underruns and
+     * overflow drops at once mean the ring is too small to hold the gap
+     * between bursts, and no correction ratio fixes that. */
+    {
+        const char* e = getenv("PSXRECOMP_AUDIO_TARGET_MS");
+        if (e && *e) { double v = atof(e); if (v >= 20.0 && v <= 4000.0) c->target_ms = v; }
+        e = getenv("PSXRECOMP_AUDIO_RING_MS");
+        if (e && *e) { double v = atof(e); if (v > c->target_ms) c->ring_ms = v; }
+        else if (c->ring_ms < c->target_ms + 100.0) c->ring_ms = c->target_ms + 100.0;
+    }
     c->em_low_ms      = 12.0;
     c->em_high_ms     = 235.0;
 }
@@ -173,6 +208,7 @@ int rab_init(rab_bridge *b, const rab_config *cfg) {
     if (cfg->source_rate <= 0.0 || cfg->host_rate <= 0.0) return 5;
 
     memset(b, 0, sizeof(*b));
+    b->base_ratio = 1.0;
     b->cfg  = *cfg;
     b->half = cfg->taps / 2;
 
@@ -310,9 +346,42 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
     if (d < -slew) d = -slew;
     b->corr += d;
 
+    /* Sustained-rate term. Production is what the emulator actually delivered
+     * since the last update; consumption is what this pull took out of the
+     * source, in source frames. Their long-run ratio is the emulator's real
+     * speed, and following it keeps playback continuous when that speed is
+     * below 1.0 — the fast controller above can only trim +/-max_correction
+     * and pins at its clamp against a persistent shortfall. */
+    if (c->adapt_max > 0.0 && b->primed) {
+        double produced = (double)(b->in_count - b->last_in_count);
+        double consumed = (double)pull_frames * b->cur_step;
+        b->last_in_count = b->in_count;
+        if (consumed > 0.0) {
+            /* ~2 s time constant: slow enough to ignore jitter and stage
+             * pauses, quick enough to follow a real speed change. */
+            double a = dt_ms / (2000.0 + dt_ms);
+            b->prod_ema += a * (produced - b->prod_ema);
+            b->cons_ema += a * (consumed - b->cons_ema);
+            if (b->cons_ema > 1e-6) {
+                double want = b->prod_ema / b->cons_ema * b->base_ratio;
+                double lo = 1.0 - c->adapt_max, hi = 1.0 + c->adapt_max;
+                if (want < lo) want = lo;
+                if (want > hi) want = hi;
+                double rate = c->adapt_rate_per_s * (dt_ms / 1000.0);
+                double dd = want - b->base_ratio;
+                if (dd >  rate) dd =  rate;
+                if (dd < -rate) dd = -rate;
+                b->base_ratio += dd;
+            }
+        }
+    } else {
+        b->last_in_count = b->in_count;
+    }
+
     /* A high queue (positive error) must be consumed FASTER -> larger step. */
-    b->cur_step = (c->source_rate / c->host_rate) * (1.0 + b->corr);
+    b->cur_step = (c->source_rate / c->host_rate) * b->base_ratio * (1.0 + b->corr);
     b->stats.last_correction = b->corr;
+    b->stats.last_base_ratio = b->base_ratio;
 }
 
 void rab_pull(rab_bridge *b, int16_t *out, int frames) {
