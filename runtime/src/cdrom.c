@@ -1396,6 +1396,10 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
 
 static int read_sector_at(int min, int sec, int sect) {
     int lba = msf_to_lba(min, sec, sect);
+    if (getenv("PSX_CD_TRACE")) {
+        static int n = 0;
+        if (n++ < 12) { fprintf(stdout, "cd:   read_sector_at lba=%d\n", lba); fflush(stdout); }
+    }
     uint8_t user_data[SECTOR_SIZE];
     uint8_t raw_data[RAW_SECTOR_SIZE];
     int have_raw = 0;
@@ -2044,6 +2048,18 @@ static void exec_command(uint8_t cmd) {
         if ((long)cmd == trap_cmd && ++trap_hits == trap_nth) raise(SIGSTOP);
     }
 #endif
+    /* PSX_CD_TRACE=1 — every command as it executes, with the status the
+     * drive will answer with. The cheapest way to see which command goes
+     * unanswered when the controller stalls. */
+    {
+        static int trace = -1;
+        if (trace < 0) { const char* e = getenv("PSX_CD_TRACE"); trace = (e && *e && *e != '0') ? 1 : 0; }
+        if (trace) {
+            fprintf(stdout, "cd: cmd 0x%02X stat=0x%02X irq_en=0x%02X disc=%d\n",
+                    cmd, stat_reg, irq_enable, has_disc());
+            fflush(stdout);
+        }
+    }
     trace_cdrom('C', 0, cmd, 0);
     /* ENQUEUE: a CD command was issued (aux = command byte). */
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
@@ -2627,6 +2643,14 @@ static int accelerated_consumer_blocked(void) {
 }
 
 static void process_read_stream(uint32_t cycles) {
+    if (getenv("PSX_CD_TRACE")) {
+        static int n = 0;
+        if (reading && n++ < 12) {
+            fprintf(stdout, "cd:   stream tick reading=%d delay=%d warm_blocked=%d\n",
+                    reading, read_delay, warm_route_consumer_blocked());
+            fflush(stdout);
+        }
+    }
     if (!reading) return;
 
     if (warm_route_consumer_blocked()) {

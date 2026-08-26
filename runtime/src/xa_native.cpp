@@ -42,6 +42,17 @@ struct Pack {
 
 Pack g_pack;
 bool g_reported = false;   /* one-shot 'substitution is live' notice */
+/* A decline is not benign here. When the sector came from a synthesised
+ * stream region its ADPCM payload is ZERO, so falling back to decoding it
+ * yields silence/garbage — an audible dropout rather than a graceful
+ * fallback. Count them: they should be zero inside a covered region. */
+unsigned long g_served = 0, g_declined = 0, g_seek_fail = 0, g_short = 0;
+void xa_tally(const char* why) {
+    g_declined++;
+    if (getenv("PSX_XA_TRACE"))
+        std::fprintf(stdout, "xa: decline (%s) served=%lu declined=%lu\n",
+                     why, g_served, g_declined);
+}
 
 void close_tracks() {
     for (auto &kv : g_pack.tracks)
@@ -131,20 +142,22 @@ extern "C" int xa_native_sector(int lba, int file, int channel,
     if (!g_pack.active || !out) return 0;
 
     const int index = lba - g_pack.first_lba;
-    if (index < 0 || index >= g_pack.audio_sectors) return 0;
-    if (index % g_pack.interleave != channel % g_pack.interleave) return 0;
+    if (index < 0 || index >= g_pack.audio_sectors) return 0;  /* outside: fine */
+    if (index % g_pack.interleave != channel % g_pack.interleave) { xa_tally("interleave"); return 0; }
 
     auto it = g_pack.tracks.find(channel);
-    if (it == g_pack.tracks.end() || !it->second.vorb) return 0;
+    if (it == g_pack.tracks.end() || !it->second.vorb) { xa_tally("no track"); return 0; }
 
     Track &tr = it->second;
     const int frames = g_pack.out_frames_per_sector;
-    if (frames > max_frames) return 0;
+    if (frames > max_frames) { xa_tally("buffer"); return 0; }
 
     const long long offset = (long long)(index / g_pack.interleave) * frames;
     if (offset != tr.next_offset) {
         if (!stb_vorbis_seek(tr.vorb, (unsigned int)offset)) {
             tr.next_offset = -1;
+            g_seek_fail++;
+            xa_tally("seek");
             return 0;
         }
     }
@@ -153,14 +166,21 @@ extern "C" int xa_native_sector(int lba, int file, int channel,
                                                              frames * 2);
     if (got <= 0) {
         tr.next_offset = -1;
+        xa_tally("decode");
         return 0;
     }
     /* Past the end of the track the decoder short-reads; pad with silence so
      * the caller still gets a full sector and timing does not shift. */
+    if (got < frames) g_short++;
     if (got < frames)
         std::memset(out + (size_t)got * 2, 0,
                     (size_t)(frames - got) * 2 * sizeof(int16_t));
     tr.next_offset = offset + frames;
+    g_served++;
+    if (getenv("PSX_XA_TRACE") &&
+        ((g_served % 20000) == 0 || (g_declined && (g_served % 5000) == 0)))
+        std::fprintf(stdout, "xa: served=%lu declined=%lu seekfail=%lu short=%lu\n",
+                     g_served, g_declined, g_seek_fail, g_short);
     if (!g_reported) {
         g_reported = true;
         std::fprintf(stdout,
