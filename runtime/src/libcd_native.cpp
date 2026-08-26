@@ -35,7 +35,11 @@ struct State {
     bool               active = false;
     std::vector<Entry> files;
     uint32_t           setloc_lba = 0;   /* last CdControl(CdlSetloc) */
-    bool               served_read = false;
+    /* Sticky, not one-shot: a game may poll CdReadSync many times for one
+     * transfer, and the first decline hands it back to a libcd whose read
+     * state we never set — which spins forever. The flag stays set until the
+     * next read we do not serve. */
+    bool               read_is_native = false;
     uint64_t           bytes_served = 0;
     uint32_t           reads = 0;
     bool               reported = false;
@@ -129,10 +133,10 @@ int on_control(CPUState* cpu, uint32_t, void*) {
 int on_read(CPUState* cpu, uint32_t, void*) {
     const uint32_t sectors = cpu->gpr[4];
     const uint32_t dest = cpu->gpr[5];
-    if (!sectors || sectors > 4096u) return 0;
+    if (!sectors || sectors > 4096u) { g.read_is_native = false; return 0; }
 
     const Entry* e = find_by_lba(g.setloc_lba);
-    if (!e) return 0;                          /* not ours: real disc path */
+    if (!e) { g.read_is_native = false; return 0; }   /* real disc path */
 
     const uint64_t offset = (uint64_t)(g.setloc_lba - e->lba) * FORM1;
     const uint64_t want = (uint64_t)sectors * FORM1;
@@ -147,7 +151,7 @@ int on_read(CPUState* cpu, uint32_t, void*) {
     std::memset(p, 0, (size_t)want);
     f.read((char*)p, (std::streamsize)want);
 
-    g.served_read = true;
+    g.read_is_native = true;
     g.reads++;
     g.bytes_served += want;
     if (!g.reported) {
@@ -161,8 +165,7 @@ int on_read(CPUState* cpu, uint32_t, void*) {
 }
 
 int on_read_sync(CPUState* cpu, uint32_t, void*) {
-    if (!g.served_read) return 0;              /* not our transfer */
-    g.served_read = false;
+    if (!g.read_is_native) return 0;           /* libcd owns this transfer */
     cpu->gpr[2] = 0;                           /* v0 = 0: complete, no error */
     return 1;
 }
