@@ -16,7 +16,11 @@ extern "C" void fmv_native_shutdown(void) {}
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <toml.hpp>
@@ -49,20 +53,47 @@ struct Decoder {
     std::vector<uint32_t> rgb;
 };
 
+/* Decoding runs on its own thread. Inline it cost ~10% of emulation
+ * throughput on R4's intro (199 s of guest progress became 220 s), and the
+ * thread paying that is the one feeding audio — so the symptom is audio
+ * artifacts, not dropped frames.
+ *
+ * Three composited buffers: the worker writes one, publishes it ready, the
+ * presenter holds a third. The worker never touches what the presenter is
+ * showing, so a frame cannot be overwritten mid-upload. State is no longer
+ * assignable (it owns a mutex), so reset() clears it in place. */
 struct State {
     bool               active = false;
     std::vector<Movie> movies;
-    int                current = -1;  /* index into movies */
-    uint32_t           want_frame = 0;
-    bool               have_request = false;
-    Decoder            dec;
-    std::vector<uint32_t> composed;   /* movie centred in the guest's framing */
-    int                composed_w = 0, composed_h = 0;
-    int                composed_for = -1;   /* frame currently composited */
-    int                presented_for = -1;  /* frame the presenter has shown */
-    int                decoded_for = -1;
+    Decoder            dec;              /* worker thread only */
+    int                dec_movie = -1;
+
+    std::vector<uint32_t> buf[3];
+    int                buf_w[3] = {0,0,0}, buf_h[3] = {0,0,0};
+    int                buf_frame[3] = {-1,-1,-1};
+    int                idx_ready = -1, idx_shown = -1;
+    int                shown_frame = -1, last_new = -2;
+
+    int                want_movie = -1, want_frame = 0, decoded_for = -1;
+    int                guest_w = 0, guest_h = 0;
+
+    std::mutex              m;
+    std::condition_variable cv;
+    std::thread             worker;
+    std::atomic<bool>       stop{false};
     unsigned long      decodes = 0, presents = 0;
     bool               reported = false;
+
+    void reset() {
+        active = false; movies.clear(); dec_movie = -1;
+        for (int i = 0; i < 3; i++) {
+            buf[i].clear(); buf_w[i] = buf_h[i] = 0; buf_frame[i] = -1;
+        }
+        idx_ready = idx_shown = -1; shown_frame = -1; last_new = -2;
+        want_movie = -1; want_frame = 0; decoded_for = -1;
+        guest_w = guest_h = 0; decodes = presents = 0; reported = false;
+        stop.store(false);
+    }
 };
 
 State g;
@@ -94,6 +125,7 @@ bool open_movie(int index) {
     if (!g.dec.pkt || !g.dec.frm) return false;
     g.dec.rgb.assign((size_t)m.width * m.height, 0);
     g.dec.pos = -1;
+    g.dec_movie = index;
     return true;
 }
 
@@ -109,7 +141,7 @@ bool decode_next() {
         av_packet_unref(g.dec.pkt);
         if (r < 0) return false;
     }
-    const Movie& m = g.movies[g.current];
+    const Movie& m = g.movies[g.dec_movie];
     g.dec.sws = sws_getCachedContext(
         g.dec.sws, g.dec.frm->width, g.dec.frm->height,
         (AVPixelFormat)g.dec.frm->format, m.width, m.height,
@@ -144,6 +176,65 @@ bool seek_to(int frame) {
     while (g.dec.pos < frame)
         if (!decode_next()) return false;
     return true;
+}
+
+
+/* Decode + composite whatever the CD path last asked for, off the emulation
+ * thread entirely. */
+void worker_main() {
+    for (;;) {
+        int movie, frame, gw, gh;
+        {
+            std::unique_lock<std::mutex> lk(g.m);
+            g.cv.wait(lk, [] {
+                return g.stop.load() ||
+                       (g.want_movie >= 0 && g.guest_w > 0 &&
+                        g.want_frame != g.decoded_for);
+            });
+            if (g.stop.load()) return;
+            movie = g.want_movie; frame = g.want_frame;
+            gw = g.guest_w;       gh = g.guest_h;
+        }
+        if (movie < 0 || movie >= (int)g.movies.size()) continue;
+        const Movie& m = g.movies[movie];
+
+        if (!g.dec.fmt || g.dec_movie != movie) {
+            if (!open_movie(movie)) { g.decoded_for = frame; continue; }
+        }
+        if (!seek_to(frame)) { g.decoded_for = frame; continue; }
+        g.decoded_for = frame;
+        g.decodes++;
+
+        int w = -1;
+        {
+            std::lock_guard<std::mutex> lk(g.m);
+            for (int i = 0; i < 3; i++)
+                if (i != g.idx_shown && i != g.idx_ready) { w = i; break; }
+            if (w < 0) w = 0;
+        }
+        /* Rebuild the guest's framing at native scale: presenting the bare
+         * movie would stretch it, because the bars are part of the picture. */
+        int out_w = m.width, out_h = m.height;
+        if (gw > 0 && gh > 0 && m.width % gw == 0) {
+            const int scale = m.width / gw;
+            const int h2 = gh * scale;
+            if (h2 >= m.height) out_h = h2;
+        }
+        if (g.buf_w[w] != out_w || g.buf_h[w] != out_h) {
+            g.buf[w].assign((size_t)out_w * out_h, 0xFF000000u);
+            g.buf_w[w] = out_w; g.buf_h[w] = out_h;
+        }
+        const int y0 = (out_h - m.height) / 2;
+        for (int y = 0; y < m.height; y++)
+            std::memcpy(&g.buf[w][(size_t)(y0 + y) * out_w],
+                        &g.dec.rgb[(size_t)y * m.width],
+                        (size_t)m.width * sizeof(uint32_t));
+        g.buf_frame[w] = frame;
+        {
+            std::lock_guard<std::mutex> lk(g.m);
+            g.idx_ready = w;
+        }
+    }
 }
 
 }  // namespace
@@ -181,11 +272,13 @@ extern "C" int fmv_native_load(const char* dir) {
         }
     } catch (const std::exception& e) {
         std::fprintf(stdout, "psxrecomp: fmv.toml unreadable (%s)\n", e.what());
-        g = State{};
+        g.reset();
         return 0;
     }
-    if (g.movies.empty()) { g = State{}; return 0; }
+    if (g.movies.empty()) { g.reset(); return 0; }
     g.active = true;
+    g.stop.store(false);
+    g.worker = std::thread(worker_main);
     std::fprintf(stdout, "psxrecomp: native FMV: %zu movie(s)\n", g.movies.size());
     for (const Movie& m : g.movies)
         std::fprintf(stdout, "psxrecomp:   %s %dx%d %d frames, lba %u..%u\n",
@@ -197,9 +290,9 @@ extern "C" int fmv_native_load(const char* dir) {
 extern "C" int fmv_native_active(void) { return g.active ? 1 : 0; }
 
 extern "C" int fmv_native_frame_is_new(void) {
-    if (!g.active || g.composed_for < 0) return 1;
-    if (g.presented_for == g.composed_for) return 0;
-    g.presented_for = g.composed_for;
+    std::lock_guard<std::mutex> lk(g.m);
+    if (g.last_new == g.shown_frame) return 0;
+    g.last_new = g.shown_frame;
     return 1;
 }
 
@@ -208,97 +301,60 @@ extern "C" void fmv_native_note_sector(uint32_t lba, uint32_t frame) {
     for (size_t i = 0; i < g.movies.size(); i++) {
         const Movie& m = g.movies[i];
         if (lba < m.first_lba || lba > m.last_lba) continue;
-        if ((int)i != g.current) {
-            g.current = (int)i;
-            g.decoded_for = -1;
-            close_decoder();
-        }
         /* STR frame numbers are 1-based. Clamp: a movie's final frame can be
-         * short in the re-encode when the last chunk is truncated on disc. */
+         * short in the re-encode when its last chunk is truncated on disc. */
         int idx = (int)frame - 1;
         if (idx < 0) idx = 0;
         if (idx >= m.frames) idx = m.frames - 1;
-        g.want_frame = (uint32_t)idx;
-        g.have_request = true;
+        {
+            std::lock_guard<std::mutex> lk(g.m);
+            g.want_movie = (int)i;
+            g.want_frame = idx;
+        }
+        g.cv.notify_one();
         return;
     }
 }
 
 extern "C" int fmv_native_frame(int guest_w, int guest_h,
                                 int* w, int* h, const uint32_t** pixels) {
-    if (!g.active || !g.have_request || g.current < 0) return 0;
-    const Movie& m = g.movies[g.current];
-    if (!g.dec.fmt && !open_movie(g.current)) { g.have_request = false; return 0; }
+    if (!g.active) return 0;
+    std::lock_guard<std::mutex> lk(g.m);
+    if (guest_w > 0 && guest_h > 0 &&
+        (g.guest_w != guest_w || g.guest_h != guest_h)) {
+        g.guest_w = guest_w; g.guest_h = guest_h;   /* framing for the worker */
+        g.cv.notify_one();
+    }
+    if (g.idx_ready >= 0 && g.idx_ready != g.idx_shown) {
+        g.idx_shown = g.idx_ready;
+        g.shown_frame = g.buf_frame[g.idx_shown];
+    }
+    const int i = g.idx_shown;
+    if (i < 0 || g.buf_w[i] <= 0) return 0;
     g.presents++;
-    if (g.decoded_for != (int)g.want_frame) {
-        if (!seek_to((int)g.want_frame)) return 0;
-        g.decoded_for = (int)g.want_frame;
-        g.decodes++;
-    }
-    /* A 15 fps movie presented at 60 Hz should decode on one present in four.
-     * More than that means want_frame is tracking the STREAM position rather
-     * than what is on screen, and every present pays for a decode. */
-    if (getenv("PSX_FMV_TRACE") && (g.presents % 300) == 0)
-        std::fprintf(stdout, "fmv: presents=%lu decodes=%lu (%.2f decodes/present)\n",
-                     g.presents, g.decodes, (double)g.decodes / (double)g.presents);
-
-    /* Rebuild the guest's framing at the native scale. Without this a 2:1
-     * movie presented as a whole 4:3 frame is stretched, because the bars it
-     * sat inside were part of the original picture. */
-    if (guest_w > 0 && guest_h > 0 && m.width % guest_w == 0) {
-        const int scale = m.width / guest_w;
-        const int out_w = m.width;
-        const int out_h = guest_h * scale;
-        if (out_h >= m.height) {
-            if (g.composed_w != out_w || g.composed_h != out_h) {
-                /* The surround is static black and every rebuild overwrites
-                 * the movie rect in full, so this clear belongs to allocation
-                 * — not to each frame. */
-                g.composed.assign((size_t)out_w * out_h, 0xFF000000u);
-                g.composed_w = out_w;
-                g.composed_h = out_h;
-                g.composed_for = -1;
-            }
-            /* Recomposite only when the frame actually changed. A 15 fps movie
-             * presented at 60 Hz repeats each frame four times, and rebuilding
-             * a 1280x960 buffer every present put ~490 MB/s of needless copy
-             * traffic on the thread that also feeds audio. */
-            if (g.composed_for != (int)g.want_frame) {
-                const int y0 = (out_h - m.height) / 2;
-                for (int y = 0; y < m.height; y++)
-                    std::memcpy(&g.composed[(size_t)(y0 + y) * out_w],
-                                &g.dec.rgb[(size_t)y * m.width],
-                                (size_t)m.width * sizeof(uint32_t));
-                g.composed_for = (int)g.want_frame;
-            }
-            if (!g.reported) {
-                g.reported = true;
-                std::fprintf(stdout,
-                             "psxrecomp: native FMV engaged (%s, %dx%d in a "
-                             "%dx%d frame, %dx)\n", m.name.c_str(),
-                             m.width, m.height, out_w, out_h, scale);
-            }
-            if (w) *w = out_w;
-            if (h) *h = out_h;
-            if (pixels) *pixels = g.composed.data();
-            return 1;
-        }
-    }
     if (!g.reported) {
         g.reported = true;
         std::fprintf(stdout,
-                     "psxrecomp: native FMV engaged (%s, %dx%d, frame %u)\n",
-                     m.name.c_str(), m.width, m.height, g.want_frame);
+                     "psxrecomp: native FMV engaged (%dx%d, threaded decode)\n",
+                     g.buf_w[i], g.buf_h[i]);
     }
-    if (w) *w = m.width;
-    if (h) *h = m.height;
-    if (pixels) *pixels = g.dec.rgb.data();
+    if (getenv("PSX_FMV_TRACE") && (g.presents % 300) == 0)
+        std::fprintf(stdout, "fmv: presents=%lu decodes=%lu\n",
+                     g.presents, g.decodes);
+    if (w) *w = g.buf_w[i];
+    if (h) *h = g.buf_h[i];
+    if (pixels) *pixels = g.buf[i].data();
     return 1;
 }
 
 extern "C" void fmv_native_shutdown(void) {
+    if (g.worker.joinable()) {
+        g.stop.store(true);
+        g.cv.notify_all();
+        g.worker.join();
+    }
     close_decoder();
-    g = State{};
+    g.reset();
 }
 
 #endif /* PSX_HAVE_FFMPEG */

@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "psx_sdl.h"
 #include "cdrom_irq.h"
 #include "dma.h"
 #include "spu.h"
@@ -1386,6 +1387,33 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
      * cdc.cpp GetCDAudio comment). */
     cd_apply_decode_volume(pcm_44100, out_frames);
     xa_zero_scan(pcm_44100, out_frames, lba, 1);
+    /* PSX_XA_TRACE: CD audio must reach the SPU at exactly 44100 frames per
+     * second of guest time. Materially more means the same sector is being
+     * delivered twice, which is heard as an echo rather than as a glitch —
+     * three call sites can reach read_sector_at, so that is worth measuring
+     * rather than assuming. */
+    {
+        static int trace = -1;
+        static uint64_t frames_pushed = 0, last_report_us = 0;
+        static int      last_lba = -1, repeats = 0;
+        if (trace < 0) { const char* e = getenv("PSX_XA_TRACE"); trace = (e && *e && *e != '0') ? 1 : 0; }
+        if (trace) {
+            if (lba == last_lba) repeats++;
+            last_lba = lba;
+            frames_pushed += (uint64_t)out_frames;
+            const uint64_t now = (uint64_t)SDL_GetTicks();
+            if (last_report_us == 0) last_report_us = now;
+            else if (now - last_report_us >= 4000) {
+                const double secs = (double)(now - last_report_us) / 1000.0;
+                fprintf(stdout,
+                        "cdaud: %.0f frames/s pushed (expect 44100), "
+                        "repeat-lba deliveries %d\n",
+                        (double)frames_pushed / secs, repeats);
+                fflush(stdout);
+                frames_pushed = 0; repeats = 0; last_report_us = now;
+            }
+        }
+    }
     spu_cd_audio_push(pcm_44100, out_frames);
     trace_cdrom('A', 0,
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
