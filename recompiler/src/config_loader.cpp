@@ -702,6 +702,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (audio.contains("spu_hq")) {
             rt.audio_spu_hq = toml::find<bool>(audio, "spu_hq");
         }
+        if (audio.contains("native_music_dir")) {
+            const auto rel = toml::find<std::string>(audio, "native_music_dir");
+            if (!rel.empty()) {
+                rt.audio_native_music_dir = fs::absolute(root / rel).string();
+                rt.has_audio_native_music_dir = true;
+            }
+        }
     }
 
     // Optional [controller] block — game-declared input defaults.

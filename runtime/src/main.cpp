@@ -39,6 +39,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "xa_native.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -1146,6 +1147,7 @@ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitr
 static float         g_video_bloom    = 0.0f;
 static int           g_video_grading  = 0;   /* 0=off, 1=vibrant */
 static int           g_video_fxaa     = 0;
+static std::string   g_native_music_dir;   /* [audio] native_music_dir */
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -10819,6 +10821,8 @@ int main(int argc, char** argv) {
             g_video_bloom      = (float)gc.runtime.video_bloom;
             g_video_grading    = gc.runtime.video_grading;
             g_video_fxaa       = gc.runtime.video_fxaa ? 1 : 0;
+            if (gc.runtime.has_audio_native_music_dir)
+                g_native_music_dir = gc.runtime.audio_native_music_dir;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
@@ -12670,6 +12674,10 @@ session_reboot:
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
     gl_renderer_set_postfx(g_video_bloom, g_video_grading, g_video_fxaa);
+    /* Native music pack, if the player generated one. Inert when absent:
+     * xa_native_load returns 0 and cdrom.c keeps decoding CD-XA off the disc. */
+    if (!g_native_music_dir.empty())
+        xa_native_load(g_native_music_dir.c_str());
     if (g_video_bloom > 0.0f || g_video_grading || g_video_fxaa)
         std::fprintf(stdout, "psxrecomp: post-FX bloom %.2f, grading %s, fxaa %s\n",
                      g_video_bloom, g_video_grading ? "vibrant" : "off",

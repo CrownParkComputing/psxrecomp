@@ -14,6 +14,7 @@
 #include "cdrom_irq.h"
 #include "dma.h"
 #include "spu.h"
+#include "xa_native.h"
 #include "event_ring.h"
 #include "audio_trace.h"
 #include "interrupts.h"
@@ -1357,12 +1358,25 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
 
     int16_t native[XA_NATIVE_FRAMES * 2];
     int16_t pcm_44100[XA_MAX_44100_FRAMES * 2];
-    int native_frames = stereo
-        ? xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native)
-        : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
-    xa_zero_scan(native, native_frames, lba, 0);
-    int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
+    int out_frames = 0;
+
+    /* Native music pack, when one is loaded and covers this sector: the track
+     * is already PCM at 44100, so both the ADPCM decode and the resample are
+     * skipped. A miss (no pack, uncovered sector, decode failure) returns 0
+     * and falls through to the disc below, so this never changes behaviour on
+     * its own. */
+    if (xa_native_active())
+        out_frames = xa_native_sector(lba, file, channel, pcm_44100,
+                                      XA_MAX_44100_FRAMES);
+
+    if (out_frames <= 0) {
+        int native_frames = stereo
+            ? xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native)
+            : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
+        xa_zero_scan(native, native_frames, lba, 0);
+        out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
+    }
     /* Volume is applied after resampling, per PS1 hardware tests (Beetle
      * cdc.cpp GetCDAudio comment). */
     cd_apply_decode_volume(pcm_44100, out_frames);

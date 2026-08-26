@@ -400,6 +400,12 @@ struct RuntimeConfig {
     int                   video_grading = 0;
     bool                  video_fxaa    = false;
 
+    // [audio] native_music_dir — directory holding a native music pack
+    // (xa.toml + tracks) built from the player's own disc. Empty = decode
+    // CD-XA off the disc as usual.
+    std::string           audio_native_music_dir;
+    bool                  has_audio_native_music_dir = false;
+
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
     // fallback. Stored as VIDEO_RENDERER_*.
