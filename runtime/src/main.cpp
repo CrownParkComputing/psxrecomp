@@ -1155,6 +1155,7 @@ static std::string   g_native_music_dir;   /* [audio] native_music_dir */
 static std::string   g_libcd_dir;          /* [libcd] asset_dir */
 static std::string   g_fmv_dir;            /* [video] fmv_pack_dir */
 static LibcdNativeAddrs g_libcd_addrs{};
+static bool          g_allow_no_disc = false;  /* [libcd] allow_no_disc */
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -10860,6 +10861,7 @@ int main(int argc, char** argv) {
                 g_libcd_addrs.cd_control     = gc.runtime.libcd_control;
                 g_libcd_addrs.cd_read        = gc.runtime.libcd_read;
                 g_libcd_addrs.cd_read_sync   = gc.runtime.libcd_read_sync;
+                g_allow_no_disc = gc.runtime.libcd_allow_no_disc;
             }
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -12506,8 +12508,20 @@ int main(int argc, char** argv) {
     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
         if (game_config_path && resolved_disc.empty()) {
-            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
-            return 1;
+            /* A pack that covers the whole disc is a complete substitute, so
+             * with allow_no_disc the runtime carries on with nothing mounted.
+             * Load it here rather than later so the decision is made on a pack
+             * that actually exists. */
+            if (g_allow_no_disc && !g_libcd_dir.empty() &&
+                disc_native_load(g_libcd_dir.c_str())) {
+                std::fprintf(stdout,
+                    "psxrecomp: no disc image — running from the native pack "
+                    "(%s)\n", g_libcd_dir.c_str());
+            } else {
+                std::fprintf(stderr,
+                    "psxrecomp: no disc image selected; exiting.\n");
+                return 1;
+            }
         }
     }
 
@@ -12722,7 +12736,7 @@ session_reboot:
     if (!g_libcd_dir.empty()) {
         libcd_native_load(g_libcd_dir.c_str(), &g_libcd_addrs);
         /* Sector-level provider: the seam every stream goes through. */
-        disc_native_load(g_libcd_dir.c_str());
+        if (!disc_native_active()) disc_native_load(g_libcd_dir.c_str());
     }
     if (!g_fmv_dir.empty())
         fmv_native_load(g_fmv_dir.c_str());

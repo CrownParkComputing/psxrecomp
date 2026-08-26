@@ -723,6 +723,8 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.libcd_control     = addr("cd_control");
         rt.libcd_read        = addr("cd_read");
         rt.libcd_read_sync   = addr("cd_read_sync");
+        if (lc.contains("allow_no_disc"))
+            rt.libcd_allow_no_disc = toml::find<bool>(lc, "allow_no_disc");
     }
     if (cfg.contains("audio")) {
         const toml::value& audio = toml::find(cfg, "audio");

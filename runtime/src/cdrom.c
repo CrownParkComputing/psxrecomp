@@ -871,7 +871,10 @@ static void record_sector_history(int lba, int size, uint8_t mode, int have_raw,
 }
 
 static int has_disc(void) {
-    return iso_handle != NULL;
+    /* A pack that covers the whole disc is a disc as far as the controller is
+     * concerned: without this the drive reports an open shell with no image
+     * mounted and the BIOS waits for media that is never coming. */
+    return iso_handle != NULL || disc_native_active();
 }
 
 /* CD status bits */
@@ -1400,14 +1403,14 @@ static int read_sector_at(int min, int sec, int sect) {
     const uint8_t *history_bytes = user_data;
     int history_size = SECTOR_SIZE;
 
+    /* Native pack first, and independently of whether an image is mounted:
+     * a pack that covers the whole disc is a complete substitute, so the
+     * runtime can run with no image at all. Anything the pack declines falls
+     * through to the image when there is one. */
+    if (disc_native_active())
+        have_raw = disc_native_raw_sector((uint32_t)lba, raw_data,
+                                          RAW_SECTOR_SIZE);
     if (iso_handle) {
-        /* Native pack first: it covers file data and synthesised stream
-         * sectors, and declines anything it does not hold so the disc image
-         * still answers for the rest. */
-        have_raw = disc_native_active()
-                       ? disc_native_raw_sector((uint32_t)lba, raw_data,
-                                                RAW_SECTOR_SIZE)
-                       : 0;
         if (!have_raw)
             have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
         if (have_raw) {
@@ -1416,6 +1419,8 @@ static int read_sector_at(int min, int sec, int sect) {
             memset(user_data, 0, sizeof(user_data));
         }
         if (subq_replacements_active) update_last_valid_subq((uint32_t)lba);
+    } else if (have_raw) {
+        memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
     } else {
         memset(user_data, 0, sizeof(user_data));
     }
@@ -1921,12 +1926,14 @@ static void cd_bisect_cmd_log(const char *kind, uint8_t cmd,
     seek_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
     /* TOC helpers: binary track count / resolved GetTD LBA (mount-side). */
     if (cmd == 0x13u)
-        tracks = iso_handle ? iso_track_count(iso_handle) : 0;
+        tracks = iso_handle ? iso_track_count(iso_handle)
+                            : (disc_native_active() ? 1 : 0);
     else if (cmd == 0x14u && params && nparam >= 1) {
         int raw = (int)params[0];
         int track = bcd_to_bin(raw);
         if (raw == 0xAA || track == 0) {
-            uint32_t sectors = iso_handle ? iso_sector_count(iso_handle) : 0u;
+            uint32_t sectors = iso_handle ? iso_sector_count(iso_handle)
+                                          : disc_native_lead_out();
             td_lba = sectors ? (int)sectors : 0;
         } else {
             td_lba = iso_handle ? (int)iso_track_start_lba(iso_handle, track) : 0;

@@ -28,6 +28,17 @@ struct FileRegion {
     fs::path    path;
 };
 
+/* Sectors kept verbatim: whatever a stream rule cannot generate. For a movie
+ * region the bytes genuinely matter — the guest's MDEC decodes them even when
+ * a native re-encode is what the player sees — so they are stored as raw 2352
+ * byte sectors rather than synthesised. */
+struct RawBlob {
+    std::string name;
+    uint32_t    first_lba = 0;
+    uint32_t    sectors = 0;
+    fs::path    path;
+};
+
 struct StreamRegion {
     std::string name;
     uint32_t    first_lba = 0;
@@ -40,8 +51,9 @@ struct State {
     bool                      active = false;
     std::vector<FileRegion>   files;
     std::vector<StreamRegion> streams;
-    uint64_t file_sectors = 0, stream_sectors = 0, declined = 0;
-    bool reported_file = false, reported_stream = false;
+    std::vector<RawBlob>      blobs;
+    uint64_t file_sectors = 0, stream_sectors = 0, raw_sectors = 0, declined = 0;
+    bool reported_file = false, reported_stream = false, reported_raw = false;
     uint64_t next_report = 20000;
 };
 
@@ -50,14 +62,15 @@ State g;
 /* One-shot lines say "it started"; a running tally says how much of the disc
  * the pack is actually carrying, which is the number that matters. */
 void maybe_report() {
-    const uint64_t total = g.file_sectors + g.stream_sectors;
+    const uint64_t total = g.file_sectors + g.stream_sectors + g.raw_sectors;
     if (total < g.next_report) return;
     g.next_report = total + 20000;
     std::fprintf(stdout,
-                 "psxrecomp: native disc: %llu file + %llu stream sectors "
-                 "served, %llu declined to the disc image\n",
+                 "psxrecomp: native disc: %llu file + %llu stream + %llu raw "
+                 "sectors served, %llu declined to the disc image\n",
                  (unsigned long long)g.file_sectors,
                  (unsigned long long)g.stream_sectors,
+                 (unsigned long long)g.raw_sectors,
                  (unsigned long long)g.declined);
 }
 
@@ -109,6 +122,16 @@ extern "C" int disc_native_load(const char* dir) {
                 g.files.push_back(std::move(r));
             }
         }
+        if (cfg.contains("rawblob")) {
+            for (const auto& t : toml::find<toml::array>(cfg, "rawblob")) {
+                RawBlob b;
+                b.name = toml::find<std::string>(t, "name");
+                b.first_lba = (uint32_t)toml::find<int64_t>(t, "first_lba");
+                b.sectors = (uint32_t)toml::find<int64_t>(t, "sectors");
+                b.path = root / toml::find<std::string>(t, "file");
+                if (b.sectors && fs::exists(b.path, ec)) g.blobs.push_back(std::move(b));
+            }
+        }
         if (cfg.contains("stream")) {
             for (const auto& t : toml::find<toml::array>(cfg, "stream")) {
                 StreamRegion r;
@@ -131,16 +154,30 @@ extern "C" int disc_native_load(const char* dir) {
         g = State{};
         return 0;
     }
-    if (g.files.empty() && g.streams.empty()) { g = State{}; return 0; }
+    if (g.files.empty() && g.streams.empty() && g.blobs.empty()) {
+        g = State{};
+        return 0;
+    }
     g.active = true;
     std::fprintf(stdout,
                  "psxrecomp: native disc provider: %zu stored file(s), "
-                 "%zu synthesised stream(s)\n",
-                 g.files.size(), g.streams.size());
+                 "%zu synthesised stream(s), %zu raw region(s)\n",
+                 g.files.size(), g.streams.size(), g.blobs.size());
     return 1;
 }
 
 extern "C" int disc_native_active(void) { return g.active ? 1 : 0; }
+
+extern "C" uint32_t disc_native_lead_out(void) {
+    uint32_t end = 0;
+    for (const FileRegion& r : g.files)
+        if (r.lba + r.sectors > end) end = r.lba + r.sectors;
+    for (const StreamRegion& r : g.streams)
+        if (r.first_lba + r.sectors > end) end = r.first_lba + r.sectors;
+    for (const RawBlob& b : g.blobs)
+        if (b.first_lba + b.sectors > end) end = b.first_lba + b.sectors;
+    return end;
+}
 
 extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size) {
     if (!g.active || !out || size < RAW) return 0;
@@ -162,6 +199,24 @@ extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size)
             std::fprintf(stdout,
                          "psxrecomp: native disc: serving %s from the pack "
                          "(first lba %u)\n", r.name.c_str(), lba);
+        }
+        return 1;
+    }
+
+    for (const RawBlob& b : g.blobs) {
+        if (lba < b.first_lba || lba >= b.first_lba + b.sectors) continue;
+        std::ifstream f(b.path, std::ios::binary);
+        if (!f) break;
+        f.seekg((std::streamoff)(lba - b.first_lba) * RAW);
+        std::memset(out, 0, RAW);
+        f.read((char*)out, RAW);
+        g.raw_sectors++;
+        maybe_report();
+        if (!g.reported_raw) {
+            g.reported_raw = true;
+            std::fprintf(stdout,
+                         "psxrecomp: native disc: serving %s raw sectors "
+                         "(first lba %u)\n", b.name.c_str(), lba);
         }
         return 1;
     }

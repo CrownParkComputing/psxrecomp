@@ -29,6 +29,10 @@ extern "C" {
 int  disc_native_load(const char* dir);
 int  disc_native_active(void);
 
+/* One past the highest LBA the pack covers — the lead-out the controller
+ * reports when no image is mounted. 0 when inactive. */
+uint32_t disc_native_lead_out(void);
+
 /* Fill `out` (2352 bytes) for `lba`. Returns 1 when served, 0 to fall back. */
 int  disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size);
 

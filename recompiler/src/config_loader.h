@@ -421,6 +421,10 @@ struct RuntimeConfig {
     uint32_t              libcd_control = 0;
     uint32_t              libcd_read = 0;
     uint32_t              libcd_read_sync = 0;
+    // [libcd] allow_no_disc — assert that the pack covers the whole disc, so
+    // the runtime may boot with no image mounted. Opt-in: a pack with gaps
+    // would otherwise fail as silent bad reads rather than a clear refusal.
+    bool                  libcd_allow_no_disc = false;
 
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
