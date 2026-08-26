@@ -29,6 +29,7 @@ struct Entry {
     uint32_t    size = 0;
     bool        stored = false;
     fs::path    path;
+    mutable std::ifstream file;   /* held open; see disc_native.cpp */
 };
 
 struct State {
@@ -146,8 +147,11 @@ int on_read(CPUState* cpu, uint32_t, void*) {
     uint8_t* p = nullptr;
     if (!ram_range(dest, (uint32_t)want, &p)) return 0;
 
-    std::ifstream f(e->path, std::ios::binary);
-    if (!f) return 0;
+    if (!e->file.is_open())
+        const_cast<Entry*>(e)->file.open(e->path, std::ios::binary);
+    if (!e->file) return 0;
+    std::ifstream& f = e->file;
+    f.clear();
     f.seekg((std::streamoff)offset);
     std::memset(p, 0, (size_t)want);
     f.read((char*)p, (std::streamsize)want);

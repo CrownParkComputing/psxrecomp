@@ -59,6 +59,7 @@ struct State {
     int                composed_w = 0, composed_h = 0;
     int                composed_for = -1;   /* frame currently composited */
     int                decoded_for = -1;
+    unsigned long      decodes = 0, presents = 0;
     bool               reported = false;
 };
 
@@ -219,10 +220,18 @@ extern "C" int fmv_native_frame(int guest_w, int guest_h,
     if (!g.active || !g.have_request || g.current < 0) return 0;
     const Movie& m = g.movies[g.current];
     if (!g.dec.fmt && !open_movie(g.current)) { g.have_request = false; return 0; }
+    g.presents++;
     if (g.decoded_for != (int)g.want_frame) {
         if (!seek_to((int)g.want_frame)) return 0;
         g.decoded_for = (int)g.want_frame;
+        g.decodes++;
     }
+    /* A 15 fps movie presented at 60 Hz should decode on one present in four.
+     * More than that means want_frame is tracking the STREAM position rather
+     * than what is on screen, and every present pays for a decode. */
+    if (getenv("PSX_FMV_TRACE") && (g.presents % 300) == 0)
+        std::fprintf(stdout, "fmv: presents=%lu decodes=%lu (%.2f decodes/present)\n",
+                     g.presents, g.decodes, (double)g.decodes / (double)g.presents);
 
     /* Rebuild the guest's framing at the native scale. Without this a 2:1
      * movie presented as a whole 4:3 frame is stretched, because the bars it

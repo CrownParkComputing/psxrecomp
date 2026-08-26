@@ -20,12 +20,17 @@ constexpr uint32_t FORM1 = 2048u;
 constexpr uint32_t FORM2_BYTES = 2336u;
 constexpr uint32_t LEAD_IN = 150u;
 
+/* Handles stay open for the life of the pack. Re-opening per sector put an
+ * open()/close() pair on the emulation thread for every sector the guest
+ * streamed — a few hundred a second during a movie, which is exactly the kind
+ * of hitching that surfaces as audio artifacts rather than dropped frames. */
 struct FileRegion {
     std::string name;
     uint32_t    lba = 0;
     uint32_t    size = 0;
     uint32_t    sectors = 0;
     fs::path    path;
+    mutable std::ifstream file;
 };
 
 /* Sectors kept verbatim: whatever a stream rule cannot generate. For a movie
@@ -37,6 +42,7 @@ struct RawBlob {
     uint32_t    first_lba = 0;
     uint32_t    sectors = 0;
     fs::path    path;
+    mutable std::ifstream file;
 };
 
 struct StreamRegion {
@@ -185,8 +191,10 @@ extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size)
     for (const FileRegion& r : g.files) {
         if (lba < r.lba || lba >= r.lba + r.sectors) continue;
         const uint64_t off = (uint64_t)(lba - r.lba) * FORM1;
-        std::ifstream f(r.path, std::ios::binary);
-        if (!f) break;
+        if (!r.file.is_open()) r.file.open(r.path, std::ios::binary);
+        if (!r.file) break;
+        std::ifstream& f = r.file;
+        f.clear();
         write_header(out, lba, 2);
         /* Form 1 data: submode bit 3 (data), no audio/video, no Form 2 bit. */
         write_subheader(out, 1, 0, 0x08, 0x00);
@@ -205,8 +213,10 @@ extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size)
 
     for (const RawBlob& b : g.blobs) {
         if (lba < b.first_lba || lba >= b.first_lba + b.sectors) continue;
-        std::ifstream f(b.path, std::ios::binary);
-        if (!f) break;
+        if (!b.file.is_open()) b.file.open(b.path, std::ios::binary);
+        if (!b.file) break;
+        std::ifstream& f = b.file;
+        f.clear();
         f.seekg((std::streamoff)(lba - b.first_lba) * RAW);
         std::memset(out, 0, RAW);
         f.read((char*)out, RAW);
