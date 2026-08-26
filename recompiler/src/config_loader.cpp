@@ -60,6 +60,7 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
 
     h.words("sprite_tag_funcs", c.ws_sprite_tag_funcs);
     h.words("mod_function_entry_funcs", c.mod_function_entry_funcs);
+    h.words("native_funcs", c.native_funcs);
     h.words("cull_bias", c.ws_cull_bias_sites);
     h.words("cull_range", c.ws_cull_range_sites);
     h.words("cull_a1", c.ws_cull_a1_sites);
@@ -696,6 +697,26 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     }
 
     // Optional [audio] block.
+    if (cfg.contains("libcd")) {
+        const toml::value& lc = toml::find(cfg, "libcd");
+        if (lc.contains("asset_dir")) {
+            const auto rel = toml::find<std::string>(lc, "asset_dir");
+            if (!rel.empty()) {
+                rt.libcd_asset_dir = fs::absolute(root / rel).string();
+                rt.has_libcd = true;
+            }
+        }
+        auto addr = [&](const char* k) -> uint32_t {
+            return lc.contains(k)
+                ? parse_hex(toml::find<std::string>(lc, k),
+                            fmt::format("libcd.{}", k))
+                : 0u;
+        };
+        rt.libcd_search_file = addr("cd_search_file");
+        rt.libcd_control     = addr("cd_control");
+        rt.libcd_read        = addr("cd_read");
+        rt.libcd_read_sync   = addr("cd_read_sync");
+    }
     if (cfg.contains("audio")) {
         const toml::value& audio = toml::find(cfg, "audio");
         if (audio.contains("buffer_ms")) {
@@ -1441,6 +1462,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // Optional [recompiler] hot_funcs — __attribute__((hot)) on emitted C.
     // Optional trusted, statically linked game-mod entry hooks.
     std::vector<uint32_t> mod_function_entry_funcs;
+    // Optional [recompiler] native_funcs — psx_native_call() entry hooks.
+    std::vector<uint32_t> native_funcs;
+    if (recomp.contains("native_funcs")) {
+        const auto& arr = toml::find<std::vector<std::string>>(
+            recomp, "native_funcs");
+        for (const auto& a : arr)
+            native_funcs.push_back(parse_hex(a, "recompiler.native_funcs"));
+    }
     if (recomp.contains("mod_function_entry_funcs")) {
         const auto& arr = toml::find<std::vector<std::string>>(
             recomp, "mod_function_entry_funcs");
@@ -2096,6 +2125,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_auto_ui_squash*/      ws_auto_ui_squash,
         /*data_shard_funcs*/      data_shard_funcs,
         /*mod_function_entry_funcs*/ mod_function_entry_funcs,
+        /*native_funcs*/          native_funcs,
         /*hot_funcs*/             hot_funcs,
         /*load_charge_batch*/     load_charge_batch,
         /*load_charge_batch_funcs*/ load_charge_batch_funcs,

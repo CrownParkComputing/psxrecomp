@@ -40,6 +40,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "xa_native.h"
+#include "libcd_native.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -1149,6 +1150,8 @@ static int           g_video_grading  = 0;   /* 0=off, 1=vibrant */
 static int           g_video_fxaa     = 0;
 static float         g_video_bloom_thresh = 0.80f;
 static std::string   g_native_music_dir;   /* [audio] native_music_dir */
+static std::string   g_libcd_dir;          /* [libcd] asset_dir */
+static LibcdNativeAddrs g_libcd_addrs{};
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -10832,6 +10835,13 @@ int main(int argc, char** argv) {
             g_video_bloom_thresh = (float)gc.runtime.video_bloom_threshold;
             if (gc.runtime.has_audio_native_music_dir)
                 g_native_music_dir = gc.runtime.audio_native_music_dir;
+            if (gc.runtime.has_libcd) {
+                g_libcd_dir = gc.runtime.libcd_asset_dir;
+                g_libcd_addrs.cd_search_file = gc.runtime.libcd_search_file;
+                g_libcd_addrs.cd_control     = gc.runtime.libcd_control;
+                g_libcd_addrs.cd_read        = gc.runtime.libcd_read;
+                g_libcd_addrs.cd_read_sync   = gc.runtime.libcd_read_sync;
+            }
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
@@ -12688,6 +12698,10 @@ session_reboot:
      * xa_native_load returns 0 and cdrom.c keeps decoding CD-XA off the disc. */
     if (!g_native_music_dir.empty())
         xa_native_load(g_native_music_dir.c_str());
+    /* Native CD layer: answers libcd from extracted files instead of a drive.
+     * Inert without [libcd], and each call declines what it cannot serve. */
+    if (!g_libcd_dir.empty())
+        libcd_native_load(g_libcd_dir.c_str(), &g_libcd_addrs);
     if (g_video_bloom > 0.0f || g_video_grading || g_video_fxaa)
         std::fprintf(stdout, "psxrecomp: post-FX bloom %.2f, grading %s, fxaa %s\n",
                      g_video_bloom, g_video_grading ? "vibrant" : "off",

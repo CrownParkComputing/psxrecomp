@@ -67,6 +67,10 @@ struct CodeGenConfig {
     // Only explicitly listed guest functions call the runtime dispatcher.
     std::set<uint32_t> mod_function_entry_funcs;
 
+    // Native function replacements ([recompiler] native_funcs). Entry gets a
+    // psx_native_call() hook that may skip the body (native_call.h).
+    std::set<uint32_t> native_funcs;
+
     // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
     // addresses (MotK VLC leaves, etc.). Host locality hint only.
     std::set<uint32_t> hot_funcs;

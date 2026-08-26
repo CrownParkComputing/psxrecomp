@@ -407,6 +407,16 @@ struct RuntimeConfig {
     std::string           audio_native_music_dir;
     bool                  has_audio_native_music_dir = false;
 
+    // [libcd] — per-game addresses of the PSY-Q CD calls, plus the directory
+    // holding the extracted asset pack (disc.toml + files). The addresses must
+    // also appear in [recompiler] native_funcs.
+    std::string           libcd_asset_dir;
+    bool                  has_libcd = false;
+    uint32_t              libcd_search_file = 0;
+    uint32_t              libcd_control = 0;
+    uint32_t              libcd_read = 0;
+    uint32_t              libcd_read_sync = 0;
+
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
     // fallback. Stored as VIDEO_RENDERER_*.
@@ -824,6 +834,12 @@ struct GameConfig {
     // entries that dispatch trusted, statically linked mod callbacks. Empty by
     // default, so projects that do not opt in emit no callback overhead.
     std::vector<uint32_t> mod_function_entry_funcs;
+
+    // [recompiler] native_funcs: guest functions whose entry gets a
+    // psx_native_call() hook, letting a registered native implementation skip
+    // the body (native_call.h). Declining falls through to the guest code, so
+    // a layer can be brought up one call at a time.
+    std::vector<uint32_t> native_funcs;
 
     // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
     // on their generated C bodies (profile/host locality; no guest semantics).

@@ -2721,6 +2721,16 @@ GeneratedFunction CodeGenerator::generate_function(
                                "  /* data-shard: replay or arm capture */\n",
                                func.start_addr);
     }
+    if (config_.native_funcs.count(func.start_addr)) {
+        // Native replacement (native_call.h): a registered handler that serves
+        // this call sets $v0, we publish $ra and skip the body. Declining runs
+        // the guest code, so a layer can be brought up one call at a time.
+        body_ss << config_.indent
+                << fmt::format(
+                       "if (psx_native_call(cpu, 0x{:08X}u)) return;"
+                       "  /* native replacement */\n",
+                       func.start_addr);
+    }
     if (config_.mod_function_entry_funcs.count(func.start_addr)) {
         body_ss << config_.indent
                 << fmt::format(
@@ -3223,6 +3233,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "#endif\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
+    ss << "extern int  psx_native_call(CPUState* cpu, uint32_t address);  /* native function replacement (native_call.c) */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
