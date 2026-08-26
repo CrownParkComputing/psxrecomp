@@ -1405,10 +1405,21 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
             if (last_report_us == 0) last_report_us = now;
             else if (now - last_report_us >= 4000) {
                 const double secs = (double)(now - last_report_us) / 1000.0;
+                /* Overflow vs underflow is the whole diagnosis: overflow
+                 * means the ring is being filled faster than drained (drops,
+                 * heard as clicks), underflow means it ran dry (the SPU
+                 * repeats what it has, heard as a smear). */
+                SpuDebugInfo st;
+                spu_debug_info(&st);
                 fprintf(stdout,
                         "cdaud: %.0f frames/s pushed (expect 44100), "
-                        "repeat-lba deliveries %d\n",
-                        (double)frames_pushed / secs, repeats);
+                        "repeat-lba %d, ring %u frames, overflow %llu, "
+                        "underflow %llu, mode=0x%02X (%s speed)\n",
+                        (double)frames_pushed / secs, repeats,
+                        st.cd_frames,
+                        (unsigned long long)st.cd_overflow_frames,
+                        (unsigned long long)st.cd_underflow_frames,
+                        mode_reg, (mode_reg & 0x80) ? "2x" : "1x");
                 fflush(stdout);
                 frames_pushed = 0; repeats = 0; last_report_us = now;
             }
