@@ -410,6 +410,11 @@ struct RuntimeConfig {
     // [libcd] — per-game addresses of the PSY-Q CD calls, plus the directory
     // holding the extracted asset pack (disc.toml + files). The addresses must
     // also appear in [recompiler] native_funcs.
+    // [video] fmv_pack_dir — directory holding a native FMV pack (fmv.toml +
+    // encoded movies) built from the player's own disc.
+    std::string           video_fmv_pack_dir;
+    bool                  has_video_fmv_pack_dir = false;
+
     std::string           libcd_asset_dir;
     bool                  has_libcd = false;
     uint32_t              libcd_search_file = 0;

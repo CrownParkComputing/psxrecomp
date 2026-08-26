@@ -16,6 +16,7 @@
 #include "spu.h"
 #include "xa_native.h"
 #include "disc_native.h"
+#include "fmv_native.h"
 #include "event_ring.h"
 #include "audio_trace.h"
 #include "interrupts.h"
@@ -1420,6 +1421,18 @@ static int read_sector_at(int min, int sec, int sect) {
     }
 
     delivery = classify_raw_sector(raw_data, have_raw);
+    /* STR video sectors carry the frame number they belong to; handing those
+     * to the FMV presenter is what keeps a native movie in step with the
+     * guest's own decode without timestamps or frame counting. */
+    if (have_raw && fmv_native_active()) {
+        const uint8_t *u = raw_data + RAW_USER_DATA_OFFSET;
+        if (u[0] == 0x60 && u[1] == 0x01 &&
+            (uint16_t)(u[2] | (u[3] << 8)) == 0x8001u) {
+            const uint32_t frame = (uint32_t)u[8] | ((uint32_t)u[9] << 8) |
+                                   ((uint32_t)u[10] << 16) | ((uint32_t)u[11] << 24);
+            fmv_native_note_sector((uint32_t)lba, frame);
+        }
+    }
     delivery.xa_audio_delivered =
         (uint8_t)maybe_deliver_xa_audio(raw_data, lba, &delivery);
     delivery.data_delivered = 1;

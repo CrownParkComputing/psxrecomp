@@ -305,6 +305,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/native_call.c
     ${PSXRECOMP_ROOT}/runtime/src/libcd_native.cpp
     ${PSXRECOMP_ROOT}/runtime/src/disc_native.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/fmv_native.cpp
     ${PSXRECOMP_ROOT}/runtime/src/xa_native.cpp
     ${PSXRECOMP_ROOT}/runtime/src/stb_vorbis_impl.c
     ${PSXRECOMP_ROOT}/runtime/src/spu.c
@@ -1337,6 +1338,30 @@ function(psxrecomp_add_runtime_target target)
     endif()
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
+    endif()
+
+    # Native FMV needs a video decoder. Optional and auto-detected: without
+    # FFmpeg the module compiles to stubs and the guest's own MDEC output is
+    # presented, so upstream builds are unaffected.
+    if(NOT DEFINED PSXRECOMP_FFMPEG_FOUND)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(PSX_FFMPEG QUIET libavcodec libavformat libswscale libavutil)
+        endif()
+        set(PSXRECOMP_FFMPEG_FOUND ${PSX_FFMPEG_FOUND} CACHE INTERNAL "")
+        set(PSXRECOMP_FFMPEG_LIBS "${PSX_FFMPEG_LINK_LIBRARIES}" CACHE INTERNAL "")
+        set(PSXRECOMP_FFMPEG_INCLUDE "${PSX_FFMPEG_INCLUDE_DIRS}" CACHE INTERNAL "")
+        if(PSX_FFMPEG_FOUND)
+            message(STATUS "psxrecomp: native FMV enabled (FFmpeg found)")
+        else()
+            message(STATUS "psxrecomp: native FMV disabled (no FFmpeg); "
+                           "guest MDEC output is presented as-is")
+        endif()
+    endif()
+    if(PSXRECOMP_FFMPEG_FOUND)
+        target_compile_definitions(${target} PRIVATE PSX_HAVE_FFMPEG=1)
+        target_include_directories(${target} PRIVATE ${PSXRECOMP_FFMPEG_INCLUDE})
+        target_link_libraries(${target} PRIVATE ${PSXRECOMP_FFMPEG_LIBS})
     endif()
 
     # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's

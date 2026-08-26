@@ -42,9 +42,24 @@ struct State {
     std::vector<StreamRegion> streams;
     uint64_t file_sectors = 0, stream_sectors = 0, declined = 0;
     bool reported_file = false, reported_stream = false;
+    uint64_t next_report = 20000;
 };
 
 State g;
+
+/* One-shot lines say "it started"; a running tally says how much of the disc
+ * the pack is actually carrying, which is the number that matters. */
+void maybe_report() {
+    const uint64_t total = g.file_sectors + g.stream_sectors;
+    if (total < g.next_report) return;
+    g.next_report = total + 20000;
+    std::fprintf(stdout,
+                 "psxrecomp: native disc: %llu file + %llu stream sectors "
+                 "served, %llu declined to the disc image\n",
+                 (unsigned long long)g.file_sectors,
+                 (unsigned long long)g.stream_sectors,
+                 (unsigned long long)g.declined);
+}
 
 inline uint8_t bcd(uint32_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
 
@@ -141,6 +156,7 @@ extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size)
         f.seekg((std::streamoff)off);
         f.read((char*)(out + 24), FORM1);
         g.file_sectors++;
+        maybe_report();
         if (!g.reported_file) {
             g.reported_file = true;
             std::fprintf(stdout,
@@ -159,6 +175,7 @@ extern "C" int disc_native_raw_sector(uint32_t lba, uint8_t* out, uint32_t size)
         /* Payload deliberately left zero: an XA audio sector's sound comes
          * from the native music pack, so the ADPCM never has to exist. */
         g.stream_sectors++;
+        maybe_report();
         if (!g.reported_stream) {
             g.reported_stream = true;
             std::fprintf(stdout,

@@ -605,6 +605,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 "[video] crt_filter must be \"raw\"|\"crt\"|\"composite\"|\"trinitron\": {}",
                 mode));
         }
+        if (video.contains("fmv_pack_dir")) {
+            const auto rel = toml::find<std::string>(video, "fmv_pack_dir");
+            if (!rel.empty()) {
+                rt.video_fmv_pack_dir = fs::absolute(root / rel).string();
+                rt.has_video_fmv_pack_dir = true;
+            }
+        }
         if (video.contains("bloom")) {
             const auto n = toml::find<double>(video, "bloom");
             if (n < 0.0 || n > 4.0)

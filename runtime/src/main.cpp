@@ -42,6 +42,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "xa_native.h"
 #include "libcd_native.h"
 #include "disc_native.h"
+#include "fmv_native.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -1152,6 +1153,7 @@ static int           g_video_fxaa     = 0;
 static float         g_video_bloom_thresh = 0.80f;
 static std::string   g_native_music_dir;   /* [audio] native_music_dir */
 static std::string   g_libcd_dir;          /* [libcd] asset_dir */
+static std::string   g_fmv_dir;            /* [video] fmv_pack_dir */
 static LibcdNativeAddrs g_libcd_addrs{};
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_video_win_w_explicit = false; /* user chose a width */
@@ -7006,6 +7008,20 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * right-edge jump the old comment describes is 0 with filtering on.
          * Set video AA off to get nearest back. */
         gl_renderer_set_fmv_filter(g_video_fmv_filter);
+        /* Native FMV: the guest still decodes its own MDEC (its pacing, audio
+         * and skip logic stay in charge) — only the picture is swapped, and
+         * only when the pack has the frame the guest is showing. */
+        {
+            int nw = 0, nh = 0;
+            const uint32_t* npx = nullptr;
+            if (fmv_native_frame(src_w, src_h, &nw, &nh, &npx) &&
+                npx && nw > 0 && nh > 0) {
+                gl_renderer_present(npx, nw, nh, g_video_aa ? 1 : 0,
+                                    pin_43 ? 1 : 0, 0);
+                netplay_note_present();
+                return ep;
+            }
+        }
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
                             g_video_aa ? 1 : 0,
                             pin_43 ? 1 : 0, 0 /* full width */);
@@ -10834,6 +10850,8 @@ int main(int argc, char** argv) {
             g_video_grading    = gc.runtime.video_grading;
             g_video_fxaa       = gc.runtime.video_fxaa ? 1 : 0;
             g_video_bloom_thresh = (float)gc.runtime.video_bloom_threshold;
+            if (gc.runtime.has_video_fmv_pack_dir)
+                g_fmv_dir = gc.runtime.video_fmv_pack_dir;
             if (gc.runtime.has_audio_native_music_dir)
                 g_native_music_dir = gc.runtime.audio_native_music_dir;
             if (gc.runtime.has_libcd) {
@@ -12706,6 +12724,8 @@ session_reboot:
         /* Sector-level provider: the seam every stream goes through. */
         disc_native_load(g_libcd_dir.c_str());
     }
+    if (!g_fmv_dir.empty())
+        fmv_native_load(g_fmv_dir.c_str());
     if (g_video_bloom > 0.0f || g_video_grading || g_video_fxaa)
         std::fprintf(stdout, "psxrecomp: post-FX bloom %.2f, grading %s, fxaa %s\n",
                      g_video_bloom, g_video_grading ? "vibrant" : "off",
