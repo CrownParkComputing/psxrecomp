@@ -15,6 +15,7 @@
 #include "dma.h"
 #include "spu.h"
 #include "xa_native.h"
+#include "disc_native.h"
 #include "event_ring.h"
 #include "audio_trace.h"
 #include "interrupts.h"
@@ -1399,7 +1400,15 @@ static int read_sector_at(int min, int sec, int sect) {
     int history_size = SECTOR_SIZE;
 
     if (iso_handle) {
-        have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
+        /* Native pack first: it covers file data and synthesised stream
+         * sectors, and declines anything it does not hold so the disc image
+         * still answers for the rest. */
+        have_raw = disc_native_active()
+                       ? disc_native_raw_sector((uint32_t)lba, raw_data,
+                                                RAW_SECTOR_SIZE)
+                       : 0;
+        if (!have_raw)
+            have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
         if (have_raw) {
             memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
         } else if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {

@@ -41,6 +41,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_gl_renderer.h"
 #include "xa_native.h"
 #include "libcd_native.h"
+#include "disc_native.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -12700,8 +12701,11 @@ session_reboot:
         xa_native_load(g_native_music_dir.c_str());
     /* Native CD layer: answers libcd from extracted files instead of a drive.
      * Inert without [libcd], and each call declines what it cannot serve. */
-    if (!g_libcd_dir.empty())
+    if (!g_libcd_dir.empty()) {
         libcd_native_load(g_libcd_dir.c_str(), &g_libcd_addrs);
+        /* Sector-level provider: the seam every stream goes through. */
+        disc_native_load(g_libcd_dir.c_str());
+    }
     if (g_video_bloom > 0.0f || g_video_grading || g_video_fxaa)
         std::fprintf(stdout, "psxrecomp: post-FX bloom %.2f, grading %s, fxaa %s\n",
                      g_video_bloom, g_video_grading ? "vibrant" : "off",

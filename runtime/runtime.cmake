@@ -304,6 +304,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/cdrom.c
     ${PSXRECOMP_ROOT}/runtime/src/native_call.c
     ${PSXRECOMP_ROOT}/runtime/src/libcd_native.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/disc_native.cpp
     ${PSXRECOMP_ROOT}/runtime/src/xa_native.cpp
     ${PSXRECOMP_ROOT}/runtime/src/stb_vorbis_impl.c
     ${PSXRECOMP_ROOT}/runtime/src/spu.c
