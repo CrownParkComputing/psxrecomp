@@ -7,6 +7,7 @@ extern "C" int  fmv_native_load(const char*) { return 0; }
 extern "C" int  fmv_native_active(void) { return 0; }
 extern "C" void fmv_native_note_sector(uint32_t, uint32_t) {}
 extern "C" int  fmv_native_frame(int, int, int*, int*, const uint32_t**) { return 0; }
+extern "C" int  fmv_native_frame_is_new(void) { return 0; }
 extern "C" void fmv_native_shutdown(void) {}
 
 #else
@@ -58,6 +59,7 @@ struct State {
     std::vector<uint32_t> composed;   /* movie centred in the guest's framing */
     int                composed_w = 0, composed_h = 0;
     int                composed_for = -1;   /* frame currently composited */
+    int                presented_for = -1;  /* frame the presenter has shown */
     int                decoded_for = -1;
     unsigned long      decodes = 0, presents = 0;
     bool               reported = false;
@@ -193,6 +195,13 @@ extern "C" int fmv_native_load(const char* dir) {
 }
 
 extern "C" int fmv_native_active(void) { return g.active ? 1 : 0; }
+
+extern "C" int fmv_native_frame_is_new(void) {
+    if (!g.active || g.composed_for < 0) return 1;
+    if (g.presented_for == g.composed_for) return 0;
+    g.presented_for = g.composed_for;
+    return 1;
+}
 
 extern "C" void fmv_native_note_sector(uint32_t lba, uint32_t frame) {
     if (!g.active) return;

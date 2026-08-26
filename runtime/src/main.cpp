@@ -7017,6 +7017,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             const uint32_t* npx = nullptr;
             if (fmv_native_frame(src_w, src_h, &nw, &nh, &npx) &&
                 npx && nw > 0 && nh > 0) {
+                /* Only hand over pixels when the movie actually advanced;
+                 * otherwise re-present what is already in the texture. */
+                if (!fmv_native_frame_is_new()) npx = nullptr;
                 gl_renderer_present(npx, nw, nh, g_video_aa ? 1 : 0,
                                     pin_43 ? 1 : 0, 0);
                 netplay_note_present();

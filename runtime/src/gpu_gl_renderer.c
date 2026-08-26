@@ -2554,6 +2554,19 @@ static void glb_vram_transfer_out(int x,int y,int w,int h,uint16_t *d){ ensure_c
 /* ---- context init / present -------------------------------------------- */
 static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear) {
     glBindTexture(GL_TEXTURE_2D, s_present_tex);
+    /* pixels == NULL: the caller is re-presenting content already in the
+     * texture. A native-FMV frame is 1280x960 where a stock scanout is
+     * 320x240, so re-uploading it on every present costs 16x the bandwidth
+     * for bytes that did not change — a 15 fps movie only needs one upload in
+     * four. Sampling state is still re-asserted; only the transfer is
+     * skipped. */
+    if (!pixels) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        return;
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     /* Re-assert clamp every upload: a stale REPEAT wrap samples past the

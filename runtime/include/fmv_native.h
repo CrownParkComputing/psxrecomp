@@ -38,6 +38,11 @@ void fmv_native_note_sector(uint32_t lba, uint32_t frame);
 int  fmv_native_frame(int guest_w, int guest_h,
                       int* w, int* h, const uint32_t** pixels);
 
+/* 1 when the last fmv_native_frame() produced a picture the presenter has not
+ * shown yet. A 15 fps movie repeats each frame across several presents, and
+ * re-uploading an unchanged one is pure bandwidth. */
+int  fmv_native_frame_is_new(void);
+
 void fmv_native_shutdown(void);
 
 #ifdef __cplusplus
