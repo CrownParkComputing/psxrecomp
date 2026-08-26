@@ -263,10 +263,15 @@ copy_runtime_dir() {
   echo "staged runtime dir ${name}/"
 }
 
-for d in "${RUNTIME_DIRS[@]}"; do
+# Empty-array expansions below use ${arr[@]+"${arr[@]}"}: under `set -u`,
+# bash 3.2 (still /bin/bash on macOS runners) treats "${arr[@]}" on an EMPTY
+# array as an unbound variable and aborts. bash >= 4.4 does not, so this only
+# ever fails on macOS CI. A game packaged without --runtime-dir hit exactly
+# that.
+for d in ${RUNTIME_DIRS[@]+"${RUNTIME_DIRS[@]}"}; do
   copy_runtime_dir "${d}" 0
 done
-for d in "${RUNTIME_DIRS_OPTIONAL[@]}"; do
+for d in ${RUNTIME_DIRS_OPTIONAL[@]+"${RUNTIME_DIRS_OPTIONAL[@]}"}; do
   copy_runtime_dir "${d}" 1
 done
 
@@ -288,10 +293,10 @@ copy_proj() {
   fi
 }
 
-for f in "${PROJECT_FILES[@]}"; do
+for f in ${PROJECT_FILES[@]+"${PROJECT_FILES[@]}"}; do
   copy_proj "${f}"
 done
-for d in "${PROJECT_DIRS[@]}"; do
+for d in ${PROJECT_DIRS[@]+"${PROJECT_DIRS[@]}"}; do
   copy_proj "${d}"
 done
 

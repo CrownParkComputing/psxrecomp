@@ -327,7 +327,7 @@ for i in "${!EXE_PATHS[@]}"; do
   bundle_one "${EXE_PATHS[$i]}" "${DEST_DIRS[$i]}" "${LABELS[$i]}"
 done
 
-for dll in "${REQUIRE[@]}"; do
+for dll in ${REQUIRE[@]+"${REQUIRE[@]}"}; do
   [[ -n "${dll}" ]] || continue
   for i in "${!EXE_PATHS[@]}"; do
     exe="${EXE_PATHS[$i]}"

@@ -63,6 +63,6 @@ for f in "${FILES[@]}"; do [ -f "$f" ] && present+=("$f"); done
 # records with a relative path while runtime.cmake recomputes with an absolute
 # one, and every configure read as STALE with a byte-identical tree. The array
 # order is defined by this script alone, so it is stable across spellings.
-for f in "${present[@]}"; do
+for f in ${present[@]+"${present[@]}"}; do
     sha256sum < "$f"
 done | sha256sum | awk '{print $1}'

@@ -286,7 +286,7 @@ note "bundled OpenBIOS (512 KiB) + MIT notice"
 
 # 4. Required mod packages. A silently mod-less launcher looks fine but has no
 #    Mods page at all, which is indistinguishable from the feature being cut.
-for m in "${REQUIRE_MODS[@]}"; do
+for m in ${REQUIRE_MODS[@]+"${REQUIRE_MODS[@]}"}; do
     [ -f "$APPDIR/Contents/Resources/mods/packages/$m" ] \
         || die "required mod package missing: mods/packages/$m"
 done
