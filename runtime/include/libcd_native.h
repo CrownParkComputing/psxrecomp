@@ -37,6 +37,11 @@ typedef struct {
 /* Load <dir>/disc.toml and bind handlers. Returns 1 when the layer is live. */
 int  libcd_native_load(const char* dir, const LibcdNativeAddrs* addrs);
 int  libcd_native_active(void);
+
+/* The resolved asset directory ([libcd] asset_dir, made absolute against
+ * game.toml). Empty string when no pack is loaded. Game-specific hooks should
+ * use this rather than guessing a path relative to the process cwd. */
+const char* libcd_native_dir(void);
 void libcd_native_shutdown(void);
 
 #ifdef __cplusplus

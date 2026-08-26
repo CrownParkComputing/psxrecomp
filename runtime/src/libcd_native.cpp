@@ -33,6 +33,7 @@ struct Entry {
 
 struct State {
     bool               active = false;
+    std::string        dir;
     std::vector<Entry> files;
     uint32_t           setloc_lba = 0;   /* last CdControl(CdlSetloc) */
     /* Sticky, not one-shot: a game may poll CdReadSync many times for one
@@ -213,6 +214,7 @@ extern "C" int libcd_native_load(const char* dir, const LibcdNativeAddrs* a) {
         bound += psx_native_call_register(a->cd_read_sync, on_read_sync, nullptr);
     if (!bound) { g = State{}; return 0; }
 
+    g.dir = root.string();
     g.active = true;
     size_t stored = 0;
     for (const Entry& e : g.files) stored += e.stored ? 1 : 0;
@@ -224,5 +226,7 @@ extern "C" int libcd_native_load(const char* dir, const LibcdNativeAddrs* a) {
 }
 
 extern "C" int libcd_native_active(void) { return g.active ? 1 : 0; }
+
+extern "C" const char* libcd_native_dir(void) { return g.dir.c_str(); }
 
 extern "C" void libcd_native_shutdown(void) { g = State{}; }
